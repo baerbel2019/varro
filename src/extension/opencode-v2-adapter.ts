@@ -352,6 +352,10 @@ export class OpenCodeV2Adapter {
           ...agents[existing],
           ...agent,
           name,
+          options: {
+            ...asRecord(agents[existing]?.options),
+            ...asRecord(asRecord(agent.request)?.body),
+          },
           model: model
             ? {
                 providerID: model.providerID,
