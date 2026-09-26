@@ -85,6 +85,8 @@ for (const phase of ['exiting', 'retained', 'held-pointer'] as const) {
     // Pointer ownership must survive the short keyboard/input-intent timeout.
     if (phase === 'held-pointer') await page.waitForTimeout(650);
     await page.mouse.move(thumb.x, thumb.y - 100, { steps: 12 });
+    // Custom Chromium scrollbars deliver the final drag movement on the next frame.
+    await waitForAnimationFrames(page, 2);
     await page.mouse.up();
     await pauseExit?.evaluate((element) => element.parentNode?.removeChild(element));
 
