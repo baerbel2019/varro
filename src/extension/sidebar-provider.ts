@@ -882,6 +882,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 {
                   ...endpointServer,
                   resolveCommand: () => this.server.resolveCommand(),
+                  get apiVersion() {
+                    return server.apiVersion;
+                  },
                   get isAttachOnly() {
                     return server.isAttachOnly;
                   },
