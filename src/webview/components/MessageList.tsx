@@ -370,6 +370,7 @@ export function MessageList() {
   let trackRef: HTMLDivElement | undefined;
   const [autoScroll, setAutoScroll] = createSignal(true);
   const [showPromptNumbers, setShowPromptNumbers] = createSignal(false);
+  const [hideAssistantMessages, setHideAssistantMessages] = createSignal(false);
   const [suppressTimestampAnimations, setSuppressTimestampAnimations] = createSignal(false);
   const [workedSummaryPromptMessageId, setWorkedSummaryPromptMessageId] = createSignal<
     string | null
@@ -568,6 +569,7 @@ export function MessageList() {
         promptNumberLoads.clear();
         promptNumberReadyWindowVersions.clear();
         setPromptNumberReadySessionIds(new Set<string>());
+        setHideAssistantMessages(false);
       } else if (sessionId) {
         promptNumberReadyWindowVersions.delete(sessionId);
         setPromptNumberReadySessionIds((current) => {
@@ -1130,6 +1132,12 @@ export function MessageList() {
     if (options?.force) forceStickyPreviewGeometryRefresh = true;
     stickyPreviewGeometryRefreshPending = true;
     scheduleStickyPreviewFrame();
+  }
+
+  function toggleHideAssistantMessages() {
+    setHideAssistantMessages((hidden) => !hidden);
+    disengageBottomFollow();
+    scheduleStickyPreviewGeometryRefresh({ force: true });
   }
 
   function publishPendingWidthMeasurements(options?: { preserveVisibleAnchor?: boolean }) {
@@ -7583,12 +7591,18 @@ export function MessageList() {
           !assistantDiffContentMessageIds.has(messageId)
       )
     );
+    if (hideAssistantMessages()) {
+      for (const message of messages()) {
+        if (isAssistantMessage(message.info)) next.add(message.info.id);
+      }
+    }
     if (previous.size === next.size && [...next].every((messageId) => previous.has(messageId))) {
       return;
     }
 
     const currentMessageIds = new Set(messages().map((message) => message.info.id));
     let forcedContentChanged = false;
+    let assistantHideTransitionChanged = false;
     for (const messageId of new Set([...previous, ...next])) {
       if (previous.has(messageId) === next.has(messageId)) continue;
       if (previous.has(messageId) && currentMessageIds.has(messageId)) {
@@ -7596,11 +7610,17 @@ export function MessageList() {
         zeroHeightRenderGeometrySignatures.delete(messageId);
         forcedVirtualContentMessageIds.add(messageId);
         forcedContentChanged = true;
+      } else if (
+        !previous.has(messageId) &&
+        hideAssistantMessages() &&
+        currentMessageIds.has(messageId)
+      ) {
+        assistantHideTransitionChanged = true;
       }
       markVirtualMetricsDirty(messageId);
     }
     setKnownZeroHeightMessageIds(next);
-    if (forcedContentChanged) publishMeasurementVersion();
+    if (forcedContentChanged || assistantHideTransitionChanged) publishMeasurementVersion();
   });
   const messageBlockBoundaryMap = createMemo(() => {
     trackMessageBlockExpansionState();
@@ -7663,13 +7683,17 @@ export function MessageList() {
     trackLayoutVersion();
     return distanceFromBottom() > JUMP_TO_LATEST_MIN_HIDDEN_CONTENT_PX;
   });
-  const activeTurnMessageId = createMemo(() => {
+  const turnNavigationVisible = createMemo<{
+    activeTurnId: string | null;
+    visibleTurnIds: ReadonlySet<string>;
+  }>(() => {
     scrollTop();
     stickyPreviewGeometryVersion();
     const navigationTargetId = activeTurnNavigationTargetId();
     const sticky = stickyUserMessagePreviewCandidate();
     const visibleMessages = messages();
-    if (visibleMessages.length === 0) return null;
+    const visibleTurnIds = new Set<string>();
+    if (visibleMessages.length === 0) return { activeTurnId: null, visibleTurnIds };
     const container = containerRef;
     let firstVisibleIndex: number | null = null;
     if (container) {
@@ -7689,8 +7713,8 @@ export function MessageList() {
         if (!bubble) continue;
         const bounds = bubble.getBoundingClientRect();
         if (bounds.bottom <= visibleTop || bounds.top >= containerBottom) continue;
-        firstVisibleIndex = index;
-        break;
+        if (firstVisibleIndex === null) firstVisibleIndex = index;
+        if (entry.info.role === 'user') visibleTurnIds.add(entry.info.id);
       }
     }
     if (firstVisibleIndex === null && shouldVirtualize()) {
@@ -7705,11 +7729,12 @@ export function MessageList() {
       sticky?.id ?? null,
       turnNavigationPreviews()[0]?.id ?? null
     );
-    return getActiveTurnNavigationMessageId(
+    const activeTurnId = getActiveTurnNavigationMessageId(
       turnNavigationPreviews(),
       viewportTurnId,
       navigationTargetId
     );
+    return { activeTurnId, visibleTurnIds };
   });
 
   async function waitForMessageRow(
@@ -7838,6 +7863,7 @@ export function MessageList() {
   }
 
   function handleStickyPreviewClick(preview: StickyUserMessagePreview) {
+    if (hideAssistantMessages()) setHideAssistantMessages(false);
     if (stickyNavigationOwnsScroll()) cancelStickyNavigation();
     pendingWheelResizeAnchor = null;
     pendingTurnNavigationAnimationMessageId = preview.id;
@@ -7882,6 +7908,11 @@ export function MessageList() {
     } else {
       setActiveTurnNavigationTargetId(null);
     }
+  }
+
+  function handlePromptNumberClick(messageId: string) {
+    const preview = turnNavigationPreviews().find((turn) => turn.id === messageId);
+    if (preview) handleStickyPreviewClick(preview);
   }
 
   async function settleMountedStickyPreviewJump(
@@ -8355,7 +8386,9 @@ export function MessageList() {
                 }
                 suppressTimestampAnimation={suppressTimestampAnimations()}
                 promptNumber={
-                  promptNumbersVisible() ? promptNumberMap().get(preview().id) : undefined
+                  promptNumbersVisible() || hideAssistantMessages()
+                    ? promptNumberMap().get(preview().id)
+                    : undefined
                 }
                 loading={pendingStickyJump()?.preview.id === preview().id}
                 onClick={handleStickyPreviewClick}
@@ -8433,12 +8466,14 @@ export function MessageList() {
               modelChangeMap={modelChangeMap()}
               sessionPauseMap={rowSessionPauseMap()}
               promptNumberMap={promptNumberMap()}
-              showPromptNumbers={promptNumbersVisible()}
+              showPromptNumbers={promptNumbersVisible() || hideAssistantMessages()}
               showSentTimestamps={showPromptNumbers()}
               revealedSentTimestampMessageId={workedSummaryPromptMessageId()}
               revealedWorkedSummaryPromptMessageId={workedSummaryPromptMessageId()}
               showWorkedSummaryTimes={showPromptNumbers()}
               suppressTimestampAnimations={suppressTimestampAnimations()}
+              hideAssistantMessages={hideAssistantMessages()}
+              onPromptNumberClick={hideAssistantMessages() ? handlePromptNumberClick : undefined}
               lastAssistantID={lastAssistantID()}
               assistantRetryStates={assistantRetryStates()}
               outerListVirtualized={shouldVirtualize()}
@@ -8500,9 +8535,19 @@ export function MessageList() {
             />
           </Show>
           <Show
-            when={!editingMessage() ? trailingAssistantDialogSummary() : null}
+            when={
+              !hideAssistantMessages() &&
+              (!editingMessage() ? trailingAssistantDialogSummary() : null)
+            }
             fallback={
-              <Show when={reserveLoadingRow() && !editingMessage() && !!state.activeSessionId}>
+              <Show
+                when={
+                  !hideAssistantMessages() &&
+                  reserveLoadingRow() &&
+                  !editingMessage() &&
+                  !!state.activeSessionId
+                }
+              >
                 <LoadingRow
                   compacting={isSessionCompacting()}
                   waiting={waitingForBackground()}
@@ -8551,9 +8596,13 @@ export function MessageList() {
       >
         <TurnNavigationRail
           turns={turnNavigationPreviews()}
-          activeTurnId={activeTurnMessageId()}
+          activeTurnId={turnNavigationVisible().activeTurnId}
+          visibleTurnIds={turnNavigationVisible().visibleTurnIds}
           loadingTurnId={pendingStickyJump()?.preview.id}
           onSelect={handleStickyPreviewClick}
+          promptNumberMap={promptNumberMap()}
+          assistantMessagesHidden={hideAssistantMessages()}
+          onToggleAssistantMessages={toggleHideAssistantMessages}
         />
       </Show>
       <ChatContentBottomFade />
