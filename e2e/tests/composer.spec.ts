@@ -1202,7 +1202,9 @@ test('keeps the sent card and previous Worked summary stable through Thinking', 
   }, text);
 
   await page.getByLabel('Send (Enter)').click();
-  await expect(page.getByText(text, { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(text, { exact: true }).and(page.locator('.user-message-text'))
+  ).toBeVisible();
   await expect
     .poll(() =>
       page.evaluate(
