@@ -153,6 +153,7 @@ import {
   reviewSession,
   updatePermissionModeForSession,
 } from '../hooks/useOpenCode';
+import { resolveAgentModelDefault } from '../hooks/routing-state';
 import { normalizeModelVariant } from '../../shared/model-variant';
 import { getPromptCompletionVariant } from '../../shared/prompt-completion';
 import {
@@ -2750,7 +2751,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         e.preventDefault();
         const agent = agents[agentFocusIndex()];
         if (agent) {
-          setSelectedAgent(agent.name, { sessionId: composerSessionId() });
+          selectComposerAgent(agent);
           setShowAgentPicker(false);
         }
         return;
@@ -5288,6 +5289,18 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     );
   }
 
+  function selectComposerAgent(agent: { name: string }) {
+    const sessionId = composerSessionId();
+    setSelectedAgent(agent.name, { sessionId });
+    const agentModel = resolveAgentModelDefault({
+      selectedAgent: agent.name,
+      agents: state.allAgents,
+      providers: state.providers,
+      providerDefaults: state.providerDefaults,
+    });
+    if (agentModel) setSelectedModel(agentModel, { sessionId, persistGlobal: false });
+  }
+
   const hasPendingPdfFallback = () =>
     !currentModelSupportsPdf() && state.nativePdfs.some((pdf) => !pdf.contextFile);
 
@@ -6634,7 +6647,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
               if (next) setAgentFocusIndex(0);
             }}
             onSelectAgent={(agent) => {
-              setSelectedAgent(agent.name, { sessionId: composerSessionId() });
+              selectComposerAgent(agent);
               setShowAgentPicker(false);
             }}
             onAgentFocusIndex={setAgentFocusIndex}
@@ -6860,7 +6873,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             if (next) setAgentFocusIndex(0);
           }}
           onSelectAgent={(agent) => {
-            setSelectedAgent(agent.name, { sessionId: composerSessionId() });
+            selectComposerAgent(agent);
             setShowAgentPicker(false);
           }}
           onAgentFocusIndex={setAgentFocusIndex}

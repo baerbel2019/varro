@@ -12,6 +12,7 @@ import {
   isProviderWorking,
   reconcileLoadedAgents,
   reconcileLoadedProviders,
+  resolveAgentModelDefault,
 } from './routing-state';
 
 function provider(id: string, models: Provider['models']): Provider {
@@ -511,6 +512,65 @@ describe('routing-state helpers', () => {
           sessionId === 'ralph-manager-1' ? { providerID: 'openai', modelID: 'gpt-5' } : null,
       })
     ).toEqual({ providerID: 'openai', modelID: 'gpt-5' });
+  });
+
+  it('resolveAgentModelDefault uses the selected agent model or falls back to null', () => {
+    const models = {
+      'gpt-5': {
+        id: 'gpt-5',
+        name: 'GPT-5',
+        capabilities: { toolcall: true },
+        cost: { input: 0, output: 0 },
+        variants: { high: {} },
+      },
+    };
+    const providers = [provider('openai', models)];
+    const providerDefaults = { openai: 'gpt-5' };
+
+    expect(
+      resolveAgentModelDefault({
+        selectedAgent: 'coordinator',
+        agents: [
+          agent('build'),
+          agent('coordinator', {
+            model: { providerID: 'openai', modelID: 'gpt-5', variant: 'high' },
+          }),
+        ],
+        providers,
+        providerDefaults,
+      })
+    ).toEqual({ providerID: 'openai', modelID: 'gpt-5', variant: 'high' });
+
+    expect(
+      resolveAgentModelDefault({
+        selectedAgent: 'build',
+        agents: [agent('build')],
+        providers,
+        providerDefaults,
+      })
+    ).toBeNull();
+
+    expect(
+      resolveAgentModelDefault({
+        selectedAgent: 'missing',
+        agents: [agent('build')],
+        providers,
+        providerDefaults,
+      })
+    ).toBeNull();
+
+    expect(
+      resolveAgentModelDefault({
+        selectedAgent: 'coordinator',
+        agents: [
+          agent('coordinator', {
+            model: { providerID: 'unavailable', modelID: 'gpt-5' },
+          }),
+        ],
+        providers,
+        providerDefaults,
+      })
+    ).toBeNull();
   });
 
   it('derives the latest selected model and agent from messages', () => {

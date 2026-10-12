@@ -173,6 +173,26 @@ export function reconcileLoadedProviders(args: {
   return { effectiveModel, nextSelectedModel: undefined };
 }
 
+export function resolveAgentModelDefault(args: {
+  selectedAgent: string | null;
+  agents: Agent[];
+  providers: Provider[];
+  providerDefaults: Record<string, string>;
+}): SelectedModel | null {
+  const agent = args.agents.find((item) => item.name === args.selectedAgent);
+  if (!agent?.model) return null;
+  return resolveSelectedModel(
+    {
+      providerID: agent.model.providerID,
+      modelID: agent.model.modelID,
+      variant: agent.model.variant,
+    } satisfies SelectedModel,
+    args.providers,
+    args.providerDefaults,
+    { allowHidden: true }
+  );
+}
+
 export function isProviderWorking(
   providerID: string,
   statuses: Record<string, SessionStatus>,

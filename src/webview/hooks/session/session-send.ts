@@ -37,6 +37,7 @@ import {
 } from '../../../shared/context-files';
 import { normalizeModelVariant } from '../../../shared/model-variant';
 import { createOpenCodeMessageID } from '../../../shared/opencode-id';
+import { resolveAgentModelDefault } from '../routing-state';
 import { appStore } from '../../lib/stores/app-store';
 import { composerStore } from '../../lib/stores/composer-store';
 import { permissionsStore } from '../../lib/stores/permissions-store';
@@ -1012,7 +1013,15 @@ export class SessionSendOperations {
           appStore.state.selectedAgent));
     const sessionSelectedModel = routingStore.getSelectedModelForSession(targetSessionId);
     const selectedModel =
-      options?.selectedModel ?? sessionSelectedModel ?? appStore.state.selectedModel;
+      options?.selectedModel ??
+      sessionSelectedModel ??
+      resolveAgentModelDefault({
+        selectedAgent,
+        agents: appStore.state.allAgents,
+        providers: appStore.state.providers,
+        providerDefaults: appStore.state.providerDefaults,
+      }) ??
+      appStore.state.selectedModel;
     const modelVariantSelections = { ...appStore.state.modelVariantSelections };
     const explicitDefaultModel = options?.selectedModel ?? sessionSelectedModel;
     if (explicitDefaultModel && !explicitDefaultModel.variant) {
