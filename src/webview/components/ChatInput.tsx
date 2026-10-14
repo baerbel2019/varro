@@ -883,6 +883,10 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   >();
   let authoritativeQueuedStatusRevision = 0;
   const queuedStatusReconciliationOwner = Symbol();
+  // Queue effects can run during construction, before the dispatch helpers below are reached.
+  let queueDispatchTimer: ReturnType<typeof setTimeout> | 0 = 0;
+  let queuedStatusReconciliationTimer: ReturnType<typeof setTimeout> | 0 = 0;
+  let queueDispatchDisposed = false;
   const composerSessionId = () => (props.newSession ? null : state.activeSessionId);
   let pdfAttachmentSessionId = untrack(composerSessionId);
   const invalidatePendingPdfAttachments = () => {
@@ -3850,9 +3854,6 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return undefined;
   }
 
-  let queueDispatchTimer: ReturnType<typeof setTimeout> | 0 = 0;
-  let queuedStatusReconciliationTimer: ReturnType<typeof setTimeout> | 0 = 0;
-  let queueDispatchDisposed = false;
   createEffect(() => {
     const initialized = connectionInitialized();
     const dispatchingId = dispatchingQueuedMessageId();
@@ -6590,6 +6591,12 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
           <div class="chat-input-toolbar-divider" aria-hidden="true" />
 
           <ChatInputMainToolbar
+            focusComposer={() => {
+              closePopups();
+              richEditorRef?.focus();
+            }}
+            remoteExtensionHost={isRemoteExtensionHost()}
+            onDictationAvailabilityChange={() => toolbarFitter.schedule({ contentChanged: true })}
             toolbarRef={(el) => {
               toolbarRef = el;
             }}

@@ -135,6 +135,7 @@ function register(
     captureContextTarget: vi.fn(() => 'sidebar'),
     revealContextTarget: vi.fn(async (_target: string, reveal: () => Promise<unknown>) => reveal()),
     generateCommitMessage: vi.fn(() => Promise.resolve()),
+    cancelCommitMessage: vi.fn(() => Promise.resolve()),
     generateUsageReport: vi.fn(() => Promise.resolve()),
     openMarkdownDocument: vi.fn(async (content: string, title: string, _show?: boolean) => {
       await vscodeMock.workspace.openTextDocument({
@@ -255,6 +256,7 @@ describe('About command', () => {
       health: { healthy: true, version: '1.18.4' },
       cliVersion: '1.18.4',
       activeAgentCount: 0,
+      processId: 1234,
       installMethod: 'bun',
       cliInstalledAt: new Date(2026, 8, 30, 12, 34, 56).getTime(),
       connections: {
@@ -282,6 +284,12 @@ describe('About command', () => {
     expect(root.querySelector('[data-about-field="installedOn"]')?.textContent).toBe(installedOn);
     expect(root.querySelector('[data-about-field="vscodeClients"]')?.textContent).toBe('1');
     expect(root.querySelector('[data-about-field="otherClients"]')?.textContent).toBe('0');
+    expect(root.querySelector('[data-about-field="serverProcessId"]')?.textContent).toBe('1234');
+    expect(sidebar.openMarkdownDocument).toHaveBeenCalledWith(
+      expect.stringContaining('  - **PID:** `1234`'),
+      'Varro About',
+      false
+    );
     expect(root.querySelector('[data-about-field="serverStartedOn"]')?.textContent).not.toBe(
       'Unknown'
     );
@@ -293,6 +301,7 @@ describe('About command', () => {
     readServerInfo.mockResolvedValue({
       ...info,
       activeAgentCount: 3,
+      processId: null,
       health: { healthy: false, version: '1.18.9' },
       cliInstalledAt: null,
       connections: {
@@ -314,6 +323,7 @@ describe('About command', () => {
         installedOn: 'Unknown',
         vscodeClients: '2',
         otherClients: '1',
+        serverProcessId: 'Unknown',
       }),
     });
     expect(panel.webview.html).toBe(html);
@@ -326,6 +336,12 @@ describe('About command', () => {
     expect(vscodeMock.env.clipboard.writeText).toHaveBeenLastCalledWith(
       expect.stringContaining('  - **Version:** `1.18.9`')
     );
+    readServerInfo.mockResolvedValue({ ...info, processId: 5678 });
+    await receive({ action: 'refresh' });
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: 'about-update',
+      data: expect.objectContaining({ serverProcessId: '5678' }),
+    });
   });
 
   it.each([null, undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1e20])(
@@ -508,7 +524,7 @@ describe('About command', () => {
       '- **CLI:**\n  - **Version:** `1.18.4`\n  - **Install method:** bun\n  - **Binary:** `/home/me/.bun/bin/opencode`'
     );
     expect(aboutMarkdown).toContain(
-      '- **Server:**\n  - **Version:** `1.18.4`\n  - **URL:** [http://127.0.0.1:4096](http://127.0.0.1:4096)\n  - **Ownership:** managed by Varro\n  - **Status:** `running, event stream unknown`\n  - **Health:** healthy\n  - **Active sessions:** `1`\n  - **Started on:** Unknown\n  - **VS Code clients:** Unknown (local connected processes)\n  - **Other clients:** Unknown (local connected processes)\n- **Auto updates:** enabled'
+      '- **Server:**\n  - **Version:** `1.18.4`\n  - **URL:** [http://127.0.0.1:4096](http://127.0.0.1:4096)\n  - **PID:** `Unknown`\n  - **Ownership:** managed by Varro\n  - **Status:** `running, event stream unknown`\n  - **Health:** healthy\n  - **Active sessions:** `1`\n  - **Started on:** Unknown\n  - **VS Code clients:** Unknown (local connected processes)\n  - **Other clients:** Unknown (local connected processes)\n- **Auto updates:** enabled'
     );
     expect(aboutMarkdown).not.toContain('## Diagnostics');
     expect(sidebar.openMarkdownDocument).toHaveBeenCalledWith(
@@ -1320,6 +1336,13 @@ describe('sidebar navigation commands', () => {
     await runCommand('varro.generateCommitMessage', sourceControl);
 
     expect(sidebar.generateCommitMessage).toHaveBeenCalledWith(sourceControl);
+  });
+
+  it('forwards the selected source control to commit-message cancellation', async () => {
+    const { sidebar } = register();
+    const sourceControl = { id: 'git', rootUri: fileUri('/repo') };
+    await runCommand('varro.cancelCommitMessage', sourceControl);
+    expect(sidebar.cancelCommitMessage).toHaveBeenCalledWith(sourceControl);
   });
 
   it.each([

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'solid-js/web';
+import { createRoot } from 'solid-js';
+import type * as SolidModule from 'solid-js';
 import { reconcile } from 'solid-js/store';
 import packageJson from '../../../package.json';
 import type * as UseOpenCodeModule from '../hooks/useOpenCode';
@@ -74,6 +76,38 @@ import { upsertMessageInfo } from '../lib/state-messages';
 import * as imageCompression from '../lib/image-compression';
 import * as imageLoading from '../lib/image-loading';
 
+describe('composer dictation integration', () => {
+  it('places the mic immediately before Attach and focuses the composer on activation', async () => {
+    const sent: WebviewMessage[] = [];
+    defaultBridgeSend = (message) => {
+      sent.push(message);
+      if (message.type !== 'handy/request') return;
+      queueMicrotask(() =>
+        window.dispatchEvent(
+          new MessageEvent('message', {
+            data: {
+              type: 'handy/result',
+              payload: { requestId: message.payload.requestId, available: true, running: true },
+            },
+          })
+        )
+      );
+    };
+    fixture<{ __sendToExtension?: (message: WebviewMessage) => void }>(window).__sendToExtension =
+      defaultBridgeSend;
+    cleanup = render(() => ChatInput(), container!);
+    await Promise.resolve();
+    const mic = container?.querySelector<HTMLButtonElement>('.toolbar-dictation-button');
+    const attach = container?.querySelector<HTMLButtonElement>('.toolbar-attach-button');
+    expect(mic).toBeInstanceOf(HTMLButtonElement);
+    expect(mic?.closest('.toolbar-right')?.querySelectorAll('button')[0]).toBe(mic);
+    expect(mic?.closest('.toolbar-right')?.querySelectorAll('button')[1]).toBe(attach);
+    mic?.click();
+    expect(document.activeElement).toBe(container?.querySelector('.rich-composer'));
+    expect(sent.at(-1)).toMatchObject({ type: 'handy/request', payload: { action: 'toggle' } });
+  });
+});
+
 interface SessionEventProperties extends UnknownRecord {
   sessionID: string;
   status?: { type: 'idle' };
@@ -121,6 +155,18 @@ const {
 }));
 
 /* oxlint-disable anti-slop/no-module-mocking -- These tests exercise ChatInput's module-level hook and client integration. */
+const immediateComposerEffects = vi.hoisted(() => ({ enabled: false }));
+vi.mock('solid-js', async (importOriginal) => {
+  const actual = await importOriginal<typeof SolidModule>();
+  return {
+    ...actual,
+    // SAFETY: Both Solid effect APIs accept the same forwarded arguments; this preserves their overloads.
+    createEffect: ((...args: Parameters<typeof actual.createEffect>) => {
+      if (immediateComposerEffects.enabled) actual.createRenderEffect(...args);
+      else actual.createEffect(...args);
+    }) as typeof actual.createEffect,
+  };
+});
 vi.mock('../hooks/useOpenCode', async () => {
   const actual = await vi.importActual<typeof UseOpenCodeModule>('../hooks/useOpenCode');
   return {
@@ -734,6 +780,28 @@ function availableProviderLimit(
 }
 
 describe('ChatInput', () => {
+  it('initializes queue timers before synchronous construction effects run', () => {
+    setupModelState();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    immediateComposerEffects.enabled = true;
+    try {
+      expect(() =>
+        createRoot((dispose) => {
+          cleanup = dispose;
+          const element = ChatInput();
+          if (!(element instanceof HTMLElement)) throw new Error('Expected a composer element');
+          container!.appendChild(element);
+        })
+      ).not.toThrow();
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(client.session.status).not.toHaveBeenCalled();
+    } finally {
+      immediateComposerEffects.enabled = false;
+    }
+  });
+
   it.each(['live messages', 'cached messages'])(
     'includes only the latest same-chat agent text from %s',
     async (source) => {

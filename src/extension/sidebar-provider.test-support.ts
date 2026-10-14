@@ -1,6 +1,7 @@
 /* oxlint-disable anti-slop/no-module-mocking, anti-slop/no-object-parameters, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion -- This support module supplies extension-host import fakes and protocol-shaped fixtures shared by sidebar tests. */
 import { beforeEach, vi } from 'vitest';
 import type * as FsPromises from 'fs/promises';
+import type * as ChildProcessModule from 'child_process';
 import type { EditorContext } from '../shared/protocol';
 import type { UriHandler } from 'vscode';
 
@@ -14,11 +15,13 @@ const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
   mkdtemp: vi.fn(),
   open: vi.fn(),
+  exportFileChunks: new Map<string, Buffer[]>(),
   providerSignatureFileSystem: {
     readFile: vi.fn(),
     stat: vi.fn(),
   },
   readFile: vi.fn(),
+  stat: vi.fn(),
   rm: vi.fn(),
   vscode: {
     env: {
@@ -153,7 +156,10 @@ export function getConfigurationValue(key: string) {
 }
 
 vi.mock('vscode', () => mocks.vscode);
-vi.mock('child_process', () => ({ spawn: mocks.spawn, default: { spawn: mocks.spawn } }));
+vi.mock('child_process', async () => {
+  const actual = await vi.importActual<typeof ChildProcessModule>('child_process');
+  return { ...actual, spawn: mocks.spawn, default: { ...actual, spawn: mocks.spawn } };
+});
 vi.mock('cross-spawn', () => ({ default: mocks.spawn, spawn: mocks.spawn }));
 vi.mock('fs/promises', async () => {
   const actual = await vi.importActual<typeof FsPromises>('fs/promises');
@@ -162,6 +168,7 @@ vi.mock('fs/promises', async () => {
     mkdtemp: mocks.mkdtemp,
     open: mocks.open,
     readFile: mocks.readFile,
+    stat: mocks.stat,
     rm: mocks.rm,
   };
 });
@@ -172,6 +179,7 @@ vi.mock('node:fs/promises', async () => {
     mkdtemp: mocks.mkdtemp,
     open: mocks.open,
     readFile: mocks.readFile,
+    stat: mocks.stat,
     rm: mocks.rm,
   };
 });
@@ -305,7 +313,7 @@ export async function createSidebarProviderInstance(
   return { SidebarProvider, provider, workspaceState, globalState, contextProvider, server };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
   mocks.configurationValues.clear();
@@ -327,8 +335,32 @@ beforeEach(() => {
   mocks.mkdtemp.mockReset();
   mocks.mkdtemp.mockResolvedValue('/tmp/varro-opencode-export-123');
   mocks.open.mockReset();
-  mocks.open.mockResolvedValue({ fd: 17, close: vi.fn(() => Promise.resolve()) });
+  mocks.exportFileChunks.clear();
+  mocks.open.mockImplementation(async (filename: string) => {
+    const chunks: Buffer[] = [];
+    mocks.exportFileChunks.set(filename, chunks);
+    return {
+      fd: 17,
+      write: vi.fn(async (chunk: Buffer, offset: number, length: number) => {
+        chunks.push(Buffer.from(chunk.subarray(offset, offset + length)));
+        return { bytesWritten: length };
+      }),
+      close: vi.fn(() => Promise.resolve()),
+    };
+  });
   mocks.readFile.mockReset();
+  mocks.readFile.mockImplementation(async (filename: string) => {
+    const chunks = mocks.exportFileChunks.get(filename);
+    return chunks ? Buffer.concat(chunks).toString('utf8') : undefined;
+  });
+  const actualFs = await vi.importActual<typeof FsPromises>('fs/promises');
+  mocks.stat.mockReset();
+  mocks.stat.mockImplementation((...args: Parameters<typeof actualFs.stat>) => {
+    const chunks = mocks.exportFileChunks.get(String(args[0]));
+    return chunks
+      ? Promise.resolve({ size: Buffer.concat(chunks).length })
+      : actualFs.stat(...args);
+  });
   mocks.providerSignatureFileSystem.readFile.mockReset();
   mocks.providerSignatureFileSystem.stat.mockReset();
   mocks.providerSignatureFileSystem.stat.mockRejectedValue(

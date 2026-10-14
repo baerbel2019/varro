@@ -109,6 +109,12 @@ With OpenCode V2, `/pause` interrupts the current session run and pauses its que
 
 Paused time is excluded from worked-duration summaries and usage statistics. Resuming starts a new work period, so returning hours later does not inflate the previous run's duration.
 
+### Handy dictation
+
+When [Handy](https://github.com/cjpais/Handy) is installed, a microphone button appears immediately before Attach. Start Handy and configure its model, microphone, and accessibility permissions. Click the mic to toggle dictation; click again to stop and let Handy paste into the focused composer. Right-click the button to cancel. Disable Handy's Auto Submit option if you want to review the text before sending.
+
+The speaking icon tracks toggles made in Varro, not recording changes made through Handy's global shortcut. Detection uses standard installation locations and PATH; set `varro.dictation.handyPath` to an absolute executable path for other installations. Requires Handy's CLI remote-control flags and a local desktop extension host. Remote SSH, WSL, and containers are unsupported.
+
 ## Permissions
 
 Permission requests provide `Reject`, `Once`, and `Always` actions. Each session has one of three modes:
@@ -179,9 +185,9 @@ Varro reloads global OpenCode configuration when OpenCode is idle. Changes to pr
 
 ## Requirements
 
-- [VS Code](https://code.visualstudio.com/) or [VSCodium](https://vscodium.com/) 1.120 or newer
+- [VS Code](https://code.visualstudio.com/) or [VSCodium](https://vscodium.com/) 1.107 or newer
 - [Node.js](https://nodejs.org/) 22.22.2+ on Node 22, or Node 24.15.0+
-- [OpenCode v2 CLI](https://opencode.ai/v2/docs/) 2.0.5+ recommended, or [v1 CLI](https://opencode.ai/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.0.27 and v1 1.19.0
+- [OpenCode v2 CLI](https://opencode.ai/v2/docs/) 2.0.5+ recommended, or [v1 CLI](https://opencode.ai/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.0.28 and v1 1.19.0
 - A trusted, non-virtual workspace. Remote workspaces run Varro and OpenCode on the remote extension host
 
 ## Documentation

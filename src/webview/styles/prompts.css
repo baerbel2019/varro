@@ -75,6 +75,10 @@
 }
 
 .question-summary-answer {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
   color: var(--color-vscode-fg);
   font-weight: 600;
   overflow-wrap: anywhere;
@@ -420,16 +424,6 @@ body.vscode-light .question-custom-input {
 
 .question-btn-danger:hover:not(:disabled) {
   background: color-mix(in srgb, var(--color-vscode-error) 84%, black);
-}
-
-.question-btn-tertiary {
-  background: transparent;
-  color: var(--color-vscode-fg-muted);
-}
-
-.question-btn-tertiary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-vscode-hover) 84%, transparent);
-  color: var(--color-vscode-fg);
 }
 
 .server-status-surface {

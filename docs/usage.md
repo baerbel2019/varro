@@ -71,7 +71,7 @@ For WSL, open the project in a VS Code WSL window, then install and authenticate
 
 | Version | Minimum supported | Tested with this release | npm package |
 | --- | --- | --- | --- |
-| v2, recommended | 2.0.5 | 2.0.27 | `@opencode/cli` |
+| v2, recommended | 2.0.5 | 2.0.28 | `@opencode/cli` |
 | v1, still supported | 1.16.0 | 1.19.0 | `opencode-ai` |
 
 To keep using v1, retain your installation or run `npm install -g opencode-ai`. Set `varro.server.command` to its executable path. Setting it to `opencode` selects v1 only if that command resolves to a v1 installation. Varro detects the API automatically.
@@ -289,6 +289,13 @@ Use `Varro: Open Global AGENTS.md` to edit OpenCode's global instructions. `Varr
 ## Sessions
 
 Sessions from every open workspace root appear in one catalog. Use the folder filter above search to narrow the list; it defaults to `All folders`. Folder labels appear only when multiple roots are open. The default list is split into `Recent`, `Archive`, and `Recycle Bin`. `Archive` is a UI grouping for older ordinary sessions; opening it does not alter those sessions in OpenCode. Pinned and active-state sessions remain surfaced, while other sessions are ordered approximately by activity age.
+
+If a workspace folder was deleted or renamed, the session list reports an incomplete load rather than
+interpreting that folder as empty history. Available roots still load; cached history and queues for
+unavailable folders remain. Opening an affected conversation explains how to restore the folder or
+reopen its new location. Varro does not recreate folders, relocate conversations, or submit prompts
+automatically. Incomplete status and pending-decision snapshots are rejected so existing state is not
+cleared by a failed read.
 
 - Start a fresh session with `Varro: New Session` or the new chat button. Right-click the button to choose `New Chat` or `New Chat in Editor`. Crafted composer text is kept for the new session, while file, image, terminal, and message-edit context is cleared.
 - Open the session list from the back button in the header.
@@ -656,6 +663,19 @@ Varro integrates commit-message generation directly into VS Code Source Control.
 
 Varro uses staged changes when the index is non-empty. If nothing is staged, it uses tracked unstaged changes and untracked files instead. It never mixes the two scopes. Varro rejects unresolved merge changes and reports when neither scope has usable changes.
 
+The wand changes to a Stop action while that repository's generation is active. Select it to cancel,
+or run `Varro: Cancel Commit Message Generation`.
+The Source Control action cancels that repository; the Command Palette action cancels all active commit-message generations.
+Cancellation also covers preparation and final validation. Generate again to retry after cancellation or failure;
+Varro does not automatically resend model requests, and a cancelled attempt cannot apply a late result.
+
+Set `varro.commitMessage.rules` for custom style and format instructions, such as `Use Conventional Commits with a scope.`
+User settings provide a default. Workspace or folder settings override it for the selected Git repository,
+including in multi-root workspaces. These instructions take precedence over inferred commit style, but not
+grounding in the diff, output validation, or the prohibition on tools and automatic commits.
+
+See [Custom commit-message prompts](commit-message-prompts.md) for short examples and settings instructions.
+
 The model is selected in this order:
 
 1. The `varro.commitMessage.model` VS Code user setting
@@ -749,6 +769,7 @@ Chat view:
 Commit messages:
 
 - `varro.commitMessage.model` - provider/model used to generate commit messages; stored in VS Code user settings and selected from Varro's Models view
+- `varro.commitMessage.rules` - style and format instructions, resolved from user, workspace, and folder settings for the selected Git repository
 
 There are also deprecated debug-only settings used for development and recovery testing:
 
@@ -759,7 +780,7 @@ There are also deprecated debug-only settings used for development and recovery 
 ## Troubleshooting
 
 - OpenCode CLI missing: install v2 with `npm install -g @opencode/cli` on macOS, Linux, or WSL, or download the native Windows CLI from the [v2 install page](https://opencode.ai/v2/docs/). V1 remains available with `npm install -g opencode-ai`.
-- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.0` and v2 `2.0.27`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
+- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.0` and v2 `2.0.28`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
 - OpenCode v2 authentication: Varro captures managed-server credentials automatically and redacts them from output. Existing local services use their registered credentials. An externally managed server can also use `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` from the extension host's environment.
 - OpenCode v2 session settings: Varro stores mutable session annotations locally because the released v2 API cannot update session metadata. Session sharing is unavailable through this API, so its menu action is disabled. Existing v1-format configuration remains supported.
 - CLI not on `PATH`: set `varro.server.command` to the executable path.

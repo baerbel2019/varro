@@ -44,7 +44,7 @@ const { getConfigurationMock, loggerMock, mkdirMock, spawnMock, vscodeMock, writ
       env: { openExternal: vi.fn() },
       Uri: { parse: vi.fn((value: string) => value) },
     },
-    writeFileMock: vi.fn(() => Promise.resolve(undefined)),
+    writeFileMock: vi.fn<typeof FsPromisesModule.writeFile>(() => Promise.resolve()),
   }));
 
 vi.mock('./logger', () => ({ logger: loggerMock }));
@@ -2026,6 +2026,11 @@ describe('OpenCodeServer event stream', () => {
 
 describe('OpenCodeServer runtime config injection', () => {
   it('injects runtime defaults without overriding caller compaction configuration', async () => {
+    const actualFs = await vi.importActual<typeof FsPromisesModule>('fs/promises');
+    const os = await import('os');
+    await actualFs.mkdir(os.tmpdir(), { recursive: true });
+    // This case reads the generated config from disk; other server fixtures keep writes mocked.
+    writeFileMock.mockImplementationOnce(actualFs.writeFile);
     const inheritedContent =
       '{\n  // inherited content\n  "provider": { "example": { "name": "Example" } },\n  "compaction": { "auto": false, "buffer": 16000 },\n}\n';
     process.env.OPENCODE_CONFIG_CONTENT = inheritedContent;
@@ -2092,7 +2097,6 @@ describe('OpenCodeServer runtime config injection', () => {
     expect(configPath).toContain('varro-opencode-config-');
     expect(configPath).toMatch(/opencode\.json$/);
     expect(options?.env?.OPENCODE_CONFIG_CONTENT).toBe(inheritedContent);
-    const actualFs = await vi.importActual<typeof FsPromisesModule>('fs/promises');
     expect(await actualFs.readFile(configPath!, 'utf-8')).toBe(configText);
     await actualFs.rm(dirname(configPath!), { recursive: true, force: true });
   });
@@ -2128,6 +2132,7 @@ describe('OpenCodeServer maintenance', () => {
     const server = new OpenCodeServer(4096, false);
     const api = server as unknown as {
       processManager: OpenCodeProcess;
+      transport: { readonly serverPid: number | null };
       readInstalledCliVersion: () => Promise<string | null>;
       readHealthInfo: () => Promise<{ healthy: boolean; version?: string }>;
       readActiveAgentCount: () => Promise<number>;
@@ -2142,6 +2147,7 @@ describe('OpenCodeServer maintenance', () => {
     const info = await server.readServerInfo();
     expect(readLocalServerConnectionInfo).toHaveBeenCalledWith(4096, 1234);
     expect(info.connections).toEqual(connections);
+    expect(info.processId).toBe(1234);
     expect(info.activeAgentCount).toBe(2);
     expect(info.ownership).toBe('unmanaged');
 
@@ -2150,6 +2156,7 @@ describe('OpenCodeServer maintenance', () => {
       return connections;
     });
     const replaced = await server.readServerInfo();
+    expect(replaced.processId).toBeNull();
     expect(replaced.connections).toEqual({
       startedAt: null,
       vscodeClients: null,
@@ -2159,12 +2166,22 @@ describe('OpenCodeServer maintenance', () => {
     api.readHealthInfo = vi.fn().mockResolvedValue({ healthy: false });
     vi.mocked(readLocalServerConnectionInfo).mockClear();
     const unhealthy = await server.readServerInfo();
+    expect(unhealthy.processId).toBeNull();
     expect(readLocalServerConnectionInfo).not.toHaveBeenCalled();
     expect(unhealthy.connections).toEqual({
       startedAt: null,
       vscodeClients: null,
       otherClients: null,
     });
+
+    // Health identifies the actual server listener, which can differ from the CLI wrapper.
+    api.readHealthInfo = vi.fn().mockResolvedValue({ healthy: true, version: '2.0.21' });
+    vi.spyOn(api.transport, 'serverPid', 'get').mockReturnValue(5678);
+    vi.mocked(readLocalServerConnectionInfo).mockResolvedValueOnce(connections);
+    const nativeServer = await server.readServerInfo();
+    expect(nativeServer.processId).toBe(5678);
+    expect(readLocalServerConnectionInfo).toHaveBeenLastCalledWith(4096, 5678);
+    expect(nativeServer.ownership).toBe('unmanaged');
   });
 
   it.each([

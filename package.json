@@ -1,7 +1,7 @@
 {
   "name": "varro",
   "displayName": "Varro: OpenCode Workbench",
-  "version": "0.32.12",
+  "version": "0.33.3",
   "description": "OpenCode agent workbench with project-aware chat, parallel sessions, plan and change review, model and permission controls, commit messages, and usage insights.",
   "categories": [
     "AI",
@@ -89,13 +89,13 @@
   "dependencies": {
     "@imagemagick/magick-wasm": "0.0.44",
     "@opencode-ai/sdk": "^1.19.0",
-    "@opencode/client": "^2.0.27",
+    "@opencode/client": "^2.0.28",
     "cross-spawn": "7.0.6",
-    "dompurify": "3.4.16",
+    "dompurify": "3.4.17",
     "highlight.js": "11.12.0",
     "jsonc-parser": "3.3.1",
-    "marked": "18.1.0",
-    "mermaid": "^12.1.0",
+    "marked": "18.1.1",
+    "mermaid": "^12.2.0",
     "solid-js": "^1.9.17"
   },
   "devDependencies": {
@@ -103,23 +103,23 @@
     "@tailwindcss/vite": "4.3.3",
     "@types/css.escape": "1.5.2",
     "@types/node": "26.6.5",
-    "@types/vscode": "1.120.0",
-    "@vitest/coverage-v8": "5.0.3",
+    "@types/vscode": "1.107.0",
+    "@vitest/coverage-v8": "5.0.4",
     "@vscode/vsce": "4.0.0",
     "css.escape": "1.5.1",
     "esbuild": "0.28.2",
     "iconoir": "7.12.1",
     "jsdom": "30.1.2",
     "material-icon-theme": "5.39.0",
-    "oxfmt": "0.72.0",
-    "oxlint": "1.87.0",
-    "oxlint-plugin-anti-slop": "github:dmmulroy/anti-slop#c44ef22",
+    "oxfmt": "0.73.0",
+    "oxlint": "1.88.0",
+    "oxlint-plugin-anti-slop": "github:dmmulroy/anti-slop#13909c9",
     "oxlint-tsgolint": "7.0.2004",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "vite": "8.3.4",
     "vite-plugin-solid": "2.11.14",
-    "vitest": "5.0.3",
+    "vitest": "5.0.4",
     "ws": "8.22.0"
   },
   "overrides": {
@@ -145,7 +145,7 @@
       ]
     },
     "views": {
-      "varro": [
+      "varro-primary": [
         {
           "icon": "assets/icon.png",
           "type": "webview",
@@ -246,6 +246,12 @@
         "icon": "$(wand)"
       },
       {
+        "command": "varro.cancelCommitMessage",
+        "title": "Varro: Cancel Commit Message Generation",
+        "icon": "$(debug-stop)",
+        "enablement": "varro:generatingCommitMessage"
+      },
+      {
         "command": "varro.agents.openGlobal",
         "title": "Varro: Open Global AGENTS.md"
       },
@@ -343,7 +349,12 @@
       "scm/title": [
         {
           "command": "varro.generateCommitMessage",
-          "when": "scmProvider == git",
+          "when": "scmProvider == git && scmProviderRootUri not in varro:commitMessageGenerationRoots",
+          "group": "navigation@99"
+        },
+        {
+          "command": "varro.cancelCommitMessage",
+          "when": "scmProvider == git && scmProviderRootUri in varro:commitMessageGenerationRoots",
           "group": "navigation@99"
         }
       ],
@@ -445,6 +456,12 @@
     "configuration": {
       "title": "Varro",
       "properties": {
+        "varro.dictation.handyPath": {
+          "type": "string",
+          "scope": "application",
+          "default": "",
+          "markdownDescription": "Optional absolute path to the Handy executable. When empty, Varro searches standard installation locations and PATH. Handy must already be running with its model and permissions configured. The composer mic toggles dictation; right-click it to cancel. Requires a local desktop extension host. The speaking icon tracks Varro's toggles, not Handy's global shortcut. Disable Handy's Auto Submit option to review dictated text before sending."
+        },
         "varro.notifications.sound": {
           "type": "object",
           "scope": "application",
@@ -595,6 +612,12 @@
           "patternErrorMessage": "Use provider/model, or leave the setting empty.",
           "markdownDescription": "Provider/model used to generate commit messages. Leave empty to let Varro select a suitable model automatically. Select a configured model from Varro's Models view."
         },
+        "varro.commitMessage.rules": {
+          "type": "string",
+          "scope": "resource",
+          "default": "",
+          "markdownDescription": "Style and format instructions for generated commit messages. User settings provide a default; workspace and folder settings override it for the selected Git repository. For example: `Use Conventional Commits with a scope.` Rules cannot override grounding in the supplied changes or enable tools and commits."
+        },
         "varro.decisions.jev.autoApprove": {
           "type": "boolean",
           "scope": "application",
@@ -656,7 +679,7 @@
   },
   "engines": {
     "node": "^22.22.2 || >=24.15.0",
-    "vscode": "^1.120.0"
+    "vscode": "^1.107.0"
   },
   "volta": {
     "node": "24.21.0",

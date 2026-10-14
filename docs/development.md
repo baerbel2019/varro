@@ -5,7 +5,7 @@ This document covers source setup, packaging, and debugging for the Varro VS Cod
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) 22.22.2+ on Node 22, or Node 24.15.0+
-- [VS Code](https://code.visualstudio.com/) 1.120 or newer
+- [VS Code](https://code.visualstudio.com/) 1.107 or newer
 - [OpenCode v2 CLI](https://opencode.ai/v2/docs/) 2.0.5+ recommended, or v1 1.16.0+
 
 ```sh
@@ -111,6 +111,14 @@ npm run test:e2e
 ```
 
 Use `npm run vscode:install` when you specifically want to package and install the VSIX into your local VS Code. The helper removes old Varro VSIX files, packages the current version, and passes its exact filename to the VS Code CLI on macOS, Linux, and Windows. Run `npm run vscode:install -- --dry-run` to inspect those operations without changing files or invoking the build or VS Code.
+
+The default target is `code` only. `VARRO_VSCODE_CLI` can select another CLI or an executable path.
+To install into multiple editors explicitly, use `npm run vscode:install -- --target code --target codium`.
+Repeat `--target` for each editor; quote executable paths containing spaces. Explicit targets override
+`VARRO_VSCODE_CLI`. The helper packages once, attempts every requested target, and reports failures
+with a nonzero exit status. It never discovers or installs into other editors automatically.
+Every target receives `--force`, including the default `code` target. Passing `--force` to this helper
+explicitly is also accepted, but is not required.
 
 ## Build
 

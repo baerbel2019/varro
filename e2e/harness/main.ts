@@ -219,6 +219,7 @@ type HarnessWindow = Window & {
     pendingHistoryRequestCount?: () => number;
     getSessionMessages?: (sessionId: string) => MessageEntry[];
     getPendingPermissions?: () => Array<Record<string, unknown>>;
+    getStartupState?: () => { initialized: boolean; loading: boolean };
     replayServerEvent?: (event: unknown, projectedMessage?: MessageEntry) => void;
   };
 };
@@ -2908,7 +2909,10 @@ function createScenarioState(name: ScenarioName): ScenarioState {
               ['All OpenCode projects'],
               ['Today, Last 7 days, Last 30 days, plus all time'],
               [
-                'Token stats by provider and model are calculated to the API cost. The current model can fetch the prices.',
+                // Overflow three lines at wide widths even with narrower Linux font metrics.
+                'Token stats by provider and model are calculated to the API cost. The current model can fetch the prices. Include input, output, and cached tokens separately for each provider and model. Keep the original token counts alongside estimated costs so the calculation can be checked. Record the price source and retrieval date, and flag models whose prices are unavailable. Do not treat missing prices as zero-cost usage. Include the full reporting period and project scope in the generated report. '.repeat(
+                  2
+                ),
               ],
               ['Untitled Markdown'],
             ],
@@ -6326,6 +6330,16 @@ function installBridge(state: ScenarioState) {
     const webviewMessage = message as WebviewMessage;
 
     switch (webviewMessage.type) {
+      case 'handy/request':
+        dispatchToWebview({
+          type: 'handy/result',
+          payload: {
+            requestId: webviewMessage.payload.requestId,
+            available: false,
+            running: false,
+          },
+        });
+        return;
       case 'api/request': {
         const { id, method, path, body } = webviewMessage.payload;
         state.requests.push({ method, path, body });
@@ -6653,6 +6667,11 @@ function setUpHarness() {
 const scenarioState = setUpHarness();
 
 await import('../../src/webview/index');
+const { connectionInitialized, state: appState } = await import('../../src/webview/lib/app-state');
+(window as HarnessWindow).__varroE2E!.getStartupState = () => ({
+  initialized: connectionInitialized(),
+  loading: appState.messagesLoading,
+});
 
 if (new URLSearchParams(window.location.search).get('expandedActivity') === '1') {
   const { getAssistantActivityGroupMap } = await import('../../src/webview/lib/assistant-activity');

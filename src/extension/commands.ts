@@ -373,6 +373,13 @@ export function registerCommands(
       }
     ),
 
+    vscode.commands.registerCommand(
+      'varro.cancelCommitMessage',
+      async (sourceControl?: vscode.SourceControl) => {
+        await sidebar.cancelCommitMessage(sourceControl);
+      }
+    ),
+
     vscode.commands.registerCommand('varro.agents.openGlobal', async () => {
       try {
         if (server.isAttachOnly) {
@@ -715,6 +722,7 @@ function renderAboutMarkdown(context: vscode.ExtensionContext, serverInfo: OpenC
     '- **Server:**',
     `  - **Version:** ${markdownCode(serverInfo.health.version || 'unknown')}`,
     `  - **URL:** [${serverInfo.url}](${serverInfo.url})`,
+    `  - **PID:** ${markdownCode(String(serverInfo.processId ?? 'Unknown'))}`,
     `  - **Ownership:** ${ownership}`,
     `  - **Status:** ${markdownCode(serverStatus)}`,
     `  - **Health:** ${serverInfo.health.healthy ? 'healthy' : 'unhealthy'}`,
@@ -763,6 +771,7 @@ function createAboutViewData(
     binary: serverInfo.resolvedCommand || 'Not resolved',
     serverVersion: serverInfo.health.version || 'Unknown',
     serverUrl: serverInfo.url,
+    serverProcessId: String(serverInfo.processId ?? 'Unknown'),
     ownership,
     serverStatus,
     healthy: serverInfo.health.healthy,

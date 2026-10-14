@@ -234,6 +234,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private openCodeCliVersion: string | null = null;
   private openCodeServerVersion: string | null = null;
   private openCodeServerStartedAt: number | null = null;
+  private openCodeServerProcessId: number | null = null;
   private openCodeUptimeTimer: ReturnType<typeof setInterval> | null = null;
   private readonly extensionVersion: string;
   private activeChatModel: ChatModelSelection | null = null;
@@ -574,7 +575,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       () => this.contextProvider.context.workspacePath || undefined,
       () => this.activeChatModel,
       isOpenAIPro,
-      () => vscode.workspace.getConfiguration('varro').get<string>('commitMessage.model', '')
+      () => vscode.workspace.getConfiguration('varro').get<string>('commitMessage.model', ''),
+      (repository) =>
+        vscode.workspace
+          .getConfiguration('varro', repository)
+          .get<string>('commitMessage.rules', '')
     );
 
     this.serverEventBridge = new ServerEventBridge(
@@ -1694,7 +1699,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     panel.title = this.editorTitle(route);
-    panel.iconPath = new vscode.ThemeIcon('chat-sparkle');
+    panel.iconPath = vscode.Uri.joinPath(this.extensionUri, 'assets', 'icon.png');
     const bridge = new SidebarProviderBridge(this.extensionUri);
     const endpoint = this.createEndpoint(
       bridge,
@@ -3377,6 +3382,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     await this.commitMessageService.generate(sourceControl);
   }
 
+  async cancelCommitMessage(sourceControl?: vscode.SourceControl) {
+    await this.commitMessageService.cancel(sourceControl);
+  }
+
   async generateUsageReport() {
     await this.usageReportService.openReport(false);
   }
@@ -3418,6 +3427,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   async dispose() {
+    await this.commitMessageService.cancel();
     this.macOSTray?.dispose();
     this.notificationUriHandler.dispose();
     this.attentionNotifications.dispose();
@@ -3891,6 +3901,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this.openCodeCliVersion = null;
       this.openCodeServerVersion = null;
       this.openCodeServerStartedAt = null;
+      this.openCodeServerProcessId = null;
       return;
     }
     if (this.openCodeVersionCheck !== 'idle') return;
@@ -3913,6 +3924,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         const startedAt = info.connections?.startedAt;
         this.openCodeServerStartedAt =
           startedAt != null && Number.isFinite(startedAt) && startedAt > 0 ? startedAt : null;
+        const processId = info.processId;
+        this.openCodeServerProcessId =
+          processId != null && Number.isSafeInteger(processId) && processId > 0 ? processId : null;
         const maximumTestedOpenCodeVersion = readMaximumTestedOpenCodeVersion(
           undefined,
           this.openCodeCliVersion?.startsWith('2.') ? 2 : 1
@@ -3952,6 +3966,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       `OpenCode Server: ${this.openCodeServerVersion ?? 'unknown'}`,
       `Server port: ${serverUrl.port || (serverUrl.protocol === 'https:' ? '443' : '80')}`,
     ];
+    if (this.openCodeServerProcessId !== null) {
+      versionLines.push(`Server PID: ${this.openCodeServerProcessId}`);
+    }
     if (this.openCodeServerStartedAt !== null) {
       versionLines.push(`Server uptime: ${formatServerUptime(this.openCodeServerStartedAt)}`);
       if (!this.openCodeUptimeTimer && !this.disposing) {
