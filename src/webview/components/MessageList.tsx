@@ -42,6 +42,7 @@ import {
   showModelPicker,
   showThinking,
   showFileDiffs,
+  showEmptyStateHistogram,
   getChildRunsByParentId,
 } from '../lib/state';
 import {
@@ -91,6 +92,7 @@ import {
 } from './message/UserMessageContent';
 import { editingMessage } from '../lib/message-edit-state';
 import { hasExpandedDiffOverlay } from '../lib/diff-overlay-state';
+import { newChatDraftKey } from '../lib/new-chat-draft';
 import {
   getPrefetchedSessionHistory,
   getSessionHistoryCursor,
@@ -135,6 +137,7 @@ import {
 import { Tooltip } from './Tooltip';
 import { UiIcon } from './UiIcon';
 import { StarterLogo } from './message-list/StarterLogo';
+import { StarterHistogram } from './message-list/StarterHistogram';
 import {
   getSubagentSessionIds,
   getStickyUserMessagePreview,
@@ -8319,6 +8322,38 @@ export function MessageList() {
       getThinkingLayoutSignatures(tailMessages(), showThinking(), expandedThinkingMessageIds())
     )
   );
+  createComputed(
+    on(
+      () => (state.remoteImages === 'off' ? 'off' : 'enabled'),
+      (mode, previous) => {
+        if (previous === undefined || mode === previous) return;
+        // Capture before fixed image frames disappear. Invalidate offscreen rows too,
+        // but scan Markdown candidates only on an explicit setting change, never on a delta.
+        const anchor =
+          containerRef?.isConnected && !autoScroll()
+            ? captureDetachedVisibleScrollAnchor(containerRef.scrollTop)
+            : null;
+        const ids = untrack(messages)
+          .filter((message) =>
+            message.parts.some(
+              (part) =>
+                ((part.type === 'text' || part.type === 'reasoning') && part.text.includes('![')) ||
+                (part.type === 'tool' &&
+                  part.state.status === 'completed' &&
+                  part.state.output.includes('!['))
+            )
+          )
+          .map((message) => message.info.id);
+        queueMicrotask(() =>
+          scheduleChangedLayoutRowMeasurements(
+            new Map(ids.map((id) => [id, previous])),
+            new Map(ids.map((id) => [id, mode])),
+            anchor
+          )
+        );
+      }
+    )
+  );
   let previousThinkingLayoutSignatures = new Map<string, string>();
   createEffect(() => {
     const current = thinkingLayoutSignatures();
@@ -10091,6 +10126,16 @@ export function MessageList() {
 
   return (
     <div class="interactive-list-shell min-h-0 flex-1">
+      <Show
+        when={
+          showEmptyStateHistogram() && !state.messagesLoading && shouldShowStarterLogo()
+            ? newChatDraftKey() + 1
+            : undefined
+        }
+        keyed
+      >
+        {(_draftKey) => <StarterHistogram onClick={requestComposerFocus} />}
+      </Show>
       <Show when={hydratingSession()}>
         <div class="chat-messages-loading" role="status" aria-label="Loading messages">
           <span class="chat-messages-loading-dot" />

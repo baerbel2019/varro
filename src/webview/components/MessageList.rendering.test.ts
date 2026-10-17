@@ -10,6 +10,7 @@ import {
   setExpandThinking,
   setSessions,
   setShowFileDiffs,
+  setShowEmptyStateHistogram,
   setShowThinkingPreference,
   setState,
   state,
@@ -27,6 +28,7 @@ import { getVisibleThreadMessages } from './message-list/thread-visibility';
 import { markSessionHistoryLoadFailed, setSessionHistoryCursor } from '../lib/message-window';
 import { fixture } from '../test-fixtures';
 import { STORAGE_KEYS, readStored, writeStored } from '../lib/state-storage';
+import { startNewChatDraft } from '../lib/new-chat-draft';
 import {
   assistantMessage,
   filePart,
@@ -910,44 +912,60 @@ describe('MessageList loading states', () => {
     expect(thinkingRow?.getAttribute('aria-hidden')).toBe('true');
   });
 
-  it('waits to place a linked question until its message loads', async () => {
-    const question: QuestionRequest = {
-      id: 'question-1',
-      sessionID: 'session-1',
-      tool: { messageID: 'message-1', callID: 'call-1' },
-      questions: [{ question: 'Choose one', header: 'Question', options: [] }],
-    };
-    setSessions([session('session-1', { time: { created: 1, updated: 2 } })]);
-    setState('activeSessionId', 'session-1');
-    setState('questions', [question]);
-    setState('messagesLoading', true);
-    replaceMessages([]);
+  it.each(['legacy', 'native-form'] as const)(
+    'waits to place a linked %s question until its message loads',
+    async (kind) => {
+      const legacy: QuestionRequest = {
+        id: 'question-1',
+        sessionID: 'session-1',
+        tool: { messageID: 'message-1', callID: 'call-1' },
+        questions: [{ question: 'Choose one', header: 'Question', options: [] }],
+      };
+      const question: QuestionRequest =
+        kind === 'legacy'
+          ? legacy
+          : {
+              ...legacy,
+              kind: 'native-form',
+              form: {
+                id: legacy.id,
+                sessionID: legacy.sessionID,
+                title: 'Question',
+                fields: [{ key: 'answer', type: 'boolean' }],
+              },
+            };
+      setSessions([session('session-1', { time: { created: 1, updated: 2 } })]);
+      setState('activeSessionId', 'session-1');
+      setState('questions', [question]);
+      setState('messagesLoading', true);
+      replaceMessages([]);
 
-    cleanup = render(() => MessageList(), container!);
-    await Promise.resolve();
+      cleanup = render(() => MessageList(), container!);
+      await Promise.resolve();
 
-    expect(container?.querySelector('.chat-messages-loading')).not.toBeNull();
-    expect(container?.querySelector('.question-prompt-card')).toBeNull();
+      expect(container?.querySelector('.chat-messages-loading')).not.toBeNull();
+      expect(container?.querySelector('.question-prompt-card')).toBeNull();
 
-    replaceMessages([
-      {
-        info: assistantMessage('message-1'),
-        parts: [{ ...toolPart('tool-1'), tool: 'question' }],
-      },
-    ]);
-    await Promise.resolve();
+      replaceMessages([
+        {
+          info: assistantMessage('message-1'),
+          parts: [{ ...toolPart('tool-1'), tool: 'question' }],
+        },
+      ]);
+      await Promise.resolve();
 
-    expect(container?.querySelector('[data-msg-id="message-1"]')).not.toBeNull();
-    expect(container?.querySelector('.question-prompt-card')).toBeNull();
-    expect(state.questions.map((request) => request.id)).toEqual([question.id]);
+      expect(container?.querySelector('[data-msg-id="message-1"]')).not.toBeNull();
+      expect(container?.querySelector('.question-prompt-card')).toBeNull();
+      expect(state.questions.map((request) => request.id)).toEqual([question.id]);
 
-    setState('messagesLoading', false);
-    await Promise.resolve();
+      setState('messagesLoading', false);
+      await Promise.resolve();
 
-    const messageRow = container?.querySelector('[data-msg-id="message-1"]');
-    expect(messageRow?.querySelectorAll('.question-prompt-card')).toHaveLength(1);
-    expect(container?.querySelectorAll('.question-prompt-card')).toHaveLength(1);
-  });
+      const messageRow = container?.querySelector('[data-msg-id="message-1"]');
+      expect(messageRow?.querySelectorAll('.question-prompt-card')).toHaveLength(1);
+      expect(container?.querySelectorAll('.question-prompt-card')).toHaveLength(1);
+    }
+  );
 
   it('waits to render an unlinked survey until the chat loads', async () => {
     const frames = installQueuedAnimationFrameMocks();
@@ -3168,6 +3186,7 @@ describe('MessageList empty state', () => {
     expect(logo?.width).toBe(256);
     expect(logo?.height).toBe(256);
     expect(logo?.getAttribute('decoding')).toBe('sync');
+    expect(container?.querySelector('.chat-empty-histogram')).toBeNull();
     const hints = container?.querySelectorAll('.chat-empty-hint');
     expect(hints).toHaveLength(6);
     expect([...hints!].map((hint) => hint.textContent)).toEqual([
@@ -3218,6 +3237,7 @@ describe('MessageList empty state', () => {
   });
 
   it('omits the logo image when no logo URI is available but keeps the hints', () => {
+    setShowEmptyStateHistogram(true);
     setState('emptyStateLogoUri', '');
     setState('sessions', [
       {
@@ -3236,9 +3256,11 @@ describe('MessageList empty state', () => {
     expect(container?.querySelector('.chat-empty-state')).toBeInstanceOf(HTMLDivElement);
     expect(container?.querySelector('.chat-empty-logo')).toBeNull();
     expect(container?.querySelectorAll('.chat-empty-hint')).toHaveLength(6);
+    expect(container?.querySelector('.chat-empty-histogram')).not.toBeNull();
   });
 
   it('does not show the starter logo while switching to an existing chat with no loaded messages yet', () => {
+    setShowEmptyStateHistogram(true);
     setState('emptyStateLogoUri', 'https://example.test/logo.svg');
     setState('sessions', [
       {
@@ -3256,7 +3278,57 @@ describe('MessageList empty state', () => {
 
     expect(container?.querySelector('.chat-empty-state')).toBeNull();
     expect(container?.querySelector('.chat-empty-logo')).toBeNull();
+    expect(container?.querySelector('.chat-empty-histogram')).toBeNull();
   });
+
+  it('mounts the starter histogram only while opted in', () => {
+    cleanup = render(() => MessageList(), container!);
+    expect(container?.querySelector('.chat-empty-histogram')).toBeNull();
+
+    setShowEmptyStateHistogram(true);
+    const histogram = container?.querySelector('.chat-empty-histogram');
+    expect(histogram).not.toBeNull();
+
+    setShowEmptyStateHistogram(false);
+    expect(container?.querySelector('.chat-empty-histogram')).toBeNull();
+    expect(histogram?.isConnected).toBe(false);
+    expect(container?.querySelector('.chat-empty-state')).not.toBeNull();
+  });
+
+  it('removes the starter histogram when the first message arrives', () => {
+    setShowEmptyStateHistogram(true);
+    setSessions([session('session-1', { time: { created: 100, updated: 100 } })]);
+    setState('activeSessionId', 'session-1');
+    cleanup = render(() => MessageList(), container!);
+    expect(container?.querySelector('.chat-empty-histogram')).not.toBeNull();
+
+    replaceMessages([
+      { info: userMessage('first-message'), parts: [textPart('first-text', 'Hello')] },
+    ]);
+
+    expect(container?.querySelector('.chat-empty-histogram')).toBeNull();
+  });
+
+  it.each([false, true])(
+    'rebuilds the histogram on New chat while already blank, existing session: %s',
+    (existing) => {
+      setShowEmptyStateHistogram(true);
+      if (existing) {
+        setSessions([session('session-1', { time: { created: 100, updated: 100 } })]);
+        setState('activeSessionId', 'session-1');
+      }
+      cleanup = render(() => MessageList(), container!);
+      const first = container?.querySelector('.chat-empty-histogram');
+      expect(first).not.toBeNull();
+      startNewChatDraft();
+      const second = container?.querySelector('.chat-empty-histogram');
+      expect(second).not.toBeNull();
+      expect(second).not.toBe(first);
+      startNewChatDraft();
+      expect(container?.querySelector('.chat-empty-histogram')).not.toBe(second);
+      expect(state.activeSessionId).toBe(existing ? 'session-1' : null);
+    }
+  );
 
   it('shows the parent starter state when only a hidden child message is retained', () => {
     setState('emptyStateLogoUri', 'https://example.test/logo.svg');

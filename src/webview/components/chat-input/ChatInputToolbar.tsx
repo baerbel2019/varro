@@ -137,6 +137,8 @@ type ToolbarSharedProps = {
   busyMenuRef?: HTMLDivElement | ((el: HTMLDivElement) => void);
   onQueue: () => void;
   onSteer: () => void;
+  onSideQuestion?: () => void;
+  sideQuestionDisabledReason?: string;
   onStopAndSend: () => void;
 };
 
@@ -144,6 +146,7 @@ type ChatInputMainToolbarProps = ToolbarSharedProps & {
   focusComposer: () => void;
   remoteExtensionHost: boolean;
   onDictationAvailabilityChange: () => void;
+  onDictationActivationChange: (requested: boolean) => void;
   toolbarRef: (el: HTMLDivElement) => void;
   toolbarLeftRef: (el: HTMLDivElement) => void;
   toolbarRightRef: (el: HTMLDivElement) => void;
@@ -325,6 +328,7 @@ export function ChatInputMainToolbar(props: ChatInputMainToolbarProps) {
           focusComposer={props.focusComposer}
           remote={props.remoteExtensionHost}
           onAvailabilityChange={props.onDictationAvailabilityChange}
+          onActivationChange={props.onDictationActivationChange}
         />
         <Show when={props.showAttachmentsControl}>
           <AttachButton onAttach={props.onAttach} />
@@ -353,6 +357,8 @@ export function ChatInputMainToolbar(props: ChatInputMainToolbarProps) {
                 ref={props.busyMenuRef}
                 onQueue={props.onQueue}
                 onSteer={props.onSteer}
+                onSideQuestion={props.onSideQuestion}
+                sideQuestionDisabledReason={props.sideQuestionDisabledReason}
                 onStopAndSend={props.onStopAndSend}
                 queueOnly={props.queueOnly}
               />

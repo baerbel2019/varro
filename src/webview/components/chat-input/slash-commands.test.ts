@@ -15,6 +15,32 @@ vi.mock('../../hooks/useOpenCode', () => ({
 describe('getSlashCommands', () => {
   beforeEach(() => resetDefaultAppState());
 
+  it.each([1, 2] as const)(
+    'reserves /btw and offers it only for an existing V2 conversation on API %s',
+    (apiVersion) => {
+      setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion });
+      const onSideQuestion = vi.fn();
+      const commands = getSlashCommands({
+        hasCurrentSession: true,
+        canInit: false,
+        onConnectProvider: () => {},
+        onOpenSettings: () => {},
+        onExportSession: () => {},
+        onPauseSession: vi.fn(async () => {}),
+        onGenerateStats: () => {},
+        onSideQuestion,
+        customCommands: [{ name: 'btw', template: 'Do not run' }],
+      });
+      const aside = commands.filter((command) => command.name === 'btw');
+      expect(aside).toHaveLength(apiVersion === 2 ? 1 : 0);
+      if (apiVersion === 2) {
+        void aside[0]!.action('Why?');
+        expect(onSideQuestion).toHaveBeenCalledWith('Why?');
+        expect(aside[0]!.acceptsArguments).toBe(true);
+      }
+    }
+  );
+
   it('includes init but hides session actions in new chats', () => {
     const onGenerateStats = vi.fn();
     const commands = getSlashCommands({
@@ -90,6 +116,39 @@ describe('getSlashCommands', () => {
     expect(commands.some((command) => command.name === 'export')).toBe(true);
     expect(commands.some((command) => command.name === 'fork')).toBe(false);
     expect(commands.some((command) => command.name === 'abort')).toBe(false);
+  });
+
+  it.each([1, 2] as const)('keeps command presentation neutral on API %s', (apiVersion) => {
+    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion });
+    const commands = getSlashCommands({
+      hasCurrentSession: true,
+      canInit: false,
+      onConnectProvider: () => {},
+      onOpenSettings: () => {},
+      onExportSession: () => {},
+      onPauseSession: vi.fn(async () => {}),
+      onGenerateStats: () => {},
+      customCommands: [
+        {
+          name: 'audit-background',
+          source: 'command',
+          template: 'Private prompt',
+          agent: 'general',
+          subtask: true,
+        },
+        { name: 'ordinary', source: 'command', template: '', description: 'Review code' },
+      ],
+    });
+    const audit = commands.find((command) => command.name === 'audit-background');
+    expect(audit?.description).toBe('Runs according to its OpenCode definition');
+    expect(audit?.acceptsArguments).toBe(true);
+    expect(audit?.help).toEqual(
+      apiVersion === 2 ? expect.stringContaining('OpenCode decides') : undefined
+    );
+    expect(commands.find((command) => command.name === 'ordinary')?.description).toBe(
+      'Review code'
+    );
+    expect(JSON.stringify(commands)).not.toContain('Private prompt');
   });
 
   it('keeps reserved built-ins hidden when a custom command reuses the name', () => {

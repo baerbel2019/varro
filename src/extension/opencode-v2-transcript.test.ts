@@ -7,8 +7,38 @@ import { projectV2Message } from './opencode-v2-projection';
 import { parseServerEvent } from '../shared/protocol';
 import { parseSkillAttachment } from '../shared/skill-reference';
 import { asRecord } from '../shared/type-utils';
+import { nativePdfFixture } from '../shared/native-pdf.test-support';
 
 vi.mock('./logger', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+
+describe('V2 PDF transcript restoration', () => {
+  it('keeps media order, MIME, filename, bytes and part identity on repeated projection', () => {
+    const pdf = nativePdfFixture();
+    const message: SessionMessageInfo = {
+      id: 'msg_pdf',
+      type: 'user',
+      text: 'Inspect',
+      time: { created: 1 },
+      files: [
+        { mime: 'image/png', name: 'first.png', data: 'AA==', source: { type: 'inline' } },
+        {
+          mime: pdf.mime,
+          name: pdf.filename,
+          data: pdf.url.split(',')[1]!,
+          source: { type: 'inline' },
+        },
+        { mime: 'text/plain', name: 'last.txt', data: 'bGFzdA==', source: { type: 'inline' } },
+      ],
+    };
+    const projected = projectV2Message(message, 'ses_pdf');
+    expect(projected.parts.slice(1)).toMatchObject([
+      { id: 'msg_pdf:content:1', filename: 'first.png', mime: 'image/png' },
+      { id: 'msg_pdf:content:2', filename: pdf.filename, mime: pdf.mime, url: pdf.url },
+      { id: 'msg_pdf:content:3', filename: 'last.txt', mime: 'text/plain' },
+    ]);
+    expect(projectV2Message(message, 'ses_pdf')).toEqual(projected);
+  });
+});
 
 describe('V2 transcript deletion', () => {
   const user: SessionMessageInfo = {
@@ -505,6 +535,69 @@ describe('V2 generated transcript records', () => {
     ).toMatchObject(expected);
   });
 
+  it.each(['completed', 'error', 'cancelled'] as const)(
+    'preserves canonical child attribution for a %s native result on history and direct reads',
+    async (state) => {
+      const record: SessionMessageInfo = {
+        ...base,
+        type: 'synthetic',
+        text: `<subagent sessionID="ses_wrong" state="${state}">\nNative result\n</subagent>`,
+        description: 'Audit auth',
+        metadata: {
+          source: 'subagent',
+          childID: 'ses_child',
+          agent: 'general',
+          state,
+          private: 'omitted',
+        },
+      };
+      const adapter = new OpenCodeV2Adapter(async (_method, path) => ({
+        data: path.endsWith('/inbox') ? [] : path.includes('/message/') ? record : [record],
+        cursor: {},
+      }));
+      const direct = await adapter.request(
+        'GET',
+        '/session/ses_one/message/msg_generated',
+        undefined
+      );
+      const history = await adapter.request('GET', '/session/ses_one/message', undefined);
+      expect(history).toEqual([direct]);
+      expect(direct).toMatchObject({
+        info: { id: base.id, sessionID: 'ses_one', role: 'user' },
+        parts: [
+          {
+            synthetic: true,
+            subagentResult: {
+              sessionID: 'ses_child',
+              state,
+              agent: 'general',
+              description: 'Audit auth',
+            },
+          },
+        ],
+      });
+      expect(JSON.stringify(direct)).not.toContain('omitted');
+    }
+  );
+
+  it.each([
+    undefined,
+    { source: 'other', childID: 'ses_child', state: 'completed' },
+    { source: 'subagent', childID: '', state: 'completed' },
+    { source: 'subagent', childID: 'ses_child', state: 'running' },
+  ])('does not infer a child result from text with metadata %j', (metadata) => {
+    const projected = projectV2Message(
+      {
+        ...base,
+        type: 'synthetic',
+        text: '<subagent sessionID="ses_child" state="completed">Result</subagent>',
+        metadata,
+      },
+      'ses_one'
+    );
+    expect(projected.parts[0]).not.toHaveProperty('subagentResult');
+  });
+
   it.each(['skill', 'shell', 'idle'] as const)(
     'keeps a paginated %s activity attached to the original prompt',
     async (type) => {
@@ -572,6 +665,18 @@ describe('V2 generated transcript records', () => {
         data: { sessionID: 'ses_one', id: 'review', name: 'Review', text: 'Instructions' },
       }).map(parseServerEvent)
     ).toEqual([expect.objectContaining({ type: 'session.next.synthetic', seq: 6 })]);
+  });
+
+  it.each(['command.updated', 'skill.updated'])('refreshes discovery after native %s', (type) => {
+    expect(
+      projectV2Event({
+        id: 'evt_catalog',
+        created: 10,
+        type,
+        data: {},
+        location: { directory: '/repo' },
+      })
+    ).toEqual([expect.objectContaining({ type: 'catalog.updated', workspaceDirectory: '/repo' })]);
   });
 
   it('refreshes failed compaction before reporting the failure, consuming its sequence once', () => {

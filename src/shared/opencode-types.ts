@@ -1,6 +1,7 @@
 import type { SessionWorkspaceScope } from './protocol';
 import type { UnknownRecord } from './type-utils';
 import type { FileChange } from './tool-file-change';
+import type { NativeForm } from './native-form';
 
 export type OutputFormatText = {
   type: 'text';
@@ -180,6 +181,13 @@ export type TextPart = {
   type: 'text';
   text: string;
   synthetic?: boolean;
+  /** Verified native completion metadata, never inferred from prompt text or session titles. */
+  subagentResult?: {
+    sessionID: string;
+    state: 'completed' | 'error' | 'cancelled';
+    description?: string;
+    agent?: string;
+  };
   ignored?: boolean;
   time?: { start: number; end?: number };
   metadata?: UnknownRecord;
@@ -510,12 +518,15 @@ export type QuestionTool = {
   callID: string;
 };
 
-export type QuestionRequest = {
+type QuestionRequestBase = {
   id: string;
   sessionID: string;
   questions: Array<QuestionInfo>;
   tool?: QuestionTool;
 };
+
+export type QuestionRequest = QuestionRequestBase &
+  ({ kind?: 'legacy'; form?: never } | { kind: 'native-form'; form: NativeForm });
 
 export type Todo = {
   content: string;

@@ -457,6 +457,14 @@
   overflow-wrap: anywhere;
 }
 
+.composer-completion-help {
+  padding: 7px 8px;
+  border-top: 1px solid color-mix(in srgb, var(--color-vscode-border) 20%, transparent);
+  color: var(--color-vscode-fg-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .composer-completion-item:hover {
   background: var(--color-vscode-hover);
   box-shadow: var(--color-vscode-hover) var(--composer-completion-scrollbar-inset) 0 0;
@@ -1703,18 +1711,53 @@
   color: var(--color-vscode-fg);
 }
 
-.toolbar-dictation-button + .toolbar-attach-button {
-  /* Keep the mic and attachment closer together without crowding their icons. */
-  margin-left: -2px;
+.toolbar-dictation-button > .ui-icon {
+  /* Adjust optical alignment without resizing the microphone or its button. */
+  transform: translateX(-0.5px);
 }
 
-.toolbar-attach-button + .toolbar-send-controls {
-  margin-left: 2px;
+.toolbar-dictation-button + .toolbar-attach-button {
+  /* Keep the mic and attachment closer together without crowding their icons. */
+  margin-left: -3px;
+}
+
+.toolbar-attach-button + .toolbar-send-controls,
+.toolbar-attach-button + .stop-button {
+  margin-left: 3px;
 }
 
 .toolbar-dictation-button.activation-requested {
   background: var(--color-vscode-toolbar-hover);
   color: var(--color-vscode-fg);
+}
+
+.chat-input-container[data-dictation-requested='true'] .rich-composer {
+  /* Theme chart colors can be reddish; the recording caret must stay orange. */
+  caret-color: #ffa500;
+}
+
+.composer-dictation-status {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--vscode-charts-red, #f14c4c);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.composer-dictation-status::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .toolbar-dictation-button:disabled {
@@ -1731,7 +1774,20 @@
 .toolbar-popover.busy-menu {
   left: auto;
   right: 0;
-  min-width: 190px;
+  width: max-content;
+}
+
+.busy-menu .toolbar-popover-item {
+  padding-right: 12px;
+}
+
+.busy-menu .toolbar-popover-item:not(:disabled):is(:hover, :focus-visible) {
+  background: var(--color-vscode-hover);
+}
+
+.busy-menu .toolbar-popover-item:disabled {
+  background: none;
+  cursor: default;
 }
 
 .busy-menu-icon {
@@ -1762,6 +1818,7 @@
   height: 28px;
   border-radius: var(--radius-control);
   border: 1px solid transparent;
+  padding: 0;
   cursor: pointer;
   transition:
     background-color 0.15s,
@@ -1769,6 +1826,10 @@
     transform 0.1s;
   user-select: none;
   -webkit-user-select: none;
+}
+
+.chat-send-button > svg {
+  flex-shrink: 0;
 }
 
 .chat-send-button.enabled:active:not(:disabled) {

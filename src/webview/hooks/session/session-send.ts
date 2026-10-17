@@ -3,6 +3,7 @@ import { captureExtensionContexts } from '../../host/extensions';
 import { cloneExtensionContexts, formatExtensionContext } from '../../../shared/extension-context';
 import type { ExtensionContext } from '../../../shared/extension-context';
 import { pastedTextDataUrl } from '../../../shared/pasted-text';
+import { getPdfInputError } from '../../../shared/native-pdf';
 import {
   cloneDatabaseContext,
   formatDatabaseAttachmentReference,
@@ -60,7 +61,7 @@ import {
   getNativePdfAttachmentSequence,
 } from '../../lib/attachment-order';
 import {
-  modelSupportsPdf,
+  modelPdfInputSupport,
   modelSupportsTools,
   modelSupportsVision,
 } from '../../lib/model-capabilities';
@@ -358,9 +359,16 @@ export function buildSessionSendBody(
     composerState.clipboardImages,
     includeClipboardImages
   );
-  const includeNativePdfs = effectiveModel
-    ? modelSupportsPdf(effectiveModel.providerID, effectiveModel.modelID, composerState.providers)
-    : false;
+  if (composerState.nativePdfs?.length) {
+    const error = getPdfInputError(
+      modelPdfInputSupport(
+        effectiveModel?.providerID ?? null,
+        effectiveModel?.modelID ?? null,
+        composerState.providers
+      )
+    );
+    if (error) throw new Error(error);
+  }
   const parts: SessionSendBody['parts'] = [];
   if (promptText.trim()) parts.push({ type: 'text', text: promptText });
   for (const name of getSkillReferences(promptText)) {
@@ -521,19 +529,12 @@ export function buildSessionSendBody(
     }
 
     if (attachment.kind === 'pdf') {
-      if (includeNativePdfs) {
-        parts.push({
-          type: 'file',
-          mime: 'application/pdf',
-          filename: attachment.pdf.filename,
-          url: attachment.pdf.url,
-        });
-      } else if (attachment.pdf.contextFile) {
-        parts.push({
-          type: 'text',
-          text: `[Attached file: ${getAttachmentReference(attachment.pdf.contextFile, workspacePath)}]`,
-        });
-      }
+      parts.push({
+        type: 'file',
+        mime: 'application/pdf',
+        filename: attachment.pdf.filename,
+        url: attachment.pdf.url,
+      });
       continue;
     }
     if (includeNativeClipboardImages) {

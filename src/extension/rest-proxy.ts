@@ -39,6 +39,7 @@ import type { AutoApproveJudge } from './auto-approve-judge';
 import type { DecisionProviders } from './decision-providers';
 import type { HiddenSessionManager } from './hidden-session-manager';
 import { isAllowedApiRequest } from './util/webview-message';
+import { SIDE_QUESTION_TIMEOUT_MS } from '../shared/side-question';
 import type { ContextProvider } from './context-provider';
 import { getWorkspaceProblems } from './workspace-problems';
 import {
@@ -48,8 +49,11 @@ import {
 import type { LocalSessionSummaryData } from './local-session-summary';
 import { sessionSummary } from './session-summary';
 import { logger } from './logger';
+import { diagnosticTimeline } from './diagnostics';
 import { projectDeferredPart, projectPartAttachments } from './message-content';
 import { ImageThumbnails } from './image-thumbnails';
+import { RemoteImages } from './remote-images';
+import { readExtensionConfigState } from './extension-config';
 import { ModelPricingCatalog } from './model-pricing';
 import type { ProviderLimitService } from './provider-limit-service';
 import type { PinnedSessionManager } from './pinned-session-manager';
@@ -445,6 +449,7 @@ export interface RestProxyCallbacks {
 
 export class RestProxy {
   private readonly imageThumbnails = new ImageThumbnails();
+  private readonly remoteImages = new RemoteImages();
   private readonly modelPricing = new ModelPricingCatalog();
   private readonly requestWorkspaceDirectory = new AsyncLocalStorage<string | undefined>();
   private sessionDirectories = new Map<string, string>();
@@ -486,8 +491,16 @@ export class RestProxy {
   private disposed = false;
   private readonly openCodeConfig: OpenCodeConfigService;
   private readonly promptCompletion: PromptCompletionService;
+  private readonly remoteImageConfigSubscription: vscode.Disposable | undefined;
 
   constructor(private readonly callbacks: RestProxyCallbacks) {
+    this.remoteImageConfigSubscription = vscode.workspace.onDidChangeConfiguration?.((event) => {
+      if (
+        event.affectsConfiguration('varro.chat.remoteImages') &&
+        readExtensionConfigState().remoteImages !== 'on'
+      )
+        this.remoteImages.cancel();
+    });
     this.promptCompletion = new PromptCompletionService(callbacks.server);
     this.openCodeConfig = new OpenCodeConfigService(
       callbacks,
@@ -696,6 +709,8 @@ export class RestProxy {
     this.cancelAllRequests('REST proxy disposed');
     this.promptCompletion.invalidate();
     this.imageThumbnails.dispose();
+    this.remoteImages.dispose();
+    this.remoteImageConfigSubscription?.dispose();
   }
 
   invalidatePromptCompletion() {
@@ -789,10 +804,20 @@ export class RestProxy {
         payload.body
       );
       // Scoped approvals carry their owning session in the body, not the route.
+      const nativeFormReply =
+        attentionReplyRequestID &&
+        new URL(payload.path, 'http://localhost').pathname.startsWith('/question/')
+          ? asRecord(payload.body)
+          : null;
+      const nativeFormSessionID =
+        nativeFormReply?.kind === 'native-form' && typeof nativeFormReply.sessionID === 'string'
+          ? nativeFormReply.sessionID
+          : undefined;
       const directSessionID =
         parseDirectSessionID(payload.path) ??
         sessionPermissionAllowRequest?.sessionId ??
-        projectPermissionAllowRequest?.sessionId;
+        projectPermissionAllowRequest?.sessionId ??
+        nativeFormSessionID;
       const transfer = directSessionID
         ? this.callbacks
             .getTransferredSessions?.(this.getOpenWorkspaceRoots())
@@ -846,6 +871,36 @@ export class RestProxy {
         payload.body
       );
       const requestPathname = new URL(payload.path, 'http://localhost').pathname;
+      if (
+        method === 'POST' &&
+        /^\/question\/[^/]+\/reply$/.test(requestPathname) &&
+        asRecord(payload.body)?.kind === 'native-form' &&
+        this.callbacks.server.apiVersion !== 2
+      ) {
+        throw new Error('Native forms require OpenCode V2');
+      }
+      if (method === 'POST' && requestPathname === VARRO_API_ENDPOINTS.remoteImage) {
+        const mode = readExtensionConfigState().remoteImages;
+        if (mode === 'off') {
+          this.remoteImages.cancel();
+          throw new Error('Remote image loading is disabled in Varro settings');
+        }
+        const body = asRecord(payload.body);
+        const automatic = body?.automatic === true;
+        if (automatic && mode !== 'on')
+          throw new Error('Automatic remote image loading is disabled');
+        const source = body?.url;
+        if (typeof source !== 'string') throw new Error('Missing remote image URL');
+        const data = await this.remoteImages.load(
+          source,
+          request?.controller.signal ?? new AbortController().signal
+        );
+        const currentMode = readExtensionConfigState().remoteImages;
+        if (currentMode === 'off' || (automatic && currentMode !== 'on'))
+          throw new Error('Remote image loading was disabled');
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
       const endpointWorkspaceDirectory =
         this.callbacks.getWorkspacePath?.() ??
         this.callbacks.contextProvider.context.workspacePath ??
@@ -905,6 +960,79 @@ export class RestProxy {
           sessionWorkspaceDirectory ?? this.getCurrentWorkspacePath(),
           sessionWorkspaceDirectory ?? explicitWorkspaceDirectory ?? undefined
         );
+        if (
+          /^\/session\/[^/]+\/(?:child-task-controls|interrupt-child|background-parent)$/.test(
+            requestPathname
+          ) &&
+          directSessionID
+        ) {
+          if (payload.body !== undefined)
+            throw new Error('Child task controls do not accept a body');
+          if (this.isHiddenSession(directSessionID)) throw new Error('404 Session not found');
+          if (this.callbacks.server.apiVersion !== 2) {
+            if (method !== 'GET') throw new Error('Child task controls require OpenCode V2');
+            this.callbacks.postApiResponse(requestGeneration, {
+              id: payload.id,
+              data: { parentID: null, stopChild: false, backgroundEligible: false },
+            });
+            return;
+          }
+          const timeout = AbortSignal.timeout(15_000);
+          const signal = requestSignal ? AbortSignal.any([requestSignal, timeout]) : timeout;
+          const options = { signal, maxResponseBytes: 2 * 1024 * 1024 };
+          const snapshotPath = setExplicitWorkspaceDirectory(
+            `/session/${encodeURIComponent(directSessionID)}/child-task-controls`,
+            explicitWorkspaceDirectory ?? this.getCurrentWorkspacePath() ?? ''
+          );
+          const snapshot = asRecord(
+            await this.requestServer('GET', snapshotPath, undefined, options)
+          );
+          if (typeof snapshot?.directory !== 'string')
+            throw new Error('Invalid child task directory');
+          this.requireAuthorizedSessionDirectory(directSessionID, snapshot.directory);
+          if (typeof snapshot.parentID === 'string') {
+            if (this.isHiddenSession(snapshot.parentID)) throw new Error('404 Session not found');
+            this.requireAuthorizedSessionDirectory(snapshot.parentID, snapshot.directory);
+          } else if (method !== 'GET')
+            throw new Error('Child task controls require a native child');
+          signal.throwIfAborted();
+          if (this.callbacks.getRequestGeneration() !== requestGeneration)
+            throw new Error(
+              'Connection changed while managing child work. Refresh before retrying.'
+            );
+          const data =
+            method === 'GET'
+              ? snapshot
+              : await this.requestServer(method, forwardedPath, undefined, options);
+          signal.throwIfAborted();
+          if (this.callbacks.getRequestGeneration() !== requestGeneration)
+            throw new Error(
+              'Connection changed while managing child work. Refresh before retrying.'
+            );
+          this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+          return;
+        }
+      }
+
+      if (method === 'POST' && requestPathname.endsWith('/side-question') && directSessionID) {
+        if (this.callbacks.server.apiVersion !== 2) {
+          throw new Error('Side questions require OpenCode V2');
+        }
+        if (this.callbacks.getStatus().state !== 'running') {
+          throw new Error('Connect to OpenCode before asking a side question');
+        }
+        const timeout = AbortSignal.timeout(SIDE_QUESTION_TIMEOUT_MS);
+        const signal = requestSignal ? AbortSignal.any([requestSignal, timeout]) : timeout;
+        const data = await this.requestServer('POST', forwardedPath, payload.body, {
+          signal,
+          maxResponseBytes: 512 * 1024,
+        });
+        signal.throwIfAborted();
+        if (this.callbacks.getRequestGeneration() !== requestGeneration) {
+          throw new Error('Connection changed while asking the side question');
+        }
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
       }
 
       const contentMatch = requestPathname.match(
@@ -1489,6 +1617,21 @@ export class RestProxy {
           throw new Error('Resume cancelled because generated dependencies are not ignored by Git');
       }
       if (promptSessionID) {
+        // V2 owns durable execution claims. Its active snapshot is process-local,
+        // so idle/absent cannot prove a claim needs a new prompt during startup.
+        // Older V2 servers without native recovery require an explicit user send.
+        if (payload.interruptedRecovery && this.callbacks.server.apiVersion === 2) {
+          diagnosticTimeline.record({
+            event: 'interrupted-recovery',
+            generation: requestGeneration,
+            state: 'native-owned',
+          });
+          this.callbacks.postApiResponse(requestGeneration, {
+            id: payload.id,
+            data: { skipped: true },
+          });
+          return;
+        }
         if (
           promptWorkspaceDirectory &&
           normalizeWorkspaceIdentity(promptWorkspaceDirectory) &&
@@ -1507,19 +1650,24 @@ export class RestProxy {
         ) {
           throw new Error('Queued message dispatch lease is no longer current');
         }
-        if (
-          payload.interruptedRecovery &&
-          !(await this.shouldAdmitInterruptedRecovery(
+        if (payload.interruptedRecovery) {
+          const admitted = await this.shouldAdmitInterruptedRecovery(
             promptSessionID,
             promptWorkspaceDirectory,
             requestSignal
-          ))
-        ) {
-          this.callbacks.postApiResponse(requestGeneration, {
-            id: payload.id,
-            data: { skipped: true },
+          );
+          diagnosticTimeline.record({
+            event: 'interrupted-recovery',
+            generation: requestGeneration,
+            state: admitted ? 'legacy-admitted' : 'legacy-blocked',
           });
-          return;
+          if (!admitted) {
+            this.callbacks.postApiResponse(requestGeneration, {
+              id: payload.id,
+              data: { skipped: true },
+            });
+            return;
+          }
         }
       }
       if (promptSessionID && promptWorkspaceDirectory) {

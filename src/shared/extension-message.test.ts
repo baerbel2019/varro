@@ -5,7 +5,7 @@ describe('parseExtensionMessage', () => {
   it('validates Handy results', () => {
     const message = {
       type: 'handy/result',
-      payload: { requestId: '1', available: true, running: true },
+      payload: { requestId: '1', available: true, running: true, state: 'idle' },
     };
     expect(parseExtensionMessage(message)).toEqual(message);
     expect(
@@ -14,6 +14,12 @@ describe('parseExtensionMessage', () => {
     for (const payload of [
       {},
       { ...message.payload, running: 'true' },
+      { ...message.payload, state: undefined },
+      { ...message.payload, state: 'guessed' },
+      { ...message.payload, revision: -1 },
+      { ...message.payload, revision: '1' },
+      { ...message.payload, revision: Infinity },
+      { ...message.payload, revision: 1.5 },
       { ...message.payload, error: 1 },
       { ...message.payload, requestId: '' },
     ]) {
@@ -1062,6 +1068,30 @@ describe('parseExtensionMessage', () => {
     ).toBeNull();
   });
 
+  it.each([true, false, 'true', undefined])(
+    'accepts only boolean histogram opt-in values: %s',
+    (showEmptyStateHistogram) => {
+      const parsed = parseExtensionMessage({
+        type: 'config/update',
+        payload: {
+          showEmptyStateHistogram,
+          desktopSessionPaneSide: 'left',
+          defaultPermissionMode: 'default',
+          chatFontSize: 13,
+          chatEditorFontSize: 12,
+          chatFontFamily: 'default',
+        },
+      });
+      expect(parsed).toMatchObject({ type: 'config/update' });
+      if (parsed?.type !== 'config/update') throw new Error('Expected a config update');
+      if (showEmptyStateHistogram === true || showEmptyStateHistogram === false) {
+        expect(parsed.payload.showEmptyStateHistogram).toBe(showEmptyStateHistogram);
+      } else {
+        expect(parsed.payload).not.toHaveProperty('showEmptyStateHistogram');
+      }
+    }
+  );
+
   it('parses config/update with strict payload', () => {
     expect(
       parseExtensionMessage({
@@ -1071,6 +1101,8 @@ describe('parseExtensionMessage', () => {
           expandThinking: true,
           showChangedFiles: true,
           showTurnTimer: true,
+          showEmptyStateHistogram: true,
+          remoteImages: 'ask',
           debugShowQuotaWarning: true,
           enableProblemsContext: false,
           desktopSessionPaneSide: 'left',
@@ -1087,6 +1119,8 @@ describe('parseExtensionMessage', () => {
         expandThinking: true,
         showChangedFiles: true,
         showTurnTimer: true,
+        showEmptyStateHistogram: true,
+        remoteImages: 'ask',
         debugShowQuotaWarning: true,
         enableProblemsContext: false,
         desktopSessionPaneSide: 'left',

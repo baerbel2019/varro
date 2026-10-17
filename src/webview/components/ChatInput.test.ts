@@ -11,6 +11,7 @@ import {
   VARRO_VISION_AGENT_PROMPT,
 } from '../../shared/vision-agent';
 import type {
+  Agent,
   AssistantMessage,
   MessageEntry,
   Part,
@@ -72,6 +73,7 @@ import { registerHostExtension } from '../host/extensions';
 import { toCssUrl } from './UiIcon';
 import { getMaterialChipIcon } from './MaterialChipIcon';
 import { getVisibleThreadMessages } from './message-list/thread-visibility';
+import { closeSideQuestion, sideQuestionView } from '../lib/side-question';
 import { upsertMessageInfo } from '../lib/state-messages';
 import * as imageCompression from '../lib/image-compression';
 import * as imageLoading from '../lib/image-loading';
@@ -87,7 +89,12 @@ describe('composer dictation integration', () => {
           new MessageEvent('message', {
             data: {
               type: 'handy/result',
-              payload: { requestId: message.payload.requestId, available: true, running: true },
+              payload: {
+                requestId: message.payload.requestId,
+                available: true,
+                running: true,
+                state: message.payload.action === 'start' ? 'recording' : 'idle',
+              },
             },
           })
         )
@@ -95,6 +102,8 @@ describe('composer dictation integration', () => {
     };
     fixture<{ __sendToExtension?: (message: WebviewMessage) => void }>(window).__sendToExtension =
       defaultBridgeSend;
+    setInputText('Existing draft');
+    addContextFile({ path: '/repo/composer.css', relativePath: 'composer.css', type: 'file' });
     cleanup = render(() => ChatInput(), container!);
     await Promise.resolve();
     const mic = container?.querySelector<HTMLButtonElement>('.toolbar-dictation-button');
@@ -102,9 +111,48 @@ describe('composer dictation integration', () => {
     expect(mic).toBeInstanceOf(HTMLButtonElement);
     expect(mic?.closest('.toolbar-right')?.querySelectorAll('button')[0]).toBe(mic);
     expect(mic?.closest('.toolbar-right')?.querySelectorAll('button')[1]).toBe(attach);
+    const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
+    const attachment = [...container!.querySelectorAll('.chat-attachment-chip')].find((chip) =>
+      chip.textContent?.includes('composer.css')
+    );
+    expect(attachment).toBeDefined();
+    editor.focus();
+    const textNode = editor.firstChild!;
+    const range = document.createRange();
+    range.setStart(textNode, 8);
+    range.collapse(true);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
     mic?.click();
-    expect(document.activeElement).toBe(container?.querySelector('.rich-composer'));
-    expect(sent.at(-1)).toMatchObject({ type: 'handy/request', payload: { action: 'toggle' } });
+    expect(document.activeElement).toBe(editor);
+    expect(sent.at(-1)).toMatchObject({ type: 'handy/request', payload: { action: 'start' } });
+    await Promise.resolve();
+    expect(
+      container?.querySelector('.chat-input-container[data-dictation-requested="true"]')
+    ).not.toBeNull();
+    expect(container?.querySelector('.composer-dictation-status > .sr-only')?.textContent).toBe(
+      'Dictation on. Click mic when done.'
+    );
+    expect(
+      container?.querySelector('.composer-dictation-status > [aria-hidden="true"]')?.textContent
+    ).toBe('Rec');
+    expect(
+      [...container!.querySelectorAll('.chat-attachment-chip')].find((chip) =>
+        chip.textContent?.includes('composer.css')
+      )
+    ).toBe(attachment);
+    expect(editor.getAttribute('aria-placeholder')).toBe('Your words will appear here');
+    expect(editor.firstChild).toBe(textNode);
+    expect(window.getSelection()?.anchorNode).toBe(textNode);
+    expect(window.getSelection()?.anchorOffset).toBe(8);
+    expect(inputText()).toBe('Existing draft');
+    mic?.click();
+    await Promise.resolve();
+    expect(
+      container?.querySelector('.chat-input-container[data-dictation-requested="true"]')
+    ).toBeNull();
+    expect(container?.querySelector('.composer-dictation-status')).toBeNull();
+    expect(inputText()).toBe('Existing draft');
   });
 });
 
@@ -310,6 +358,7 @@ afterEach(() => {
   setState('providerRefreshPending', false);
   setState('workspaceCatalogReloadPending', false);
   resetProviderConnectionState();
+  closeSideQuestion();
   setState('activeSessionId', null);
   setState('messagesLoading', false);
   setState('messages', []);
@@ -1697,7 +1746,7 @@ describe('ChatInput', () => {
     expect(container?.textContent).toContain('spec.pdf');
     const pdfChip = container?.querySelector('.chat-attachment-chip');
     expect(pdfChip).toBeInstanceOf(HTMLElement);
-    expect(pdfChip?.textContent).not.toContain('PDF');
+    expect(pdfChip?.textContent).toContain('PDF');
 
     setState('providers', 0, 'models', 'pdf-model', {
       id: 'pdf-model',
@@ -1711,8 +1760,39 @@ describe('ChatInput', () => {
     expect(pdfChip?.textContent).toContain('PDF');
 
     setState('selectedModel', { providerID: 'openai', modelID: 'gpt-4o' });
-    expect(pdfChip?.textContent).not.toContain('PDF');
+    expect(pdfChip?.textContent).toContain('PDF');
   });
+
+  it.each([undefined, ['text']])(
+    'keeps the PDF draft and explains capability %j on Enter',
+    async (input) => {
+      setupModelState();
+      setState('providers', 0, 'models', 'gpt-4o', 'capabilities', { input });
+      const pdf = {
+        id: 'pdf-blocked',
+        mime: 'application/pdf' as const,
+        filename: 'keep.pdf',
+        size: 5,
+        url: 'data:application/pdf;base64,JVBERi0=',
+      };
+      setState('nativePdfs', [pdf]);
+      setInputText('Keep my draft');
+      cleanup = render(() => ChatInput(), container!);
+      container
+        ?.querySelector('.rich-composer')
+        ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await flushAsyncWork();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(inputText()).toBe('Keep my draft');
+      expect(state.nativePdfs).toEqual([pdf]);
+      expect(showSessionActionFeedbackMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          input ? 'does not support PDF input' : 'PDF input support is unknown'
+        ),
+        'warning'
+      );
+    }
+  );
 
   it('does not attach a delayed pasted PDF after switching sessions', async () => {
     const fileReader = installControllableFileReader();
@@ -1819,6 +1899,33 @@ describe('ChatInput', () => {
       await flushAsyncWork();
 
       expect(state.nativePdfs).toEqual([]);
+    } finally {
+      fileReader.restore();
+    }
+  });
+
+  it('preserves image/PDF/image paste order when the PDF finishes first', async () => {
+    const fileReader = installControllableFileReader();
+    try {
+      setupModelState();
+      cleanup = render(() => ChatInput(), container!);
+      const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
+      dispatchImagePaste(editor, [
+        new File(['first'], 'first.png', { type: 'image/png' }),
+        new File(['%PDF-1.7\n'], 'middle.pdf', { type: 'application/pdf' }),
+        new File(['last'], 'last.png', { type: 'image/png' }),
+      ]);
+      await flushAsyncWork();
+      fileReader.resolve('middle.pdf');
+      await flushAsyncWork();
+      fileReader.resolve('last.png');
+      fileReader.resolve('first.png');
+      await flushAsyncWork();
+      expect(state.clipboardImages).toHaveLength(2);
+      expect(state.nativePdfs).toHaveLength(1);
+      const pdfSequence = state.nativePdfs[0]!.attachmentSequence!;
+      expect(state.clipboardImages[0]!.attachmentSequence!).toBeLessThan(pdfSequence);
+      expect(state.clipboardImages[1]!.attachmentSequence!).toBeGreaterThan(pdfSequence);
     } finally {
       fileReader.restore();
     }
@@ -7550,6 +7657,75 @@ describe('ChatInput', () => {
     expect(editMessageMock).not.toHaveBeenCalled();
   });
 
+  it.each(['published', 'failed', 'session-switched'] as const)(
+    'shows chat-loading dots while an edit reconciles and clears them when %s',
+    async (outcome) => {
+      setState('activeSessionId', 'session-1');
+      setState('messages', [
+        {
+          info: {
+            id: 'message-1',
+            sessionID: 'session-1',
+            role: 'user',
+            time: { created: 1 },
+            agent: 'build',
+            model: { providerID: 'openai', modelID: 'gpt-4o' },
+          },
+          parts: [],
+        },
+      ]);
+      let finishEdit: ((sent: boolean) => void) | undefined;
+      let publishEdit: (() => void) | undefined;
+      editMessageMock.mockImplementationOnce(
+        (_messageId, _text, options) =>
+          new Promise((resolve) => {
+            finishEdit = resolve;
+            publishEdit = options?.onOptimisticPublish;
+          })
+      );
+      cleanup = render(() => ChatInput(), container!);
+      startEditingMessage('message-1', 'session-1', 'corrected prompt');
+      await flushAsyncWork();
+      const editor = container!.querySelector<HTMLElement>('.rich-composer')!;
+      editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await flushAsyncWork();
+
+      const loading = container!.querySelector(
+        '[role="status"][aria-label="Updating conversation"]'
+      );
+      expect(loading?.querySelector('.composer-edit-loading-title')?.textContent).toBe(
+        'Updating conversation'
+      );
+      expect(loading?.querySelectorAll('.chat-messages-loading-dot')).toHaveLength(3);
+      expect(inputText()).toBe('');
+      expect(container!.querySelector('.interactive-input-part')?.getAttribute('aria-busy')).toBe(
+        'true'
+      );
+      expect(container!.querySelector<HTMLElement>('.composer-edit-banner')?.inert).toBe(true);
+      expect(container!.querySelector<HTMLElement>('.chat-input-shell')?.inert).toBe(true);
+      editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      expect(editMessageMock).toHaveBeenCalledTimes(1);
+
+      if (outcome === 'published') {
+        publishEdit?.();
+        expect(container!.querySelector('.composer-edit-loading')).toBeNull();
+      }
+      if (outcome === 'session-switched') {
+        setState('activeSessionId', 'session-2');
+        expect(container!.querySelector('.composer-edit-loading')).toBeNull();
+      }
+      finishEdit?.(outcome === 'published');
+      await flushAsyncWork();
+
+      expect(container!.querySelector('.composer-edit-loading')).toBeNull();
+      expect(container!.querySelector<HTMLElement>('.chat-input-shell')?.inert).toBe(false);
+      if (outcome === 'failed') {
+        expect(inputText()).toBe('corrected prompt');
+        expect(container!.querySelector<HTMLElement>('.composer-edit-banner')?.inert).toBe(false);
+      }
+    }
+  );
+
   it('restores edited text and preserves the prior draft when an optimistic send fails', async () => {
     setState('activeSessionId', 'session-1');
     setInputText('original draft');
@@ -9020,7 +9196,7 @@ describe('ChatInput', () => {
         [...container!.querySelectorAll<HTMLButtonElement>('.busy-menu button')].find((button) =>
           button.textContent?.includes(label)
         );
-      expect(menuAction('Steer with Message')?.disabled).toBe(true);
+      expect(menuAction('Steer')?.disabled).toBe(true);
       expect(menuAction('Stop and Send')?.disabled).toBe(true);
       menuAction('Stop and Send')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
       expect(abortSessionMock).not.toHaveBeenCalled();
@@ -9048,9 +9224,9 @@ describe('ChatInput', () => {
       );
       setState('selectedAgent', 'build');
       setInputText('Matching settings');
-      if (!menuAction('Steer with Message'))
+      if (!menuAction('Steer'))
         container?.querySelector<HTMLButtonElement>('[aria-label="More send options"]')?.click();
-      expect(menuAction('Steer with Message')?.disabled).toBe(false);
+      expect(menuAction('Steer')?.disabled).toBe(false);
       expect(
         container?.querySelector<HTMLButtonElement>('[aria-label="Send as Steer"]')?.disabled
       ).toBe(true);
@@ -9285,6 +9461,247 @@ describe('ChatInput', () => {
     expect(abortSessionMock).toHaveBeenCalledTimes(1);
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(inputText()).toBe('Do not send after a failed stop');
+  });
+
+  it.each([
+    ['@explore Why?', 'subagents'],
+    ['$[docs] Why?', 'skills'],
+    ['/test example', 'commands'],
+    ['session:ses_other Why?', 'other conversations'],
+  ])('disables side-question sends for incompatible inline content %s', async (prompt, reason) => {
+    setupMatchingActiveTurn();
+    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+    setState('activeSessionId', 'session-1');
+    setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+    setState('allAgents', [fixture<Agent>({ name: 'explore' })]);
+    setIsLoading(true);
+    setInputText(`/btw ${prompt}`);
+    cleanup = render(() => ChatInput(), container!);
+    expect(
+      container?.querySelector<HTMLButtonElement>('[aria-label="Send (Enter)"]')?.disabled
+    ).toBe(true);
+    container
+      ?.querySelector('.rich-composer')
+      ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await flushAsyncWork();
+    expect(sideQuestionView()).toBeNull();
+    expect(inputText()).toBe(`/btw ${prompt}`);
+    setInputText(prompt);
+    await flushAsyncWork();
+    container?.querySelector<HTMLButtonElement>('[aria-label="More send options"]')!.click();
+    const action = [...container!.querySelectorAll<HTMLButtonElement>('.busy-menu button')].find(
+      (button) => button.textContent?.trim() === 'Side question'
+    );
+    expect(action?.disabled).toBe(true);
+    expect(action?.title).toContain(reason);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(abortSessionMock).not.toHaveBeenCalled();
+    expect(state.queuedMessages).toEqual([]);
+  });
+
+  it('asks the plain draft from the busy menu without stopping, queueing, steering, or consuming attachments', async () => {
+    setupMatchingActiveTurn();
+    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+    setState('activeSessionId', 'session-1');
+    setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+    setState('sessionStatus', 'session-1', { type: 'busy' });
+    setIsLoading(true);
+    setState('droppedFiles', [{ path: '/repo/keep.ts', relativePath: 'keep.ts', type: 'file' }]);
+    setInputText('Why did that fail?\nKeep it short.');
+    cleanup = render(() => ChatInput(), container!);
+    container?.querySelector<HTMLButtonElement>('[aria-label="More send options"]')!.click();
+    const labels = [...container!.querySelectorAll('.busy-menu-label')];
+    expect(labels.map((label) => label.textContent)).toEqual([
+      'Queue',
+      'Steer',
+      'Side question',
+      'Stop and Send',
+    ]);
+    labels[2]!.closest('button')!.click();
+    await flushAsyncWork();
+    expect(sideQuestionView()).toMatchObject({
+      sessionID: 'session-1',
+      question: 'Why did that fail?\nKeep it short.',
+    });
+    expect(inputText()).toBe('');
+    expect(container?.querySelector('.busy-menu')).toBeNull();
+    expect(state.droppedFiles).toHaveLength(1);
+    expect(state.sessionStatus['session-1']).toEqual({ type: 'busy' });
+    expect(state.queuedMessages).toEqual([]);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(abortSessionMock).not.toHaveBeenCalled();
+    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+  });
+
+  it('does not offer a busy-menu side question on OpenCode V1', async () => {
+    setupMatchingActiveTurn();
+    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 1 });
+    setState('activeSessionId', 'session-1');
+    setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+    setIsLoading(true);
+    setInputText('Ordinary follow-up');
+    cleanup = render(() => ChatInput(), container!);
+    container?.querySelector<HTMLButtonElement>('[aria-label="More send options"]')!.click();
+    await flushAsyncWork();
+    expect(
+      [...container!.querySelectorAll('.busy-menu-label')].map((label) => label.textContent)
+    ).toEqual(['Queue', 'Steer', 'Stop and Send']);
+    expect(inputText()).toBe('Ordinary follow-up');
+    expect(sideQuestionView()).toBeNull();
+  });
+
+  it.each(['/b', '/bt'])(
+    'opens the /btw suggestion from %s without treating the draft as a command',
+    async (draft) => {
+      setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+      setState('activeSessionId', 'session-1');
+      setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+      setInputText(draft);
+      cleanup = render(() => ChatInput(), container!);
+      const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+      if (!editor?.firstChild) throw new Error('Expected populated composer editor');
+      editor.focus();
+      setCollapsedSelection(editor.firstChild, draft.length);
+      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 't', bubbles: true }));
+      await flushAsyncWork();
+      const suggestion = [
+        ...container!.querySelectorAll<HTMLElement>('.composer-completion-item'),
+      ].find((option) => option.textContent?.includes('/btw'));
+      expect(suggestion).toBeDefined();
+      suggestion!.click();
+      await flushAsyncWork();
+      expect(sideQuestionView()).toMatchObject({ sessionID: 'session-1', question: '' });
+      expect(inputText()).toBe('');
+      expect(state.queuedMessages).toEqual([]);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(abortSessionMock).not.toHaveBeenCalled();
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it('opens /btw without sending or consuming existing attachments', async () => {
+    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+    setState('activeSessionId', 'session-1');
+    setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+    setState('droppedFiles', [{ path: '/repo/keep.ts', relativePath: 'keep.ts', type: 'file' }]);
+    setInputText('/btw Why did that fail?');
+    cleanup = render(() => ChatInput(), container!);
+    container
+      ?.querySelector('.rich-composer')
+      ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await flushAsyncWork();
+    expect(sideQuestionView()).toMatchObject({
+      sessionID: 'session-1',
+      question: 'Why did that fail?',
+    });
+    expect(inputText()).toBe('');
+    expect(state.droppedFiles).toHaveLength(1);
+    expect(state.queuedMessages).toEqual([]);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 2] as const)(
+    'never sends an unavailable /btw as chat or a custom command on API %s',
+    async (apiVersion) => {
+      setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion });
+      setState('activeSessionId', 'session-1');
+      setState('sessions', [
+        session('session-1', 1, {
+          transfer: { originDirectory: '/other', available: false },
+        }),
+      ]);
+      setState('commands', [{ name: 'btw', template: 'Must not execute' }]);
+      setInputText('/btw Why?');
+      cleanup = render(() => ChatInput(), container!);
+      container
+        ?.querySelector('.rich-composer')
+        ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await flushAsyncWork();
+      expect(sideQuestionView()).toBeNull();
+      expect(inputText()).toBe('/btw Why?');
+      expect(state.queuedMessages).toEqual([]);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['send', 'enter', 'ctrl-enter', 'meta-enter'] as const)(
+    'asks /btw during active work using %s without queueing, steering, or stopping',
+    async (action) => {
+      setupMatchingActiveTurn();
+      setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+      setState('activeSessionId', 'session-1');
+      setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+      setState('sessionStatus', 'session-1', { type: 'busy' });
+      setIsLoading(true);
+      setState('droppedFiles', [{ path: '/repo/keep.ts', relativePath: 'keep.ts', type: 'file' }]);
+      setInputText('/btw How is it going?\nKeep it short.');
+      cleanup = render(() => ChatInput(), container!);
+      expect(container?.querySelector('[aria-label="More send options"]')).toBeNull();
+      expect(container?.querySelector('[aria-label="Add to queue (Enter)"]')).toBeNull();
+      expect(container?.querySelector('[aria-label="Stop"]')).toBeNull();
+      const send = container?.querySelector<HTMLButtonElement>('[aria-label="Send (Enter)"]');
+      expect(send?.disabled).toBe(false);
+      if (action === 'send') send!.click();
+      else
+        container?.querySelector('.rich-composer')?.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            bubbles: true,
+            ctrlKey: action === 'ctrl-enter',
+            metaKey: action === 'meta-enter',
+          })
+        );
+      await flushAsyncWork();
+      expect(sideQuestionView()).toMatchObject({
+        sessionID: 'session-1',
+        question: 'How is it going?\nKeep it short.',
+      });
+      expect(state.sessionStatus['session-1']).toEqual({ type: 'busy' });
+      expect(state.queuedMessages).toEqual([]);
+      expect(state.droppedFiles).toHaveLength(1);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(abortSessionMock).not.toHaveBeenCalled();
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+      expect(showSessionActionFeedbackMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it('closes the busy-send menu when the draft becomes /btw and restores ordinary queue controls afterward', async () => {
+    setupMatchingActiveTurn();
+    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+    setState('activeSessionId', 'session-1');
+    setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+    setIsLoading(true);
+    setInputText('Ordinary follow-up');
+    cleanup = render(() => ChatInput(), container!);
+    container?.querySelector<HTMLButtonElement>('[aria-label="More send options"]')!.click();
+    expect(container?.querySelector('.busy-menu')).not.toBeNull();
+    setInputText('/btw How is it going?');
+    await flushAsyncWork();
+    expect(container?.querySelector('.busy-menu')).toBeNull();
+    expect(container?.querySelector('[aria-label="More send options"]')).toBeNull();
+    expect(container?.querySelector('[aria-label="Send (Enter)"]')).not.toBeNull();
+    setInputText('Ordinary follow-up');
+    await flushAsyncWork();
+    expect(container?.querySelector('[aria-label="Add to queue (Enter)"]')).not.toBeNull();
+    expect(container?.querySelector('[aria-label="More send options"]')).not.toBeNull();
+  });
+
+  it('does not ask about a previously selected conversation from the new-chat composer', async () => {
+    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+    setState('activeSessionId', 'session-1');
+    setState('sessions', [session('session-1', 1)]);
+    setInputText('/btw Why?');
+    cleanup = render(() => ChatInput({ newSession: true }), container!);
+    container
+      ?.querySelector('.rich-composer')
+      ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await flushAsyncWork();
+    expect(sideQuestionView()).toBeNull();
+    expect(inputText()).toBe('/btw Why?');
+    expect(sendMessageMock).not.toHaveBeenCalled();
   });
 
   it('runs a typed slash command with args on Enter', async () => {

@@ -12,6 +12,7 @@ import type {
 } from '@opencode/client';
 import { asRecord, isNumber, isString, type UnknownRecord } from '../shared/type-utils';
 import { formatSkillAttachment } from '../shared/skill-reference';
+import { parseNativeForm } from '../shared/native-form';
 import type { OpenCodeV2GenerationTiming } from './opencode-v2-generation-timing';
 
 export function v2PartId(messageID: string, type: string, ordinal: number): string {
@@ -449,7 +450,26 @@ export function projectV2Message(
     };
   }
   if (message.type === 'synthetic') {
-    return { info, parts: [part(0, 'text', { text: message.text, synthetic: true })] };
+    const metadata = message.metadata;
+    const state = metadata?.state;
+    const subagentResult =
+      metadata?.source === 'subagent' &&
+      isString(metadata.childID) &&
+      metadata.childID.length > 0 &&
+      (state === 'completed' || state === 'error' || state === 'cancelled')
+        ? {
+            sessionID: metadata.childID,
+            state,
+            description: message.description,
+            agent: isString(metadata.agent) ? metadata.agent : undefined,
+          }
+        : undefined;
+    const fields: UnknownRecord = { text: message.text, synthetic: true };
+    if (subagentResult) fields.subagentResult = subagentResult;
+    return {
+      info,
+      parts: [part(0, 'text', fields)],
+    };
   }
   if (message.type === 'compaction')
     return {
@@ -467,26 +487,27 @@ export function projectV2Message(
 }
 
 export function projectV2Form(form: FormInfo): UnknownRecord {
-  return {
+  const native = parseNativeForm(form);
+  if (!native) throw new Error('Invalid OpenCode native form');
+  const result: UnknownRecord = {
     id: form.id,
     sessionID: form.sessionID,
-    questions: form.fields.map((field) => ({
-      header: field.title ?? form.title,
-      question: field.description ?? field.title ?? form.title,
-      multiple: field.type === 'multiselect',
-      custom: 'custom' in field ? field.custom !== false : true,
-      options:
-        'options' in field
-          ? (field.options?.map((option) => ({
-              label: option.label,
-              description: option.description ?? '',
-            })) ?? [])
-          : field.type === 'boolean'
-            ? [
-                { label: 'Yes', description: '' },
-                { label: 'No', description: '' },
-              ]
-            : [],
-    })),
+    kind: 'native-form',
+    form: native,
+    // Older webviews retain a visible, non-answerable fallback. Never flatten native fields.
+    questions: [
+      {
+        header: form.title,
+        question:
+          'This form needs an updated Varro view. Reload the view or answer in another OpenCode client.',
+        options: [],
+        custom: false,
+      },
+    ],
   };
+  const tool = asRecord(native.metadata?.tool);
+  if (isString(tool?.messageID) && isString(tool.id)) {
+    result.tool = { messageID: tool.messageID, callID: tool.id };
+  }
+  return result;
 }

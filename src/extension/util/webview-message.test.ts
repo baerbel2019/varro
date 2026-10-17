@@ -61,14 +61,15 @@ function createRalphRun() {
 
 describe('webview message validation', () => {
   it('accepts only bounded Handy requests with fixed actions', () => {
-    for (const action of ['status', 'toggle', 'cancel']) {
+    for (const action of ['status', 'start', 'stop', 'cancel']) {
       const message = { type: 'handy/request', payload: { requestId: 'handy-1', action } };
       expect(parseWebviewMessage(message)).toEqual(message);
     }
     for (const payload of [
       {},
-      { requestId: '', action: 'toggle' },
-      { requestId: 'x'.repeat(129), action: 'toggle' },
+      { requestId: '', action: 'start' },
+      { requestId: 'x'.repeat(129), action: 'start' },
+      { requestId: '1', action: 'toggle' },
       { requestId: '1', action: '--anything' },
     ]) {
       expect(parseWebviewMessage({ type: 'handy/request', payload })).toBeNull();
@@ -224,6 +225,11 @@ describe('webview message validation', () => {
     expect(isAllowedApiRequest('POST', '/session/abc/init')).toBe(true);
     expect(isAllowedApiRequest('POST', '/session/abc/prompt_async')).toBe(true);
     expect(isAllowedApiRequest('POST', '/session/abc/resume-steering')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/session/abc/side-question')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/session/abc/side-question?directory=%2Frepo')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/session/abc/side-question')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/session/abc/side-question?model=other')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/api/session/abc/generate')).toBe(false);
     expect(isAllowedApiRequest('POST', '/session/abc/resume-steering?directory=%2Frepo-a')).toBe(
       true
     );

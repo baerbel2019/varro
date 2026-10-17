@@ -198,7 +198,7 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       if (
         !requestId ||
         requestId.length > 128 ||
-        (action !== 'status' && action !== 'toggle' && action !== 'cancel')
+        (action !== 'status' && action !== 'start' && action !== 'stop' && action !== 'cancel')
       )
         return null;
       return { type, payload: { requestId, action } };
@@ -1724,6 +1724,8 @@ interface ApiRoute {
 
 const SESSION_ACTIONS = new Set([
   'abort',
+  'interrupt-child',
+  'background-parent',
   'resume-steering',
   'fork',
   'prompt_async',
@@ -1732,6 +1734,7 @@ const SESSION_ACTIONS = new Set([
   'unrevert',
   'init',
   'command',
+  'side-question',
 ]);
 
 const noQuery = (url: URL) => !url.search;
@@ -1865,6 +1868,7 @@ const API_ROUTES: ApiRoute[] = [
   ),
   route(VARRO_API_ENDPOINTS.workspaceFilePick, methodsNoQuery('GET')),
   route(VARRO_API_ENDPOINTS.copiedSelectionMatch, methodsNoQuery('POST')),
+  route(VARRO_API_ENDPOINTS.remoteImage, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.workspaceProblems, methodsNoQuery('GET')),
   route(
     VARRO_API_ENDPOINTS.sessionHistoryScope,
@@ -1987,6 +1991,10 @@ const API_ROUTES: ApiRoute[] = [
     ({ method, url }) => method === 'DELETE' && optionalDirectoryQuery(url)
   ),
   route('/session/:id/todo', ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)),
+  route(
+    '/session/:id/child-task-controls',
+    ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)
+  ),
   route(
     '/session/:id/background-process',
     ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)

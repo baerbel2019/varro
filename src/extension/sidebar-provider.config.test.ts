@@ -448,18 +448,25 @@ describe('SidebarProvider local config routing', () => {
     expect(vscodeMock.workspace.fs.writeFile).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])(
-    'persists local provider disabling and handles concurrent edits, conflict=%s',
-    async (conflict) => {
-      const raw =
-        '// Keep this comment\n' +
-        JSON.stringify({
-          model: 'openai/gpt-5',
-          providers: { ollama: { settings: { baseURL: 'http://localhost:11434/v1' } } },
-          experimental: {
-            policies: [{ action: 'provider.use', resource: 'other', effect: 'deny' }],
-          },
-        });
+  it.each([
+    ['experimental', false],
+    ['experimental', true],
+    ['native', false],
+    ['native', true],
+  ] as const)(
+    'persists local provider disabling in %s policies and handles concurrent edits, conflict=%s',
+    async (format, conflict) => {
+      const policies = [{ action: 'provider.use', resource: 'other', effect: 'deny' }];
+      const config = {
+        model: 'openai/gpt-5',
+        providers: { ollama: { settings: { baseURL: 'http://localhost:11434/v1' } } },
+        experimental: { policies },
+        policies:
+          format === 'native'
+            ? [...policies, { action: 'provider.use', resource: 'ollama', effect: 'allow' }]
+            : undefined,
+      };
+      const raw = '// Keep this comment\n' + JSON.stringify(config);
       vscodeMock.workspace.fs.readFile.mockImplementation((uri: { fsPath: string }) =>
         uri.fsPath === '/repo/opencode.json'
           ? Promise.resolve(new TextEncoder().encode(raw))
@@ -510,16 +517,14 @@ describe('SidebarProvider local config routing', () => {
         expect(write?.[0]).toEqual(expect.objectContaining({ fsPath: '/repo/opencode.json' }));
         const written = new TextDecoder().decode(write?.[1] as Uint8Array);
         expect(written).toContain('// Keep this comment');
-        expect(JSON.parse(written.slice(written.indexOf('\n') + 1))).toEqual({
-          model: 'openai/gpt-5',
-          providers: { ollama: { settings: { baseURL: 'http://localhost:11434/v1' } } },
-          experimental: {
-            policies: [
-              { action: 'provider.use', resource: 'other', effect: 'deny' },
-              { action: 'provider.use', resource: 'ollama', effect: 'deny' },
-            ],
-          },
-        });
+        const nextPolicies = [
+          ...policies,
+          { action: 'provider.use', resource: 'ollama', effect: 'deny' },
+        ];
+        const expected = { ...config };
+        if (format === 'native') expected.policies = nextPolicies;
+        else expected.experimental = { policies: nextPolicies };
+        expect(JSON.parse(written.slice(written.indexOf('\n') + 1))).toEqual(expected);
         expect(server.request).toHaveBeenCalledWith('POST', '/instance/dispose', undefined, {
           directory: '/repo',
         });
@@ -567,6 +572,24 @@ describe('SidebarProvider local config routing', () => {
       });
     }
   );
+
+  it.each([false, true])('broadcasts the histogram opt-in value %s', async (enabled) => {
+    const { provider } = await createSidebarProviderInstance();
+    const { posted } = attachTestView(provider);
+    const listener = vscodeMock.workspace.onDidChangeConfiguration.mock.calls.at(-1)?.[0];
+
+    await vscodeMock.workspace
+      .getConfiguration('varro')
+      .update('chat.showEmptyStateHistogram', enabled);
+    listener?.({
+      affectsConfiguration: (key: string) => key === 'varro.chat.showEmptyStateHistogram',
+    });
+
+    expect(posted).toContainEqual({
+      type: 'config/update',
+      payload: expect.objectContaining({ showEmptyStateHistogram: enabled }),
+    });
+  });
 
   it('broadcasts turn-timer configuration changes', async () => {
     const { provider } = await createSidebarProviderInstance();

@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => {
   return {
     values,
     getConfiguration: vi.fn((section: string) => ({
+      inspect: vi.fn((key: string) => ({ globalValue: values.get(`${section}.${key}`) })),
       get: vi.fn((key: string, fallback?: unknown) => {
         const fullKey = `${section}.${key}`;
         return values.has(fullKey) ? values.get(fullKey) : fallback;
@@ -42,6 +43,7 @@ describe('readExtensionConfigState', () => {
     expect(readExtensionConfigState()).toMatchObject({
       expandThinking: false,
       showTurnTimer: true,
+      showEmptyStateHistogram: false,
       debugShowQuotaWarning: false,
       debugResetWarningDays: 5,
       enableProblemsContext: true,
@@ -61,6 +63,23 @@ describe('readExtensionConfigState', () => {
     mocks.values.set('varro.chat.showTurnTimer', false);
 
     expect(readExtensionConfigState().showTurnTimer).toBe(false);
+  });
+
+  it('reads the empty-state histogram opt-in', () => {
+    mocks.values.set('varro.chat.showEmptyStateHistogram', true);
+
+    expect(readExtensionConfigState().showEmptyStateHistogram).toBe(true);
+  });
+
+  it('defaults to ask and reads automatic loading only from application settings', () => {
+    expect(readExtensionConfigState().remoteImages).toBe('ask');
+    mocks.values.set('varro.chat.remoteImages', 'on');
+    expect(readExtensionConfigState().remoteImages).toBe('on');
+    mocks.getConfiguration.mockReturnValueOnce({
+      get: vi.fn(() => 'on'),
+      inspect: vi.fn(() => ({ globalValue: undefined })),
+    });
+    expect(readExtensionConfigState().remoteImages).toBe('ask');
   });
 
   it('reads the quota-warning debug setting', () => {

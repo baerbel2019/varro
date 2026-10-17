@@ -71,8 +71,8 @@ For WSL, open the project in a VS Code WSL window, then install and authenticate
 
 | Version | Minimum supported | Tested with this release | npm package |
 | --- | --- | --- | --- |
-| v2, recommended | 2.0.5 | 2.0.28 | `@opencode/cli` |
-| v1, still supported | 1.16.0 | 1.19.0 | `opencode-ai` |
+| v2, recommended | 2.0.5 | 2.0.32 | `@opencode/cli` |
+| v1, still supported | 1.16.0 | 1.19.3 | `opencode-ai` |
 
 To keep using v1, retain your installation or run `npm install -g opencode-ai`. Set `varro.server.command` to its executable path. Setting it to `opencode` selects v1 only if that command resolves to a v1 installation. Varro detects the API automatically.
 
@@ -111,7 +111,7 @@ On macOS or Linux, use `lsof -nP -iTCP:4096 -sTCP:LISTEN` to find the listener. 
 
 ### Version differences and history
 
-- V2 does not expose session sharing or an OpenCode LSP service. Sharing is disabled on v2. VS Code Problems remain available as explicit context.
+- OpenCode has discontinued session sharing. Varro no longer offers new share links; existing v1 links can be cleared with **Unshare session**. V2 does not expose an OpenCode LSP service. VS Code Problems remain available as explicit context.
 - V2 cannot patch arbitrary session metadata. Varro keeps session annotations in `opencode-v2/` under its per-user state directory, described below. These annotations are local to Varro and are not synchronized to other OpenCode clients.
 - Changing CLI versions does not synchronize history. After switching to v2, opening a v1 conversation that is still in the session list imports a copy of it and its child sessions when v2 cannot load the original. The copy has new IDs and a title ending in `(v1 copy)`. You can continue it without changing the original v1 history. Imports do not execute recorded tools or send a model request.
 
@@ -205,7 +205,17 @@ Use any of these flows to add more context.
 - Type `@agent-name` to mention an available agent.
 - Type `&` to search recent root sessions and insert a stable `session:<id>` reference. Session references in the composer and rendered responses open the referenced session.
 
-Varro keeps at most five pasted images, with a maximum size of 5 MiB per image. Native PDFs can be picked, dropped, or pasted and are limited to 20 MiB in total. When the selected model does not advertise PDF input support, a picked or dropped PDF with an available file path is sent as a file reference instead of native PDF data. A pasted PDF without an available path remains visible but is not sent. In environments where other dropped items do not expose local paths, content-only drops are limited to 20 files, 10 MiB per file, and 50 MiB in total.
+Varro keeps at most five pasted images, with a maximum size of 5 MiB per image. In environments where other dropped items do not expose local paths, content-only drops are limited to 20 files, 10 MiB per file, and 50 MiB in total.
+
+### PDF attachments
+
+Native PDFs can be picked, dropped, or pasted and are limited to 20 MiB in total, with filenames of at most 512 characters. Varro checks the PDF header, base64 encoding, and declared size, not whether the document is readable, encrypted, or structurally valid.
+
+Select a model whose catalog advertises PDF input. Unsupported or unknown capability blocks sending and leaves the draft and attachment intact. There is no automatic file-reference fallback, OCR, text extraction, rasterization, or resend after a provider rejection. Remove the PDF or explicitly convert it yourself if your model cannot read it.
+
+Send PDFs as regular prompts. V2 one-shot generation and configured-command PDF routing are not supported by this verification.
+
+Advertised capability does not prove provider support. Native conversion was verified only with OpenCode 2.0.31, client 2.0.32, and a local OpenAI-compatible fixture receiver on October 16, 2026. No external provider/model combination is certified by that test. V1, older V2 releases, and separately hosted remote profiles remain unverified. See [PDF compatibility](pdf-compatibility.md) for the evidence and the upstream documentation disagreement.
 
 ### Add vision to a text-only model
 
@@ -250,6 +260,78 @@ The `vision` agent must be visible, have subagent or all mode, and have an expli
 - Slash commands are available directly in the composer.
 
 Unsent composer text and explicit file or folder attachments are restored after webview or window reloads. Images, PDFs, terminal selections, and diagnostic attachments are persisted when they are queued, not as part of an ordinary unsent draft.
+
+### Side questions
+
+With an OpenCode V2 conversation open, type `/btw Why did that test fail?`
+or choose **Ask a side question…** from the conversation's title menu. `/btw`
+without a question opens an empty form.
+
+Before the first question is sent, the dialog shows the independently centered
+Varro logo with the same hover effects as new chat and one dim caption below it.
+The welcome disappears when you submit, but its height remains the dialog's minimum,
+subject to the available viewport height.
+
+During active work, the send-options menu also offers **Side question** above
+**Stop and Send**. This asks the current draft without needing `/btw`, queueing it,
+or interrupting the main task. Existing attachments stay in the main composer.
+
+The temporary dialog uses the chat's message bubbles and rich prompt composer,
+without repeated Question/Answer labels. Question bubbles show at most two lines,
+with longer text scrolling inside the bubble. Main-chat bubbles are unchanged.
+Enter sends; Shift+Enter adds a line, and
+the usual undo/redo shortcuts work. Follow-ups include
+the earlier side questions and answers as context without adding them to the main
+conversation. The thread is kept only while the dialog is open. Each response has
+a right-aligned Copy button in the divider row below it, revealed on hover or
+keyboard focus. Send/Stop is vertically centered beside the input rather
+than in a separate toolbar row.
+
+The side input stays at one-line height and keeps the caret's line vertically
+centered while typing or moving between lines. Neighboring lines can peek into
+the padding above and below rather than expanding the composer. These edges fade
+smoothly, and the scrollbar is hidden without disabling scrolling. Each response's divider
+shows elapsed request time, measured from sending the question to receiving the
+completed answer. The native endpoint does not return token usage, so token counts
+and tokens per second are unavailable for side answers.
+
+Side questions accept text only. Pasting an image shows a warning and does not
+attach it. If the clipboard also contains plain text, that text is still pasted.
+
+Text contexts, captured editor/terminal selections, diagnostics, pasted text, and
+file/line references use the main chat's attachment formatting and chips. Context
+is captured when the dialog opens and retained in its local history. File and line
+references do not automatically read files; contents are available only when captured
+text or the existing conversation provides them.
+
+Images, PDFs, inline subagent/skill directives, commands, and other-conversation
+directives disable side-question sending instead of silently dropping prompt content.
+The question and serialized context must fit the 8,000-character request limit;
+oversized context is rejected without clearing the main draft or attachments.
+
+While the first answer is pending, the dialog shows just the question and animated
+Thinking indicator, without an input or Stop button. Close with X to cancel.
+After the first answer, the follow-up composer stays available, with request-local
+Stop while a follow-up is pending. Native V2 transient generation returns a completed answer,
+not token deltas, so side answers do not stream. Stopping the request does not
+guarantee that the provider stopped generation or billing.
+
+Side questions use the conversation's current native model and context. They cannot
+run tools or edit files. Each question is a normal model request and may incur usage.
+Threads are bounded to 12 answers and 128,000 characters of side-conversation context;
+when full, start another side conversation instead of silently losing earlier context.
+
+The menu preserves your composer draft and attachments. The slash action consumes
+only its command text, leaving existing attachments in the composer. Closing the
+dialog cancels only its request where supported, never the main task. Errors stay
+in the dialog with a Retry action. Switching conversation, directory, or server
+closes the dialog and discards its answer.
+
+Side questions work while the main task is running or waiting for input. `/btw`
+shows only Send, never Queue, Steer, or Stop and Send. It uses a read-only snapshot
+of the current context without pausing the task or resolving its pending requests.
+Side questions require native V2 transient generation support. Unsupported servers report
+an error rather than sending a normal message or creating a helper conversation.
 
 ### Queued Messages
 
@@ -302,7 +384,7 @@ cleared by a failed read.
 - Search uses OpenCode's native root-session search across loaded and older history and returns up to 30 results. Matching fields depend on the installed OpenCode version. Run `Varro: Search Sessions` to open and focus search directly.
 - Filter or jump to `Running`, `Needs attention`, `Failed`, `Plan ready`, and `Completed` sessions from the header badges.
 - Open sub-agent sessions from the parent session row when they exist.
-- Top-level sessions can be renamed, pinned, or moved to the recycle bin. Drag a pinned session's handle, or focus it and press `ArrowUp` or `ArrowDown`, to reorder pinned sessions. Any session can open in the sidebar, an editor tab, or the OpenCode TUI, and its ID can be copied. Opening an editor session in the sidebar closes its matching editor tab. On v1, sharing asks OpenCode to create a share link and copies it to the clipboard; v2 sharing is unavailable.
+- Top-level sessions can be renamed, pinned, or moved to the recycle bin. Drag a pinned session's handle, or focus it and press `ArrowUp` or `ArrowDown`, to reorder pinned sessions. Any session can open in the sidebar, an editor tab, or the OpenCode TUI, and its ID can be copied. Opening an editor session in the sidebar closes its matching editor tab. OpenCode has discontinued sharing. Existing v1 share links retain an **Unshare session** action to clear the local link.
 - Deleted session roots move into a recycle bin section where you can restore them or delete them permanently for 24 hours before they expire.
 - Stop the active run with `Varro: Abort Session`.
 - Use `/export` to open the current session as JSON in the editor.
@@ -327,7 +409,7 @@ On large layouts, Varro can keep a persistent session pane beside the chat. Use 
 
 If the sidebar is hidden, Varro can show VS Code notifications when a plan is ready, a top-level session fails, or the agent is blocked on a permission or question. It also exposes a status bar item that summarizes waiting or completed top-level sessions, including ordinary completed sessions that do not produce a notification, and alerts in sibling workspaces. Clicking that item opens pending-attention sessions first, otherwise it focuses Varro.
 
-If VS Code reloads while a session was running, Varro reconnects to those sessions and can continue interrupted work automatically when the session is still resumable.
+If VS Code reloads while a session was running, Varro reconnects and restores canonical history and pending inputs. OpenCode V2 owns automatic execution recovery; Varro does not send a second restart-continuation prompt. Older V2 versions or standalone services may require an explicit follow-up. V1 retains Varro's existing elected-owner continuation. Recovery can repeat external effects, and active shells are not preserved as durable processes. See [restart continuity](restart-recovery.md).
 
 ## Plans, Reviews, And Ralph
 
@@ -780,7 +862,7 @@ There are also deprecated debug-only settings used for development and recovery 
 ## Troubleshooting
 
 - OpenCode CLI missing: install v2 with `npm install -g @opencode/cli` on macOS, Linux, or WSL, or download the native Windows CLI from the [v2 install page](https://opencode.ai/v2/docs/). V1 remains available with `npm install -g opencode-ai`.
-- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.0` and v2 `2.0.28`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
+- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.3` and v2 `2.0.32`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
 - OpenCode v2 authentication: Varro captures managed-server credentials automatically and redacts them from output. Existing local services use their registered credentials. An externally managed server can also use `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` from the extension host's environment.
 - OpenCode v2 session settings: Varro stores mutable session annotations locally because the released v2 API cannot update session metadata. Session sharing is unavailable through this API, so its menu action is disabled. Existing v1-format configuration remains supported.
 - CLI not on `PATH`: set `varro.server.command` to the executable path.

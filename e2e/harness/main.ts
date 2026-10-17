@@ -92,6 +92,9 @@ const SCENARIO_NAMES = [
   'server-error-update-blocked-sessions',
   'server-error-update-blocked-setting',
   'question-prompt',
+  'native-form-prompt',
+  'native-question-prompt',
+  'native-question-inputs',
   'archive-overflow',
   'context-compact',
   'review-slash',
@@ -2352,6 +2355,9 @@ function createScenarioState(name: ScenarioName): ScenarioState {
       },
     };
     state.nextSequence = 120;
+    if (new URLSearchParams(window.location.search).get('nativeCommand') === '1') {
+      state.readyStatus = { state: 'running', url: 'mock://opencode', apiVersion: 2 };
+    }
     return state;
   }
 
@@ -2653,6 +2659,134 @@ function createScenarioState(name: ScenarioName): ScenarioState {
     state.providers = [];
     state.providerDefaults = {};
     state.nextSequence = 234;
+    return state;
+  }
+
+  if (name === 'native-form-prompt') {
+    const session = makeSession('session-native-form', 'Native form flow', BASE_TIME - 500);
+    state.sessions = [session];
+    state.sessionStatuses[session.id] = { type: 'idle' };
+    state.messagesBySessionId[session.id] = [];
+    state.persistedActiveSessionId = session.id;
+    state.questions = [
+      {
+        id: 'frm_native',
+        sessionID: session.id,
+        kind: 'native-form',
+        questions: [],
+        form: {
+          id: 'frm_native',
+          sessionID: session.id,
+          title: 'Connection settings',
+          fields: [
+            { key: 'proxy', type: 'boolean', title: 'Use proxy?', default: false, required: true },
+            {
+              key: 'url',
+              type: 'string',
+              title: 'Proxy URL',
+              required: true,
+              format: 'uri',
+              when: [{ key: 'proxy', op: 'eq', value: true }],
+            },
+            { key: 'count', type: 'integer', title: 'Retry count', minimum: 0 },
+            {
+              key: 'region',
+              type: 'string',
+              title: 'Region',
+              required: true,
+              options: [
+                { label: 'Same region', value: 'east' },
+                { label: 'Same region', value: 'west' },
+              ],
+            },
+            {
+              key: 'setup',
+              type: 'external',
+              title: 'External setup',
+              url: 'https://example.com/setup',
+            },
+          ],
+        },
+      },
+    ];
+    return state;
+  }
+
+  if (name === 'native-question-prompt' || name === 'native-question-inputs') {
+    const session = makeSession('session-native-question', 'Native question flow', BASE_TIME - 500);
+    state.sessions = [session];
+    state.sessionStatuses[session.id] = { type: 'idle' };
+    state.messagesBySessionId[session.id] = [];
+    state.persistedActiveSessionId = session.id;
+    state.questions = [
+      {
+        id: 'frm_native_question',
+        sessionID: session.id,
+        kind: 'native-form',
+        questions: [],
+        form: {
+          id: 'frm_native_question',
+          sessionID: session.id,
+          title: 'Questions',
+          metadata: { kind: 'question' },
+          fields:
+            name === 'native-question-inputs'
+              ? [
+                  {
+                    key: 'notes',
+                    type: 'string',
+                    title: 'Notes',
+                    description: 'What else should we know?',
+                    options: [],
+                    custom: true,
+                  },
+                  {
+                    key: 'capabilities',
+                    type: 'multiselect',
+                    title: 'Capabilities',
+                    description: 'Select any that apply, or add your own',
+                    custom: true,
+                    options: [
+                      {
+                        value: 'search',
+                        label: 'Search',
+                        description: 'Search across the workspace',
+                      },
+                      {
+                        value: 'edit',
+                        label: 'Edit',
+                        description: 'Update files in the workspace',
+                      },
+                    ],
+                  },
+                ]
+              : [
+                  {
+                    key: 'q0',
+                    type: 'string',
+                    title: 'Restore actual limits',
+                    description:
+                      'Should I use your separate Codex login for actual quota and reset-credit polling, while leaving token sharing enabled for chat?',
+                    custom: true,
+                    options: [
+                      {
+                        value: 'separate-login',
+                        label: 'Use separate Codex login',
+                        description:
+                          'Keep current chat authentication. Restore numeric limits and reset credits using a renewed Codex login for the intended account.',
+                      },
+                      {
+                        value: 'switch-chat',
+                        label: 'Switch chat to Codex',
+                        description:
+                          'Use Codex authentication for both chat and usage. This changes the active chat connection and may change model availability.',
+                      },
+                    ],
+                  },
+                ],
+        },
+      },
+    ];
     return state;
   }
 
@@ -3268,9 +3402,147 @@ function createScenarioState(name: ScenarioName): ScenarioState {
     state.messagesBySessionId[parent.id] = [];
     state.messagesBySessionId[childA.id] = [];
     state.messagesBySessionId[childB.id] = [];
+    if (new URLSearchParams(window.location.search).get('emptyChildModel') === '1') {
+      childA.model = { providerID: 'openai', id: 'gpt-6.1-sol' };
+      const interrupted = makeAssistantMessage(
+        childA.id,
+        'child-interrupted',
+        'child-user',
+        '',
+        BASE_TIME - 100
+      );
+      interrupted.info.providerID = '';
+      interrupted.info.modelID = '';
+      interrupted.info.error = { name: 'MessageAbortedError', data: {} };
+      interrupted.parts = [];
+      state.messagesBySessionId[childA.id] = [interrupted];
+    }
     state.persistedActiveSessionId = null;
     persistRecentSessionsListView(state);
     state.nextSequence = 310;
+    if (new URLSearchParams(window.location.search).get('subagentResult') === '1') {
+      const result = makeUserMessage(
+        parent.id,
+        'native-result',
+        ['<subagent sessionID="session-child-b">\nAudit result\n</subagent>'],
+        BASE_TIME - 200
+      );
+      result.parts = result.parts.map((part) =>
+        part.type === 'text'
+          ? {
+              ...part,
+              synthetic: true,
+              subagentResult: {
+                sessionID: childA.id,
+                state: 'completed',
+                description: 'Audit auth',
+                agent: 'general',
+              },
+            }
+          : part
+      );
+      state.messagesBySessionId[parent.id] = [result];
+      state.persistedActiveSessionId = parent.id;
+      persistRecentSessionView(state, parent.id);
+    }
+    const childTaskState = new URLSearchParams(window.location.search).get('childTaskState');
+    if (
+      childTaskState === 'running' ||
+      childTaskState === 'completed' ||
+      childTaskState === 'error'
+    ) {
+      const user = makeUserMessage(
+        parent.id,
+        'child-controls-user',
+        ['Inspect the API routes.'],
+        BASE_TIME - 200
+      );
+      const assistant = makeAssistantMessage(
+        parent.id,
+        'child-controls-assistant',
+        user.info.id,
+        '',
+        BASE_TIME - 100
+      );
+      const input = { agent: 'general', prompt: 'Review the API routes without modifying files.' };
+      const metadata = { sessionId: childA.id };
+      const task: Extract<Part, { type: 'tool' }> = {
+        id: 'child-controls-tool',
+        sessionID: parent.id,
+        messageID: assistant.info.id,
+        type: 'tool',
+        callID: 'child-controls-call',
+        tool: 'task',
+        state:
+          childTaskState === 'running'
+            ? {
+                status: 'running',
+                input,
+                metadata,
+                title: childA.title,
+                time: { start: BASE_TIME - 100 },
+              }
+            : childTaskState === 'completed'
+              ? {
+                  status: 'completed',
+                  input,
+                  metadata,
+                  title: childA.title,
+                  output: 'API review complete.',
+                  time: { start: BASE_TIME - 100, end: BASE_TIME },
+                }
+              : {
+                  status: 'error',
+                  input,
+                  metadata,
+                  error: 'Child interrupted.',
+                  time: { start: BASE_TIME - 100, end: BASE_TIME },
+                },
+      };
+      assistant.parts = [task];
+      if (childTaskState === 'running') markAssistantInProgress(assistant);
+      state.messagesBySessionId[parent.id] = [user, assistant];
+      state.sessionStatuses[parent.id] = { type: childTaskState === 'running' ? 'busy' : 'idle' };
+      state.sessionStatuses[childA.id] = { type: childTaskState === 'running' ? 'busy' : 'idle' };
+      if (new URLSearchParams(window.location.search).has('nestedChildTask')) {
+        const grandchild = {
+          ...makeSession('child-controls-grandchild', 'Review nested routes', BASE_TIME - 100),
+          parentID: childA.id,
+        };
+        state.sessions.push(grandchild);
+        const nested = makeAssistantMessage(
+          childA.id,
+          'nested-assistant',
+          'nested-user',
+          '',
+          BASE_TIME - 100
+        );
+        markAssistantInProgress(nested);
+        nested.parts = [
+          {
+            ...task,
+            id: 'nested-tool',
+            callID: 'nested-call',
+            sessionID: childA.id,
+            messageID: nested.info.id,
+            state: {
+              status: 'running',
+              input,
+              metadata: { sessionId: grandchild.id },
+              title: grandchild.title,
+              time: { start: BASE_TIME - 100 },
+            },
+          },
+        ];
+        state.messagesBySessionId[childA.id] = [
+          makeUserMessage(childA.id, 'nested-user', ['Review nested routes.'], BASE_TIME - 200),
+          nested,
+        ];
+        state.sessionStatuses[grandchild.id] = { type: 'busy' };
+      }
+      state.persistedActiveSessionId = parent.id;
+      persistRecentSessionView(state, parent.id);
+    }
     return state;
   }
 
@@ -5211,6 +5483,8 @@ function buildInitialState(state: ScenarioState): InitialWebviewState {
     droppedFiles: [],
     emptyStateLogoUri: '/assets/icon.png',
     showFileDiffs: state.showFileDiffs,
+    showEmptyStateHistogram:
+      new URLSearchParams(window.location.search).get('showEmptyStateHistogram') === 'true',
     defaultPermissionMode: 'default',
     chatEditorFontSize: 12,
     chatFontSize: 13,
@@ -5442,6 +5716,17 @@ async function handleApiRequest(
   const url = new URL(rawPath, 'http://varro.test');
   const path = url.pathname;
 
+  if (method === 'GET' && /^\/session\/[^/]+\/child-task-controls$/.test(path)) {
+    const id = decodeURIComponent(path.split('/')[2]!);
+    const parentID = state.sessions.find((session) => session.id === id)?.parentID ?? null;
+    return {
+      parentID,
+      stopChild: Boolean(parentID),
+      backgroundEligible:
+        Boolean(parentID) && new URLSearchParams(window.location.search).has('childTaskBackground'),
+    };
+  }
+
   const backgroundRoute = path.match(
     /^\/session\/([^/]+)\/background-process(?:\/([^/]+)\/output)?$/
   );
@@ -5556,6 +5841,19 @@ async function handleApiRequest(
     return state.recycleBinEntries;
   }
 
+  if (method === 'POST' && path === '/varro/remote-image') {
+    // Deterministic host response only. This fixture never contacts the supplied URL.
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+    const canvas = document.createElement('canvas');
+    canvas.width = 384;
+    canvas.height = 216;
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Canvas unavailable');
+    context.fillStyle = '#4080c0';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    return { url: canvas.toDataURL('image/webp'), hostname: 'images.example' };
+  }
+
   if (method === 'GET' && path === '/varro/workspace-problems') {
     return {
       total: 2,
@@ -5628,6 +5926,9 @@ async function handleApiRequest(
       throw new Error('Command catalog unavailable');
     if (new URLSearchParams(window.location.search).get('skillCommand') === '1') {
       return [{ name: 'control', template: 'Check machines', source: 'skill' }];
+    }
+    if (new URLSearchParams(window.location.search).get('nativeCommand') === '1') {
+      return [{ name: 'audit', source: 'command', description: '', template: '', hints: [] }];
     }
     return [];
   }
@@ -6337,6 +6638,7 @@ function installBridge(state: ScenarioState) {
             requestId: webviewMessage.payload.requestId,
             available: false,
             running: false,
+            state: 'idle',
           },
         });
         return;

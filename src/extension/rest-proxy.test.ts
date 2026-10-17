@@ -18,7 +18,10 @@ const mocks = vi.hoisted(() => ({
     workspace: {
       textDocuments: [],
       getWorkspaceFolder: vi.fn(() => undefined),
-      getConfiguration: vi.fn(() => ({ get: vi.fn<() => string | undefined>(() => undefined) })),
+      getConfiguration: vi.fn(() => ({
+        get: vi.fn<() => string | undefined>(() => undefined),
+        inspect: vi.fn(() => ({ globalValue: undefined as unknown })),
+      })),
       asRelativePath: vi.fn((uri: { fsPath: string }) => uri.fsPath),
       fs: {
         readFile: vi.fn(),
@@ -46,6 +49,7 @@ import {
 } from './rest-proxy';
 import type { RestProxyCallbacks } from './rest-proxy';
 import { SharedThumbnailClient } from './image-thumbnail-shared-client';
+import { RemoteImages } from './remote-images';
 import * as workspaceProblems from './workspace-problems';
 import { OpenCodeResponseTooLargeError } from './open-code-transport';
 import { HiddenSessionManager } from './hidden-session-manager';
@@ -254,6 +258,196 @@ async function requestSanitizedMessagePage(messages: unknown[]) {
   return response.data.items;
 }
 
+describe('native-form proxy boundary', () => {
+  it('does not forward a native reply to a V1 server', async () => {
+    const { proxy, callbacks } = createProxy();
+    await proxy.handleRequest(
+      makePayload(1, 'POST', '/question/frm_one/reply', {
+        kind: 'native-form',
+        sessionID: 'ses_child',
+        answer: { enabled: false },
+      })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 1,
+      error: 'Native forms require OpenCode V2',
+    });
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+    proxy.dispose();
+  });
+  it('checks the owning session before forwarding a native reply', async () => {
+    const request = vi.fn(async () => true);
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2, request },
+    });
+    const body = {
+      kind: 'native-form',
+      sessionID: 'ses_child',
+      answer: { enabled: false, count: 0 },
+    };
+    await proxy.handleRequest(makePayload(2, 'POST', '/question/frm_one/reply', body));
+    expect(callbacks.sessionState.isSessionInWorkspace).toHaveBeenCalledWith('ses_child', '/repo');
+    expect(request).toHaveBeenCalledWith(
+      'POST',
+      '/question/frm_one/reply',
+      body,
+      expect.anything()
+    );
+    proxy.dispose();
+  });
+});
+
+describe('side-question proxy boundary', () => {
+  it('authorizes a narrow V2 action without prompt admission or lifecycle writes', async () => {
+    const request = vi.fn().mockResolvedValue({ text: 'Because.' });
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2, request },
+    });
+    await proxy.handleRequest(
+      makePayload(1, 'POST', '/session/ses_side/side-question', { question: 'Why?' })
+    );
+    expect(request).toHaveBeenCalledWith(
+      'POST',
+      '/session/ses_side/side-question',
+      { question: 'Why?' },
+      expect.objectContaining({ signal: expect.any(AbortSignal), maxResponseBytes: 512 * 1024 })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 1,
+      data: { text: 'Because.' },
+    });
+    expect(callbacks.sessionState.markSessionBusy).not.toHaveBeenCalled();
+    expect(callbacks.confirmPromptAdmission).not.toHaveBeenCalled();
+    expect(callbacks.cleanupExpiredRecycleBin).not.toHaveBeenCalled();
+    proxy.dispose();
+  });
+
+  it('rejects V1 without forwarding or creating a helper session', async () => {
+    const { proxy, callbacks } = createProxy();
+    await proxy.handleRequest(
+      makePayload(2, 'POST', '/session/ses_side/side-question', { question: 'Why?' })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 2,
+      error: 'Side questions require OpenCode V2',
+    });
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+    proxy.dispose();
+  });
+
+  it('rejects a foreign directory before generation', async () => {
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2 },
+      contextProvider: {
+        ...createCallbacks().contextProvider,
+        getOpenWorkspaceRoot: vi.fn(() => null),
+      },
+    });
+    await proxy.handleRequest(
+      makePayload(3, 'POST', '/session/ses_side/side-question?directory=%2Fforeign', {
+        question: 'Why?',
+      })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ id: 3, error: expect.any(String) })
+    );
+    expect(callbacks.server.request).not.toHaveBeenCalledWith(
+      'POST',
+      expect.anything(),
+      expect.anything(),
+      expect.anything()
+    );
+    proxy.dispose();
+  });
+});
+
+describe('child task proxy boundary', () => {
+  it('does not dispatch after connection generation changes during native authorization', async () => {
+    let generation = 1;
+    const request = vi.fn(async () => {
+      generation = 2;
+      return { parentID: 'ses_parent', directory: '/repo', stopChild: true };
+    });
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2, request },
+      getRequestGeneration: () => generation,
+    });
+    await proxy.handleRequest(makePayload(6, 'POST', '/session/ses_child/interrupt-child'));
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ id: 6, error: expect.stringContaining('Connection changed') })
+    );
+    proxy.dispose();
+  });
+  it.each(['interrupt-child', 'background-parent'])(
+    'revalidates native scope before %s',
+    async (action) => {
+      const request = vi.fn(async (_method: string, path: string) =>
+        path.includes('/child-task-controls')
+          ? {
+              parentID: 'ses_parent',
+              directory: '/repo',
+              stopChild: true,
+              backgroundEligible: true,
+            }
+          : { interrupted: true }
+      );
+      const { proxy, callbacks } = createProxy({
+        server: { ...createCallbacks().server, apiVersion: 2, request },
+      });
+      await proxy.handleRequest(makePayload(1, 'POST', `/session/ses_child/${action}`));
+      expect(request.mock.calls.map(([method]) => method)).toEqual(['GET', 'POST']);
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id: 1,
+        data: { interrupted: true },
+      });
+      expect(callbacks.confirmPromptAdmission).not.toHaveBeenCalled();
+      proxy.dispose();
+    }
+  );
+  it('rejects canonical directory drift even with stale cached workspace membership', async () => {
+    const request = vi.fn().mockResolvedValue({ parentID: 'ses_parent', directory: '/foreign' });
+    const base = createCallbacks();
+    const { proxy, callbacks } = createProxy({
+      server: { ...base.server, apiVersion: 2, request },
+      contextProvider: {
+        ...base.contextProvider,
+        getOpenWorkspaceRoot: vi.fn((directory) => (directory === '/repo' ? directory : null)),
+      },
+    });
+    await proxy.handleRequest(makePayload(2, 'POST', '/session/ses_child/interrupt-child'));
+    expect(request.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ id: 2, error: expect.any(String) })
+    );
+    proxy.dispose();
+  });
+  it('rejects a supplied tree before dispatch', async () => {
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2 },
+    });
+    await proxy.handleRequest(
+      makePayload(3, 'POST', '/session/ses_child/interrupt-child', { tree: ['ses_parent'] })
+    );
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+    proxy.dispose();
+  });
+  it('hides unsupported V1 actions and refuses mutation', async () => {
+    const { proxy, callbacks } = createProxy();
+    await proxy.handleRequest(makePayload(4, 'GET', '/session/ses_child/child-task-controls'));
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 4,
+      data: { parentID: null, stopChild: false, backgroundEligible: false },
+    });
+    await proxy.handleRequest(makePayload(5, 'POST', '/session/ses_child/interrupt-child'));
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+    proxy.dispose();
+  });
+});
+
 describe('scopeOpenCodeRequest', () => {
   it('returns URL string when path is valid', () => {
     const result = scopeOpenCodeRequest('http://127.0.0.1:4096', '/session');
@@ -437,6 +631,90 @@ describe('getOpenCodeDirectoryHeaders', () => {
 });
 
 describe('RestProxy handleRequest', () => {
+  it('refuses remote-image requests when disabled without network or server access', async () => {
+    const { proxy, callbacks } = createProxy();
+    mocks.vscode.workspace.getConfiguration.mockReturnValueOnce({
+      get: vi.fn<() => string | undefined>(() => undefined),
+      inspect: vi.fn(() => ({ globalValue: 'off' })),
+    });
+    const load = vi.spyOn(RemoteImages.prototype, 'load');
+    await proxy.handleRequest(
+      makePayload(99001, 'POST', '/varro/remote-image', { url: 'https://images.test/a.png' })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 99001,
+      error: 'Remote image loading is disabled in Varro settings',
+    });
+    expect(load).not.toHaveBeenCalled();
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+    load.mockRestore();
+    proxy.dispose();
+  });
+
+  it('requires on mode before admitting automatic image requests', async () => {
+    const { proxy, callbacks } = createProxy();
+    const load = vi.spyOn(RemoteImages.prototype, 'load');
+    await proxy.handleRequest(
+      makePayload(99003, 'POST', '/varro/remote-image', {
+        url: 'https://images.test/a.png',
+        automatic: true,
+      })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 99003,
+      error: 'Automatic remote image loading is disabled',
+    });
+    expect(load).not.toHaveBeenCalled();
+    load.mockRestore();
+    proxy.dispose();
+  });
+
+  it('admits automatic image requests in explicit on mode', async () => {
+    const { proxy, callbacks } = createProxy();
+    const config = {
+      get: vi.fn<() => string | undefined>(() => undefined),
+      inspect: vi.fn(() => ({ globalValue: 'on' })),
+    };
+    mocks.vscode.workspace.getConfiguration
+      .mockReturnValueOnce(config)
+      .mockReturnValueOnce(config)
+      .mockReturnValueOnce(config)
+      .mockReturnValueOnce(config);
+    const data = { url: 'data:image/webp;base64,AAAA', hostname: 'images.test' };
+    const load = vi.spyOn(RemoteImages.prototype, 'load').mockResolvedValue(data);
+    await proxy.handleRequest(
+      makePayload(99004, 'POST', '/varro/remote-image', {
+        url: 'https://images.test/a.png',
+        automatic: true,
+      })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 99004, data });
+    load.mockRestore();
+    proxy.dispose();
+  });
+
+  it('handles a manually admitted remote-image request locally', async () => {
+    const { proxy, callbacks } = createProxy();
+    const config = {
+      get: vi.fn<() => string | undefined>(() => undefined),
+      inspect: vi.fn(() => ({ globalValue: 'ask' })),
+    };
+    mocks.vscode.workspace.getConfiguration
+      .mockReturnValueOnce(config)
+      .mockReturnValueOnce(config)
+      .mockReturnValueOnce(config)
+      .mockReturnValueOnce(config);
+    const data = { url: 'data:image/webp;base64,AAAA', hostname: 'images.test' };
+    const load = vi.spyOn(RemoteImages.prototype, 'load').mockResolvedValue(data);
+    await proxy.handleRequest(
+      makePayload(99002, 'POST', '/varro/remote-image', { url: 'https://images.test/a.png' })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 99002, data });
+    expect(load).toHaveBeenCalledWith('https://images.test/a.png', expect.any(AbortSignal));
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+    load.mockRestore();
+    proxy.dispose();
+  });
   it.each([true, false])(
     'notifies completion test results without changing model assignment, success=%s',
     async (success) => {
@@ -560,6 +838,7 @@ describe('RestProxy handleRequest', () => {
   it('rejects manually configured unsupported completion without creating chats', async () => {
     mocks.vscode.workspace.getConfiguration.mockReturnValueOnce({
       get: vi.fn(() => 'openai/subscription-model'),
+      inspect: vi.fn(() => ({ globalValue: undefined })),
     });
     const { proxy, callbacks } = createProxy();
     await proxy.handleRequest(
@@ -4982,43 +5261,50 @@ describe('RestProxy handleRequest', () => {
     });
   });
 
-  it('loads original attachment content only through the scoped detail request', async () => {
-    const part = {
-      id: 'image-1',
-      sessionID: 's1',
-      messageID: 'm1',
-      type: 'file',
-      mime: 'image/png',
-      filename: 'shot.png',
-      url: `data:image/png;base64,${'a'.repeat(100_000)}`,
-    };
-    const message = { ...makeSessionMessage('m1', 'image-1'), parts: [part] };
-    const serverRequest = vi.fn(async (_method: string, path: string) =>
-      path.includes('/message/m1') ? message : { data: [message] }
-    );
-    const { proxy, callbacks } = createProxy({
-      server: { ...createCallbacks().server, request: serverRequest } as never,
-    });
-    await proxy.handleRequest(makePayload(191, 'GET', '/session/s1/message?limit=200'));
-    const response = vi.mocked(callbacks.postApiResponse).mock.calls.at(-1)?.[1];
-    expect(JSON.stringify(response).length).toBeLessThan(1000);
-    expect(JSON.stringify(response)).toContain('varro-content:');
-    expect(serverRequest).toHaveBeenCalledTimes(1);
+  it.each(['image', 'pdf'])(
+    'loads original %s attachment content only through the scoped detail request',
+    async (kind) => {
+      const part = {
+        id: 'image-1',
+        sessionID: 's1',
+        messageID: 'm1',
+        type: 'file',
+        mime: kind === 'pdf' ? 'application/pdf' : 'image/png',
+        filename: kind === 'pdf' ? 'document.pdf' : 'shot.png',
+        url:
+          kind === 'pdf'
+            ? `data:application/pdf;base64,${Buffer.from('%PDF-1.7\n' + ' '.repeat(100_000)).toString('base64')}`
+            : `data:image/png;base64,${'a'.repeat(100_000)}`,
+      };
+      const message = { ...makeSessionMessage('m1', 'image-1'), parts: [part] };
+      const serverRequest = vi.fn(async (_method: string, path: string) =>
+        path.includes('/message/m1') ? message : { data: [message] }
+      );
+      const { proxy, callbacks } = createProxy({
+        server: { ...createCallbacks().server, request: serverRequest } as never,
+      });
+      await proxy.handleRequest(makePayload(191, 'GET', '/session/s1/message?limit=200'));
+      const response = vi.mocked(callbacks.postApiResponse).mock.calls.at(-1)?.[1];
+      expect(JSON.stringify(response).length).toBeLessThan(1000);
+      expect(JSON.stringify(response)).toContain('varro-content:');
+      expect(JSON.stringify(response)).not.toContain(part.url);
+      expect(serverRequest).toHaveBeenCalledTimes(1);
 
-    await proxy.handleRequest(makePayload(192, 'GET', '/session/s1/message/m1/part/image-1'));
-    expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 192, data: part });
-    expect(serverRequest).toHaveBeenLastCalledWith(
-      'GET',
-      '/session/s1/message/m1',
-      undefined,
-      withSignal({ maxResponseBytes: 256 * 1024 * 1024 })
-    );
-    await proxy.handleRequest(makePayload(193, 'GET', '/session/s1/message/m1/part/missing'));
-    expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
-      id: 193,
-      error: '404 Message content not found',
-    });
-  });
+      await proxy.handleRequest(makePayload(192, 'GET', '/session/s1/message/m1/part/image-1'));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 192, data: part });
+      expect(serverRequest).toHaveBeenLastCalledWith(
+        'GET',
+        '/session/s1/message/m1',
+        undefined,
+        withSignal({ maxResponseBytes: 256 * 1024 * 1024 })
+      );
+      await proxy.handleRequest(makePayload(193, 'GET', '/session/s1/message/m1/part/missing'));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 193,
+        error: '404 Message content not found',
+      });
+    }
+  );
 
   it('generates uncached external-session thumbnails and sends originals only on detail requests', async () => {
     const part = {
@@ -7052,6 +7338,34 @@ describe('RestProxy handleRequest', () => {
     expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
       id: 30,
       data: { ok: true },
+    });
+  });
+
+  it('leaves V2 restart recovery to the server even when its active snapshot is empty', async () => {
+    const serverRequest = vi.fn((method: string, path: string) => {
+      if (method === 'GET' && path === '/session/status') return Promise.resolve({});
+      if (method === 'GET' && (path === '/permission' || path === '/question'))
+        return Promise.resolve([]);
+      return Promise.resolve({ ok: true });
+    });
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2, request: serverRequest },
+    });
+
+    await proxy.handleRequest({
+      ...makePayload(309, 'POST', '/session/session-1/prompt_async', {
+        messageID: 'msg_recovery',
+        parts: [{ type: 'text', text: 'Do not replay this interrupted turn' }],
+      }),
+      interruptedRecovery: true,
+    });
+
+    expect(serverRequest.mock.calls.filter(([method]) => method !== 'GET')).toEqual([]);
+    expect(callbacks.sessionState.markSessionBusy).not.toHaveBeenCalled();
+    expect(callbacks.confirmPromptAdmission).not.toHaveBeenCalled();
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 309,
+      data: { skipped: true },
     });
   });
 

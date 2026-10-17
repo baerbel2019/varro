@@ -2,12 +2,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { ModelInfo, SessionMessageAssistant, SessionInfo } from '@opencode/client';
+import type { FormInfo, ModelInfo, SessionMessageAssistant, SessionInfo } from '@opencode/client';
 import { OpenCodeStartupOutput, openCodeApiVersion } from './opencode-connection';
 import {
   projectV2Message,
   projectV2Model,
   projectV2Permission,
+  projectV2Form,
   v2Action,
   v2Rules,
 } from './opencode-v2-projection';
@@ -17,13 +18,144 @@ import { findProviderLimitAdapter } from './provider-limits';
 import { OpenCodeV2SessionState } from './opencode-v2-session-state';
 import { OpenCodeTransport } from './open-code-transport';
 import { asRecord } from '../shared/type-utils';
+import type { UnknownRecord } from '../shared/type-utils';
 import { parseServerEvent } from '../shared/protocol';
 import { parseHealthResponse } from '../shared/health';
 import { normalizeRecycleBinSession } from '../shared/recycle-bin';
 import { formatSkillAttachment } from '../shared/skill-reference';
+import { nativePdfFixture } from '../shared/native-pdf.test-support';
 
 vi.mock('./logger', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 afterEach(() => vi.unstubAllGlobals());
+
+describe('native session forms', () => {
+  const form: FormInfo = {
+    id: 'frm_fixture',
+    sessionID: 'ses_child',
+    title: 'Native form',
+    metadata: { source: 'fixture', tool: { messageID: 'msg_tool', id: 'call_tool' } },
+    fields: [
+      { key: 'proxy', type: 'boolean', required: true, default: false },
+      {
+        key: 'url',
+        type: 'string',
+        required: true,
+        format: 'uri',
+        when: [{ key: 'proxy', op: 'eq', value: true }],
+      },
+      { key: 'count', type: 'integer', minimum: 0, maximum: 10 },
+      {
+        key: 'region',
+        type: 'string',
+        options: [
+          { value: 'a', label: 'Same' },
+          { value: 'b', label: 'Same' },
+        ],
+      },
+      { key: 'external', type: 'external', url: 'https://example.test/setup' },
+    ],
+  };
+
+  it('projects snapshots and ask events identically without losing native metadata', async () => {
+    const adapter = new OpenCodeV2Adapter(async () => ({ data: [form] }));
+    expect(await adapter.request('GET', '/question', undefined)).toEqual([projectV2Form(form)]);
+    expect(projectV2Event({ type: 'form.created', data: { form } })).toMatchObject([
+      { type: 'question.asked', properties: projectV2Form(form) },
+    ]);
+    expect(projectV2Form(form)).toMatchObject({
+      kind: 'native-form',
+      form,
+      tool: { messageID: 'msg_tool', callID: 'call_tool' },
+    });
+  });
+  it('routes typed keyed values to the owning child session without reconstructing absent fields', async () => {
+    const wire = vi.fn(async () => ({ data: [form] }));
+    const adapter = new OpenCodeV2Adapter(wire);
+    const answer = { proxy: false, count: 0, region: 'b', external: true };
+    await adapter.request('POST', '/question/frm_fixture/reply', {
+      kind: 'native-form',
+      sessionID: form.sessionID,
+      answer,
+    });
+    expect(wire).toHaveBeenLastCalledWith(
+      'POST',
+      '/api/session/ses_child/form/frm_fixture/reply',
+      { answer },
+      expect.anything()
+    );
+  });
+  it.each([
+    { answers: [['No']] },
+    { kind: 'native-form', sessionID: 'ses_other', answer: {} },
+    { kind: 'native-form', sessionID: 'ses_child', answer: { count: NaN } },
+    { kind: 'native-form', sessionID: 'ses_child', answer: { count: null } },
+  ])('rejects unsafe or obsolete reply envelopes: %j', async (input) => {
+    const wire = vi.fn(async (_method: string) => ({ data: [form] }));
+    const adapter = new OpenCodeV2Adapter(wire);
+    await expect(adapter.request('POST', '/question/frm_fixture/reply', input)).rejects.toThrow(
+      'keyed, typed answers'
+    );
+    expect(wire.mock.calls.every((call) => call[0] === 'GET')).toBe(true);
+  });
+  it('keeps the native request cached and retryable after a validation failure', async () => {
+    let fail = true;
+    const wire = vi.fn(async (method: string) => {
+      if (method === 'GET') return { data: [form] };
+      if (fail) throw new Error('400 Missing required form field: proxy');
+      return {};
+    });
+    const adapter = new OpenCodeV2Adapter(wire);
+    const input = {
+      kind: 'native-form',
+      sessionID: form.sessionID,
+      answer: { proxy: false, external: true },
+    };
+    await expect(adapter.request('POST', '/question/frm_fixture/reply', input)).rejects.toThrow(
+      'Missing required'
+    );
+    fail = false;
+    await expect(adapter.request('POST', '/question/frm_fixture/reply', input)).resolves.toBe(true);
+    expect(wire.mock.calls.filter((call) => call[0] === 'GET')).toHaveLength(1);
+  });
+  it('does not send overlapping native replies or cancellation from multiple views', async () => {
+    let acknowledge!: () => void;
+    const wire = vi.fn(async (method: string) => {
+      if (method === 'GET') return { data: [form] };
+      await new Promise<void>((done) => {
+        acknowledge = done;
+      });
+      return {};
+    });
+    const adapter = new OpenCodeV2Adapter(wire);
+    await adapter.request('GET', '/question', undefined);
+    const reply = {
+      kind: 'native-form',
+      sessionID: form.sessionID,
+      answer: { proxy: false, external: true },
+    };
+    const pending = adapter.request('POST', '/question/frm_fixture/reply', reply);
+    await expect(adapter.request('POST', '/question/frm_fixture/reply', reply)).rejects.toThrow(
+      'already in progress'
+    );
+    await expect(
+      adapter.request('POST', '/question/frm_fixture/reject', undefined)
+    ).rejects.toThrow('already in progress');
+    expect(wire.mock.calls.filter((call) => call[0] !== 'GET')).toHaveLength(1);
+    acknowledge();
+    await pending;
+  });
+
+  it('does not forward answer values in resolution events', () => {
+    const events = projectV2Event({
+      type: 'form.replied',
+      data: { id: form.id, sessionID: form.sessionID, answer: { secret: 'sensitive' } },
+    });
+    expect(events).toMatchObject([
+      { type: 'question.replied', properties: { requestID: form.id, sessionID: form.sessionID } },
+    ]);
+    expect(JSON.stringify(events)).not.toContain('sensitive');
+  });
+});
 
 describe('v2 Windows location paths', () => {
   it.each([
@@ -48,6 +180,140 @@ describe('v2 Windows location paths', () => {
 });
 
 describe('v2 prompt delivery', () => {
+  it.each(['steer', 'queue'])(
+    'preserves exact PDF bytes and media order with %s delivery',
+    async (delivery) => {
+      const pdf = nativePdfFixture();
+      const wire = vi.fn<ConstructorParameters<typeof OpenCodeV2Adapter>[0]>(
+        async (_method, path) => ({
+          data: path.startsWith('/api/model?')
+            ? [{ providerID: 'fixture', id: 'pdf', capabilities: { input: ['text', 'pdf'] } }]
+            : { id: 'ses_pdf' },
+        })
+      );
+      await new OpenCodeV2Adapter(wire).request(
+        'POST',
+        '/session/ses_pdf/prompt_async',
+        {
+          model: { providerID: 'fixture', modelID: 'pdf' },
+          delivery,
+          parts: [
+            { type: 'text', text: 'Inspect the attachment.' },
+            {
+              type: 'file',
+              mime: 'image/png',
+              filename: 'first.png',
+              url: 'data:image/png;base64,AA==',
+            },
+            { type: 'file', mime: pdf.mime, filename: pdf.filename, url: pdf.url },
+            {
+              type: 'file',
+              mime: 'text/plain',
+              filename: 'last.txt',
+              url: 'data:text/plain;base64,bGFzdA==',
+            },
+          ],
+        },
+        { directory: '/repo' }
+      );
+      expect(wire).toHaveBeenLastCalledWith(
+        'POST',
+        '/api/session/ses_pdf/prompt',
+        expect.objectContaining({
+          delivery,
+          files: [
+            { uri: 'data:image/png;base64,AA==', name: 'first.png' },
+            { uri: pdf.url, name: pdf.filename },
+            { uri: 'data:text/plain;base64,bGFzdA==', name: 'last.txt' },
+          ],
+        }),
+        expect.anything()
+      );
+    }
+  );
+
+  it.each([undefined, ['text']])(
+    'rejects PDF input before any mutation when native capability is %j',
+    async (input) => {
+      const pdf = nativePdfFixture();
+      const wire = vi.fn<ConstructorParameters<typeof OpenCodeV2Adapter>[0]>(async () => ({
+        data: [{ providerID: 'fixture', id: 'pdf', capabilities: { input } }],
+      }));
+      const adapter = new OpenCodeV2Adapter(wire);
+      await expect(
+        adapter.request('POST', '/session/ses_pdf/prompt_async', {
+          model: { providerID: 'fixture', modelID: 'pdf' },
+          parts: [{ type: 'file', mime: pdf.mime, filename: pdf.filename, url: pdf.url }],
+        })
+      ).rejects.toThrow(input ? 'does not support PDF input' : 'PDF input support is unknown');
+      expect(wire.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+    }
+  );
+
+  it('does not replay an admitted PDF after a provider rejection', async () => {
+    const pdf = nativePdfFixture();
+    const wire = vi.fn<ConstructorParameters<typeof OpenCodeV2Adapter>[0]>(async (method, path) => {
+      if (method === 'GET' && path === '/api/model')
+        return { data: [{ providerID: 'fixture', id: 'pdf', capabilities: { input: ['pdf'] } }] };
+      if (path.endsWith('/wait')) throw new Error('Provider rejected PDF');
+      return { data: { id: 'ses_pdf' } };
+    });
+    await expect(
+      new OpenCodeV2Adapter(wire).request('POST', '/session/ses_pdf/prompt', {
+        model: { providerID: 'fixture', modelID: 'pdf' },
+        parts: [{ type: 'file', mime: pdf.mime, filename: pdf.filename, url: pdf.url }],
+      })
+    ).rejects.toThrow('Provider rejected PDF');
+    expect(
+      wire.mock.calls.filter(([, path]) => path === '/api/session/ses_pdf/prompt')
+    ).toHaveLength(1);
+  });
+
+  it('rejects malformed PDF bytes, one-shot media and unverified command routing without mutations', async () => {
+    const pdf = nativePdfFixture();
+    const wire = vi.fn();
+    const adapter = new OpenCodeV2Adapter(wire);
+    await expect(
+      adapter.request('POST', '/session/ses_pdf/prompt_async', {
+        parts: [
+          {
+            type: 'file',
+            mime: pdf.mime,
+            filename: pdf.filename,
+            url: 'data:application/pdf;base64,bm90IGEgcGRm',
+          },
+        ],
+      })
+    ).rejects.toThrow('Invalid PDF');
+    await expect(
+      adapter.request('POST', '/session/ses_pdf/message', {
+        system: 'Reply briefly',
+        parts: [{ type: 'file', mime: pdf.mime, filename: pdf.filename, url: pdf.url }],
+      })
+    ).rejects.toThrow('one-shot generation');
+    await expect(
+      adapter.request('POST', '/session/ses_pdf/command', {
+        command: 'review',
+        parts: [{ type: 'file', mime: pdf.mime, filename: pdf.filename, url: pdf.url }],
+      })
+    ).rejects.toThrow('cannot be verified for configured commands');
+    expect(wire).not.toHaveBeenCalled();
+  });
+
+  it('reports unavailable backend PDF capability without submitting or mutating the session', async () => {
+    const pdf = nativePdfFixture();
+    const wire = vi.fn<ConstructorParameters<typeof OpenCodeV2Adapter>[0]>(async () => {
+      throw new Error('404 native catalog unavailable');
+    });
+    await expect(
+      new OpenCodeV2Adapter(wire).request('POST', '/session/ses_pdf/prompt_async', {
+        model: { providerID: 'fixture', modelID: 'pdf' },
+        parts: [{ type: 'file', mime: pdf.mime, filename: pdf.filename, url: pdf.url }],
+      })
+    ).rejects.toThrow('Cannot verify PDF input support from the backend model catalog');
+    expect(wire.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+  });
+
   it.each(['steer', 'queue'])(
     'sends selected skills as native attachments with %s delivery',
     async (delivery) => {
@@ -902,37 +1168,53 @@ describe('v2 provider disconnect', () => {
     });
   });
 
-  it('offers local-provider disabling and does not restore disabled configured models', async () => {
-    let disabled = false;
-    const adapter = new OpenCodeV2Adapter(async (_method, path) => {
-      if (path === '/api/provider')
-        return { data: disabled ? [] : [{ id: 'ollama', name: 'Ollama' }] };
-      if (path === '/api/model' || path === '/api/integration') return { data: [] };
-      if (path === '/api/config')
-        return [
-          {
-            info: {
-              providers: { ollama: { models: { qwen3: {} } } },
-              experimental: {
-                policies: disabled
-                  ? [{ action: 'provider.use', resource: 'ollama', effect: 'deny' }]
-                  : [],
-              },
-            },
-          },
-        ];
-      throw new Error(`Unexpected request: ${path}`);
-    });
-    expect(await adapter.request('GET', '/provider', undefined)).toMatchObject({
-      all: [expect.objectContaining({ id: 'ollama', disconnectMode: 'disable' })],
-      connected: [],
-    });
-    disabled = true;
-    expect(await adapter.request('GET', '/provider', undefined)).toMatchObject({
-      all: [],
-      connected: [],
-    });
-  });
+  it.each(['experimental', 'native', 'mixed'])(
+    'offers local-provider disabling without restoring models denied by %s policies',
+    async (format) => {
+      let disabled = false;
+      const adapter = new OpenCodeV2Adapter(async (_method, path) => {
+        if (path === '/api/provider')
+          return { data: disabled ? [] : [{ id: 'ollama', name: 'Ollama' }] };
+        if (path === '/api/model') return { data: [] };
+        if (path === '/api/integration')
+          return { data: [{ id: 'ollama', name: 'Ollama', methods: [], connections: [] }] };
+        if (path === '/api/config') {
+          const info: UnknownRecord = { providers: { ollama: { models: { qwen3: {} } } } };
+          if (format !== 'native')
+            info.experimental = {
+              policies: [
+                {
+                  action: 'provider.use',
+                  resource: 'ollama',
+                  effect: format === 'mixed' || disabled ? 'deny' : 'allow',
+                },
+              ],
+            };
+          if (format !== 'experimental')
+            info.policies = [
+              { action: 'provider.use', resource: 'ollama', effect: disabled ? 'deny' : 'allow' },
+            ];
+          return [{ info }];
+        }
+        throw new Error(`Unexpected request: ${path}`);
+      });
+      expect(await adapter.request('GET', '/provider', undefined)).toMatchObject({
+        all: [
+          expect.objectContaining({
+            id: 'ollama',
+            disconnectMode: 'disable',
+            models: expect.objectContaining({ qwen3: expect.objectContaining({ enabled: true }) }),
+          }),
+        ],
+        connected: [],
+      });
+      disabled = true;
+      expect(await adapter.request('GET', '/provider', undefined)).toMatchObject({
+        all: [],
+        connected: [],
+      });
+    }
+  );
   it('does not report a missing integration as a successful disconnect', async () => {
     const wire = vi.fn(async (_method: string, path: string) => {
       if (path === '/api/provider/ollama') return { data: { id: 'ollama' } };
@@ -1425,7 +1707,7 @@ describe('v2 transcript and permission projection', () => {
       return { data: [{ name: 'inspect' }] };
     });
     expect(await adapter.request('GET', '/command', undefined)).toEqual([
-      { name: 'inspect', description: '', template: '', hints: [] },
+      { name: 'inspect', description: '', source: 'command', template: '', hints: [] },
       {
         name: 'code-review',
         description: 'Inspect code',
@@ -1436,21 +1718,29 @@ describe('v2 transcript and permission projection', () => {
     ]);
   });
 
-  it('normalizes description-less native commands for slash-command search', async () => {
-    const adapter = new OpenCodeV2Adapter(async (_method, path) =>
-      path.startsWith('/api/config')
+  it('uses the native registry without leaking templates or guessing delegation from config', async () => {
+    const paths: string[] = [];
+    const adapter = new OpenCodeV2Adapter(async (_method, path) => {
+      paths.push(path);
+      return path.startsWith('/api/config')
         ? [{ type: 'document', info: { commands: { local: { template: 'Local prompt' } } } }]
         : {
             data: path.startsWith('/api/skill')
               ? []
               : [{ name: 'inspect' }, { name: 'explain', description: 'Explain this code' }],
-          }
-    );
+          };
+    });
     expect(await adapter.request('GET', '/command', undefined)).toEqual([
-      { name: 'inspect', description: '', template: '', hints: [] },
-      { name: 'explain', description: 'Explain this code', template: '', hints: [] },
-      { name: 'local', description: '', template: 'Local prompt', hints: [] },
+      { name: 'inspect', description: '', source: 'command', template: '', hints: [] },
+      {
+        name: 'explain',
+        description: 'Explain this code',
+        source: 'command',
+        template: '',
+        hints: [],
+      },
     ]);
+    expect(paths.some((path) => path.startsWith('/api/config'))).toBe(false);
   });
   const message: SessionMessageAssistant = {
     id: 'msg_assistant',
@@ -1741,6 +2031,31 @@ describe('v2 transcript and permission projection', () => {
       properties: { status: { type: 'idle' } },
     });
     expect(events[1]?.seq).toBeUndefined();
+  });
+
+  it('reports exhausted native recovery as a terminal failure before idle', () => {
+    const failureMessage =
+      'Execution was interrupted repeatedly and will not be resumed automatically.';
+    const events = projectV2Event({
+      id: 'evt_exhausted',
+      created: 20,
+      type: 'session.execution.failed',
+      durable: { seq: 8 },
+      data: { sessionID: 'ses_one', error: { type: 'aborted', message: failureMessage } },
+    }).map(parseServerEvent);
+
+    expect(events[0]).toMatchObject({
+      type: 'message.updated',
+      properties: { info: { error: { data: { message: failureMessage } } } },
+    });
+    expect(events[1]).toMatchObject({
+      type: 'session.error',
+      properties: { error: { data: { message: failureMessage } } },
+    });
+    expect(events[2]).toMatchObject({
+      type: 'session.status',
+      properties: { status: { type: 'idle' } },
+    });
   });
 
   it('creates an error row before reporting a pre-turn authentication failure', () => {

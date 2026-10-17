@@ -43,6 +43,8 @@ import type {
   WorkspaceStatusEventSummary,
 } from '../../shared/protocol';
 import { isPermissionMode } from '../../shared/protocol';
+import { parseRemoteImageMode } from '../../shared/remote-images';
+import type { RemoteImageMode } from '../../shared/remote-images';
 import { isInlineProblem } from './editor-problems';
 import { mergeContextFile } from '../../shared/context-files';
 import { isSameWorkspacePath } from '../../shared/workspace-path';
@@ -123,6 +125,7 @@ export interface AppState {
   issuesEnabled: boolean;
   enableProblemsContext: boolean;
   promptCompletionModel: string;
+  remoteImages: RemoteImageMode;
   debugShowQuotaWarning: boolean;
   debugResetWarningDays?: number;
   draftCurrentDocumentEnabled: boolean | null;
@@ -234,6 +237,8 @@ export interface AppStateInstance {
   setShowChangedFiles: Setter<boolean>;
   showTurnTimer: Accessor<boolean>;
   setShowTurnTimer: Setter<boolean>;
+  showEmptyStateHistogram: Accessor<boolean>;
+  setShowEmptyStateHistogram: Setter<boolean>;
   desktopSessionPaneSide: Accessor<DesktopSessionPaneSide>;
   setDesktopSessionPaneSide: Setter<DesktopSessionPaneSide>;
   inputText: Accessor<string>;
@@ -389,6 +394,7 @@ export function createAppState(): AppStateInstance {
         : [],
     enableProblemsContext: initialWebviewState.enableProblemsContext ?? true,
     promptCompletionModel: initialWebviewState.promptCompletionModel ?? '',
+    remoteImages: parseRemoteImageMode(initialWebviewState.remoteImages),
     debugShowQuotaWarning: initialWebviewState.debugShowQuotaWarning ?? false,
     debugResetWarningDays: initialWebviewState.debugResetWarningDays,
     emptyStateLogoUri: initialWebviewState.emptyStateLogoUri ?? '',
@@ -510,6 +516,9 @@ export function createAppState(): AppStateInstance {
   const [showTurnTimer, setShowTurnTimer] = createSignal(
     initialWebviewState.showTurnTimer ?? false
   );
+  const [showEmptyStateHistogram, setShowEmptyStateHistogram] = createSignal(
+    initialWebviewState.showEmptyStateHistogram ?? false
+  );
   const [desktopSessionPaneSide, setDesktopSessionPaneSide] = createSignal<DesktopSessionPaneSide>(
     readDesktopSessionPaneSide(initialWebviewState)
   );
@@ -609,6 +618,8 @@ export function createAppState(): AppStateInstance {
     setShowChangedFiles,
     showTurnTimer,
     setShowTurnTimer,
+    showEmptyStateHistogram,
+    setShowEmptyStateHistogram,
     desktopSessionPaneSide,
     setDesktopSessionPaneSide,
     inputText,
@@ -702,6 +713,8 @@ export const showChangedFiles = defaultAppState.showChangedFiles;
 export const setShowChangedFiles = defaultAppState.setShowChangedFiles;
 export const showTurnTimer = defaultAppState.showTurnTimer;
 export const setShowTurnTimer = defaultAppState.setShowTurnTimer;
+export const showEmptyStateHistogram = defaultAppState.showEmptyStateHistogram;
+export const setShowEmptyStateHistogram = defaultAppState.setShowEmptyStateHistogram;
 export const desktopSessionPaneSide = defaultAppState.desktopSessionPaneSide;
 export const setDesktopSessionPaneSide = defaultAppState.setDesktopSessionPaneSide;
 export const inputText = defaultAppState.inputText;
@@ -773,6 +786,7 @@ export function resetDefaultAppState() {
   setExpandThinking(next.expandThinking());
   setShowChangedFiles(next.showChangedFiles());
   setShowTurnTimer(next.showTurnTimer());
+  setShowEmptyStateHistogram(next.showEmptyStateHistogram());
   setDesktopSessionPaneSide(next.desktopSessionPaneSide());
   setInputText(next.inputText());
   setNextPastedImageIndex(next.nextPastedImageIndex());

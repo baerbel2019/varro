@@ -1,4 +1,5 @@
 import type { DesktopSessionPaneSide, PermissionMode } from './protocol';
+import type { RemoteImageMode } from './remote-images';
 
 export const DEFAULT_PROVIDER_LIMIT_POLL_INTERVAL_SECONDS = 120;
 export const DEFAULT_RESET_WARNING_DAYS = 5;
@@ -8,6 +9,8 @@ export type ExtensionConfigState = {
   expandThinking?: boolean;
   showChangedFiles?: boolean;
   showTurnTimer?: boolean;
+  showEmptyStateHistogram?: boolean;
+  remoteImages?: RemoteImageMode;
   promptCompletionModel?: string;
   debugShowQuotaWarning?: boolean;
   debugResetWarningDays?: number;
@@ -25,6 +28,7 @@ export type WebviewConfigUpdatePayload = Pick<
   | 'expandThinking'
   | 'showChangedFiles'
   | 'showTurnTimer'
+  | 'showEmptyStateHistogram'
   | 'promptCompletionModel'
   | 'debugShowQuotaWarning'
   | 'debugResetWarningDays'
@@ -34,4 +38,7 @@ export type WebviewConfigUpdatePayload = Pick<
 >;
 
 export type ExtensionConfigSnapshot = WebviewConfigUpdatePayload &
-  Pick<ExtensionConfigState, 'chatFontSize' | 'chatEditorFontSize' | 'chatFontFamily'>;
+  Pick<
+    ExtensionConfigState,
+    'chatFontSize' | 'chatEditorFontSize' | 'chatFontFamily' | 'remoteImages'
+  >;

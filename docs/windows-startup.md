@@ -29,9 +29,10 @@ children, and requires the exact launch PID plus the host birth identity. Restri
 or exited ancestry falls back to fresh bounded CIM inspection. Ambiguous listener
 sets never select an arbitrary process as launch ownership proof.
 
-The native helper integration test runs in a Node-environment Vitest project after
-the parallel unit suite. This avoids making PowerShell startup and `Add-Type`
-compete with jsdom workers on Windows CI without relaxing the production timeout.
+The native helper integration and isolated-process teardown tests run serially in
+a Node-environment Vitest project after the parallel unit suite. This avoids making
+PowerShell startup and `Add-Type` compete with jsdom workers on Windows CI without
+relaxing the production timeout.
 Its suite fixture shares one helper and waits up to fifteen seconds for an explicit
 readiness message after compilation, without restarting compilation at five seconds.
 Preparation reads no process identity and readiness grants no account or ownership proof.
@@ -41,6 +42,11 @@ and always obtain fresh observations. Persistent startup failures still fail set
 deterministic unit tests check both deadlines, rejection of all pending reads, and
 restart without cached or partial evidence. The native suite does not prove cold
 startup always fits five seconds.
+
+The teardown suite also prepares the shared process-inspection helper before launching
+fixtures and disposes it after the suite. Its twenty-second setup bound is separate
+from the unchanged identity-read and per-test deadlines. Preparation failure grants
+no identity evidence; listener capture and teardown still require fresh verified reads.
 
 Activation starts optional helper preparation without awaiting it, overlapping PowerShell/C# startup
 with extension and webview setup. Preparation observes no PID and grants no admission evidence.
@@ -152,6 +158,12 @@ tabs retain their private, unscoped serializer state. VS Code owns sidebar visib
 and maximization restoration; do not toggle or reset the workbench layout at startup.
 
 Essential snapshot readiness is separate from permission automation completion.
+V2 interrupted execution is owned by OpenCode's native recovery, not a Varro
+resubmission. An empty process-local active snapshot is not proof that no durable
+claim exists. The host skips automatic V2 restart-continuation prompts; explicit
+sends and V1's elected-owner continuation retain their existing admission checks.
+See [restart continuity](restart-recovery.md).
+
 Known automatic requests retain their bounded owner; unknown ancestry is visible
 while classification continues. Pending automatic requests also block interrupted
 recovery even when their prompt is hidden. Snapshot mutation guards and reply
