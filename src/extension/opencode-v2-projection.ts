@@ -11,6 +11,7 @@ import type {
   SessionStructuredError,
 } from '@opencode/client';
 import { asRecord, isNumber, isString, type UnknownRecord } from '../shared/type-utils';
+import { parseFollowupTitle } from '../shared/followups';
 import { formatSkillAttachment } from '../shared/skill-reference';
 import { parseNativeForm } from '../shared/native-form';
 import type { OpenCodeV2GenerationTiming } from './opencode-v2-generation-timing';
@@ -328,6 +329,8 @@ export function projectV2Message(
   ) {
     const interrupted = message.outcome === 'interrupted';
     const error = normalizeV2Error(message.error) ?? normalizeV2Error(context.error);
+    // Status records have no model of their own. Only retain a complete contextual identity.
+    const model = context.model?.id && context.model.providerID ? context.model : undefined;
     return {
       info: {
         ...base,
@@ -335,9 +338,9 @@ export function projectV2Message(
         parentID,
         agent: context.agent ?? '',
         mode: context.agent ?? '',
-        modelID: context.model?.id ?? '',
-        providerID: context.model?.providerID ?? '',
-        variant: context.model?.variant,
+        modelID: model?.id ?? '',
+        providerID: model?.providerID ?? '',
+        variant: model?.variant,
         path: { cwd: directory, root: directory },
         time: { created: message.time.created, completed: message.time.created },
         cost: 0,
@@ -421,6 +424,8 @@ export function projectV2Message(
     },
   };
   if (message.type === 'user') {
+    const followupTitle = parseFollowupTitle(message.metadata?.varroFollowupTitle);
+    if (followupTitle) info.followupTitle = followupTitle;
     const delivery = message.metadata?.varroDelivery;
     if (delivery === 'steer' || delivery === 'queue') info.delivery = delivery;
     return {

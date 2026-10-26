@@ -343,15 +343,15 @@ describe('ContextProvider', () => {
     const provider = new ContextProvider(noop);
     const scratch = vscodeMock.Uri.file(varroStatePaths.getVarroStateDirectory('scratch')).fsPath;
     vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
-    vscodeMock.workspace.openTextDocument.mockResolvedValue({});
-    vscodeMock.window.showTextDocument.mockResolvedValue({});
     try {
       await expect(provider.openPath('notes.txt', { workspaceDirectory: scratch })).resolves.toBe(
         'opened'
       );
-      expect(vscodeMock.workspace.openTextDocument).toHaveBeenCalledWith({
-        fsPath: `${scratch}/notes.txt`,
-      });
+      expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith(
+        'vscode.open',
+        { fsPath: `${scratch}/notes.txt` },
+        { preview: false }
+      );
     } finally {
       provider.dispose();
     }
@@ -365,8 +365,6 @@ describe('ContextProvider', () => {
     const scratch = vscodeMock.Uri.file(nativeScratch).fsPath;
     const provider = new ContextProvider(noop);
     vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
-    vscodeMock.workspace.openTextDocument.mockResolvedValue({});
-    vscodeMock.window.showTextDocument.mockResolvedValue({});
     try {
       expect(provider.context).toMatchObject({
         workspacePath: scratch,
@@ -387,9 +385,11 @@ describe('ContextProvider', () => {
       await expect(
         provider.openPath('notes.txt', { workspaceDirectory: nativeScratch })
       ).resolves.toBe('opened');
-      expect(vscodeMock.workspace.openTextDocument).toHaveBeenCalledWith({
-        fsPath: `${scratch}/notes.txt`,
-      });
+      expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith(
+        'vscode.open',
+        { fsPath: `${scratch}/notes.txt` },
+        { preview: false }
+      );
     } finally {
       provider.dispose();
       statePath.mockRestore();
@@ -1288,25 +1288,65 @@ describe('ContextProvider', () => {
     }
   });
 
+  it.each(['png', 'jpg', 'svg', 'pdf', 'custom'])(
+    'opens existing .%s response files with the registered editor instead of forcing text',
+    async (extension) => {
+      const provider = new ContextProvider(noop);
+      const folder = { name: 'repo', uri: { fsPath: '/repo' } };
+      const uri = { fsPath: `/repo/dist/dynatrace-after.${extension}` };
+      vscodeMock.workspace.workspaceFolders = [folder];
+      vscodeMock.workspace.getWorkspaceFolder.mockReturnValue(folder);
+      vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
+      vscodeMock.workspace.openTextDocument.mockRejectedValue(new Error('File seems to be binary'));
+
+      try {
+        await expect(
+          provider.openPath(`dist/dynatrace-after.${extension}`, {
+            kind: 'file',
+            workspaceDirectory: '/repo',
+          })
+        ).resolves.toBe('opened');
+        expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith('vscode.open', uri, {
+          preview: false,
+        });
+        expect(vscodeMock.workspace.openTextDocument).not.toHaveBeenCalled();
+        expect(vscodeMock.window.showTextDocument).not.toHaveBeenCalled();
+        expect(vscodeMock.workspace.findFiles).not.toHaveBeenCalled();
+      } finally {
+        provider.dispose();
+      }
+    }
+  );
+
+  it('reports an unavailable file when its registered editor fails to open', async () => {
+    const provider = new ContextProvider(noop);
+    vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
+    vscodeMock.commands.executeCommand.mockRejectedValueOnce(new Error('Editor failed to open'));
+
+    try {
+      await expect(provider.openPath('/repo/dist/screenshot.png')).resolves.toBe('unavailable');
+      expect(loggerMock.error).toHaveBeenCalledWith(
+        'Failed to open file /repo/dist/screenshot.png:',
+        expect.objectContaining({ message: 'Editor failed to open' })
+      );
+    } finally {
+      provider.dispose();
+    }
+  });
+
   it('opens absolute paths outside the workspace', async () => {
     const provider = new ContextProvider(vi.fn());
     const uri = { fsPath: '/tmp/varro-drop.txt' };
-    const document = { uri, getText: vi.fn(() => 'text') };
-    const editor = {
-      selection: null,
-      revealRange: vi.fn(),
-    };
 
     vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
     vscodeMock.workspace.getWorkspaceFolder.mockReturnValue(undefined);
-    vscodeMock.workspace.openTextDocument.mockResolvedValue(document);
-    vscodeMock.window.showTextDocument = vi.fn(() => Promise.resolve(editor));
 
     try {
       await provider.openPath('/tmp/varro-drop.txt');
 
-      expect(vscodeMock.workspace.openTextDocument).toHaveBeenCalledWith(uri);
-      expect(vscodeMock.window.showTextDocument).toHaveBeenCalledWith(document, { preview: false });
+      expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith('vscode.open', uri, {
+        preview: false,
+      });
     } finally {
       provider.dispose();
     }
@@ -1325,21 +1365,23 @@ describe('ContextProvider', () => {
           : undefined
     );
     vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
-    vscodeMock.workspace.openTextDocument.mockImplementation((uri: unknown) =>
-      Promise.resolve({ uri })
-    );
-    vscodeMock.window.showTextDocument.mockResolvedValue({});
 
     try {
       await provider.openPath('src/app.ts', { workspaceDirectory: '/repo-b' });
       await provider.openPath('/tmp/outside.ts', { workspaceDirectory: '/repo-b' });
 
-      expect(vscodeMock.workspace.openTextDocument).toHaveBeenNthCalledWith(1, {
-        fsPath: '/repo-b/src/app.ts',
-      });
-      expect(vscodeMock.workspace.openTextDocument).toHaveBeenNthCalledWith(2, {
-        fsPath: '/tmp/outside.ts',
-      });
+      expect(vscodeMock.commands.executeCommand).toHaveBeenNthCalledWith(
+        1,
+        'vscode.open',
+        { fsPath: '/repo-b/src/app.ts' },
+        { preview: false }
+      );
+      expect(vscodeMock.commands.executeCommand).toHaveBeenNthCalledWith(
+        2,
+        'vscode.open',
+        { fsPath: '/tmp/outside.ts' },
+        { preview: false }
+      );
     } finally {
       provider.dispose();
     }
@@ -1385,7 +1427,7 @@ describe('ContextProvider', () => {
       await provider.openPath('/repo/MarkdownRenderer.tsx', { kind: 'file', line: 1447 });
 
       expect(vscodeMock.workspace.findFiles).toHaveBeenCalledWith(
-        '**/MarkdownRenderer.tsx',
+        new vscodeMock.RelativePattern({ fsPath: '/repo' }, '**/MarkdownRenderer.tsx'),
         null,
         2
       );
@@ -1415,6 +1457,73 @@ describe('ContextProvider', () => {
 
       expect(vscodeMock.workspace.openTextDocument).not.toHaveBeenCalled();
       expect(vscodeMock.window.showTextDocument).not.toHaveBeenCalled();
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it('does not open an unrelated workspace match for a missing absolute file', async () => {
+    const provider = new ContextProvider(vi.fn());
+    const unrelatedUri = { fsPath: '/other/src/Shared.ts' };
+    vscodeMock.workspace.workspaceFolders = [{ name: 'other', uri: { fsPath: '/other' } }];
+    vscodeMock.workspace.fs.stat.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath === '/repo/Shared.ts') throw new Error('File not found');
+      return { type: 0 };
+    });
+    vscodeMock.workspace.findFiles.mockImplementation(async (pattern: unknown) =>
+      pattern instanceof vscodeMock.RelativePattern ? [] : [unrelatedUri]
+    );
+    vscodeMock.workspace.openTextDocument.mockResolvedValue({ uri: unrelatedUri });
+    vscodeMock.window.showTextDocument.mockResolvedValue({});
+    fsState.directories.set('/repo', []);
+
+    try {
+      await expect(provider.openPath('/repo/Shared.ts', { kind: 'file' })).resolves.toBe(
+        'unavailable'
+      );
+      expect(vscodeMock.workspace.openTextDocument).not.toHaveBeenCalled();
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it('does not search the whole filesystem for a missing root-level file', async () => {
+    const provider = new ContextProvider(vi.fn());
+    vscodeMock.workspace.fs.stat.mockRejectedValue(new Error('File not found'));
+
+    try {
+      await expect(provider.openPath('/Missing.ts', { kind: 'file' })).resolves.toBe('unavailable');
+      expect(vscodeMock.workspace.findFiles).not.toHaveBeenCalled();
+      expect(vscodeMock.workspace.fs.readDirectory).not.toHaveBeenCalled();
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it.each([undefined, '/repo'])('keeps basename lookup with workspace scope %s', async (scope) => {
+    const provider = new ContextProvider(vi.fn());
+    const folder = { name: 'repo', uri: { fsPath: '/repo' } };
+    const matchedUri = { fsPath: '/repo/src/Shared.ts' };
+    vscodeMock.workspace.workspaceFolders = [folder];
+    vscodeMock.workspace.getWorkspaceFolder.mockReturnValue(folder);
+    vscodeMock.workspace.fs.stat.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath === '/repo/Shared.ts') throw new Error('File not found');
+      return { type: 0 };
+    });
+    vscodeMock.workspace.findFiles.mockResolvedValue([matchedUri]);
+
+    try {
+      await expect(provider.openPath('Shared.ts', { workspaceDirectory: scope })).resolves.toBe(
+        'opened'
+      );
+      expect(vscodeMock.workspace.findFiles).toHaveBeenCalledWith(
+        scope ? new vscodeMock.RelativePattern(folder.uri, '**/Shared.ts') : '**/Shared.ts',
+        null,
+        2
+      );
+      expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith('vscode.open', matchedUri, {
+        preview: false,
+      });
     } finally {
       provider.dispose();
     }
@@ -1544,13 +1653,10 @@ describe('ContextProvider', () => {
   it('opens the file when Git has no change to show', async () => {
     const provider = new ContextProvider(vi.fn());
     const uri = { fsPath: '/repo/src/session-only.ts' };
-    const document = { uri };
 
     vscodeMock.workspace.workspaceFolders = [{ name: 'repo', uri: { fsPath: '/repo' } }];
     vscodeMock.workspace.getWorkspaceFolder.mockReturnValue({ uri: { fsPath: '/repo' } });
     vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
-    vscodeMock.workspace.openTextDocument.mockResolvedValue(document);
-    vscodeMock.window.showTextDocument.mockResolvedValue({});
     vscodeMock.extensions.getExtension.mockReturnValue({
       isActive: true,
       exports: {
@@ -1562,8 +1668,9 @@ describe('ContextProvider', () => {
       await provider.openPath('src/session-only.ts', { kind: 'file', view: 'diff' });
 
       expect(vscodeMock.commands.executeCommand).not.toHaveBeenCalledWith('git.openChange', uri);
-      expect(vscodeMock.workspace.openTextDocument).toHaveBeenCalledWith(uri);
-      expect(vscodeMock.window.showTextDocument).toHaveBeenCalledWith(document, { preview: false });
+      expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith('vscode.open', uri, {
+        preview: false,
+      });
     } finally {
       provider.dispose();
     }
@@ -1572,7 +1679,6 @@ describe('ContextProvider', () => {
   it('opens the file when the Git diff command leaves an unrelated diff active', async () => {
     const provider = new ContextProvider(vi.fn());
     const uri = { fsPath: '/repo/src/stale-change.ts' };
-    const document = { uri };
     vscodeMock.window.tabGroups.activeTabGroup.activeTab = {
       input: new vscodeMock.TabInputTextDiff(
         { fsPath: '/repo/src/other.ts', scheme: 'git' },
@@ -1583,8 +1689,6 @@ describe('ContextProvider', () => {
     vscodeMock.workspace.workspaceFolders = [{ name: 'repo', uri: { fsPath: '/repo' } }];
     vscodeMock.workspace.getWorkspaceFolder.mockReturnValue({ uri: { fsPath: '/repo' } });
     vscodeMock.workspace.fs.stat.mockResolvedValue({ type: 0 });
-    vscodeMock.workspace.openTextDocument.mockResolvedValue(document);
-    vscodeMock.window.showTextDocument.mockResolvedValue({});
     vscodeMock.extensions.getExtension.mockReturnValue({
       isActive: true,
       exports: {
@@ -1602,8 +1706,9 @@ describe('ContextProvider', () => {
       await provider.openPath('src/stale-change.ts', { kind: 'file', view: 'diff' });
 
       expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith('git.openChange', uri);
-      expect(vscodeMock.workspace.openTextDocument).toHaveBeenCalledWith(uri);
-      expect(vscodeMock.window.showTextDocument).toHaveBeenCalledWith(document, { preview: false });
+      expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith('vscode.open', uri, {
+        preview: false,
+      });
     } finally {
       provider.dispose();
     }

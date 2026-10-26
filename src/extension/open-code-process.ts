@@ -1017,7 +1017,20 @@ export class OpenCodeProcess {
         'OpenCode endpoint changed during credential verification'
       );
     this.clearLocalOwnership();
-    this.credentialRegistration = { url, path, lease, source, discovered };
+    // Background ownership preparation can reverify the same credential-only
+    // attachment while SSE admission is pending. Preserve its identity unless
+    // connection evidence changed; replacement/reset still invalidates old reads.
+    const registered = this.credentialRegistration;
+    if (
+      registered?.url !== url ||
+      registered.path !== path ||
+      registered.source !== source ||
+      registered.discovered !== discovered ||
+      registered.lease.port !== lease.port ||
+      registered.lease.password !== lease.password ||
+      (registered.lease.username || 'opencode') !== (lease.username || 'opencode')
+    )
+      this.credentialRegistration = { url, path, lease, source, discovered };
     this.serverPassword = lease.password;
     this.serverUsername = lease.username;
     this.credentialUrl = url;
@@ -1701,10 +1714,14 @@ export class OpenCodeProcess {
     if (!reconnect && Date.now() - this.lastConnectionVerification < 1000) return;
     if (this.connectionVerification) return this.connectionVerification;
     const operation = (async () => {
-      if (!(await this.matchesOwnershipLease(lease)))
+      const verification = await this.inspectOwnershipLease(lease);
+      if (!verification.matches) {
+        const message = `The managed OpenCode listener could not be verified; its registration was retained for recovery. ${verification.reason}`;
+        if (verification.inconclusive) throw new Error(message);
         throw new ManagedServerConnectionChangedError(
-          'The managed OpenCode listener changed; its registration was retained for recovery'
+          `The managed OpenCode listener changed; its registration was retained for recovery. ${verification.reason}`
         );
+      }
       this.lastConnectionVerification = Date.now();
     })();
     this.connectionVerification = operation;
@@ -2068,8 +2085,16 @@ export class OpenCodeProcess {
     this._processErrorHandler = value;
   }
 
-  async prepareForHealthyExistingServer() {
-    if (this.credentialRegistration) return;
+  async prepareForHealthyExistingServer(signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    if (this.credentialRegistration) {
+      // Credential fallback can follow one missed OS observation of our original
+      // process. Recheck its private lease before making attachment permanent.
+      // Changed or still-unverifiable processes retain credential-only attachment.
+      await this.refreshStartupRegistration(signal);
+      signal?.throwIfAborted();
+      if (this.credentialRegistration) return;
+    }
     if (this._managedProcess && this.ownershipLease) {
       this.portFallbackAttempts = Math.max(0, this._port - this.originalPort);
       this.portInUseDetected = false;
@@ -3200,23 +3225,33 @@ export class OpenCodeProcess {
       }
     }
 
+    const stillOwned = async (): Promise<boolean> => {
+      try {
+        return await this.matchesOwnershipLease(lease);
+      } catch (error) {
+        // After signalling the verified listener, it can exit between the
+        // listener query and identity reads. A live, unverifiable PID still fails closed.
+        if (!isProcessAlive(lease.pid)) return false;
+        throw error;
+      }
+    };
     const deadline = Date.now() + PROCESS_STOP_TIMEOUT_MS;
-    while (Date.now() < deadline && (await this.matchesOwnershipLease(lease))) {
+    while (Date.now() < deadline && (await stillOwned())) {
       await delay(100);
     }
-    if (await this.matchesOwnershipLease(lease)) {
+    if (await stillOwned()) {
       if (process.platform === 'win32') {
         throw new Error(`Port ${lease.port} is still occupied after stopping managed OpenCode`);
       }
       // Revalidate immediately before escalating so a reused PID is never signalled.
-      if (await this.matchesOwnershipLease(lease)) {
+      if (await stillOwned()) {
         try {
           process.kill(lease.pid, 'SIGKILL');
         } catch (err) {
           if ((err as NodeJS.ErrnoException)?.code !== 'ESRCH') throw err;
         }
       }
-      if (await this.matchesOwnershipLease(lease)) {
+      if (await stillOwned()) {
         throw new Error(`Port ${lease.port} is still occupied after stopping managed OpenCode`);
       }
     }
@@ -3231,12 +3266,15 @@ export class OpenCodeProcess {
 
   private async inspectOwnershipLease(
     lease: ManagedServerOwnershipLease
-  ): Promise<{ matches: true } | { matches: false; reason: string }> {
+  ): Promise<{ matches: true } | { matches: false; reason: string; inconclusive?: boolean }> {
     const listeners = await findListeningPids(lease.port, this.linuxProcRoot);
     if (!listeners.includes(lease.pid))
       return {
         matches: false,
         reason: `Expected PID ${lease.pid} on port ${lease.port}; observed listening PIDs: ${listeners.join(', ') || 'none'}.`,
+        // Missing OS visibility is not evidence that a live process was replaced.
+        // Startup and lifecycle callers still reject this unverified observation.
+        inconclusive: listeners.length === 0 && isProcessAlive(lease.pid),
       };
     const windowsIdentity =
       process.platform === 'win32' ? await readWindowsProcessIdentity(lease.pid) : undefined;

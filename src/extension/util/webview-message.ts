@@ -1871,6 +1871,10 @@ const API_ROUTES: ApiRoute[] = [
   route(VARRO_API_ENDPOINTS.remoteImage, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.workspaceProblems, methodsNoQuery('GET')),
   route(
+    VARRO_API_ENDPOINTS.sessionTransferHide,
+    ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
+  ),
+  route(
     VARRO_API_ENDPOINTS.sessionHistoryScope,
     ({ method, url }) =>
       (method === 'GET' || method === 'POST') &&
@@ -1905,7 +1909,7 @@ const API_ROUTES: ApiRoute[] = [
   route(VARRO_API_ENDPOINTS.permissionServerMemory, ({ method, url }) =>
     method === 'GET'
       ? onlyQuery(url, 'sessionId', 'directory')
-      : method === 'DELETE' && optionalDirectoryQuery(url)
+      : (method === 'DELETE' || method === 'PATCH') && optionalDirectoryQuery(url)
   ),
   route(
     VARRO_API_ENDPOINTS.permissionJudgeModel,
@@ -1916,6 +1920,14 @@ const API_ROUTES: ApiRoute[] = [
     ({ method, url }) => method === 'GET' && queryWithOptionalDirectory(url, 'revision')
   ),
   route(`${VARRO_API_ENDPOINTS.session}/:id/activate`, methodsNoQuery('POST')),
+  route(
+    `${VARRO_API_ENDPOINTS.session}/:id/followups`,
+    ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
+  ),
+  route(
+    `${VARRO_API_ENDPOINTS.session}/:id/followups/dismiss`,
+    ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
+  ),
   route(
     `${VARRO_API_ENDPOINTS.session}/:id/pin`,
     ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)

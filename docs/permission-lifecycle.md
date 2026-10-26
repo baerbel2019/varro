@@ -256,7 +256,13 @@ ID and owning session against the server before changing rules.
   `todowrite`, `question`, `webfetch`, `websearch`, and `doom_loop` accept only scalar actions inside
   the permission object; never serialize pattern maps for those names or broaden a non-wildcard
   standing scope to make it fit.
-- Varro shows only server-memory entries that match a successful `always` reply it observed. OpenCode's
+- Varro shows only server-memory entries linked to a successful `always` reply it observed. Native
+   saved IDs preserve that link when another client edits the action/resource scope. Confirmed native
+   IDs are stored in workspace state, scoped by server address, API version, and project, so host reloads
+   retain the management link. Capture these IDs after successful approval even when the Permissions
+   screen is closed. Reconcile restored IDs against the native list and discard removed entries; a
+   new ID with the same scope is not proof of user approval. Legacy process-only observations are not
+   persisted. OpenCode's
   saved-permission endpoint can also return internal allowances that the user did not add; those do not
   belong in the user-managed layer. Legacy OpenCode permission replies keep `always` rules in an
   internal instance-local array with no list or removal endpoint. Varro mirrors those replies from
@@ -272,6 +278,14 @@ updates; changing mode may replace those rules. Saved server-memory permissions 
 saved-permission list and remove endpoints when the server supports them. Removing one must not alter
 project or session rules. Servers without those endpoints report the layer as unavailable rather than
 blocking the rest of the screen.
+
+On servers advertising saved-permission PATCH support, the same layer can edit
+its action/resource patterns. The host validates the owning project and managed
+rule ID, waits for the confirmed update, replaces the tracked scope, and refreshes
+the list. Saved rules remain allowances, not editable allow/ask/deny effects.
+Legacy restart-only entries remain non-editable. Conflicts and request failures
+retain the draft and do not replace project/session rules or resolve pending asks.
+
 - A failed response must leave the user with an actionable retry.
 - A successful response records a bounded decision reference for later auto-judge context across the
   same root conversation and its child sessions.
@@ -460,6 +474,12 @@ sessions before reconciling host attention. It must first collect each snapshot 
 directory instance that can own a visible session. If any required directory or session catalog fails,
 reject the snapshot rather than using partial omissions as proof that a request resolved. Keep
 permission and question reconciliation independent.
+
+OpenCode V2 also lists location-owned MCP forms with `sessionID: 'global'`. This sentinel is not a
+session and must never enter session-question snapshots, events, or attention state. The V2 adapter
+excludes it before workspace session resolution, without answering or cancelling the form. These
+forms remain pending for an OpenCode client with location-scoped form UI. Real session forms retain
+the complete-resolution requirement above, including failures for unknown owning sessions.
 
 ## Mode Changes
 

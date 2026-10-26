@@ -53,7 +53,12 @@ import { diagnosticTimeline } from './diagnostics';
 import { projectDeferredPart, projectPartAttachments } from './message-content';
 import { ImageThumbnails } from './image-thumbnails';
 import { RemoteImages } from './remote-images';
-import { readExtensionConfigState } from './extension-config';
+import {
+  readExtensionConfigState,
+  readFollowupModel,
+  readFollowupsEnabled,
+} from './extension-config';
+import { parseSelectedModel } from '../shared/model-preferences';
 import { ModelPricingCatalog } from './model-pricing';
 import type { ProviderLimitService } from './provider-limit-service';
 import type { PinnedSessionManager } from './pinned-session-manager';
@@ -81,6 +86,9 @@ import { FULL_SESSION_LIST_LIMIT, FULL_SESSION_LIST_PATH } from './util/session-
 import { WorkspaceSessionStatusCoordinator } from './workspace-session-status-coordinator';
 import { OpenCodeConfigService, type OpenCodeConfigRequest } from './opencode-config-service';
 import { PromptCompletionService } from './prompt-completion-service';
+import { FollowupService } from './followup-service';
+import type { Persistence } from '../shared/persistence';
+import { EMPTY_FOLLOWUP_SUGGESTIONS, parseFollowupSource } from '../shared/followups';
 import {
   parsePromptCompletionRequest,
   parsePromptCompletionTestRequest,
@@ -264,7 +272,8 @@ type SessionPermissionRulesRequest =
 
 type ServerMemoryPermissionRequest =
   | { kind: 'list'; sessionID?: string }
-  | { kind: 'remove'; sessionID?: string; id: string };
+  | { kind: 'remove'; sessionID?: string; id: string }
+  | { kind: 'update'; sessionID?: string; id: string; permission: string; pattern: string };
 
 type SessionSummaryCacheEntry = {
   pending: boolean;
@@ -302,12 +311,13 @@ export { scopeOpenCodeRequest, getOpenCodeDirectoryHeaders } from './util/openco
 export { resolveOpenCodeProjectConfigPaths } from './opencode-config-service';
 
 export interface RestProxyCallbacks {
+  legacyFollowupPersistence?: Persistence;
   restoreStreamingText?(
     info: Record<string, unknown>,
     parts: Record<string, unknown>[]
   ): Record<string, unknown>[];
   server: Pick<OpenCodeServer, 'apiVersion' | 'getWorkspaceCwd' | 'request'> &
-    Partial<Pick<OpenCodeServer, 'isAttachOnly'>>;
+    Partial<Pick<OpenCodeServer, 'isAttachOnly' | 'url'>>;
   contextProvider: Pick<
     ContextProvider,
     'context' | 'getOpenWorkspaceRoot' | 'readFile' | 'resolvePath'
@@ -382,8 +392,10 @@ export interface RestProxyCallbacks {
   refreshOpenCodeGlobalConfig?(): Promise<void>;
   cleanupExpiredRecycleBin(): Promise<void>;
   removeSessionImages(sessionIds: Iterable<string>): Promise<void>;
-  rememberServerMemoryPermissions(rules: readonly OpenCodeServerMemoryPermission[]): void;
-  forgetServerMemoryPermission(rule: OpenCodeServerMemoryPermission): void;
+  rememberServerMemoryPermissions(
+    rules: readonly OpenCodeServerMemoryPermission[]
+  ): void | Promise<void>;
+  forgetServerMemoryPermission(rule: OpenCodeServerMemoryPermission): void | Promise<void>;
   getServerMemoryPermissions(projectID: string): readonly OpenCodeServerMemoryPermission[];
   postApiResponse(requestGeneration: number, payload: ApiResponsePayload): void;
   isPermissionAutomationLeaseCurrent(
@@ -444,7 +456,11 @@ export interface RestProxyCallbacks {
     directory: string,
     originDirectory?: string
   ): Promise<void>;
-  getTransferredSessions?(roots: readonly string[]): Session[];
+  getTransferredSessions?(
+    roots: readonly string[],
+    options?: { includeHidden?: boolean }
+  ): Session[];
+  hideTransferredSession?(sessionID: string, roots: readonly string[]): Promise<boolean>;
 }
 
 export class RestProxy {
@@ -495,6 +511,14 @@ export class RestProxy {
 
   constructor(private readonly callbacks: RestProxyCallbacks) {
     this.remoteImageConfigSubscription = vscode.workspace.onDidChangeConfiguration?.((event) => {
+      if (
+        event.affectsConfiguration('varro.chat.followupModel') ||
+        event.affectsConfiguration('varro.chat.followupsEnabled')
+      )
+        FollowupService.forServer(
+          callbacks.server,
+          callbacks.legacyFollowupPersistence
+        ).invalidate();
       if (
         event.affectsConfiguration('varro.chat.remoteImages') &&
         readExtensionConfigState().remoteImages !== 'on'
@@ -820,7 +844,7 @@ export class RestProxy {
         nativeFormSessionID;
       const transfer = directSessionID
         ? this.callbacks
-            .getTransferredSessions?.(this.getOpenWorkspaceRoots())
+            .getTransferredSessions?.(this.getOpenWorkspaceRoots(), { includeHidden: true })
             .find((session) => session.id === directSessionID)
         : undefined;
       const transferRead = Boolean(
@@ -909,6 +933,7 @@ export class RestProxy {
         Boolean(activationRequest || directSessionID || attentionReplyDirectory) ||
         requestPathname === '/session' ||
         requestPathname === VARRO_API_ENDPOINTS.sessionHistoryScope ||
+        requestPathname === VARRO_API_ENDPOINTS.sessionTransferHide ||
         (method === 'GET' && requestPathname === '/session/status');
       if (
         scopedWorkspaceDirectory &&
@@ -1179,6 +1204,49 @@ export class RestProxy {
         payload.path,
         payload.body
       );
+      if (
+        method === 'POST' &&
+        /^\/varro\/session\/[^/]+\/followups(?:\/dismiss)?$/.test(requestPathname)
+      ) {
+        const modelRef = readFollowupModel();
+        const model = modelRef
+          ? parseModelRoute(modelRef)
+          : parseSelectedModel(asRecord(payload.body)?.model);
+        const source = parseFollowupSource(payload.body);
+        if (!source) throw new Error('Invalid follow-ups source');
+        const service = FollowupService.forServer(
+          this.callbacks.server,
+          this.callbacks.legacyFollowupPersistence
+        );
+        if (requestPathname.endsWith('/dismiss')) {
+          if (!directSessionID || this.isHiddenSession(directSessionID))
+            throw new Error('404 Session not found');
+          await service.dismiss({
+            sessionId: directSessionID,
+            source,
+            directory: scopedWorkspaceDirectory ?? this.getCurrentWorkspacePath(),
+          });
+          this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data: true });
+          return;
+        }
+        const data =
+          readFollowupsEnabled() &&
+          model &&
+          directSessionID &&
+          !this.isHiddenSession(directSessionID)
+            ? await service.suggest({
+                sessionId: directSessionID,
+                source,
+                model,
+                directory: scopedWorkspaceDirectory ?? this.getCurrentWorkspacePath(),
+                signal: requestSignal,
+                allowGenerate: asRecord(payload.body)?.allowGenerate === true,
+                isModelCurrent: () => readFollowupsEnabled() && readFollowupModel() === modelRef,
+              })
+            : EMPTY_FOLLOWUP_SUGGESTIONS;
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
       if (method === 'POST' && requestPathname === VARRO_API_ENDPOINTS.promptCompletionTest) {
         const model = parsePromptCompletionTestRequest(payload.body);
         const data = await this.promptCompletion.test(
@@ -1313,7 +1381,7 @@ export class RestProxy {
         const data = await this.openCodeConfig.readServerMemoryPermissions(
           serverMemoryRequest.sessionID,
           directory ?? undefined,
-          serverMemoryRequest.kind === 'remove' ? serverMemoryRequest.id : undefined
+          serverMemoryRequest.kind === 'list' ? undefined : serverMemoryRequest
         );
         this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
         return;
@@ -1365,6 +1433,19 @@ export class RestProxy {
       if (this.isWorkspaceFilePickRequest(method, payload.path)) {
         const data = await this.pickWorkspaceFile();
         this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
+
+      if (method === 'POST' && requestPathname === VARRO_API_ENDPOINTS.sessionTransferHide) {
+        const sessionID = asRecord(payload.body)?.sessionID;
+        if (!isSafePersistedSessionId(sessionID)) throw new Error('Invalid session ID');
+        const roots = scopedWorkspaceDirectory
+          ? [scopedWorkspaceDirectory]
+          : this.getOpenWorkspaceRoots();
+        if (!(await this.callbacks.hideTransferredSession?.(sessionID, roots))) {
+          throw new Error('404 Transferred session not found');
+        }
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data: true });
         return;
       }
 
@@ -1809,7 +1890,23 @@ export class RestProxy {
         }
         throw err;
       }
-      this.callbacks.rememberServerMemoryPermissions(legacyServerMemoryRules);
+      if (promptSessionID) {
+        const messageID = asRecord(payload.body)?.messageID;
+        await FollowupService.forServer(
+          this.callbacks.server,
+          this.callbacks.legacyFollowupPersistence
+        )
+          .clearPreviousTurn({
+            sessionId: promptSessionID,
+            directory: promptWorkspaceDirectory ?? undefined,
+            userMessageId: typeof messageID === 'string' ? messageID : undefined,
+          })
+          .catch(() => logger.warn('Could not clear previous-turn follow-up cache'));
+      }
+      await this.openCodeConfig.rememberApprovedServerMemoryPermissions(
+        legacyServerMemoryRules,
+        explicitWorkspaceDirectory ?? this.getCurrentWorkspaceResolutionRoot() ?? undefined
+      );
       if (
         method === 'GET' &&
         directSessionID &&
@@ -3398,7 +3495,7 @@ export class RestProxy {
         this.readAndRememberSessionWorkspaceScope(session)
       );
       const transfer = this.callbacks
-        .getTransferredSessions?.(this.getOpenWorkspaceRoots())
+        .getTransferredSessions?.(this.getOpenWorkspaceRoots(), { includeHidden: true })
         .find((entry) => entry.id === session.id);
       return transfer ? { ...result, transfer: transfer.transfer } : result;
     }
@@ -3409,7 +3506,9 @@ export class RestProxy {
     const url = new URL(path, 'http://localhost');
     const directory = getExplicitWorkspaceDirectory(path);
     const roots = directory ? [directory] : this.getOpenWorkspaceRoots();
-    const transfers = this.callbacks.getTransferredSessions?.(roots) ?? [];
+    // Keep hidden link metadata in snapshots so pagination and active-session
+    // refreshes cannot restore an old visible copy in the webview.
+    const transfers = this.callbacks.getTransferredSessions?.(roots, { includeHidden: true }) ?? [];
     if (!transfers.length) return data;
     const page = asRecord(data);
     const items = Array.isArray(data) ? data : Array.isArray(page?.items) ? page.items : null;
@@ -4369,7 +4468,8 @@ export class RestProxy {
     if (
       target === 'commit_message' ||
       target === 'auto_approve' ||
-      target === 'prompt_completion'
+      target === 'prompt_completion' ||
+      target === 'followups'
     ) {
       return { kind: 'update', target, providerID, modelID, unset };
     }
@@ -4427,11 +4527,25 @@ export class RestProxy {
       const sessionID = url.searchParams.get('sessionId')?.trim() ?? '';
       return sessionID ? { kind: 'list', sessionID } : { kind: 'list' };
     }
-    if (method !== 'DELETE') return null;
+    if (method !== 'DELETE' && method !== 'PATCH') return null;
     const record = asRecord(body);
     const sessionID = typeof record?.sessionId === 'string' ? record.sessionId.trim() : '';
     const id = typeof record?.id === 'string' ? record.id.trim() : '';
     if (!id) throw new Error('Saved permission ID is required');
+    if (method === 'PATCH') {
+      const permission = record?.permission;
+      const pattern = record?.pattern;
+      if (
+        typeof permission !== 'string' ||
+        !permission.trim() ||
+        permission.length > 200 ||
+        typeof pattern !== 'string' ||
+        !pattern.trim() ||
+        pattern.length > 2000
+      )
+        throw new Error('Every saved rule needs a permission name and pattern');
+      return { kind: 'update', sessionID: sessionID || undefined, id, permission, pattern };
+    }
     return sessionID ? { kind: 'remove', sessionID, id } : { kind: 'remove', id };
   }
 

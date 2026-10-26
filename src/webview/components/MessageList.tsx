@@ -30,6 +30,7 @@ import {
   requestMessageListScrollToBottom,
   getActiveUsageLimitNotice,
   isActiveSessionWorking,
+  isSessionStatusWorking,
   isSessionTreeStatusWorking,
   getSessionTreeIds,
   getSessionTreeRootId,
@@ -174,6 +175,7 @@ import {
 } from './message-list/scrolling';
 import { VirtualizedContent } from './message-list/VirtualizedContent';
 import { AssistantDialogSummaryForMessage, type ModelChangeInfo } from './message-list/MessageRows';
+import { FollowupSuggestions } from './message-list/FollowupSuggestions';
 import { deduplicateFileEdits } from './message/AssistantMessageContent';
 import {
   getLinkedToolCallKeys,
@@ -191,6 +193,7 @@ import {
   getLatestPlanImplementationMessageId,
   isPlanImplementationMessage,
 } from './message-list/plan-actions';
+import { getFollowupActionTitle } from '../../shared/followups';
 import {
   sameAssistantRetryScanState,
   scanAssistantRetryStates,
@@ -388,6 +391,7 @@ function numberPrompts(messages: readonly MessageEntry[], previous?: PromptNumbe
   for (const message of messages) {
     if (message.info.role !== 'user' || message.info.pendingDelivery) continue;
     if (isSessionResumeMessage(message.parts)) continue;
+    if (getFollowupActionTitle(message.info, message.parts) !== null) continue;
     const parsed = parseUserMessageContent(message.parts);
     if (!hasUserMessageContent(parsed)) continue;
     if (steering.ids.has(message.info.id)) {
@@ -820,6 +824,7 @@ export function MessageList() {
     observer: MutationObserver | null;
   } | null = null;
   let pointerScrollOwnershipActive = false;
+  let scrollTouch: { identifier: number; x: number; y: number } | null = null;
   let pointerScrollRange = 0;
   let wheelListenerPassive = true;
   let diffFocusPauseActive = false;
@@ -907,6 +912,11 @@ export function MessageList() {
     return notice && shouldDisplayUsageLimitNotice(notice) ? notice : null;
   });
   const activeSessionWorking = createMemo(() => isActiveSessionWorking());
+  const subagentsWorking = createMemo(() =>
+    getSessionTreeIds(state.activeSessionId).some(
+      (id) => id !== state.activeSessionId && isSessionStatusWorking(state.sessionStatus[id])
+    )
+  );
   const backgroundWorkPending = createMemo(() => {
     const sessionId = state.activeSessionId;
     if (!sessionId) return false;
@@ -954,6 +964,8 @@ export function MessageList() {
   const mountedMessageRows = new Map<string, HTMLDivElement>();
   const pendingMountedRowMeasurements = new Map<string, HTMLDivElement>();
   let mountedRowMeasurementScheduled = false;
+  let batchingScrollMounts = false;
+  let mountedStickyPreviewCheckPending = false;
   onCleanup(() => pendingMountedRowMeasurements.clear());
   let previousVisibleStructureSessionId: string | null = null;
   let previousVisibleStructureMessageIds: readonly string[] | null = null;
@@ -1220,7 +1232,7 @@ export function MessageList() {
   });
   const committedTextBlocksReappear = createMemo(() => {
     const key = committedTextBlockKey();
-    return key !== null && loadingRowCommittedTextKey() !== key;
+    return !subagentsWorking() && key !== null && loadingRowCommittedTextKey() !== key;
   });
   const messageIndexById = createMemo(() => {
     const result = new Map<string, number>();
@@ -2532,7 +2544,7 @@ export function MessageList() {
     );
   });
   const trailingSummaryMessageId = createMemo(() =>
-    presentation.pending() || waitingForBackground()
+    presentation.pending() || waitingForBackground() || subagentsWorking()
       ? null
       : (structurallyTrailingInterruptedMessageId() ??
         explicitTerminalFinalResponseMessageId() ??
@@ -2986,6 +2998,7 @@ export function MessageList() {
     const owner = trailingSummaryOwner();
     const ownerMatchesCurrentResponse =
       !waitingForBackground() &&
+      !subagentsWorking() &&
       owner &&
       owner.sessionId === sessionId &&
       owner.messageId === structurallyTrailingFinalResponseCandidateMessageId();
@@ -4322,6 +4335,35 @@ export function MessageList() {
     });
   }
 
+  function reconcileMountedStickyPreview() {
+    const currentStickyPreview = untrack(stickyUserMessagePreview);
+    if (
+      currentStickyPreview &&
+      shouldHideStickyUserMessagePreviewAfterLayout(currentStickyPreview)
+    ) {
+      setStickyUserMessagePreview(null);
+      previousStickyPreviewId = currentStickyPreview.id;
+    }
+  }
+
+  function flushPendingMountedRowMeasurements() {
+    if (disposed || !shouldMeasureRows()) {
+      pendingMountedRowMeasurements.clear();
+      return;
+    }
+    const rows = [...pendingMountedRowMeasurements].flatMap(([messageId, element]) =>
+      element.isConnected &&
+      mountedMessageRows.get(messageId) === element &&
+      !element.classList.contains('interactive-item-virtual-placeholder')
+        ? [{ element, messageId }]
+        : []
+    );
+    pendingMountedRowMeasurements.clear();
+    if (rows.length === 0) return;
+    measureMountedRows(rows);
+    restorePendingHistoryAnchorIfMounted();
+  }
+
   function observeMeasuredRow(element: HTMLDivElement, messageId: string, active: boolean) {
     if (!active) {
       if (mountedMessageRows.get(messageId) === element) mountedMessageRows.delete(messageId);
@@ -4337,21 +4379,15 @@ export function MessageList() {
     if (inlineDiffHeight > 0) element.style.minHeight = `${inlineDiffHeight}px`;
     if (widthResizeActive) widthResizeNewlyMountedRows.add(element);
     if (element.classList.contains('interactive-request')) {
-      const currentStickyPreview = untrack(stickyUserMessagePreview);
-      if (
-        currentStickyPreview &&
-        shouldHideStickyUserMessagePreviewAfterLayout(currentStickyPreview)
-      ) {
-        setStickyUserMessagePreview(null);
-        previousStickyPreviewId = currentStickyPreview.id;
-      }
+      if (batchingScrollMounts) mountedStickyPreviewCheckPending = true;
+      else reconcileMountedStickyPreview();
     }
     if (!shouldMeasureRows() && element.classList.contains('interactive-request')) {
       scheduleStickyPreviewGeometryRefresh();
     }
     if (!shouldMeasureRows()) return;
 
-    if (shouldVirtualize() && userScrollRecentlyActive()) {
+    if (shouldVirtualize() && userScrollRecentlyActive() && !batchingScrollMounts) {
       // A direct gesture's newly mounted overscan can correct height above its painted destination.
       // Apply that bounded correction before the scroll event remembers the destination anchor.
       measureMountedRows([{ element, messageId }]);
@@ -4370,20 +4406,7 @@ export function MessageList() {
       mountedRowMeasurementScheduled = true;
       queueMicrotask(() => {
         mountedRowMeasurementScheduled = false;
-        if (disposed || !shouldMeasureRows()) {
-          pendingMountedRowMeasurements.clear();
-          return;
-        }
-        const rows = [...pendingMountedRowMeasurements].flatMap(([pendingId, pendingElement]) =>
-          pendingElement.isConnected &&
-          mountedMessageRows.get(pendingId) === pendingElement &&
-          !pendingElement.classList.contains('interactive-item-virtual-placeholder')
-            ? [{ element: pendingElement, messageId: pendingId }]
-            : []
-        );
-        pendingMountedRowMeasurements.clear();
-        measureMountedRows(rows);
-        restorePendingHistoryAnchorIfMounted();
+        flushPendingMountedRowMeasurements();
       });
     }
     if (element.isConnected && mountedMessageRows.get(messageId) === element) {
@@ -4571,6 +4594,7 @@ export function MessageList() {
       if (nextMessage?.info.role !== 'user') continue;
       if (steeringIds.has(nextMessage.info.id)) continue;
       if (isPlanImplementationMessage(nextMessage.info, nextMessage.parts)) continue;
+      if (getFollowupActionTitle(nextMessage.info, nextMessage.parts) !== null) continue;
 
       const nextRow = mountedMessageRows.get(nextMessage.info.id);
       if (!nextRow) return null;
@@ -4603,6 +4627,8 @@ export function MessageList() {
       const rowMessageIndex = rowMessageId ? messageIndexById().get(rowMessageId) : undefined;
       const rowMessage = rowMessageIndex === undefined ? undefined : messages()[rowMessageIndex];
       if (rowMessage && isPlanImplementationMessage(rowMessage.info, rowMessage.parts)) continue;
+      if (rowMessage && getFollowupActionTitle(rowMessage.info, rowMessage.parts) !== null)
+        continue;
       const source = row.querySelector<HTMLElement>(
         '.user-message-card, .inline-edit-composer-slot'
       );
@@ -4916,8 +4942,9 @@ export function MessageList() {
   function startActivityExitSummaryObserver(anchor: ActivityExitSummaryAnchor) {
     if (!trackRef || activityExitSummaryObserver) return;
     activityExitSummaryObserver = new MutationObserver(() => {
-      // New standalone content ends the collapse owner's hold even during settling.
-      // Otherwise an inline edit and bottom follow can race the obsolete summary target.
+      // New standalone content or admitted steering ends the collapse owner's hold.
+      // Steering continues the turn without restarting loading, so its card must also
+      // release the obsolete summary target and let the existing follower advance.
       if (
         activityExitHeldResponseContentSignature !== null &&
         activityExitBottomTarget === null &&
@@ -5012,13 +5039,13 @@ export function MessageList() {
     if (Math.abs(delta) <= 0.5) return;
 
     const nextScrollTop = containerRef.scrollTop + delta;
-    if (delta > 0) setAppendBottomReserve((current) => current + delta);
     appendBottomReserveTarget = nextScrollTop;
+    // Growth above the summary already extends the scroll range. Reserve only an
+    // actual shortfall, not that same growth again as accumulating empty space.
     setPreservedScrollTop(nextScrollTop);
     const shortfall = nextScrollTop - containerRef.scrollTop;
     if (shortfall <= 0.5) return;
 
-    appendBottomReserveTarget += shortfall;
     setAppendBottomReserve((current) => current + shortfall);
     queueMicrotask(() => {
       if (!containerRef || state.activeSessionId !== anchor.sessionId) return;
@@ -5036,14 +5063,18 @@ export function MessageList() {
     if (!trackRef) return '';
     return [
       ...trackRef.querySelectorAll<HTMLElement>(
-        '.assistant-message-flow-item[data-assistant-render-key^="part:"], .assistant-message-flow-item[data-assistant-render-key^="file-edit-stack:"]'
+        '.assistant-message-flow-item[data-assistant-render-key^="part:"], .assistant-message-flow-item[data-assistant-render-key^="file-edit-stack:"], .user-message-card.user-message-steering'
       ),
     ]
       .filter((element) => (element.textContent?.length ?? 0) > 0)
       .map((element) => {
-        // Inline edits and other standalone parts consume the exit reserve just like prose.
+        // Steering, inline edits and other standalone parts consume the reserve just like prose.
         // Exclude activity groups/trays: their own collapse must keep its summary anchor.
-        return `${element.dataset.assistantRenderKey ?? ''}:${element.textContent?.length ?? 0}`;
+        const key =
+          element.dataset.assistantRenderKey ??
+          element.closest<HTMLElement>('[data-msg-id]')?.dataset.msgId ??
+          '';
+        return `${key}:${element.textContent?.length ?? 0}`;
       })
       .join('|');
   }
@@ -5578,6 +5609,25 @@ export function MessageList() {
     setAppendBottomReserve(0);
   }
 
+  function releaseEmptyPointerScrollRange() {
+    if (!containerRef || !pointerScrollOwnershipActive) return;
+    const reserve = untrack(appendBottomReserve);
+    if (reserve <= 0.5) return;
+    const reserveElement = trackRef?.querySelector<HTMLElement>('.append-scroll-bottom-reserve');
+    if (
+      !reserveElement ||
+      reserveElement.getBoundingClientRect().top > containerRef.getBoundingClientRect().top
+    ) {
+      return;
+    }
+    // Measurement can shorten a virtual prefix by more than a viewport. Keeping that obsolete
+    // range must not let a native drag leave every message above the viewport. There is no painted
+    // anchor to preserve here; let the browser clamp to real content, without a competing scroll write.
+    pointerScrollRange = Math.max(0, bottomScrollTop() - reserve);
+    appendBottomReserveTarget = 0;
+    setAppendBottomReserve(0);
+  }
+
   function startAppendScrollTransition(sessionId: string) {
     if (!containerRef || stickyNavigationOwnsScroll()) return;
     pendingMeasuredAppendScroll = false;
@@ -6058,6 +6108,7 @@ export function MessageList() {
 
   function onScroll() {
     if (!containerRef) return;
+    releaseEmptyPointerScrollRange();
     const autoScrollEnabled = autoScroll();
     const now = performance.now();
     const top = clampEditScrollTop(containerRef.scrollTop);
@@ -6209,10 +6260,22 @@ export function MessageList() {
       lastUserScrollAt = now;
     }
     if (!suppressSyncScrollTop) {
-      batch(() => {
-        setScrollTop(top);
-        setViewportHeight(currentViewportHeight);
-      });
+      // Mount the whole range before reading its geometry, but apply corrections
+      // within this scroll event, before remembering the user's destination.
+      batchingScrollMounts = true;
+      try {
+        batch(() => {
+          setScrollTop(top);
+          setViewportHeight(currentViewportHeight);
+        });
+      } finally {
+        batchingScrollMounts = false;
+      }
+      if (mountedStickyPreviewCheckPending) {
+        mountedStickyPreviewCheckPending = false;
+        reconcileMountedStickyPreview();
+      }
+      flushPendingMountedRowMeasurements();
     }
     scheduleStickyPreviewViewportState(top, currentViewportHeight);
     const pendingStickyHandoff = upwardStickyHandoff;
@@ -6561,10 +6624,20 @@ export function MessageList() {
   }
 
   function nestedScrollerWillConsumeWheel(event: WheelEvent) {
-    if (!containerRef || !(event.target instanceof Element)) return false;
-    const deltaY = getWheelDeltaPixels(event);
-    const deltaX = getHorizontalWheelDeltaPixels(event);
-    for (let element: Element | null = event.target; element && element !== containerRef;) {
+    return nestedScrollerWillConsumeMovement(
+      event.target,
+      getWheelDeltaPixels(event),
+      getHorizontalWheelDeltaPixels(event)
+    );
+  }
+
+  function nestedScrollerWillConsumeMovement(
+    target: EventTarget | null,
+    deltaY: number,
+    deltaX: number
+  ) {
+    if (!containerRef || !(target instanceof Element)) return false;
+    for (let element: Element | null = target; element && element !== containerRef;) {
       // Most ancestors cannot scroll at all. Checking overflowing geometry first keeps
       // getComputedStyle - which forces a style recalculation - off the wheel hot path.
       if (element instanceof HTMLElement && element.scrollHeight > element.clientHeight + 1) {
@@ -6798,11 +6871,60 @@ export function MessageList() {
     virtualPlaceholderReleaseBlockedUntil = lastScrollInputAt + USER_SCROLL_IDLE_MS;
   }
 
-  function releasePointerScrollOwnership() {
+  function handleTouchStart(event: TouchEvent) {
+    if (!pointerScrollOwnershipActive || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    scrollTouch = { identifier: touch.identifier, x: touch.clientX, y: touch.clientY };
+  }
+
+  function handleTouchMove(event: TouchEvent) {
+    if (!scrollTouch || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    if (!touch || touch.identifier !== scrollTouch.identifier) return;
+    const deltaX = scrollTouch.x - touch.clientX;
+    const deltaY = scrollTouch.y - touch.clientY;
+    scrollTouch.x = touch.clientX;
+    scrollTouch.y = touch.clientY;
+    if (
+      Math.abs(deltaY) <= Math.abs(deltaX) ||
+      nestedScrollerWillConsumeMovement(event.target, deltaY, deltaX)
+    )
+      return;
+    lastScrollInputAt = performance.now();
+    directScrollInputEpoch += 1;
+    virtualPlaceholderReleaseBlockedUntil = lastScrollInputAt + USER_SCROLL_IDLE_MS;
+    // Release follow before the browser delivers movement, including after pointercancel
+    // hands the gesture to native scrolling. Momentum must remain detached after touchend.
+    if (deltaY < 0) {
+      resumeAutoScrollAfterDiffFocus = false;
+      disengageBottomFollow();
+    }
+  }
+
+  function handleTouchEnd(event: TouchEvent) {
+    if (!scrollTouch) return;
+    for (const touch of Array.from(event.touches)) {
+      if (touch.identifier === scrollTouch.identifier) return;
+    }
+    scrollTouch = null;
+    releasePointerScrollOwnership();
+  }
+
+  function releasePointerScrollOwnership(event?: PointerEvent) {
+    // Native panning cancels the pointer, not the touch. Keep the gesture's range
+    // and scroll ownership until touchend/touchcancel, even during a long swipe.
+    if (event?.pointerType === 'touch' && scrollTouch) return;
+    const ownedScroll = pointerScrollOwnershipActive;
+    releaseEmptyPointerScrollRange();
     pointerScrollOwnershipActive = false;
     pointerScrollRange = 0;
     containerRef?.style.removeProperty('overflow-anchor');
     if (containerRef) delete containerRef.dataset.pointerScrollOwned;
+    // Scroll events deliberately retain the whole range while the thumb is held. Release its
+    // offscreen reserve now: pointerup need not produce another scroll or resize event, and a
+    // subsequent drag would otherwise grab that stale range and land below every message.
+    if (ownedScroll) releaseOffscreenBottomReserve();
   }
 
   function handleFocusIn(event: FocusEvent) {
@@ -7202,8 +7324,6 @@ export function MessageList() {
             !containerRef?.isConnected ||
             !containerRef.contains(element) ||
             state.messagesLoading ||
-            !autoScroll() ||
-            !pinnedToBottom ||
             editingMessage() ||
             diffFocusPauseActive ||
             stickyNavigationOwnsScroll()
@@ -7221,15 +7341,28 @@ export function MessageList() {
             next?.classList.contains('file-change-inline-diffs')
               ? Number.parseFloat(getComputedStyle(next).marginTop) || 0
               : 0;
-          reserveBottomCollapseSpace(
+          const collapseHeight =
             bounds.height +
-              (Number.parseFloat(styles.marginTop) || 0) +
-              (Number.parseFloat(styles.marginBottom) || 0) +
-              (Number.parseFloat(parentStyles?.rowGap || '') || 0) +
-              previewMargin,
-            undefined,
-            { captureSummary: false }
-          );
+            (Number.parseFloat(styles.marginTop) || 0) +
+            (Number.parseFloat(styles.marginBottom) || 0) +
+            (Number.parseFloat(parentStyles?.rowGap || '') || 0) +
+            previewMargin;
+          if (pointerScrollOwnershipActive) {
+            reserveHeldScrollbarRange(collapseHeight);
+            return;
+          }
+          if (!autoScroll() || !pinnedToBottom) {
+            // Protect the detached reader before removal can clamp the scroll range. Do not
+            // arm a collapse scroll owner that could undo their next wheel or key movement.
+            const shortfall =
+              containerRef.scrollTop -
+              (containerRef.scrollHeight - containerRef.clientHeight - collapseHeight);
+            if (shortfall <= 0) return;
+            appendBottomReserveTarget = containerRef.scrollTop;
+            setAppendBottomReserve((reserve) => reserve + Math.ceil(shortfall));
+            return;
+          }
+          reserveBottomCollapseSpace(collapseHeight, undefined, { captureSummary: false });
         })
       )
     );
@@ -7325,6 +7458,10 @@ export function MessageList() {
     containerRef.addEventListener('focusin', handleFocusIn);
     containerRef.addEventListener('focusout', handleFocusOut);
     containerRef.addEventListener('pointerdown', handlePointerDown);
+    containerRef.addEventListener('touchstart', handleTouchStart, { passive: true });
+    containerRef.addEventListener('touchmove', handleTouchMove, { passive: true });
+    document.addEventListener('touchend', handleTouchEnd, { passive: true });
+    document.addEventListener('touchcancel', handleTouchEnd, { passive: true });
     document.addEventListener('click', handleExternalLayoutClickCapture, true);
     document.addEventListener('keydown', handleKeyDown);
     document.addEventListener('keydown', handleKeyDownCapture, true);
@@ -7448,6 +7585,7 @@ export function MessageList() {
         // Replacement content consumes reserve. Counting both as new range would retain another
         // tray's height on every completion throughout the hold.
         pointerScrollRange = Math.max(pointerScrollRange, range - untrack(appendBottomReserve));
+        releaseEmptyPointerScrollRange();
       }
       if (trackChanged && !appendReserveReconcileFrame) {
         // Consuming a reserve changes the observed track itself. A microtask still runs
@@ -7527,6 +7665,11 @@ export function MessageList() {
       if (diffFocusResumeRafId) cancelAnimationFrame(diffFocusResumeRafId);
       diffFocusResumeRafId = 0;
       containerRef?.removeEventListener('pointerdown', handlePointerDown);
+      containerRef?.removeEventListener('touchstart', handleTouchStart);
+      containerRef?.removeEventListener('touchmove', handleTouchMove);
+      document.removeEventListener('touchend', handleTouchEnd);
+      document.removeEventListener('touchcancel', handleTouchEnd);
+      scrollTouch = null;
       document.removeEventListener('click', handleExternalLayoutClickCapture, true);
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('keydown', handleKeyDownCapture, true);
@@ -8030,6 +8173,8 @@ export function MessageList() {
       const cur = msg.info as AssistantMessage;
       if (cur.mode === 'subagent') continue;
       if (msg.parts.some((part) => part.type === 'compaction')) continue;
+      // Model-less status rows neither announce a switch nor replace the last known model.
+      if (!cur.providerID || !cur.modelID) continue;
       if (previous) {
         const previousProvider = providerMap.get(previous.providerID);
         const currentProvider = providerMap.get(cur.providerID);
@@ -9569,20 +9714,7 @@ export function MessageList() {
     const aligned = alignMountedMessage(preview);
     if (aligned) {
       directMovementAnchor = null;
-      const target = getStickyUserMessageSourceElement(preview.id);
-      const row = mountedMessageRows.get(preview.id);
-      const containerRect = containerRef?.getBoundingClientRect();
-      rememberDetachedVisibleAnchor(
-        target && row && containerRect
-          ? {
-              messageId: preview.id,
-              element: target,
-              top: target.getBoundingClientRect().top - containerRect.top,
-              messageTop: row.getBoundingClientRect().top - containerRect.top,
-              topPad: visibleRange().topPad,
-            }
-          : captureMessageScrollAnchor(preview.id)
-      );
+      rememberTurnNavigationAnchor(preview.id);
       animateTurnNavigationDestination(preview.id);
     }
     const currentPreview = untrack(stickyUserMessagePreview);
@@ -9592,6 +9724,23 @@ export function MessageList() {
       previousStickyPreviewBounds = null;
     }
     return aligned;
+  }
+
+  function rememberTurnNavigationAnchor(messageId: string) {
+    const target = getStickyUserMessageSourceElement(messageId);
+    const row = mountedMessageRows.get(messageId);
+    const containerRect = containerRef?.getBoundingClientRect();
+    rememberDetachedVisibleAnchor(
+      target && row && containerRect
+        ? {
+            messageId,
+            element: target,
+            top: target.getBoundingClientRect().top - containerRect.top,
+            messageTop: row.getBoundingClientRect().top - containerRect.top,
+            topPad: visibleRange().topPad,
+          }
+        : captureMessageScrollAnchor(messageId)
+    );
   }
 
   function animateTurnNavigationDestination(messageId: string) {
@@ -9680,13 +9829,19 @@ export function MessageList() {
         targetRect.top - container.getBoundingClientRect().top - getMessageJumpTopInset();
       if (Math.abs(offset) <= 0.5) {
         stableFrames += 1;
-        if (stableFrames >= 2) return;
+        if (stableFrames >= 2) {
+          // The first alignment can synchronously remeasure the virtual core. Remember the
+          // final painted destination, not that earlier position, for subsequent width reflow.
+          rememberTurnNavigationAnchor(preview.id);
+          return;
+        }
         continue;
       }
 
       stableFrames = 0;
       setPreservedScrollTop(container.scrollTop + offset);
     }
+    rememberTurnNavigationAnchor(preview.id);
   }
 
   function getMessageJumpTopInset() {
@@ -10375,6 +10530,23 @@ export function MessageList() {
               </div>
             )}
           </Show>
+          <FollowupSuggestions
+            finalMessageId={
+              !activeSessionWorking() && !waitingForBackground() && !subagentsWorking()
+                ? trailingFinalResponseMessageId()
+                : null
+            }
+            turnId={trailingAssistantTurn()?.userMessageId ?? null}
+            working={activeSessionWorking()}
+            blocked={
+              !!editingMessage() ||
+              hasActiveQuestion() ||
+              hasActivePermission() ||
+              isSessionCompacting() ||
+              isLoading() ||
+              state.queuedMessages.some((item) => item.sessionId === state.activeSessionId)
+            }
+          />
           <Show when={appendBottomReserve() > 0.5}>
             <div
               class="append-scroll-bottom-reserve"

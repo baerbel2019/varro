@@ -101,6 +101,8 @@ Varro starts in `Auto` unless overridden by `varro.chat.defaultPermissionMode` o
 
 Connect or reauthenticate supported API-key and OAuth providers in the Models view. The picker shows known model capabilities and lets you pin, hide, or rename models locally. MCP servers come from OpenCode configuration and can be toggled per session.
 
+Follow-ups are enabled by default using the session's model and reasoning. Override with **Use for follow-ups** in a model's context menu or `varro.chat.followupModel`; opt out with `varro.chat.followupsEnabled: false`. Requires OpenCode V2; sends the current request and answer for extra inference that may consume tokens or subscription quota. Hover to preview prompts; click to send, preserving your agent, permissions, draft, and attachments. No history backfill or helper chats.
+
 Inline prompt completion is off by default and requires v2 with a supported direct API-key connection. Right-click an eligible model and choose **Use for prompt completion**, or set `varro.chat.promptCompletionModel`. After a typing pause, Varro sends the draft, up to ten recent user prompts, and the latest agent reply from that chat directly to the model. Credentials stay in the extension host. Tab accepts a suggestion; Escape dismisses it; Enter sends only typed or accepted text. Choose **Don't use for prompt completion** to disable it. **Test prompt completion** makes a sample API call that may consume usage but sends no conversation history.
 
 For image analysis with a text-only model, configure an image-capable `vision` agent and mention `@vision`. For read-only investigation, configure an `ask` agent with read and search permissions. See [vision setup](https://github.com/koltyakov/varro/blob/main/docs/usage.md#add-vision-to-a-text-only-model) and [primary agents](https://github.com/koltyakov/varro/blob/main/docs/usage.md#configure-primary-agents).
@@ -135,7 +137,7 @@ Global configuration reloads when OpenCode is idle. Project changes may need `Va
 
 - [VS Code](https://code.visualstudio.com/) or [VSCodium](https://vscodium.com/) 1.107 or newer
 - [Node.js](https://nodejs.org/) 22.22.2+ on Node 22, or Node 24.15.0+
-- [OpenCode v2 CLI](https://opencode.ai/v2/docs/) 2.0.5+ recommended, or [v1 CLI](https://opencode.ai/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.0.32 and v1 1.19.3
+- [OpenCode v2 CLI](https://opencode.ai/v2/docs/) 2.0.5+ recommended, or [v1 CLI](https://opencode.ai/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.1.4 and v1 1.19.4
 - A trusted, non-virtual workspace. Remote workspaces run Varro and OpenCode on the remote extension host
 
 ## Documentation

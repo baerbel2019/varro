@@ -44,9 +44,11 @@ describe('readExtensionConfigState', () => {
       expandThinking: false,
       showTurnTimer: true,
       showEmptyStateHistogram: false,
+      followupsEnabled: true,
       debugShowQuotaWarning: false,
       debugResetWarningDays: 5,
-      enableProblemsContext: true,
+      autoAttachProblems: true,
+      autoAttachActiveFile: true,
       chatFontSize: 13,
       chatEditorFontSize: 12,
       chatFontFamily: 'default',
@@ -69,6 +71,33 @@ describe('readExtensionConfigState', () => {
     mocks.values.set('varro.chat.showEmptyStateHistogram', true);
 
     expect(readExtensionConfigState().showEmptyStateHistogram).toBe(true);
+  });
+
+  it('defaults follow-ups to enabled and respects a user-level opt-out', () => {
+    expect(readExtensionConfigState().followupsEnabled).toBe(true);
+    mocks.values.set('varro.chat.followupsEnabled', false);
+    expect(readExtensionConfigState().followupsEnabled).toBe(false);
+    mocks.values.set('varro.chat.followupsEnabled', true);
+    expect(readExtensionConfigState().followupsEnabled).toBe(true);
+  });
+
+  it('does not let repository settings override the follow-up opt-out', () => {
+    mocks.getConfiguration.mockReturnValueOnce({
+      get: vi.fn(() => true),
+      inspect: vi.fn(() => ({ globalValue: false })),
+    });
+    expect(readExtensionConfigState().followupsEnabled).toBe(false);
+  });
+
+  it('reads follow-up model overrides only from user settings', () => {
+    expect(readExtensionConfigState().followupModel).toBe('');
+    mocks.values.set('varro.chat.followupModel', 'openai/fast');
+    expect(readExtensionConfigState().followupModel).toBe('openai/fast');
+    mocks.getConfiguration.mockReturnValueOnce({
+      get: vi.fn(() => 'openai/from-repository'),
+      inspect: vi.fn(() => ({ globalValue: undefined })),
+    });
+    expect(readExtensionConfigState().followupModel).toBe('');
   });
 
   it('defaults to ask and reads automatic loading only from application settings', () => {
@@ -98,8 +127,13 @@ describe('readExtensionConfigState', () => {
   });
 
   it('reads the Problems context opt-out', () => {
-    mocks.values.set('varro.chat.enableProblemsContext', false);
-    expect(readExtensionConfigState().enableProblemsContext).toBe(false);
+    mocks.values.set('varro.chat.autoAttachProblems', false);
+    expect(readExtensionConfigState().autoAttachProblems).toBe(false);
+  });
+
+  it('reads the active-file auto-attachment opt-out', () => {
+    mocks.values.set('varro.chat.autoAttachActiveFile', false);
+    expect(readExtensionConfigState().autoAttachActiveFile).toBe(false);
   });
 
   it('prefers the Varro chat font size override', () => {

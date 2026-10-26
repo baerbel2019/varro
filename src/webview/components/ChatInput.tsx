@@ -6,6 +6,7 @@ import {
   MAX_PASTED_TEXT_TOTAL_BYTES,
 } from '../../shared/pasted-text';
 import { captureExtensionContexts } from '../host/extensions';
+import { getFollowupActionTitle } from '../../shared/followups';
 import type { ExtensionContext } from '../../shared/extension-context';
 import { cloneExtensionContexts } from '../../shared/extension-context';
 import {
@@ -115,6 +116,7 @@ import {
   setSessionUsageLimit,
   isSessionCompacting,
   isSessionAwaitingInput,
+  isSessionStatusWorking,
   isSessionTreeStatusWorking,
   replaceClipboardImages,
   replaceNativePdfs,
@@ -210,6 +212,7 @@ import {
   TERMINAL_SELECTION_MARKER,
 } from '../../shared/context-files';
 import { normalizeSessionTitle } from '../../shared/session-title';
+import { isSubagentCardVisible } from '../lib/subagent-visibility';
 import { createOpenCodeMessageID } from '../../shared/opencode-id';
 import { getQueuedAttachmentSnapshot } from '../hooks/session/session-send';
 import {
@@ -349,6 +352,7 @@ import {
   acceptQueuedSteer,
   failedSteerQueuedMessageIds,
   getPromptEventText,
+  getQueuedMessageWorkspaceDirectory,
   sendWithQueuedModelSnapshot,
   sendQueuedAsSteer,
   canSteerQueuedMessage,
@@ -775,7 +779,7 @@ async function readPdfFile(file: File) {
 }
 
 function attachCurrentDiagnostics() {
-  if (!state.enableProblemsContext) {
+  if (!state.autoAttachProblems) {
     showSessionActionFeedback('Problems context is disabled in settings');
     return;
   }
@@ -1672,7 +1676,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         icon: 'problems',
         severity: problemReferenceSeverity(reference),
         problemDetails: problemReferenceDetails(reference, state.editorContext.workspacePath),
-        disabled: !state.enableProblemsContext,
+        disabled: !state.autoAttachProblems,
         textMarker: marker,
       });
     }
@@ -1685,7 +1689,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         icon: 'problems',
         severity: getProblemsSeverity(problems.text),
         problemDetails: problems.text,
-        disabled: !state.enableProblemsContext,
+        disabled: !state.autoAttachProblems,
         textMarker: PROBLEMS_REFERENCE,
       });
     }
@@ -2184,6 +2188,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         icon: 'table' as const,
         lineRange: databaseContextDetail(database),
       };
+    if (!state.autoAttachActiveFile) return null;
     const file = composerActiveFile();
     const editorText = state.editorContext.editorText;
     if (!file && !editorText) return null;
@@ -2231,11 +2236,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     !!activeContext() ||
     composerIssueCount() > 0 ||
     (!!visibleTerminalSelection() && !inputText().includes(TERMINAL_SELECTION_MARKER)) ||
-    (state.enableProblemsContext && !!visibleDiagnostics() && !visibleDiagnostics()!.inline) ||
+    (state.autoAttachProblems && !!visibleDiagnostics() && !visibleDiagnostics()!.inline) ||
     hasMentions();
 
   const composerIssueCount = createMemo(() => {
-    if (!state.enableProblemsContext) return 0;
+    if (!state.autoAttachProblems) return 0;
     if (state.attachedDiagnostics) return 0;
     const editing = composerEditingMessage();
     return editing
@@ -2261,7 +2266,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   }
 
   const composerProblemDetails = createMemo(() => {
-    if (!state.enableProblemsContext) return null;
+    if (!state.autoAttachProblems) return null;
     const attached = state.attachedDiagnostics;
     if (attached)
       return formatAttachedDiagnostics(
@@ -2323,6 +2328,30 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return false;
   });
   const isComposerBusy = createMemo(() => !props.newSession && isActiveSessionWorking());
+  const workingSubagentIds = createMemo(() => {
+    const sessionId = composerSessionId();
+    if (!sessionId) return [];
+    return getSessionTreeIds(sessionId).filter(
+      (id) => id !== sessionId && isSessionStatusWorking(state.sessionStatus[id])
+    );
+  });
+  const waitingForSubagents = createMemo(
+    () =>
+      workingSubagentIds().length > 0 &&
+      (latestAssistantResponseIsTerminal() ||
+        !isSessionStatusWorking(state.sessionStatus[composerSessionId()!]))
+  );
+  const workingSubagentTitles = createMemo(() => {
+    if (!waitingForSubagents()) return '';
+    const ids = new Set(workingSubagentIds());
+    return state.sessions
+      .filter((session) => ids.has(session.id))
+      .map((session) => normalizeSessionTitle(session.title) || 'Untitled subagent')
+      .join(', ');
+  });
+  const showSubagentWaitingStatus = createMemo(
+    () => waitingForSubagents() && workingSubagentIds().some((id) => !isSubagentCardVisible(id))
+  );
   const [composerBusyDisplayHold, setComposerBusyDisplayHold] = createSignal(
     !props.newSession && isActiveSessionWorking()
   );
@@ -2348,7 +2377,9 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   });
   onCleanup(clearComposerBusyDisplayTimer);
   const isComposerDisplayBusy = createMemo(
-    () => !latestAssistantResponseIsTerminal() && (isComposerBusy() || composerBusyDisplayHold())
+    () =>
+      workingSubagentIds().length > 0 ||
+      (!latestAssistantResponseIsTerminal() && (isComposerBusy() || composerBusyDisplayHold()))
   );
 
   const slashCommands = createMemo(() =>
@@ -2564,7 +2595,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
   const problemsPickerScope = createMemo(() => {
     const completion = activeCompletion();
-    return state.enableProblemsContext &&
+    return state.autoAttachProblems &&
       completion?.type === 'slash' &&
       completion.query.toLowerCase().startsWith(`${PROBLEMS_COMMAND_NAME} `)
       ? JSON.stringify([getFileSearchScopeKey(), composerSessionId(), getNewChatDraftGeneration()])
@@ -3001,7 +3032,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   }
 
   async function requestWorkspaceProblems(): Promise<boolean> {
-    if (!state.enableProblemsContext || pendingProblems()) return false;
+    if (!state.autoAttachProblems || pendingProblems()) return false;
     const scope = getFileSearchScopeKey();
     const sessionId = composerSessionId();
     const generation = getNewChatDraftGeneration();
@@ -3013,7 +3044,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       scope === getFileSearchScopeKey() &&
       sessionId === composerSessionId() &&
       generation === getNewChatDraftGeneration() &&
-      state.enableProblemsContext;
+      state.autoAttachProblems;
     try {
       const snapshot = await client.varro.workspaceProblems({ signal: controller.signal });
       if (!isCurrent()) return false;
@@ -3036,7 +3067,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   function attachPickedProblems(diagnostic: EditorDiagnostic | null) {
     const snapshot = workspaceProblems();
     const completion = activeCompletion();
-    if (!state.enableProblemsContext || !snapshot || completion?.type !== 'slash') return;
+    if (!state.autoAttachProblems || !snapshot || completion?.type !== 'slash') return;
     if (snapshot.diagnostics.length === 0) return;
     const references = [...state.inlineProblems];
     const text = inputText();
@@ -3068,7 +3099,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   }
 
   function attachProblemsFromEditor(added: EditorDiagnostic[]) {
-    if (!state.enableProblemsContext || added.length === 0) return;
+    if (!state.autoAttachProblems || added.length === 0) return;
     const existing = uniqueProblems(state.attachedDiagnostics?.diagnostics ?? []);
     const additions = uniqueProblems(
       added,
@@ -3196,7 +3227,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       await requestPauseSession();
       return true;
     }
-    if ((name === PROBLEMS_COMMAND_NAME || name === 'promlems') && state.enableProblemsContext) {
+    if ((name === PROBLEMS_COMMAND_NAME || name === 'promlems') && state.autoAttachProblems) {
       setComposerValue(`/${PROBLEMS_COMMAND_NAME} ${args}`);
       return true;
     }
@@ -3331,7 +3362,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       return;
     }
     if (pendingProblems() || problemsPickerScope()) return;
-    if (/^\/(?:problems|promlems)(?:\s|$)/i.test(text.trim()) && state.enableProblemsContext) {
+    if (/^\/(?:problems|promlems)(?:\s|$)/i.test(text.trim()) && state.autoAttachProblems) {
       await runSlashCommand(text);
       return;
     }
@@ -3542,6 +3573,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       let autoAttachedFilePath: string | undefined;
       if (
         activeFile &&
+        state.autoAttachActiveFile &&
         activeContextEnabled(sessionId) &&
         !composerExtensionContexts()?.some((context) => context.placement === 'replace-document')
       ) {
@@ -3728,11 +3760,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     setDispatchingQueuedMessageId(item.id);
     const priorAttemptId = item.messageId;
     const messageId = priorAttemptId ?? createOpenCodeMessageID();
-    const capturedWorkspaceDirectory = item.queuedContext?.editorContext.workspacePath;
-    const workspaceDirectory =
-      capturedWorkspaceDirectory === undefined
-        ? state.sessions.find((session) => session.id === item.sessionId)?.directory
-        : capturedWorkspaceDirectory || undefined;
+    const workspaceDirectory = getQueuedMessageWorkspaceDirectory(item);
     const currentWorkspaceDirectory = state.editorContext.workspacePath;
     const isForeignWorkspace =
       !!workspaceDirectory &&
@@ -4241,6 +4269,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         if (
           entry.info.sessionID !== sessionId ||
           entry.info.role !== 'user' ||
+          getFollowupActionTitle(entry.info, entry.parts) !== null ||
           seen.has(entry.info.id)
         )
           return null;
@@ -6270,6 +6299,19 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         />
       </Show>
       <Show
+        when={showSubagentWaitingStatus() && !hasExpandedDiffOverlay() && !composerEditingMessage()}
+      >
+        <div class="chat-subagent-waiting" role="status">
+          <span class="chat-subagent-waiting-label">
+            Waiting for {workingSubagentIds().length}{' '}
+            {workingSubagentIds().length === 1 ? 'subagent' : 'subagents'}
+          </span>
+          <span class="chat-subagent-waiting-titles" title={workingSubagentTitles()}>
+            {workingSubagentTitles()}
+          </span>
+        </div>
+      </Show>
+      <Show
         when={
           !hasExpandedDiffOverlay() &&
           (queuedForSession().length > 0 || pendingSteersForSession().length > 0) &&
@@ -6470,7 +6512,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
                 inputText().includes(TERMINAL_SELECTION_MARKER) ? null : visibleTerminalSelection()
               }
               diagnostics={
-                state.enableProblemsContext && visibleDiagnostics() && !visibleDiagnostics()!.inline
+                state.autoAttachProblems && visibleDiagnostics() && !visibleDiagnostics()!.inline
                   ? {
                       count: visibleDiagnostics()!.diagnostics.length,
                       total: visibleDiagnostics()!.total,

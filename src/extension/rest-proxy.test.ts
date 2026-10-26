@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => ({
       getWorkspaceFolder: vi.fn(() => undefined),
       getConfiguration: vi.fn(() => ({
         get: vi.fn<() => string | undefined>(() => undefined),
-        inspect: vi.fn(() => ({ globalValue: undefined as unknown })),
+        inspect: vi.fn((_key?: string) => ({ globalValue: undefined as unknown })),
       })),
       asRelativePath: vi.fn((uri: { fsPath: string }) => uri.fsPath),
       fs: {
@@ -52,10 +52,14 @@ import { SharedThumbnailClient } from './image-thumbnail-shared-client';
 import { RemoteImages } from './remote-images';
 import * as workspaceProblems from './workspace-problems';
 import { OpenCodeResponseTooLargeError } from './open-code-transport';
+import { OpenCodeV2Adapter } from './opencode-v2-adapter';
 import { HiddenSessionManager } from './hidden-session-manager';
 import { PromptCompletionService } from './prompt-completion-service';
+import { FollowupService } from './followup-service';
 import { QueuedMessageStore } from './queued-message-store';
 import { SessionStateManager } from './session-state-manager';
+import { ServerMemoryPermissionStore } from './server-memory-permission-store';
+import { fixture as testFixture } from '../webview/test-fixtures';
 import type { OpenCodeServerMemoryPermission } from '../shared/opencode-types';
 import type { Persistence } from '../shared/persistence';
 import type { RecycleBinEntry } from '../shared/protocol';
@@ -188,11 +192,11 @@ function createCallbacks(overrides: Partial<RestProxyCallbacks> = {}): RestProxy
     removeSessionImages: vi.fn(() => Promise.resolve()),
     rememberServerMemoryPermissions: vi.fn((rules) => {
       for (const rule of rules) {
-        serverMemoryPermissions.set(`${rule.projectID}\0${rule.permission}\0${rule.pattern}`, rule);
+        serverMemoryPermissions.set(`${rule.projectID}\0${rule.id}`, rule);
       }
     }),
     forgetServerMemoryPermission: vi.fn((rule) => {
-      serverMemoryPermissions.delete(`${rule.projectID}\0${rule.permission}\0${rule.pattern}`);
+      serverMemoryPermissions.delete(`${rule.projectID}\0${rule.id}`);
     }),
     getServerMemoryPermissions: vi.fn((projectID) =>
       [...serverMemoryPermissions.values()].filter((rule) => rule.projectID === projectID)
@@ -259,6 +263,47 @@ async function requestSanitizedMessagePage(messages: unknown[]) {
 }
 
 describe('native-form proxy boundary', () => {
+  it('loads pending session questions when OpenCode also has a global MCP form', async () => {
+    const fields = [{ key: 'enabled', type: 'boolean' }];
+    const wire = vi.fn(async (method: string, path: string) => {
+      if (method === 'GET' && new URL(path, 'http://localhost').pathname === '/api/form') {
+        return {
+          data: [
+            { id: 'frm_global', sessionID: 'global', title: 'MCP input', fields },
+            { id: 'frm_child', sessionID: 'ses_child', title: 'Session input', fields },
+          ],
+        };
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    });
+    const adapter = new OpenCodeV2Adapter(wire);
+    const { proxy, callbacks } = createProxy({
+      server: {
+        ...createCallbacks().server,
+        apiVersion: 2,
+        request: adapter.request.bind(adapter),
+      } as never,
+      sessionState: {
+        ...createCallbacks().sessionState,
+        getSessionWorkspaceMatch: vi.fn((id: string) => (id === 'ses_child' ? true : undefined)),
+      } as never,
+    });
+
+    await proxy.handleRequest(makePayload(3, 'GET', '/question'));
+
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 3,
+      data: [expect.objectContaining({ id: 'frm_child', sessionID: 'ses_child' })],
+    });
+    expect(callbacks.sessionState.reconcilePendingAttention).toHaveBeenCalledWith(
+      'question',
+      [expect.objectContaining({ id: 'frm_child', sessionID: 'ses_child' })],
+      expect.anything()
+    );
+    expect(wire).toHaveBeenCalledTimes(1);
+    proxy.dispose();
+  });
+
   it('does not forward a native reply to a V1 server', async () => {
     const { proxy, callbacks } = createProxy();
     await proxy.handleRequest(
@@ -771,6 +816,198 @@ describe('RestProxy handleRequest', () => {
     expect(callbacks.server.request).not.toHaveBeenCalled();
   });
 
+  it('honors the user follow-up opt-out even with a model and repository opt-in', async () => {
+    const { proxy, callbacks } = createProxy();
+    const configuration = mocks.vscode.workspace.getConfiguration.mockReturnValue({
+      get: vi.fn(() => 'openai/repository-model'),
+      inspect: vi.fn((key?: string) => ({
+        globalValue: key === 'chat.followupsEnabled' ? false : 'openai/user-model',
+      })),
+    });
+    try {
+      await proxy.handleRequest(
+        makePayload(508, 'POST', '/varro/session/session-1/followups', {
+          assistantMessageId: 'a',
+          userMessageId: 'u',
+          userPrompt: 'Fix the parser',
+          answer: 'One issue remains.',
+          model: { providerID: 'openai', modelID: 'session', variant: 'high' },
+          allowGenerate: true,
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 508,
+        data: { summary: '', actions: [] },
+      });
+      expect(callbacks.server.request).not.toHaveBeenCalled();
+    } finally {
+      configuration.mockReturnValue({
+        get: vi.fn(() => undefined),
+        inspect: vi.fn(() => ({ globalValue: undefined })),
+      });
+    }
+  });
+
+  it.each([undefined, 'openai/small'])(
+    'uses the session model and reasoning unless an override is set: %s',
+    async (override) => {
+      const { proxy, callbacks } = createProxy();
+      let enabled = true;
+      const configuration = mocks.vscode.workspace.getConfiguration.mockReturnValue({
+        get: vi.fn(() => 'openai/repository-model'),
+        inspect: vi.fn((key?: string) => ({
+          globalValue: key === 'chat.followupsEnabled' ? enabled : override,
+        })),
+      });
+      const suggest = vi
+        .spyOn(FollowupService.forServer(callbacks.server), 'suggest')
+        .mockResolvedValue({ summary: '', actions: [] });
+      const model = { providerID: 'openai', modelID: 'session', variant: 'high' };
+      try {
+        await proxy.handleRequest(
+          makePayload(511, 'POST', '/varro/session/session-1/followups', {
+            assistantMessageId: 'a',
+            userMessageId: 'u',
+            userPrompt: 'Review',
+            answer: 'One bug remains',
+            model,
+            allowGenerate: true,
+          })
+        );
+        expect(suggest).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: override ? { providerID: 'openai', modelID: 'small' } : model,
+            allowGenerate: true,
+          })
+        );
+        const isModelCurrent = suggest.mock.calls[0]![0].isModelCurrent;
+        expect(isModelCurrent()).toBe(true);
+        enabled = false;
+        expect(isModelCurrent()).toBe(false);
+      } finally {
+        suggest.mockRestore();
+        configuration.mockReturnValue({
+          get: vi.fn(() => undefined),
+          inspect: vi.fn(() => ({ globalValue: undefined })),
+        });
+        proxy.dispose();
+      }
+    }
+  );
+
+  it.each([
+    undefined,
+    { providerID: '', modelID: 'session' },
+    { providerID: 'openai', modelID: 'session', variant: 42 },
+  ])('does not infer without a valid session fallback: %j', async (model) => {
+    const { proxy, callbacks } = createProxy();
+    await proxy.handleRequest(
+      makePayload(512, 'POST', '/varro/session/session-1/followups', {
+        assistantMessageId: 'a',
+        userMessageId: 'u',
+        userPrompt: 'Review',
+        answer: 'One bug remains',
+        model,
+        allowGenerate: true,
+      })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+      id: 512,
+      data: { summary: '', actions: [] },
+    });
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+    proxy.dispose();
+  });
+
+  it.each([false, true])(
+    'forwards explicit follow-up admission %s to the host service',
+    async (allowGenerate) => {
+      const { proxy, callbacks } = createProxy();
+      const configuration = mocks.vscode.workspace.getConfiguration.mockReturnValue({
+        get: vi.fn(() => 'openai/small'),
+        inspect: vi.fn(() => ({ globalValue: 'openai/small' })),
+      });
+      const suggest = vi
+        .spyOn(FollowupService.forServer(callbacks.server), 'suggest')
+        .mockResolvedValue({ summary: '', actions: [] });
+      try {
+        await proxy.handleRequest(
+          makePayload(509, 'POST', '/varro/session/session-1/followups', {
+            assistantMessageId: 'a',
+            userMessageId: 'u',
+            userPrompt: 'Review',
+            answer: 'One bug remains',
+            allowGenerate,
+          })
+        );
+        expect(suggest).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: 'session-1', allowGenerate })
+        );
+      } finally {
+        suggest.mockRestore();
+        configuration.mockReturnValue({
+          get: vi.fn(() => undefined),
+          inspect: vi.fn(() => ({ globalValue: undefined })),
+        });
+      }
+    }
+  );
+
+  it('persists dismissal through the host rather than forwarding it to OpenCode', async () => {
+    const { proxy, callbacks } = createProxy();
+    const dismiss = vi
+      .spyOn(FollowupService.forServer(callbacks.server), 'dismiss')
+      .mockResolvedValue();
+    try {
+      await proxy.handleRequest(
+        makePayload(510, 'POST', '/varro/session/session-1/followups/dismiss', {
+          assistantMessageId: 'a',
+          userMessageId: 'u',
+          userPrompt: 'Review',
+          answer: 'One bug remains',
+        })
+      );
+      expect(dismiss).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: 'session-1', directory: '/repo' })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 510, data: true });
+      expect(callbacks.server.request).not.toHaveBeenCalled();
+    } finally {
+      dismiss.mockRestore();
+    }
+  });
+
+  it.each([false, true])(
+    'clears the prior follow-up cache only after accepted prompts, rejected=%s',
+    async (rejected) => {
+      const { proxy, callbacks } = createProxy();
+      const clear = vi
+        .spyOn(FollowupService.forServer(callbacks.server), 'clearPreviousTurn')
+        .mockResolvedValue();
+      if (rejected)
+        vi.mocked(callbacks.server.request).mockRejectedValue(new Error('Rejected prompt'));
+      try {
+        await proxy.handleRequest(
+          makePayload(511, 'POST', '/session/session-1/prompt_async', {
+            messageID: 'next-user',
+            parts: [],
+          })
+        );
+        if (rejected) expect(clear).not.toHaveBeenCalled();
+        else
+          expect(clear).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: 'session-1',
+              userMessageId: 'next-user',
+              directory: '/repo',
+            })
+          );
+      } finally {
+        clear.mockRestore();
+      }
+    }
+  );
+
   it('does not notify tests after their request generation changes', async () => {
     const { proxy, callbacks } = createProxy();
     const spy = vi
@@ -930,6 +1167,86 @@ describe('RestProxy handleRequest', () => {
       id: 9013,
       error: '404 Session not found',
     });
+  });
+  it.each([undefined, '/repo'])(
+    'hides a transferred link locally with scope %s, without mutating the server',
+    async (directory) => {
+      const hideTransferredSession = vi.fn(async () => true);
+      const { proxy, callbacks } = createProxy({ hideTransferredSession });
+      const path = '/varro/session-transfer/hide' + (directory ? '?directory=%2Frepo' : '');
+      await proxy.handleRequest(makePayload(9020, 'POST', path, { sessionID: 'moved' }));
+      expect(hideTransferredSession).toHaveBeenCalledExactlyOnceWith('moved', ['/repo']);
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 9020, data: true });
+      expect(callbacks.server.request).not.toHaveBeenCalled();
+      expect(callbacks.sessionTrash.moveToTrash).not.toHaveBeenCalled();
+      expect(callbacks.hiddenSessions.hide).not.toHaveBeenCalled();
+    }
+  );
+
+  it('rejects malformed IDs, closed folders, and missing transfer links', async () => {
+    const hideTransferredSession = vi.fn(async () => false);
+    const { proxy, callbacks } = createProxy({ hideTransferredSession });
+    vi.mocked(callbacks.contextProvider.getOpenWorkspaceRoot).mockImplementation((path) =>
+      path === '/repo' ? path : null
+    );
+    await proxy.handleRequest(
+      makePayload(9021, 'POST', '/varro/session-transfer/hide', { sessionID: '' })
+    );
+    await proxy.handleRequest(
+      makePayload(9022, 'POST', '/varro/session-transfer/hide?directory=%2Foutside', {
+        sessionID: 'moved',
+      })
+    );
+    expect(hideTransferredSession).not.toHaveBeenCalled();
+    await proxy.handleRequest(
+      makePayload(9023, 'POST', '/varro/session-transfer/hide', { sessionID: 'unknown' })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9021,
+      error: 'Invalid session ID',
+    });
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9022,
+      error: expect.any(String),
+    });
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9023,
+      error: '404 Transferred session not found',
+    });
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+  });
+
+  it('retains hidden transfer metadata in paginated snapshots and history reads', async () => {
+    const moved = {
+      id: 'moved',
+      projectID: 'project-1',
+      directory: '/outside',
+      title: 'Moved chat',
+      version: '2',
+      time: { created: 1, updated: 2 },
+      transfer: { originDirectory: '/repo', available: false, hidden: true },
+    };
+    const getTransferredSessions = vi.fn(
+      (_roots: readonly string[], options?: { includeHidden?: boolean }) =>
+        options?.includeHidden ? [moved] : []
+    );
+    const { proxy, callbacks } = createProxy({
+      getTransferredSessions,
+      server: {
+        ...createCallbacks().server,
+        request: vi.fn(async (_method: string, path: string) =>
+          path.startsWith('/session/moved') ? moved : []
+        ),
+      },
+    });
+    await proxy.handleRequest(makePayload(9024, 'GET', '/session?limit=20&directory=%2Frepo'));
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9024,
+      data: { items: [moved], hasMore: false },
+    });
+    await proxy.handleRequest(makePayload(9025, 'GET', '/session/moved?directory=%2Foutside'));
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 9025, data: moved });
+    expect(proxy.isSessionCatalogEventAuthorized('moved', '/outside')).toBe(false);
   });
   it('detects a missed transfer when a session read returns a different directory', async () => {
     const sessionTransferred = vi.fn(async () => {});
@@ -3227,6 +3544,345 @@ describe('RestProxy handleRequest', () => {
     expect(callbacks.postApiResponse).toHaveBeenNthCalledWith(2, 1, {
       id: 859,
       data: { supported: true, rules: [] },
+    });
+  });
+
+  describe('saved-permission editing', () => {
+    type SavedPermissionApiFixture = { paths: Record<string, unknown> };
+    function fixture(overrides: Partial<RestProxyCallbacks> = {}) {
+      const state = {
+        pending: true,
+        saved: [
+          { id: 'saved-1', projectID: 'project-1', action: 'shell', resource: 'git status *' },
+        ],
+        spec: {
+          paths: {
+            '/api/permission/saved/{id}': {
+              patch: {
+                requestBody: {
+                  content: {
+                    'application/json': {
+                      schema: {
+                        properties: { action: { type: 'string' }, resource: { type: 'string' } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        } as SavedPermissionApiFixture,
+        failure: '',
+      };
+      const request = vi.fn(async (method: string, path: string, body?: unknown) => {
+        if (method === 'GET' && path === '/permission')
+          return state.pending
+            ? [
+                {
+                  id: 'perm-1',
+                  sessionID: 'session-1',
+                  permission: 'bash',
+                  always: ['git status *'],
+                },
+              ]
+            : [];
+        if (method === 'POST' && path === '/permission/perm-1/reply') {
+          state.pending = false;
+          return true;
+        }
+        if (path === '/session/session-1')
+          return { id: 'session-1', projectID: 'project-1', directory: '/repo' };
+        if (path === '/project/current') return { id: 'project-1' };
+        if (path === '/openapi.json') return state.spec;
+        if (method === 'GET' && path === '/api/permission/saved?projectID=project-1')
+          return { data: state.saved };
+        if (method === 'PATCH' && path === '/api/permission/saved/saved-1') {
+          if (state.failure) throw new Error(state.failure);
+          const input = body as { action: string; resource: string };
+          state.saved[0] = { ...state.saved[0]!, ...input };
+          return { data: state.saved[0] };
+        }
+        if (method === 'DELETE' && path === '/api/permission/saved/saved-1') {
+          state.saved = state.saved.filter((rule) => rule.id !== 'saved-1');
+          return true;
+        }
+        throw new Error(`Unexpected ${method} ${path}`);
+      });
+      const result = createProxy({
+        server: { ...createCallbacks().server, apiVersion: 2, request } as never,
+        updatePermissionRulesForSession: vi.fn().mockResolvedValue([]),
+        ...overrides,
+      });
+      void result.callbacks.rememberServerMemoryPermissions([
+        {
+          id: 'legacy:perm-1:0',
+          projectID: 'project-1',
+          permission: 'bash',
+          pattern: 'git status *',
+          retractable: false,
+        },
+      ]);
+      return { ...result, state, request };
+    }
+
+    it('keeps approved native rules editable and retractable after host recreation without opening settings first', async () => {
+      let stored: unknown;
+      const persistence = testFixture<Persistence>({
+        get: () => structuredClone(stored),
+        set: (_key: string, value: unknown) => {
+          stored = structuredClone(value);
+        },
+        remove: vi.fn(),
+      });
+      let store = new ServerMemoryPermissionStore(persistence);
+      const observers = {
+        rememberServerMemoryPermissions: (rules: readonly OpenCodeServerMemoryPermission[]) =>
+          store.remember('server', rules),
+        forgetServerMemoryPermission: (rule: OpenCodeServerMemoryPermission) =>
+          store.forget('server', rule),
+        getServerMemoryPermissions: (projectID: string) => store.get('server', projectID),
+      };
+      const { proxy, callbacks, state, request } = fixture(observers);
+      store = new ServerMemoryPermissionStore(persistence);
+      expect(store.get('server', 'project-1')).toEqual([]);
+      state.saved.push({
+        id: 'internal-1',
+        projectID: 'project-1',
+        action: 'shell',
+        resource: 'internal *',
+      });
+      await proxy.handleRequest(
+        makePayload(870, 'POST', '/permission/perm-1/reply', { reply: 'always' })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 870, data: true });
+      store = new ServerMemoryPermissionStore(persistence);
+      expect(store.get('server', 'project-1')).toEqual([
+        expect.objectContaining({ id: 'saved-1' }),
+      ]);
+      // A request remains pending while the saved layer is managed.
+      state.pending = true;
+      state.saved[0]!.resource = 'git status --short';
+      const reloaded = createProxy({ server: callbacks.server, ...observers });
+      const path = '/varro/permission/server-memory?directory=%2Frepo';
+      await reloaded.proxy.handleRequest(makePayload(871, 'GET', path));
+      expect(reloaded.callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 871,
+        data: {
+          supported: true,
+          rules: [
+            expect.objectContaining({
+              id: 'saved-1',
+              pattern: 'git status --short',
+              editable: true,
+            }),
+          ],
+        },
+      });
+      await reloaded.proxy.handleRequest(
+        makePayload(872, 'PATCH', path, { id: 'saved-1', permission: 'read', pattern: 'README.md' })
+      );
+      expect(reloaded.callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 872,
+        data: {
+          supported: true,
+          rules: [
+            expect.objectContaining({
+              id: 'saved-1',
+              permission: 'read',
+              pattern: 'README.md',
+              editable: true,
+            }),
+          ],
+        },
+      });
+      await reloaded.proxy.handleRequest(makePayload(873, 'DELETE', path, { id: 'saved-1' }));
+      expect(reloaded.callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 873,
+        data: { supported: true, rules: [] },
+      });
+      expect(new ServerMemoryPermissionStore(persistence).get('server', 'project-1')).toEqual([]);
+      expect(state.pending).toBe(true);
+      expect(request.mock.calls.filter(([method]) => method === 'POST')).toHaveLength(1);
+      expect(state.saved.map((rule) => rule.id)).toEqual(['internal-1']);
+    });
+
+    it('does not adopt an unobserved replacement with the same scope as a removed native ID', async () => {
+      const { proxy, callbacks, state } = fixture();
+      const path = '/varro/permission/server-memory?directory=%2Frepo';
+      await proxy.handleRequest(makePayload(870, 'GET', path));
+      state.saved[0]!.id = 'internal-replacement';
+      await proxy.handleRequest(makePayload(871, 'GET', path));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 871,
+        data: { supported: true, rules: [] },
+      });
+      expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([]);
+    });
+
+    it.each([undefined, 'session-1'])(
+      'edits only the saved layer and retains visibility: session=%s',
+      async (sessionId) => {
+        const { proxy, callbacks, request } = fixture();
+        await proxy.handleRequest(
+          makePayload(860, 'PATCH', '/varro/permission/server-memory?directory=%2Frepo', {
+            sessionId,
+            id: 'saved-1',
+            permission: 'bash',
+            pattern: 'git diff *',
+          })
+        );
+        expect(request).toHaveBeenCalledWith(
+          'PATCH',
+          '/api/permission/saved/saved-1',
+          {
+            action: 'shell',
+            resource: 'git diff *',
+          },
+          expect.objectContaining({ directory: '/repo' })
+        );
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+          id: 860,
+          data: {
+            supported: true,
+            rules: [
+              {
+                id: 'saved-1',
+                projectID: 'project-1',
+                permission: 'bash',
+                pattern: 'git diff *',
+                editable: true,
+              },
+            ],
+          },
+        });
+        expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([
+          expect.objectContaining({ id: 'saved-1', permission: 'bash', pattern: 'git diff *' }),
+        ]);
+        expect(callbacks.updatePermissionRulesForSession).not.toHaveBeenCalled();
+        expect(request.mock.calls.filter(([method]) => method === 'PATCH')).toHaveLength(1);
+      }
+    );
+
+    it('tracks external edits by native ID and drops externally removed native rules', async () => {
+      const { proxy, callbacks, state } = fixture();
+      const path = '/varro/permission/server-memory?directory=%2Frepo';
+      await proxy.handleRequest(makePayload(860, 'GET', path));
+      state.saved[0]!.resource = 'git diff *';
+      await proxy.handleRequest(makePayload(861, 'GET', path));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 861,
+        data: {
+          supported: true,
+          rules: [expect.objectContaining({ id: 'saved-1', pattern: 'git diff *' })],
+        },
+      });
+      state.saved = [];
+      await proxy.handleRequest(makePayload(862, 'GET', path));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 862,
+        data: { supported: true, rules: [] },
+      });
+      expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([]);
+    });
+
+    it('keeps list/remove support but rejects edits when PATCH is absent', async () => {
+      const { proxy, callbacks, state, request } = fixture();
+      state.spec = { paths: {} };
+      await proxy.handleRequest(
+        makePayload(860, 'PATCH', '/varro/permission/server-memory?directory=%2Frepo', {
+          id: 'saved-1',
+          permission: 'bash',
+          pattern: 'git diff *',
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 860,
+        error: 'Saved-permission editing is unavailable on this OpenCode server',
+      });
+      expect(request.mock.calls.some(([method]) => method === 'PATCH')).toBe(false);
+    });
+
+    it('does not reuse a cached editable flag when the current saved snapshot is unavailable', async () => {
+      const { proxy, callbacks, request } = fixture();
+      const path = '/varro/permission/server-memory?directory=%2Frepo';
+      await proxy.handleRequest(makePayload(860, 'GET', path));
+      const original = request.getMockImplementation()!;
+      request.mockImplementation(async (method, route, body) => {
+        if (route === '/api/permission/saved?projectID=project-1')
+          throw new Error('network failed');
+        return original(method, route, body);
+      });
+      await proxy.handleRequest(
+        makePayload(861, 'PATCH', path, { id: 'saved-1', permission: 'bash', pattern: '*' })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 861,
+        error: 'Saved-permission editing is unavailable on this OpenCode server',
+      });
+      expect(request.mock.calls.some(([method]) => method === 'PATCH')).toBe(false);
+    });
+
+    it.each(['internal-1', 'other-project', 'legacy:perm-1:0'])(
+      'rejects edits to unmanaged or legacy rule %s',
+      async (id) => {
+        const { proxy, callbacks, state, request } = fixture();
+        state.saved.push(
+          { id: 'internal-1', projectID: 'project-1', action: 'shell', resource: 'internal *' },
+          { id: 'other-project', projectID: 'project-2', action: 'shell', resource: 'git status *' }
+        );
+        await proxy.handleRequest(
+          makePayload(860, 'PATCH', '/varro/permission/server-memory?directory=%2Frepo', {
+            id,
+            permission: 'bash',
+            pattern: '*',
+          })
+        );
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+          id: 860,
+          error: expect.any(String),
+        });
+        expect(request.mock.calls.some(([method]) => method === 'PATCH')).toBe(false);
+      }
+    );
+
+    it.each([
+      '409 duplicate saved allowance',
+      '404 Saved permission not found',
+      '401 Unauthorized',
+      'network failed',
+    ])('preserves the old scope after a failed edit: %s', async (failure) => {
+      const { proxy, callbacks, state } = fixture();
+      state.failure = failure;
+      await proxy.handleRequest(
+        makePayload(860, 'PATCH', '/varro/permission/server-memory?directory=%2Frepo', {
+          id: 'saved-1',
+          permission: 'bash',
+          pattern: 'git diff *',
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 860, error: failure });
+      expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([
+        expect.objectContaining({ permission: 'bash', pattern: 'git status *' }),
+      ]);
+    });
+
+    it.each([
+      { permission: '', pattern: '*' },
+      { permission: 'bash', pattern: '   ' },
+      { permission: 'x'.repeat(201), pattern: '*' },
+    ])('rejects invalid saved-rule input: %j', async (rule) => {
+      const { proxy, callbacks, request } = fixture();
+      await proxy.handleRequest(
+        makePayload(860, 'PATCH', '/varro/permission/server-memory?directory=%2Frepo', {
+          id: 'saved-1',
+          ...rule,
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 860,
+        error: 'Every saved rule needs a permission name and pattern',
+      });
+      expect(request).not.toHaveBeenCalled();
     });
   });
 
@@ -5951,33 +6607,36 @@ describe('RestProxy handleRequest', () => {
     });
   });
 
-  it('rejects an incomplete pending snapshot when an unknown session cannot be resolved', async () => {
-    const permission = { id: 'permission-1', sessionID: 'unknown-child' };
-    const serverRequest = vi.fn(async (_method: string, path: string) => {
-      if (path === '/permission') return [permission];
-      if (path === '/session') return [];
-      if (path === '/session/unknown-child?directory=%2Frepo') {
-        throw new Error('404 Session not found');
-      }
-      throw new Error(`Unexpected path: ${path}`);
-    });
-    const { proxy, callbacks } = createProxy({
-      server: { ...createCallbacks().server, request: serverRequest } as never,
-      sessionState: {
-        ...createCallbacks().sessionState,
-        getSessionWorkspaceMatch: vi.fn(() => undefined),
-      } as never,
-    });
+  it.each(['/permission', '/question'])(
+    'rejects an incomplete %s snapshot when an unknown session cannot be resolved',
+    async (requestPath) => {
+      const permission = { id: 'permission-1', sessionID: 'unknown-child' };
+      const serverRequest = vi.fn(async (_method: string, path: string) => {
+        if (path === requestPath) return [permission];
+        if (path === '/session') return [];
+        if (path === '/session/unknown-child?directory=%2Frepo') {
+          throw new Error('404 Session not found');
+        }
+        throw new Error(`Unexpected path: ${path}`);
+      });
+      const { proxy, callbacks } = createProxy({
+        server: { ...createCallbacks().server, request: serverRequest } as never,
+        sessionState: {
+          ...createCallbacks().sessionState,
+          getSessionWorkspaceMatch: vi.fn(() => undefined),
+        } as never,
+      });
 
-    await proxy.handleRequest(makePayload(223, 'GET', '/permission'));
+      await proxy.handleRequest(makePayload(223, 'GET', requestPath));
 
-    expect(callbacks.sessionState.reconcilePendingAttention).not.toHaveBeenCalled();
-    expect(callbacks.sessionState.finishPendingAttentionReconciliation).toHaveBeenCalled();
-    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
-      id: 223,
-      error: 'Could not resolve pending request session unknown-child',
-    });
-  });
+      expect(callbacks.sessionState.reconcilePendingAttention).not.toHaveBeenCalled();
+      expect(callbacks.sessionState.finishPendingAttentionReconciliation).toHaveBeenCalled();
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id: 223,
+        error: 'Could not resolve pending request session unknown-child',
+      });
+    }
+  );
 
   it('bounds concurrent lookups for unknown permission sessions', async () => {
     const lookupGate = deferred<void>();

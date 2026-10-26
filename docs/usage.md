@@ -71,10 +71,14 @@ For WSL, open the project in a VS Code WSL window, then install and authenticate
 
 | Version | Minimum supported | Tested with this release | npm package |
 | --- | --- | --- | --- |
-| v2, recommended | 2.0.5 | 2.0.32 | `@opencode/cli` |
-| v1, still supported | 1.16.0 | 1.19.3 | `opencode-ai` |
+| v2, recommended | 2.0.5 | 2.1.4 | `@opencode/cli` |
+| v1, still supported | 1.16.0 | 1.19.4 | `opencode-ai` |
 
 To keep using v1, retain your installation or run `npm install -g opencode-ai`. Set `varro.server.command` to its executable path. Setting it to `opencode` selects v1 only if that command resolves to a v1 installation. Varro detects the API automatically.
+
+The v1 `1.16.0` support floor has an upstream MCP limitation: tool discovery reads
+only the first page from paginated MCP servers. Upgrade to the current v1 release
+or v2 if MCP tools are missing. Varro cannot repair the server's tool catalog.
 
 Both package families now provide the same `opencode` command. When switching from a package-managed v1 installation to v2, remove the v1 package with its package manager first, then install `@opencode/cli`. For npm, use `npm uninstall -g opencode-ai`, then `npm install -g @opencode/cli`. This removes the package, not your history or configuration. If you keep both versions, use separate installation locations and explicit executable paths.
 
@@ -127,10 +131,17 @@ Varro uses one per-user state root for files shared across editor windows and di
 
 Relative or empty `LOCALAPPDATA` and `XDG_STATE_HOME` values are ignored for new paths.
 The root contains `scratch/` for no-project files, `servers/` for server ownership records, `opencode-v2/` for
-`<sessionID>.json` annotations and session locks, and `provider-quota-v2/` for shared
-quota snapshots and polling locks. Annotation JSON includes `generationTiming`,
+`<sessionID>.json` annotations and session locks, `followups/` for follow-up suggestions and admission records,
+and `provider-quota-v2/` for shared quota snapshots and polling locks. Annotation JSON includes `generationTiming`,
 the text/reasoning boundaries used with OpenCode's token counts to estimate tok/s.
 Quota disk sharing remains disabled on Windows until private ACL handling is supported.
+
+Follow-ups use `followups/cache.json` with atomic replacement and a cross-process lock on all platforms.
+Existing workspace caches are merged before the old workspace key is removed. Dismissals win over
+older suggestions. Closing a card, accepting its action, or accepting a new prompt clears its text
+while retaining admission records so it cannot be generated again. At most 512 turns retain suggestion
+text; older turns retain only admission and dismissal metadata. Tests redirect this directory through
+`VARRO_TEST_STATE_ROOT`, with no fallback to the normal state root.
 
 Existing annotation directories at `$XDG_STATE_HOME/varro/opencode-v2/` and quota
 directories at `~/.varro-provider-quota-v2/` remain intact. When needed, Varro creates
@@ -735,6 +746,12 @@ The judge uses `varro.chat.autoApproveModel` first, then OpenCode's `small_model
 
 `Full access` updates the session permission rules and auto-approves pending permission prompts for that session. Select it only when the session can operate without confirmation.
 
+In the Permissions screen, **Server memory** lists saved allowances from approvals
+Varro observed. On V2.1+ servers with editing support, use the pencil button to
+change an allowance's permission name or resource pattern, then save or cancel.
+This does not change project or session rules. Older servers keep their existing
+removal controls; legacy allowances marked **Restart to clear** cannot be edited.
+
 ## Generate Commit Messages
 
 Varro integrates commit-message generation directly into VS Code Source Control.
@@ -862,7 +879,7 @@ There are also deprecated debug-only settings used for development and recovery 
 ## Troubleshooting
 
 - OpenCode CLI missing: install v2 with `npm install -g @opencode/cli` on macOS, Linux, or WSL, or download the native Windows CLI from the [v2 install page](https://opencode.ai/v2/docs/). V1 remains available with `npm install -g opencode-ai`.
-- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.3` and v2 `2.0.32`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
+- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.4` and v2 `2.1.4`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
 - OpenCode v2 authentication: Varro captures managed-server credentials automatically and redacts them from output. Existing local services use their registered credentials. An externally managed server can also use `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` from the extension host's environment.
 - OpenCode v2 session settings: Varro stores mutable session annotations locally because the released v2 API cannot update session metadata. Session sharing is unavailable through this API, so its menu action is disabled. Existing v1-format configuration remains supported.
 - CLI not on `PATH`: set `varro.server.command` to the executable path.

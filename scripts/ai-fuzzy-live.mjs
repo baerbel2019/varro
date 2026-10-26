@@ -16,7 +16,7 @@ import { requireFixtureWorkspace } from './ai-fuzzy-preconditions.mjs';
 import { requireIsolatedTestServer } from './ai-test-isolation.mjs';
 import { AiOpenCodeClient } from './ai-opencode-client.mjs';
 import { normalizeCapturedEvents, savePlaybackCapture } from './ai-session-playback.mjs';
-import { installObserver } from './ai-streaming.mjs';
+import { installObserver, readRouteEvidence } from './ai-streaming.mjs';
 import { goToLatest } from './ai-fuzzy-navigation.mjs';
 import { ReversibleFixtureEdit } from './ai-fuzzy-fixture-edit.mjs';
 
@@ -24,6 +24,7 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_MODEL = 'openai/gpt-6-luna-fast';
 const DEFAULT_MAX_PROMPTS = 3;
 const DEFAULT_GATE_TIMEOUT_MS = 90_000;
+export const DEFAULT_AI18_FIXTURE_EDIT_PATH = 'packages/util/src/bom.ts';
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
@@ -527,17 +528,7 @@ async function inspectVarroTarget(port, target) {
     const inspected = await controller.call('Runtime.evaluate', {
       contextId: mainContext.id,
       expression: `(() => {
-        const context = globalThis.__initialWebviewState?.webviewContext ?? null;
-        let persisted = null;
-        try {
-          persisted = globalThis.__vscodeWebviewState?.getState?.()?.['varro.lastOpenedView'] ?? null;
-        } catch {}
-        if (!persisted) {
-          try {
-            const raw = localStorage.getItem('varro.lastOpenedView');
-            persisted = raw ? JSON.parse(raw) : null;
-          } catch {}
-        }
+        const { context, route: persisted } = (${readRouteEvidence.toString()})();
         const route = persisted?.type === 'session' && typeof persisted.sessionId === 'string'
           ? { type: 'session', sessionId: persisted.sessionId }
           : context?.initialRoute ?? null;
@@ -843,13 +834,7 @@ export class CdpController {
     const route = await this.call('Runtime.evaluate', {
       contextId: this.mainContextId,
       expression: `(() => {
-        let persisted = globalThis.__vscodeWebviewState?.getState?.()?.['varro.lastOpenedView'] ?? null;
-        if (!persisted) {
-          try {
-            const raw = localStorage.getItem('varro.lastOpenedView');
-            persisted = raw ? JSON.parse(raw) : null;
-          } catch {}
-        }
+        const { route: persisted } = (${readRouteEvidence.toString()})();
         return persisted?.type === 'session' ? persisted.sessionId ?? null : null;
       })()`,
       returnByValue: true,
@@ -1301,16 +1286,23 @@ export class CdpController {
     if (!(await this.click('[aria-label="Message composer"]'))) return false;
     const selectAllModifier = process.platform === 'darwin' ? 4 : 2;
     for (const type of ['keyDown', 'keyUp']) {
-      await this.call('Input.dispatchKeyEvent', {
+      const event = {
         type,
         key: 'a',
         code: 'KeyA',
         windowsVirtualKeyCode: 65,
         nativeVirtualKeyCode: 65,
         modifiers: selectAllModifier,
-      });
+      };
+      if (type === 'keyDown') event.commands = ['selectAll'];
+      await this.call('Input.dispatchKeyEvent', event);
     }
     await this.call('Input.insertText', { text: prompt });
+    if ((await this.readComposerText()) !== prompt) {
+      throw new Error(
+        'Native composer text did not match the requested prompt; Enter was not sent'
+      );
+    }
     for (const type of ['keyDown', 'keyUp']) {
       await this.call('Input.dispatchKeyEvent', {
         type,
@@ -1498,6 +1490,7 @@ export class CdpController {
           label: element.getAttribute('aria-label'),
         })),
         expandedDiffCount: scoped('[aria-label^="Collapse changes in"], [aria-label="Close expanded diff"], .diff-view-overlay-content').length,
+        inlineDiffCount: scoped('.file-change-inline-diffs').length,
         queueItems: [...document.querySelectorAll('[data-queued-message-id]')].map((element) => ({
           id: element.getAttribute('data-queued-message-id'),
           ownerViewId: element.getAttribute('data-queued-message-owner'),
@@ -1513,6 +1506,84 @@ export class CdpController {
         }),
       };
     })()`);
+  }
+
+  async dragTranscriptScrollbar(fraction) {
+    const attempts = [];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const geometry = await this.evaluate(`(() => {
+      const list = document.querySelector('.interactive-list');
+      if (!list || list.scrollHeight <= list.clientHeight) return null;
+      const rect = list.getBoundingClientRect();
+      const thumb = Math.max(20, rect.height * list.clientHeight / list.scrollHeight);
+      const travel = rect.height - thumb;
+      return {
+        range: list.scrollHeight - list.clientHeight,
+        x: rect.right - Math.max(3, (list.offsetWidth - list.clientWidth) / 2),
+        start: rect.top + list.scrollTop / (list.scrollHeight - list.clientHeight) * travel + thumb / 2,
+        end: ${JSON.stringify(fraction)} === 0
+          ? Math.max(1, rect.top - 40)
+          : Math.min(innerHeight - 1, rect.bottom + 40),
+      };
+    })()`);
+      if (!geometry) return { dispatched: attempts.length > 0, held: false, attempts };
+      await this.call('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: geometry.x,
+        y: geometry.start,
+        button: 'left',
+        buttons: 1,
+        clickCount: 1,
+      });
+      let held;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        for (let step = 1; step <= 12; step++) {
+          await this.call('Input.dispatchMouseEvent', {
+            type: 'mouseMoved',
+            x: geometry.x,
+            y: geometry.start + ((geometry.end - geometry.start) * step) / 12,
+            button: 'left',
+            buttons: 1,
+          });
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 650));
+        held = await this.evaluate(
+          `document.querySelector('.interactive-list')?.hasAttribute('data-pointer-scroll-owned') === true`
+        );
+      } finally {
+        await this.call('Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x: geometry.x,
+          y: geometry.end,
+          button: 'left',
+          buttons: 0,
+          clickCount: 1,
+        });
+      }
+      const after = await this.captureActionState();
+      const range = after.transcript
+        ? after.transcript.scrollHeight - after.transcript.clientHeight
+        : null;
+      const reached =
+        after.transcript &&
+        (fraction === 0
+          ? after.transcript.scrollTop <= 1.5
+          : range - after.transcript.scrollTop <= 1.5);
+      attempts.push({ geometry, held, after, reached: !!reached });
+      // First-time virtual measurements can grow the range after the grab. Only that observed
+      // targeting miss gets one re-grab with fresh geometry; never replay a blank-content failure.
+      if (
+        reached ||
+        !held ||
+        !after.transcript?.visibleRows?.length ||
+        range === null ||
+        Math.abs(range - geometry.range) <= 1.5
+      )
+        break;
+    }
+    return { dispatched: true, held: attempts.every((entry) => entry.held), attempts };
   }
 
   countScoped(selector, scope) {
@@ -1605,6 +1676,13 @@ async function writeJsonAtomic(filePath, value) {
   await rename(temporaryPath, filePath);
 }
 
+function controllerErrorMessage(error) {
+  if (error instanceof AggregateError) {
+    return [error.message, ...error.errors.map(controllerErrorMessage)].join(': ');
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
 export async function persistFixtureExitEvidence({
   manifest,
   manifestPath,
@@ -1617,9 +1695,7 @@ export async function persistFixtureExitEvidence({
   const fixture = await readFixture(workspace);
   manifest.livePreparation ??= {};
   const previous = manifest.livePreparation[scenario] ?? { scenario, prepared: false };
-  const failure = error
-    ? `controller failure: ${error instanceof Error ? error.message : String(error)}`
-    : null;
+  const failure = error ? `controller failure: ${controllerErrorMessage(error)}` : null;
   const record = {
     ...previous,
     prepared: error ? false : previous.prepared,
@@ -2046,6 +2122,30 @@ function transcriptAtBoundary(action, state) {
 
 export function verifyActionEffect(action, before, after, details = {}) {
   if (!details.dispatched) return { verified: false, reason: 'input was not dispatched' };
+  if (action.action === 'show file diffs' || action.action === 'hide file diffs') {
+    const enabled = action.action === 'show file diffs';
+    return (
+      enabled
+        ? (after?.inlineDiffCount ?? 0) > (before?.inlineDiffCount ?? 0)
+        : (before?.inlineDiffCount ?? 0) > 0 && after?.inlineDiffCount === 0
+    )
+      ? { verified: true }
+      : { verified: false, reason: 'inline diff visibility transition was not observed' };
+  }
+  if (action.action.startsWith('held scrollbar to ')) {
+    const transcript = after?.transcript;
+    const atDestination =
+      transcript &&
+      (action.action.endsWith('top')
+        ? transcript.scrollTop <= 1.5
+        : transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop <= 1.5);
+    return details.held && atDestination && transcript.visibleRows?.length > 0
+      ? { verified: true }
+      : {
+          verified: false,
+          reason: 'held native thumb, destination, and painted rows were not all verified',
+        };
+  }
   if (action.action === 'switch session away and back') {
     return details.switchedAway && details.returned
       ? { verified: true }
@@ -2151,7 +2251,18 @@ export async function executeActionPlan(cdp, plan, currentTitle, port, options =
     const before = await cdp.captureActionState(options.scope);
     let dispatched = false;
     const details = {};
-    if (action.action === 'switch session away and back') {
+    if (action.action === 'show file diffs' || action.action === 'hide file diffs') {
+      await executeVscodeCommand(
+        port,
+        `Varro: ${action.action.startsWith('show') ? 'Show' : 'Hide'} File Diffs`
+      );
+      dispatched = true;
+    } else if (action.action.startsWith('held scrollbar to ')) {
+      const drag = await cdp.dragTranscriptScrollbar(action.action.endsWith('top') ? 0 : 1);
+      dispatched = drag.dispatched;
+      details.held = drag.held;
+      details.nativeDrag = drag;
+    } else if (action.action === 'switch session away and back') {
       const switched = await switchAwayAndBack(cdp, options.sessionId, currentTitle);
       dispatched = switched.dispatched;
       details.switchedAway = switched.switchedAway;
@@ -2275,6 +2386,8 @@ export async function executeActionPlan(cdp, plan, currentTitle, port, options =
     if (settledAfter) result.settledAfter = settledAfter;
     if (details.messageOrder) result.messageOrder = details.messageOrder;
     if (details.targetingAttempts) result.targetingAttempts = details.targetingAttempts;
+    if (details.held !== undefined) result.pointerHeld = details.held;
+    if (details.nativeDrag) result.nativeDrag = details.nativeDrag;
     if (effect.reason) result.reason = effect.reason;
     results.push(result);
     if (!effect.verified) break;
@@ -2791,6 +2904,7 @@ async function runMultiWebviewScenario({
   descendantsBefore,
   promptRun,
   markModelMayEdit,
+  childEdit,
 }) {
   const timeoutMs = Number(options['gate-timeout-ms'] ?? DEFAULT_GATE_TIMEOUT_MS);
   const permissionMode = options['permission-mode'] ?? 'auto';
@@ -3055,20 +3169,18 @@ async function runMultiWebviewScenario({
     evidence.leakage.rootAbsentFromChild = !(await editor.evaluate(
       `${JSON.stringify(rootMarkers)}.some((marker) => document.body.innerText.includes(marker))`
     ));
-    const childEdit = new ReversibleFixtureEdit(
-      manifest.workspace,
-      'packages/opencode/src/util/timeout.ts',
-      `VFZ AI18 transient ${manifest.seed} R${String(promptRun)}`
-    );
-    const childEditEvidencePath = `${manifestPath}.AI-18.R${String(promptRun)}.fixture-edit.json`;
-    await childEdit.prepare(childEditEvidencePath);
+    const childEditEvidencePath = childEdit.evidencePath;
+    await childEdit.verifyTarget();
+    if (!(await readFile(childEdit.file)).equals(childEdit.original)) {
+      throw new Error('AI-18 fixture edit target changed after preflight; model edit was not sent');
+    }
     let childEditSettled = false;
     let childEditSent = false;
     let childEditError = null;
     try {
       await client.send(
         child.id,
-        `${childEditTurn.promptMarker} Work only in the current OpenCode repository. Read ${childEdit.relativePath}. Use the edit tool once to append the exact standalone comment ${JSON.stringify(childEdit.comment)} at the end of the file. Preserve all existing bytes and line endings. Leave this comment in place; the test controller will restore the recorded original after your turn. Do not change any other content, spawn subagents, or delegate work. Finish with ${childEditTurn.responseMarker}.`,
+        `${childEditTurn.promptMarker} Work only in the current OpenCode repository. Read ${childEdit.relativePath}. Use the edit tool once to append exactly this string at the end of the file: ${JSON.stringify(childEdit.appendText)}. Preserve all existing bytes and line endings. Add no extra blank line before or after that string. Leave it in place; the test controller will restore the recorded original after your turn. Do not change any other content, spawn subagents, or delegate work. Finish with ${childEditTurn.responseMarker}.`,
         parseModel(requestedModel)
       );
       childEditSent = true;
@@ -4021,6 +4133,15 @@ async function runLive(options) {
   let playbackSource = null;
   let activityObservationStarted = false;
   try {
+    let childEdit;
+    if (scenario === 'AI-18') {
+      childEdit = new ReversibleFixtureEdit(
+        manifest.workspace,
+        options['fixture-edit-path'] ?? DEFAULT_AI18_FIXTURE_EDIT_PATH,
+        `VFZ AI18 transient ${manifest.seed} R${String(promptRun)}`
+      );
+      await childEdit.prepare(`${manifestPath}.AI-18.R${String(promptRun)}.fixture-edit.json`);
+    }
     await (async () => {
       if (scenario === 'AI-17') {
         for (let restart = 0; restart < restartCount; restart += 1) {
@@ -4046,13 +4167,12 @@ async function runLive(options) {
         const width = await cdp.evaluate('innerWidth');
         if (Math.abs(width - 486) > 8) throw new Error(`Live sidebar width remained ${width}`);
       }
-      if (scenario === 'AI-08' && manifest.hostState?.fileDiffsEnabled !== true) {
-        const diffsVisible = await cdp.evaluate(
-          `!!document.querySelector('.file-change-inline-diffs')`
-        );
-        if (!diffsVisible) {
-          await executeVscodeCommand(launch.remoteDebuggingPort, 'Varro: Show File Diffs');
-        }
+      if (scenario === 'AI-08') {
+        // Hidden/unmounted previews do not describe the setting. VS Code exposes the
+        // opposite exclusive command when this setting is already enabled.
+        await executeVscodeCommand(launch.remoteDebuggingPort, 'Varro: Show File Diffs', {
+          alreadySelectedCommand: 'Varro: Hide File Diffs',
+        });
         await new Promise((resolve) => setTimeout(resolve, 300));
         manifest.hostState = {
           ...manifest.hostState,
@@ -4205,6 +4325,7 @@ async function runLive(options) {
           fixture,
           descendantsBefore,
           promptRun,
+          childEdit,
           markModelMayEdit: () => {
             modelMayEdit = true;
           },
@@ -4576,13 +4697,13 @@ async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
   if (command === 'run') return runLive(options);
   throw new Error(
-    'Usage: ai-fuzzy-live.mjs run --manifest <path> --launch <path> --scenario AI-07|AI-08|AI-17|AI-18|AI-19 [--playback-label <label>]'
+    'Usage: ai-fuzzy-live.mjs run --manifest <path> --launch <path> --scenario AI-07|AI-08|AI-17|AI-18|AI-19 [--playback-label <label>] [--fixture-edit-path <workspace-relative-path> for AI-18]'
   );
 }
 
 if (path.resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`${controllerErrorMessage(error)}\n`);
     process.exitCode = 1;
   });
 }

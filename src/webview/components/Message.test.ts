@@ -135,7 +135,6 @@ describe('V2 generated transcript rendering', () => {
         status: 'completed',
         reason: 'auto',
         summary: '## Objective\n\nGenerated context',
-        recent: '',
       },
       'session-1'
     );
@@ -522,6 +521,57 @@ describe('Message user prompt rendering', () => {
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
     expect(container?.querySelector('.message-sent-time')).toBeNull();
     expect(parts[0]?.text).toBe(buildPlanImplementationPrompt([]));
+  });
+
+  it('renders an attributed follow-up as a compact action without exposing its prompt as user text', () => {
+    const parts = [
+      textPart(
+        'followup-text',
+        'Investigate the reported parser failures without unrelated edits.'
+      ),
+    ];
+    cleanup = render(
+      () =>
+        Message({
+          info: { ...userMessage('followup'), followupTitle: 'Inspect parser failures' },
+          parts,
+          promptNumber: 2,
+          showSentTimestamp: true,
+        }),
+      container!
+    );
+    const action = container?.querySelector<HTMLElement>('.followup-action');
+    expect(action?.textContent?.trim()).toBe('Inspect parser failures');
+    expect(action?.querySelector('.ui-icon')).not.toBeNull();
+    expect(action?.classList).toContain('user-message-card-wrapperless');
+    expect(action?.classList).not.toContain('user-message-card-editable');
+    expect(container?.querySelector('.user-message-text-scroll')).toBeNull();
+    expect(container?.querySelector('.prompt-number-badge')).toBeNull();
+    expect(container?.querySelector('.message-sent-time')).toBeNull();
+    expect(container?.textContent).not.toContain(parts[0]!.text);
+    expect(parts[0]!.text).toContain('Investigate the reported parser failures');
+  });
+
+  it('keeps manually typed follow-up text and attachments visible as normal user content', () => {
+    cleanup = render(
+      () => [
+        Message({
+          info: userMessage('typed'),
+          parts: [textPart('typed-text', 'Investigate the parser failures.')],
+        }),
+        Message({
+          info: { ...userMessage('attached'), followupTitle: 'Inspect parser failures' },
+          parts: [
+            textPart('attached-text', 'Investigate the parser failures.'),
+            filePart('attached-file', 'report.pdf'),
+          ],
+        }),
+      ],
+      container!
+    );
+    expect(container?.querySelector('.followup-action')).toBeNull();
+    expect(container?.textContent).toContain('Investigate the parser failures.');
+    expect(container?.textContent).toContain('report.pdf');
   });
 
   it('does not hide attachments or custom implementation requests', () => {
@@ -2489,22 +2539,36 @@ describe('Message streamed assistant text rendering', () => {
     expect(container?.querySelectorAll('hr')).toHaveLength(0);
   });
 
-  it('keeps a completed compact summary streaming buffer in pending Markdown mode', () => {
+  it('keeps a completed compact summary streaming buffer in pending Markdown mode', async () => {
+    const [streamingText, setStreamingText] = createSignal(
+      'Files: `src/webview/components/MarkdownRenderer'
+    );
     cleanup = render(
       () =>
         Message({
           info: assistantSummaryMessage('message-stream-pending-summary'),
           parts: [textPart('text-1', '')],
           streamingPartId: 'text-1',
-          streamingText: 'Files: `src/webview/components/MarkdownRenderer',
+          get streamingText() {
+            return streamingText();
+          },
         }),
       container!
     );
 
-    expect(container?.querySelector('.streaming-markdown-pending')?.textContent).toContain(
-      'MarkdownRenderer'
-    );
+    const indicator = container?.querySelector('.streaming-markdown-indicator');
+    expect(indicator?.getAttribute('aria-label')).toBe('Streaming content');
+    expect(indicator?.children).toHaveLength(3);
+    expect(container?.textContent).not.toContain('MarkdownRenderer');
     expect(container?.querySelector('a.file-path-link')).toBeNull();
+
+    setStreamingText('Files: `src/webview/components/MarkdownRenderer.tsx`');
+    await vi.waitFor(() => {
+      expect(container?.querySelector('.streaming-markdown-pending')).toBeNull();
+      expect(container?.querySelector('a.file-path-link')?.textContent).toBe(
+        'MarkdownRenderer.tsx'
+      );
+    });
   });
 
   it('preserves a compact stream boundary that completes a bare URL', () => {

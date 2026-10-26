@@ -215,6 +215,12 @@ describe('webview message validation', () => {
 
   it('accepts known API routes used by the webview client', () => {
     expect(isAllowedApiRequest('POST', '/varro/prompt-completion/test')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/session/s/followups')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/session/s/followups/dismiss')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/varro/session/s/followups/dismiss')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/varro/session/s/followups?directory=%2Frepo')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/varro/session/s/followups')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/varro/session/s/followups?model=other')).toBe(false);
     expect(isAllowedApiRequest('GET', '/varro/prompt-completion/test')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/prompt-completion/test?model=other')).toBe(false);
     expect(isAllowedApiRequest('GET', '/command')).toBe(true);
@@ -269,6 +275,9 @@ describe('webview message validation', () => {
     );
     expect(isAllowedApiRequest('GET', '/varro/permission/server-memory')).toBe(true);
     expect(isAllowedApiRequest('DELETE', '/varro/permission/server-memory')).toBe(true);
+    expect(isAllowedApiRequest('PATCH', '/varro/permission/server-memory')).toBe(true);
+    expect(isAllowedApiRequest('PATCH', '/api/permission/saved/saved-1')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/varro/permission/server-memory')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/permission/judge')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/permission/project-allow?directory=%2Frepo-a')).toBe(
       true
@@ -286,6 +295,13 @@ describe('webview message validation', () => {
     expect(isAllowedApiRequest('POST', '/varro/session/session-1/pin')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session/session-1/rename-if-untitled')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session/session-1/reorder-pin')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/session-transfer/hide')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/session-transfer/hide?directory=%2Frepo')).toBe(
+      true
+    );
+    expect(isAllowedApiRequest('DELETE', '/varro/session-transfer/hide')).toBe(false);
+    expect(isAllowedApiRequest('GET', '/varro/session-transfer/hide')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/varro/session-transfer/hide?unexpected=true')).toBe(false);
     expect(isAllowedApiRequest('DELETE', '/varro/session/session-1/delete')).toBe(true);
     expect(isAllowedApiRequest('GET', '/varro/session-trash')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session-trash/session-1/restore')).toBe(true);

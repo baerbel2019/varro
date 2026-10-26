@@ -103,8 +103,10 @@ the shared invariants below remain true.
   Drop disconnected/replaced rows and never measure inert placeholders. The threshold bootstrap
   observer setup also measures its connected snapshot as a batch. While history owns an exact anchor,
   measurement publication must not queue a competing generic anchor after direct input becomes idle.
-  Ordinary gesture-driven virtual mounts still measure synchronously so the scroll event cannot save
-  an already-shifted destination before height compensation above the viewport runs.
+   Gesture-driven range updates collect mounted rows during the scroll handler's reactive batch, then
+   measure them together before saving the destination anchor. Coalesce mounted sticky-preview checks
+   at the same boundary. Other gesture-driven mounts still measure synchronously. Never defer height
+   compensation above the viewport until after the handler has remembered an already-shifted destination.
 
 ### Height Accounting
 
@@ -300,6 +302,9 @@ the shared invariants below remain true.
   history anchoring, edit visibility, or a direct user gesture.
 - Programmatic settling must be bounded and conditional. Do not repeatedly call `scrollIntoView()`
   when the target is already aligned.
+- Sticky navigation refreshes its remembered detached anchor after final alignment settles. Virtual
+  core measurement can move the initial destination; retaining that earlier offset makes the next
+  width resize restore a stale position. `scroll-sticky-reflow.spec.ts` covers this handoff.
 - Deferred bottom corrections retain the direct-input epoch as well as the session/request identity.
   A newer gesture cancels a queued forced correction even when the original request ID is unchanged.
 - User interaction with the destination cancels navigation settling before editing or attachment
@@ -356,6 +361,10 @@ the shared invariants below remain true.
 - A bottom-pinned activity exit may temporarily reserve the disappearing flow space and freeze its
   existing bottom target. The reserve is a bounded geometry owner, must not compete with bottom-follow,
   and yields immediately to direct user movement, session replacement, or transition cancellation.
+  Restoring its summary reserves only the scroll target's actual shortfall. Growth above the summary
+  already extends the scroll range; adding the same position delta as reserve double-counts it and can
+  accumulate more than a viewport of empty space. Keep the target at the requested coordinate, not the
+  coordinate plus its shortfall. `scroll-activity-collapse.spec.ts` checks repeated reachable growth.
   Appended assistant steps must not start a measured append transition while this owner or its
   retained summary anchor is active. A group-collapse settle restores that summary instead of
   briefly jumping to a different bottom target and letting the summary undo it next frame.
@@ -378,6 +387,12 @@ the shared invariants below remain true.
   collapses before removal: resize delivery is too late to prevent native thumb mapping from seeing
   the shorter range. Keep offscreen reserve through the hold, consume it against the held range,
   and exclude reserve from new range growth so repeated replacements cannot accumulate blank space.
+  On pointer release or cancellation, discard reserve wholly below the viewport even if no further
+  scroll or resize event arrives. Otherwise a later drag can inherit that obsolete range and land
+  below every message. Preserve reserve intersecting the viewport and do not write a scroll position.
+  If a measurement correction leaves the entire held viewport inside trailing reserve, retire that
+  obsolete range and let the browser clamp to real content. There is no painted anchor to preserve
+  there; range protection must not maintain a wholly blank viewport during or after the gesture.
   Finish activity-entry height animations immediately while the pointer owns scrolling. Their
   incremental growth otherwise changes native thumb mapping even when no JavaScript scroll write
   occurs. Preserve animation-end cleanup and restore normal entry timing on release.
@@ -421,6 +436,11 @@ Direct input acquires ownership only when it can affect the transcript:
 - Ignore transcript-scrolling keys from inputs, textareas, selects, and editable composer content.
 - Mouse pointer ownership begins from the scrollbar gutter or another explicit transcript interaction;
   touch owns the scroll surface.
+- Native panning emits `pointercancel` while the finger is still down. Retain touch ownership until
+  `touchend` or `touchcancel`, and use passive touch movement to release bottom-follow on upward outer
+  intent before the native scroll event. Nested scrollers and horizontal swipes do not detach follow.
+  A tap retains follow; upward reading stays detached through momentum and later streamed output.
+  `scroll-touch.spec.ts` covers native cancellation, a held swipe, detached streaming, and return to latest.
 - Nested wheel input still cancels sticky settling because the user has interacted with the
   destination, even when it does not own the outer transcript.
 
@@ -470,6 +490,10 @@ Direct input acquires ownership only when it can affect the transcript:
   enough trailing reserve to make that destination reachable. Assistant growth consumes that reserve
   while direct transcript input cancels destination settling. Measured appends retain their
   viewport-only transition so provisional row reconciliation cannot create a large jump.
+- Steering, including a queued message sent as a steer, preserves the current follow owner rather
+  than issuing a send-time jump. An admitted steering card releases a retained activity-summary
+  anchor so bottom-follow can reveal it. A reader detached before steering or while admission is
+  pending stays detached; neither admission nor queue removal may reattach them.
 - A first turn that already fits at scroll position zero keeps that position without an alignment
   reserve. Track `min-height` can hide a small unreachable target, and repeated reconciliation then
   accumulates blank reserve until the scrollbar appears. `scroll-short-transcript.spec.ts` covers
@@ -488,6 +512,10 @@ Direct input acquires ownership only when it can affect the transcript:
 - The append reserve is general bottom-pinned flow geometry, not only activity-exit state. It may
   replace space lost from trays, todo collapse, external panels, or local container changes. Real
   appended growth consumes it while its original bottom target remains fixed.
+- Removing a message block below a detached reader must reserve any scroll-range shortfall before
+  removal, without arming a bottom-follow or collapse scroll owner. Dismissing follow-ups near the
+  bottom otherwise clamps the already-painted answer backward. `followups.spec.ts` checks both
+  viewport preservation and subsequent native upward movement at narrow and wide widths.
 - Reserve consumption accounts for pending row-rounding reductions. A queued tool entering a freed
   tray slot can otherwise consume the last reserved pixel before a deferred correction removes it,
   clamping the viewport backward. A deferred rounding write must recreate the required reserve even
@@ -578,6 +606,47 @@ Direct input acquires ownership only when it can affect the transcript:
   through background notices and continuation loading, and mark only the settled continuation.
   Earlier completed turns keep their markers while a new turn runs. `MessageList.rendering.test.ts`
   covers busy, retry, local loading, child execution, streaming, and background handoffs.
+- Follow-ups use that same settled final-response identity. New inference requires an observed
+  unfinished assistant or new live prompt, or an unread opening captured before acknowledging it.
+  Unread eligibility compares answer completion with the previous seen timestamp. A busy snapshot
+  alone, an idle read-history load, or a virtual row mount must never admit inference.
+  Cache-only retrieval restores current suggestions without model calls. The host persists admission
+  before inference and caches results, abstentions, failures, and explicit dismissals across reloads.
+  Navigation and invalidation do not persist dismissal; closing the card or an accepted action does.
+  An accepted new turn clears prior suggestion contents and retires pending results for that session,
+  retaining compact admission metadata. Rejected sends do not clear the cache.
+  Follow-up persistence lives in Varro's shared `followups/cache.json`, not workspace state. All
+  admissions, dismissals, completions, retirements, and legacy workspace merges share a cross-process
+  lock and atomic file replacement. Migration preserves admission and lets dismissal win; it removes
+  the old workspace key only after committing. Retiring suggestion text must not remove admission.
+  Only source responses explicitly identified as Build are eligible, in both the webview and host.
+  Follow-ups default to enabled; the application-scoped `chat.followupsEnabled` opt-out gates both
+  display and host inference. An unset `chat.followupModel` uses the current session model and reasoning
+  variant. Model, reasoning, or enabled-state changes invalidate pending presentation without admitting
+  another inference for the same turn.
+  The model supplies a bounded plain-text summary with zero to three title/prompt pairs; prompt hints
+  use the shared tooltip component, and the close control uses the shared icon.
+  Suggestions are optional post-message flow chrome outside row-only prefixes. Arrival leaves focus
+  and detached anchors unchanged; dismissal reserves disappearing space through the existing block
+  removal handler. Clicking an action sends its prompt immediately without a confirmation dialog,
+  using the normal session-targeted send path while preserving the main draft and attachments.
+  Remove the suggestion card in the same optimistic-publication batch that inserts its compact
+  action row, not after network admission. On rejection, restore it only while the original source
+  and view still own the send; do not persist dismissal until admission succeeds.
+  Sent follow-ups use the same compact play-icon action styling as Implement the plan, showing only
+  the generated title instead of an editable user prompt bubble. Explicit `followupTitle` attribution
+  travels with the optimistic message and native V2 metadata, surviving inbox delivery and history
+  reloads. The full text remains the model input. Follow-up actions do not receive prompt numbers,
+  sticky prompt ownership, navigation dots, composer-history entries, or user edit controls. Never
+  infer action attribution from matching prompt text or hide attached content under an action label.
+  Pending sends disable the card buttons; rejected sends retain the card with an inline retryable
+  error and do not persist dismissal. Model, workspace, session, source text,
+  pending input, editing, or renewed work invalidates suggestions without automatic retry.
+- A terminal parent response does not finish the turn while any descendant session is busy or retrying.
+  Suppress the trailing Worked summary, including a retained summary, until those sessions settle.
+  Keep the existing loading slot and the composer's subagent-waiting status. Show that status when
+  at least one working descendant has no running card header half-visible in the viewport. Shared
+  intersection observation accounts for scroll clipping and virtual unmounts without scanning on scroll.
 - Starting the next turn moves the previous Worked summary from the shared trailing slot into its
   assistant row. Its painted top must remain fixed across that ownership handoff; row-local spacing
   must match the spacing previously supplied by the assistant row boundary.

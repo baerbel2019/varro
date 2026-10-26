@@ -100,7 +100,8 @@ type ComposerState = {
   nativePdfs?: NativePdfAttachment[];
   attachedDiagnostics?: AttachedDiagnostics | null;
   issuesEnabled?: boolean;
-  enableProblemsContext?: boolean;
+  autoAttachProblems?: boolean;
+  autoAttachActiveFile?: boolean;
   issuesAttachment?: IssueAttachment | null;
   extensionContexts?: ExtensionContext[];
   inlineProblems?: InlineProblemAttachment[];
@@ -109,6 +110,7 @@ type ComposerState = {
 };
 
 export type SessionSendBody = {
+  followupTitle?: string;
   messageID?: string;
   parts: Array<{
     type: string;
@@ -125,7 +127,12 @@ export type SessionSendBody = {
   queuedMessageDispatch?: { itemId: string; lease: number };
 };
 
-type SendFlowOptions = { noReply?: boolean; delivery?: 'steer' | 'queue'; omitContext?: boolean };
+type SendFlowOptions = {
+  noReply?: boolean;
+  delivery?: 'steer' | 'queue';
+  omitContext?: boolean;
+  followupTitle?: string;
+};
 
 export type QueuedAttachmentSnapshot = Pick<
   QueuedMessage,
@@ -337,7 +344,7 @@ export function buildSessionSendBody(
   );
   const inlineProblems = normalized.references;
   const problemText =
-    composerState.enableProblemsContext === false
+    composerState.autoAttachProblems === false
       ? inlineProblems.reduce(
           (value, reference) => value.replaceAll(problemReferenceMarker(reference), ''),
           normalized.text
@@ -348,7 +355,7 @@ export function buildSessionSendBody(
       ? null
       : composerState.issuesAttachment;
   const includeProblemReference =
-    composerState.enableProblemsContext !== false &&
+    composerState.autoAttachProblems !== false &&
     (!!attachedProblems ||
       (!!capturedProblems && (capturedProblems.inline || composerState.issuesEnabled !== false)));
   const promptText = getPromptTextForClipboardImages(
@@ -380,6 +387,7 @@ export function buildSessionSendBody(
   const selection = composerState.editorContext.selection;
   const activeFile = composerState.editorContext.activeFile;
   const currentDocumentEnabled = isCurrentDocumentEnabled(sessionId);
+  const activeFileEnabled = currentDocumentEnabled && composerState.autoAttachActiveFile !== false;
   const editorText = composerState.editorContext.editorText;
   const databaseContext = composerState.editorContext.databaseContext;
   const extensionContexts = captureExtensionContexts(
@@ -395,7 +403,7 @@ export function buildSessionSendBody(
     // The provider owns active context. Supplemental providers retain ordinary file context.
   } else if (databaseContext && currentDocumentEnabled) {
     parts.push({ type: 'text', text: formatDatabaseContext(databaseContext) });
-  } else if (editorText && currentDocumentEnabled) {
+  } else if (editorText && activeFileEnabled) {
     const range = `lines ${editorText.range.startLine}-${editorText.range.endLine}`;
     const source = editorText.kind === 'selection' ? 'Unsaved selection' : 'Unsaved buffer';
     const truncation = editorText.truncated ? '; truncated' : '';
@@ -406,7 +414,7 @@ export function buildSessionSendBody(
       type: 'text',
       text: `[${source} from ${editorTextPath} ${range}${truncation}]\n${fenceAttachmentText(editorText.text, editorText.language || 'text')}`,
     });
-  } else if (activeFile && currentDocumentEnabled) {
+  } else if (activeFile && activeFileEnabled) {
     const activeFilePath = getAttachmentReference(
       { path: activeFile.path, type: 'file' },
       workspacePath
@@ -447,7 +455,7 @@ export function buildSessionSendBody(
 
   const terminalSelection = composerState.terminalSelection;
   if (
-    composerState.enableProblemsContext !== false &&
+    composerState.autoAttachProblems !== false &&
     (capturedProblems?.inline || composerState.issuesEnabled !== false) &&
     !attachedProblems &&
     !(
@@ -468,7 +476,7 @@ export function buildSessionSendBody(
     });
   }
 
-  if (composerState.enableProblemsContext !== false && attachedProblems) {
+  if (composerState.autoAttachProblems !== false && attachedProblems) {
     const attached = attachedProblems;
     parts.push({
       type: 'text',
@@ -476,7 +484,7 @@ export function buildSessionSendBody(
     });
   }
 
-  if (composerState.enableProblemsContext !== false) {
+  if (composerState.autoAttachProblems !== false) {
     for (const reference of inlineProblems)
       parts.push({ type: 'text', text: formatInlineProblem(reference) });
   }
@@ -517,7 +525,7 @@ export function buildSessionSendBody(
         });
         continue;
       }
-      if (currentDocumentEnabled && isSamePath(attachment.file.path, activeFile?.path)) continue;
+      if (activeFileEnabled && isSamePath(attachment.file.path, activeFile?.path)) continue;
       const fileReference = getAttachmentReference(attachment.file, workspacePath);
       parts.push({
         type: 'text',
@@ -579,6 +587,7 @@ function buildRoutedSendBody(
   options?: SendFlowOptions
 ): SessionSendBody {
   const body: SessionSendBody = { parts };
+  if (options?.followupTitle) body.followupTitle = options.followupTitle;
   if (agent) body.agent = agent;
   if (model) body.model = { providerID: model.providerID, modelID: model.modelID };
   if (model?.variant)
@@ -1040,6 +1049,19 @@ export class SessionSendOperations {
       modelVariantSelections,
     });
     const capturedAttachments = captureComposerAttachments(options?.queuedAttachments);
+    const queuedContext = options?.queuedContext;
+    if (!appStore.state.autoAttachActiveFile && queuedContext?.currentDocumentEnabled) {
+      const activePath = queuedContext.editorContext.activeFile?.path;
+      const autoAttachedPath = queuedContext.autoAttachedFilePath;
+      const ranges = getSelectionRangesFromEditorContext(queuedContext.editorContext.selection);
+      capturedAttachments.snapshot.droppedFiles = capturedAttachments.snapshot.droppedFiles.filter(
+        (file) =>
+          !isSamePath(file.path, autoAttachedPath ?? activePath) ||
+          (!autoAttachedPath &&
+            (file.attachmentSequence !== undefined ||
+              JSON.stringify(file.lineRanges ?? []) !== JSON.stringify(ranges)))
+      );
+    }
     const sourceEditorContext =
       options?.queuedContext?.editorContext ?? appStore.state.editorContext;
     const capturedComposerState: ComposerState = {
@@ -1067,7 +1089,8 @@ export class SessionSendOperations {
       },
       ...capturedAttachments.snapshot,
       issuesEnabled: options?.queuedContext?.issuesEnabled ?? appStore.state.issuesEnabled,
-      enableProblemsContext: appStore.state.enableProblemsContext,
+      autoAttachProblems: appStore.state.autoAttachProblems,
+      autoAttachActiveFile: appStore.state.autoAttachActiveFile,
       allAgents: appStore.state.allAgents.map((agent) => ({
         ...agent,
         model: agent.model ? { ...agent.model } : undefined,
@@ -1226,6 +1249,7 @@ export class SessionSendOperations {
             agent: original.info.agent,
             model: original.info.model,
             variant: original.info.model.variant,
+            followupTitle: original.info.followupTitle,
           });
           await Promise.all([
             this.deps.syncSession(targetSessionId),
@@ -1380,7 +1404,13 @@ export async function sendMessageWithDependencies(
     }
 
     deps.clearSessionUsageLimit(sessionId);
-    if (deps.getActiveSessionId() === sessionId && !options?.preserveScrollPosition) {
+    // Steering continues the current turn and must not reattach a detached reader,
+    // including when admission arrives after they scroll away from the pending steer.
+    if (
+      !isSteerDelivery &&
+      deps.getActiveSessionId() === sessionId &&
+      !options?.preserveScrollPosition
+    ) {
       deps.requestMessageListScrollToBottom(
         expectsAssistantReply && optimisticMessage ? messageId : undefined
       );
@@ -1560,6 +1590,7 @@ function createOptimisticUserMessage(
       role: 'user',
       pendingDelivery: body.delivery === 'steer' ? 'steer' : undefined,
       delivery: body.delivery,
+      followupTitle: body.followupTitle,
       time: { created },
       agent,
       model: optimisticModel,

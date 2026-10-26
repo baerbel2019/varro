@@ -10,7 +10,7 @@ V2 is recommended for new installations; v1 remains supported. See the [usage gu
 - `open-code-process.ts` retains credentials in the private ownership lease for window handoff and reads registered local service credentials. CLI update lookup and recovery commands select the matching package family.
 - `open-code-transport.ts` authenticates health, REST, and SSE requests and selects the adapter from validated server responses.
 - `opencode-v2-adapter.ts`, `opencode-v2-projection.ts`, and `opencode-v2-events.ts` translate requests, transcript records, catalogs, permissions, forms, and events into the existing Varro contracts.
-- `opencode-v2-session-state.ts` persists Varro-owned metadata and timestamp overrides across the supported v2 range. Native metadata updates are available from 2.0.15, but Varro still uses local annotations under the user's XDG state directory in `varro/opencode-v2/`.
+- `opencode-v2-session-state.ts` persists Varro-owned metadata and legacy timestamp overrides under the user's XDG state directory in `varro/opencode-v2/`. Native metadata updates are available from 2.0.15, but Varro still uses local metadata annotations. Archive changes use the native API when the server advertises its archive field; older servers retain local archive annotations.
 - Native v2 agent and permission configuration keys are preserved when Varro edits a file already using them. V1-format files retain their format.
 
 Session-info statistics try the local SQLite database before fetching API histories.
@@ -25,7 +25,7 @@ update does not block later deletion. Cancelled updates check their signal befor
 reading, and before replacing the annotation file, so cancellation while queued or preparing a write
 does not commit that update.
 
-`npm run test:compatibility:adapters` installs published binaries into isolated directories and tests the production adapters. The current tested versions are v1 `1.19.3` and v2 `2.0.32`, alongside the v1 `1.16.0` and v2 `2.0.5` support floors. Release-specific results are recorded below. The checks cover managed startup, credential recovery in a second window, restart, multi-window recovery after process exit, bootstrap, workspace path encoding, v2 configuration precedence, session updates, deterministic streamed model responses, actual fixture-only tool execution, message pagination, tail editing, helper generation, fork/revert, deletion, and native v2 permissions/forms. The generated report is `artifacts/opencode-adapters/verified.json`.
+`npm run test:compatibility:adapters` installs published binaries into isolated directories and tests the production adapters. The current tested versions are v1 `1.19.4` and v2 `2.1.4`, alongside the v1 `1.16.0` and v2 `2.0.5` support floors. Release-specific results are recorded below. The checks cover managed startup, credential recovery in a second window, restart, multi-window recovery after process exit, bootstrap, workspace path encoding, v2 configuration precedence, session updates, deterministic streamed model responses, actual fixture-only tool execution, message pagination, tail editing, helper generation, fork/revert, deletion, and native v2 permissions/forms. The generated report is `artifacts/opencode-adapters/verified.json`.
 
 Fresh VS Code sandbox windows passed `v2-first-run` and the existing `healthy-first-run` scenario. These editor checks verify activation, ownership, health, and event-stream connection. `test:compatibility:ui` additionally exercises the actual composer, successful replies, pre-turn failures, HTTP 401 handling, recovery through a working provider, and reopening history. Full visual streaming performance remains a separate verification task.
 
@@ -83,6 +83,409 @@ resolve to `literal/directory`. V2 location queries retain their normal URL enco
 The released-server adapter tests cover exact workspace resolution for Japanese text, emoji,
 and literal percent escapes. Unit tests also cover header construction with embedded newlines
 and preservation of Windows separators and casing.
+
+### 2.1.4 compatibility review
+
+Reviewed v2.1.3 to v2.1.4, `e965774fa` through `2a3e7c0f3`. All 121 existing
+OpenAPI routes are unchanged. SSE names and payloads, session/message/inbox shapes, permissions/forms,
+and managed `serve`/upgrade arguments remain compatible. No adapter changes are
+required. V1 `1.19.4` is still the latest published v1 release; both support floors
+remain unchanged.
+
+V2 adds experimental client-hosted MCP connections, heap-dump diagnostics, and
+opt-in background compaction. These additions require no Varro integration for
+existing behavior. Server-owned fixes cover MCP elicitation event locations,
+OAuth callbacks and timeouts, MCP startup/shutdown, compaction overflow recovery,
+native agent-file detection, agent model selection, and imported v1 project
+ownership. ChatGPT model filtering and context caps remain server-owned catalog
+behavior. App/TUI changes are optional parity work.
+
+The complete upstream diff is retained in `artifacts/opencode-2.1.4-upstream.diff`.
+The development/CI Node pin remains `24.22.0`; supported Node floors are unchanged.
+
+The published-server adapter matrix passed all 149 applicable checks, with 47
+family/platform skips and no leaked or recovered processes. Evidence is
+`artifacts/opencode-2.1.4-adapters.log` and
+`artifacts/opencode-adapters/run-lva5LK/`.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 19 | None in tested cases | Yes, applicable automated cases |
+| v1.19.4 | 31 | 18 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 42 | 7 | None in tested cases | Yes, applicable automated cases |
+| v2.1.4 | 46 | 3 | None in tested cases | Yes, applicable automated cases |
+
+All 1,059 focused tests and five compatibility-summary tests passed.
+`npm run lint`, `npm run fmt`, `npm run lint:check`, `npm run typecheck`,
+`npm run typecheck:suggestions`, and `npm run build` passed. Logs use the
+`artifacts/opencode-2.1.4-` prefix. The v1 dependency is unchanged, so the Docker
+v1 support-range matrix was not rerun. Real-editor, visual streaming, live-model
+action parity, and native Windows checks were not run for this bump.
+
+The full `npm run test` run passed 10,603 tests, skipped 51, and failed one:
+`src/extension/macos-tray.test.ts` could not discover a Unix socket created after
+the publisher started. It expected one snapshot but received none. The failure
+reproduced in isolated file and single-case runs on Node `24.22.1`; all 24 tray
+tests passed with the same dependency tree on Node `24.22.0`. Evidence is
+`artifacts/opencode-2.1.4-unit-tests.log`,
+`artifacts/opencode-2.1.4-macos-tray-recheck.log`,
+`artifacts/opencode-2.1.4-macos-tray-node-baseline.log`, and
+`artifacts/opencode-2.1.4-macos-tray-volta-target.log`. This is a Node-version-linked
+macOS discovery issue, not an OpenCode adapter failure. Next, compare a minimal
+`fs.watch` reproduction on both Node versions and check whether the event is lost
+or the publisher ignores it. Tray implementation changes are outside this bump.
+The Node `24.22.1` pin was reverted to `24.22.0` because of this failure; the
+OpenCode version update is retained.
+
+### 2.1.3 and 1.19.4 compatibility review
+
+Reviewed v2.1.2 to v2.1.3, `4b50f5cc` through `e965774f`, and v1.19.3 to
+v1.19.4, `e3c4eb24` through `148842ef`. Consumed HTTP routes, SSE names and
+envelopes, session/message/inbox shapes, permissions/forms, and managed
+`serve`/upgrade arguments remain compatible. No adapter changes are required.
+Support floors remain v2 `2.0.5` and v1 `1.16.0`.
+
+V2 adds experimental voice-model discovery and hosted voice instruction updates,
+which Varro does not consume. The OpenAPI document also adds the existing optional
+`retryAfterMs` error field. Server-owned fixes cover provider `baseURL` precedence,
+compaction output limits, title generation, legacy `apply_patch` permission
+migration, unsupported agent colors, relative-directory migration, MCP resource
+handling, and instruction deltas. The Windows shared-service default port changes
+to `28894`; Varro discovers registered endpoints and passes its managed port
+explicitly, so it does not depend on the old default. App/TUI highlighting,
+scrolling, and styling changes remain optional parity work.
+
+Both releases bundle Bun `1.4.4`. V1 otherwise changes packaging, native file-search
+dependencies, and test setup without changing its HTTP API or generated SDK.
+Complete upstream diffs are retained in `artifacts/opencode-2.1.3-upstream.diff`
+and `artifacts/opencode-1.19.4-upstream.diff`.
+
+The Docker support-range run passed all 519 required checks across 14 published
+v1 releases, including 43/43 on `1.19.4` and 37/37 on the `1.16.0` floor. Advisory
+checks passed 76/78; `1.16.0` and the below-floor `1.15.13` still fail the MCP
+tool-discovery pagination advisory. No required-check boundary was found, so this
+does not justify changing the support floor. The runner regenerated
+`scripts/opencode-compatibility/verified.json`; all five shared summary tests
+passed afterward. Evidence is `artifacts/opencode-1.19.4-compatibility.log`.
+
+The published-server adapter matrix completed with 147 passed, two failed, and 47
+family/platform skips. No processes leaked. V2.1.3 installed and ran as a native
+macOS ARM64 binary.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 19 | None in tested cases | Yes, applicable automated cases |
+| v1.19.4 | 31 | 18 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 42 | 7 | None in tested cases | Yes, applicable automated cases |
+| v2.1.3 | 44 | 3 | Two managed-restart failures; both passed one isolated rerun | Yes, applicable automated cases |
+
+The original matrix exited with code 1. In the `configured` and `desktop-service`
+cases, the SSE connection phase failed after inherited attachment, and managed restart then
+reported `Cannot verify executable identity for managed OpenCode PID`. Cleanup
+subsequently reported an ownership-lease mismatch, masking the earlier error in
+the test output. Both cases passed one isolated rerun with no leaked processes.
+The original run did not identify the cause; the follow-up below fixes a
+deterministically reproduced shutdown race with the same identity error.
+
+Evidence is `artifacts/opencode-2.1.3-adapters.log`,
+`artifacts/opencode-adapters/run-YB2lgK/`,
+`artifacts/opencode-2.1.3-startup-recheck.log`, and the original isolated fixtures
+`artifacts/ai-test-data/startup-qPZmax/` and `startup-mD88xg/`. The original failed
+result remains in the retained log and per-version run directory; the generated
+`artifacts/opencode-adapters/verified.json` describes the latest matrix.
+
+All 303 focused adapter, transcript, inbox, transport, message, and API-capability
+tests passed. The five shared compatibility-summary tests also passed after both
+published-server runs completed. `npm run lint`, `npm run fmt`,
+`npm run lint:check`, `npm run typecheck`, `npm run typecheck:suggestions`, and
+`npm run build` passed. Logs use the `artifacts/opencode-2.1.3-` prefix. Real-editor,
+visual streaming, live-model action parity, and provider sign-in checks were not
+run for this bump.
+
+#### Follow-up restart fix
+
+Owned shutdown can observe a listener PID just before the signalled process
+exits, then fail to read its executable or birth identity. The post-signal wait
+now accepts a fresh process-existence check confirming exit instead of reporting
+failed identity verification. Pre-signal checks remain unchanged. Missing identity
+on a still-live process still rejects cleanup, retains the lease, and never
+authorizes escalation. Four regression cases cover both missing identities and
+both exited/live outcomes. The exited cases fail before the fix and pass afterward;
+evidence is `artifacts/opencode-2.1.3-stop-race-{baseline,fixed}.log`.
+
+Startup-fixture cleanup now preserves the original scenario error alongside
+cleanup failures rather than replacing it. Two unit cases cover preserving both
+errors, completing later cleanup, and leaving a successfully cleaned-up scenario's
+original failure intact.
+
+All 799 focused lifecycle, transport, ownership, process-inspection, and cleanup
+tests passed. `npm run lint`, `npm run fmt`, `npm run lint:check`,
+`npm run typecheck`, `npm run typecheck:suggestions`, and `npm run build` passed.
+Follow-up logs use the `artifacts/opencode-2.1.3-fix-` prefix.
+
+Both formerly failing native v2.1.3 startup cases passed three consecutive
+isolated repetitions, six checks total, with no recovered or leaked processes.
+Evidence is `artifacts/opencode-2.1.3-fix-startup-repeats.json` and the corresponding
+`startup-repeat-{1,2,3}.log` files.
+
+The first follow-up matrix passed the v2.1.3 cases but exposed a separate
+credential-only reconnection race on v2.0.5. Background ownership preparation
+published a new registration object with unchanged credentials while SSE
+verification was pending, which incorrectly rejected the connection as changed.
+The failing attachment's actual error is retained in
+`artifacts/ai-test-data/startup-1T40X3/failure.json`; its run is
+`artifacts/opencode-2.1.3-fix-adapters.log`.
+
+Credential publication now preserves registration identity when the endpoint,
+record path, source, discovery mode, saved port, password, and effective username
+are unchanged. It still revalidates enforced authentication. Changed evidence and
+reset still invalidate pending checks, and attachment never gains lifecycle rights.
+Two deterministic interleaving tests fail before this fix and pass afterward for
+lease and credential-companion recovery; four safety cases reject concurrent
+password, username, endpoint, and reset changes. Evidence is
+`artifacts/opencode-2.1.3-credential-race-{baseline,fixed}.log`.
+
+The final published-server matrix passed all 149 applicable checks, with 47
+family/platform skips and no leaked or recovered processes. All five shared
+summary tests passed after it completed. The formerly failing native v2.0.5
+credential-only case also passed three consecutive isolated repetitions.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 19 | None in final tested cases | Yes, applicable automated cases |
+| v1.19.4 | 31 | 18 | None in final tested cases | Yes, applicable automated cases |
+| v2.0.5 | 42 | 7 | Credential-only race fixed | Yes, applicable automated cases |
+| v2.1.3 | 46 | 3 | Post-signal shutdown race fixed | Yes, applicable automated cases |
+
+Final evidence is `artifacts/opencode-2.1.3-fix-final-adapters.log`,
+`artifacts/opencode-adapters/run-yKOWGj/`,
+`artifacts/opencode-2.1.3-fix-credential-repeats.json`, and
+`artifacts/opencode-2.1.3-fix-summary-tests.log`. No further product fixes are
+indicated by these automated cases. Real-editor, visual streaming, live-model
+action parity, and native Windows verification were not run for this follow-up.
+
+The MCP pagination advisories require an upstream upgrade, not a Varro adapter
+change. The published `1.16.0` implementation maps a single `listTools` response
+directly to its tools and ignores `nextCursor`; the retained source is
+`artifacts/opencode-1.16.0-mcp-source.ts`. Current tested versions pass that check.
+The usage guide now explains the limitation and upgrade remedy. Historical
+advisory results and support floors remain unchanged.
+
+### 2.1.2 compatibility review
+
+Reviewed v2.1.1 to v2.1.2, `133b1ebf` through `4b50f5cc`. Consumed local
+HTTP routes, SSE names and envelopes, session/message/inbox shapes,
+permissions/forms, and managed `serve`/upgrade arguments remain compatible.
+Structured errors add optional `retryAfterMs` and the `provider.free-limit`
+type. Varro's existing error projection preserves the message and HTTP status;
+the new "Free usage limit reached" message matches its existing usage-limit
+notice. The projection does not retain `retryAfterMs`, so a server-supplied reset
+countdown and prompt recall remain optional UI parity work.
+
+The follow-up review reproduced a model-picker bug against the published 2.1.2
+server: configuration fallback restored free OpenCode/Go models omitted by the
+native catalog with `OPENCODE_DISABLE_FREE_MODELS=true`. The adapter now treats
+that catalog's exclusions as authoritative for `opencode` and `opencode-go` on
+2.1.2 and later, using the version from validated transport health. It still
+merges overrides into returned models and retains configuration fallback for
+older servers and custom providers. The version is cleared on adapter reset.
+Unit coverage checks both catalog routes, older/current versions, custom models,
+returned-model overrides, and reset. The isolated released-server regression
+failed before the fix and passed afterward; logs are
+`artifacts/opencode-2.1.2-free-models-baseline.log` and
+`artifacts/opencode-2.1.2-free-models-fixed.log`.
+
+The release removes the legacy Console inference proxy. OpenCode Go quota polling
+now calls `https://opencode.ai/inference/go/v1/usage`, the destination used by the
+removed proxy. Its existing request/response regression checks the new URL, bearer
+authentication, usage percentages, and reset times. Unauthenticated probes of both
+URLs returned JSON 401 responses during review; authenticated live quota polling
+was not verified.
+
+Server-owned changes keep locations loaded during active sessions and background
+jobs, add `experimental.location_idle_timeout`,
+generate titles with lower reasoning variants, restore legacy Console credentials,
+and fix Code Mode job ordering. Provider decoding, realtime requests, app/TUI
+free-limit dialogs, Electron, Console, and release tooling need no further adaptation.
+
+The tested v2 client is `2.1.2`; v1 remains `1.19.3`. Support floors remain
+v2 `2.0.5` and v1 `1.16.0`. The unchanged v1 SDK does not require a new Docker
+support-range run. The optional editor sandbox reads its expected version from
+the selected binary.
+
+All 305 focused Go quota, provider-limit, transport, v2 adapter, transcript, and
+inbox tests passed. `npm run lint`, `npm run fmt`, `npm run lint:check`,
+`npm run typecheck`, `npm run typecheck:suggestions`, and `npm run build` passed.
+The first combined lint/format command reported an output-parser error; running
+lint with retained output and formatting separately succeeded. Evidence is
+`artifacts/opencode-2.1.2-focused-tests.log`,
+`artifacts/opencode-2.1.2-lint.log`, `artifacts/opencode-2.1.2-lint-check.log`,
+and `artifacts/opencode-2.1.2-build.log`.
+
+The initial published-server adapter matrix passed all 148 applicable checks, with 44
+family/platform skips and no leaked processes. V2.1.2 installed and ran as a
+native macOS ARM64 binary. All five shared compatibility-summary tests passed
+after the matrix completed.
+
+Follow-up alignment validation passed 322 focused tests, the 924-test startup
+checklist, and all 15 startup/MCP/reload/busy Playwright cases. `npm run lint`,
+`npm run fmt`, `npm run lint:check`, `npm run typecheck`,
+`npm run typecheck:suggestions`, and `npm run build` passed. Retained logs use the
+`artifacts/opencode-2.1.2-alignment-` prefix. The startup and focused runs overlap
+in transport coverage; their counts are not a count of unique tests.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 29 | 19 | One ownership-unavailable SSE startup failure; isolated rerun passed | Yes, applicable automated cases |
+| v1.19.3 | 30 | 18 | One ownership-unavailable SSE startup failure; isolated rerun passed | Yes, applicable automated cases |
+| v2.0.5 | 42 | 7 | None in tested cases | Yes, applicable automated cases |
+| v2.1.2 | 46 | 3 | None in tested cases | Yes, applicable automated cases |
+
+The table records the follow-up matrix, which exited with code 1: 147 passed,
+two failed, and 47 skipped, with no leaked processes. Both V2 runs passed,
+including the new free-model regression on 2.1.2. Both V1 failures occurred
+during repeated ownership-unavailable reconnection after successful HTTP health
+and session reads; each passed one isolated rerun. Their cause remains unresolved.
+Recommended follow-up is to retain the attached window's status/error and SSE
+admission diagnostics at the failing assertion, then reproduce repeated V1
+credential-only reconnection. Current failure snapshots retain the stopped owner
+status rather than the attached window's error.
+
+Evidence is `artifacts/opencode-2.1.2-alignment-adapters.log`,
+`artifacts/opencode-adapters/verified.json`, and
+`artifacts/opencode-2.1.2-alignment-v1-{floor,current}-recheck.log`. Original failure
+evidence is under `artifacts/ai-test-data/startup-PY9R01` and `startup-NGYDyp`.
+All five shared compatibility-summary tests passed after the follow-up matrix.
+The initial successful matrix remains in `artifacts/opencode-2.1.2-adapters.log`.
+Real-editor, visual streaming, and live provider sign-in checks were not run for
+this bump.
+
+### 2.1.1 compatibility review
+
+#### Optional archive and saved-permission support
+
+Varro checks the connected server's OpenAPI request schemas rather than raising
+the support floor. Archive writes map the common `time.archived` timestamp or
+`null` restore into native `PATCH /api/session/{sessionID}` with `archived: true`
+or `false`. The server owns the confirmed timestamp. Native `session.archived`
+and `session.unarchived` events trigger a guarded session-header refresh without
+starting transcript activity. Older V2 servers keep the local annotation path;
+V1 transport behavior is unchanged.
+
+On capable servers, native archive state, including an absent timestamp after
+restore, takes precedence over an old local archive annotation. Legacy files
+remain intact for older servers. Merely reading history never migrates archives
+or patches production sessions; explicitly archiving a session publishes its
+state to the server. The session list's age-based **Archive** section and the
+Recycle Bin keep their existing meanings. The legacy include-archived list query
+is not forwarded as native `archived=true`, which means archived-only and would
+otherwise omit active sessions from usage reports.
+
+The Permissions screen offers saved-allowance editing only when the server
+advertises `PATCH /api/permission/saved/{id}` with action/resource fields.
+Edits remain project-checked, apply only to user-managed saved allowances, and
+leave session/project rules untouched. Native IDs keep edited scopes visible
+across refreshes and edits from other clients. Unsupported servers retain their
+existing list/remove behavior, and legacy restart-only allowances cannot be edited.
+Conflicts and failed edits preserve the UI draft. No saved-permission event is
+assumed; the screen refreshes on opening and after successful mutations.
+
+Focused coverage lives in `opencode-api-capabilities.test.ts`,
+`opencode-v2-archive.test.ts`, the REST proxy and permission-panel tests, and the
+released-server archive/edit cases in `opencode-v2.integration.test.ts`.
+
+Follow-up verification passed 1,060 focused tests, 13 permission E2E checks, and
+all 148 applicable released-server adapter/startup checks across V1.16.0,
+V1.19.3, V2.0.5, and V2.1.1, with 44 family/platform skips. V2.1.1 ran as a
+native macOS ARM64 binary. The new archive fallback passed on V2.0.5, and native
+archive/restore events and saved-permission editing passed on V2.1.1. Evidence is
+`artifacts/archive-permissions-adapters-rerun.log` and
+`artifacts/opencode-adapters/verified.json`. The first attempt hit its outer
+two-minute command timeout; its two detached fixture servers were removed through
+installation-scoped process cleanup before the longer rerun. Build, lint,
+formatting, typecheck, suggestion checks, and compatibility-summary tests passed.
+
+#### Release review
+
+Reviewed v2.0.32 to v2.1.1, `843a6c51` through `133b1ebf`, including the
+intentional 2.1 HTTP, event, and generated-client contract changes. Tool lifecycle
+events now project `native` replay data into Varro's existing call/result fields,
+with the pre-2.1 `state` and `resultState` fallback retained. Regression tests
+cover called, successful, and failed tools on both shapes.
+
+Text/reasoning and assistant replay fields also become `native`, but Varro does
+not consume those opaque fields. Compaction no longer requires `recent`; the
+server owns kept-message references and native replacement windows. Updated typed
+fixtures retain the existing compaction divider and status checks. The removed
+transitional `session.compacted` event was not consumed by the v2 adapter.
+
+Key credentials drop `configuration` in favor of `metadata`. Varro already sends
+typed answers through the unchanged integration connection endpoints, rather than
+writing key credentials directly. Session archive filtering, saved-permission
+editing, Gemini Live voice, and experimental todos add optional functionality;
+this bump does not add those controls. Consumed request paths, SSE envelopes,
+inbox operations, permission/form replies, and managed `serve` flags remain
+compatible.
+
+Server-owned changes improve compaction context and cache reuse, shell completion
+ordering, retry handling, provider stream decoding, skill discovery, filesystem
+access failures, and provider reasoning variants. Catalog refreshes and SDK plugin
+updates are broadcast globally. Windows persistent terminals and app, desktop,
+TUI, Console, documentation, and build-tooling changes need no further adaptation.
+
+The tested v2 client is `2.1.1`; v1 remains `1.19.3`. Support floors remain
+v2 `2.0.5` and v1 `1.16.0`. The unchanged v1 SDK does not require a new Docker
+support-range run. Historical version observations remain unchanged, and the
+optional editor sandbox reads its expected version from the selected binary.
+
+All 10,378 unit tests and 270 script tests passed, with 48 and three skips
+respectively. The final focused rerun passed all 346 adapter, transcript, inbox,
+streaming-tool, and message-rendering tests. `npm run lint`, `npm run fmt`,
+`npm run fmt:check`, `npm run lint:check`, `npm run typecheck`,
+`npm run typecheck:suggestions`, and `npm run build` passed. All five shared
+compatibility-summary tests passed after the final published-server reruns.
+
+The adapter runner now writes an isolated manifest allowing only the exact CLI
+version's install script. npm 12 otherwise leaves the CLI's non-executable
+placeholder installed, producing `spawn ENOEXEC` before any contract check.
+No global npm trust settings change.
+
+The native matrix could not install `@opencode/cli-darwin-arm64@2.1.1`, which
+was absent from npm on October 20, 2026 despite the CLI and client release being
+published. A separate exact-version macOS x64 binary ran under Rosetta and
+passed all 43 applicable checks, with three family/platform skips. The isolated
+VS Code `v2-first-run` scenario also passed against that binary. This verifies
+released-server behavior, not native ARM64 installation or execution. Retry the
+native matrix once upstream publishes the missing package. The installation
+failure stops the runner before it writes a new `verified.json`; use this run's
+logs rather than the earlier report.
+
+Across the completed per-version runs, all 145 applicable checks passed, with
+39 family/platform skips:
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 16 | None in tested cases | Yes, applicable automated cases |
+| v1.19.3 | 31 | 15 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 41 | 5 | Initial recovery assertion failed; focused and full reruns passed | Yes, applicable automated cases on rerun |
+| v2.1.1, macOS x64 under Rosetta | 43 | 3 | None in tested cases | Yes, applicable automated cases |
+| v2.1.1, native macOS ARM64 | Not run | Not run | Missing published platform package | No |
+
+The initial v2.0.5 `credential-port-replacement` check expected an attach-only
+restart rejection but received a successful connection URL. The single-case
+rerun and the complete 41-check floor rerun passed without a product change.
+If it recurs, record the attached server's status and pending preparation at the
+restart boundary to distinguish reconnection from lifecycle ownership. Initial
+evidence is `artifacts/ai-test-data/startup-ThkEWE/`; rerun logs are
+`artifacts/opencode-2.1.1-floor-recovery-rerun.log` and
+`artifacts/opencode-2.1.1-floor-adapters-rerun.log`.
+
+Evidence is `artifacts/opencode-2.1.1-all-tests.log`,
+`artifacts/opencode-2.1.1-script-tests.log`,
+`artifacts/opencode-2.1.1-adapters-final.log`,
+`artifacts/opencode-2.1.1-x64-adapters.log`, and
+`artifacts/opencode-2.1.1-editor-startup.log`. Full visual streaming and live
+provider sign-in checks were not run for this bump.
 
 ### 2.0.32 and 1.19.3 compatibility review
 

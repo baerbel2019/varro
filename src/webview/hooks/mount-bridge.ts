@@ -116,8 +116,11 @@ export function createMountBridgeOperations(deps: {
         },
         setConfig: (payload) => {
           applyChatFontConfig(payload);
-          if (payload.enableProblemsContext !== undefined) {
-            appStore.setState('enableProblemsContext', payload.enableProblemsContext);
+          if (payload.autoAttachProblems !== undefined) {
+            appStore.setState('autoAttachProblems', payload.autoAttachProblems);
+          }
+          if (payload.autoAttachActiveFile !== undefined) {
+            appStore.setState('autoAttachActiveFile', payload.autoAttachActiveFile);
           }
           if (payload.showFileDiffs !== undefined) {
             uiStore.setShowFileDiffs(payload.showFileDiffs);
@@ -140,6 +143,12 @@ export function createMountBridgeOperations(deps: {
           }
           if (payload.promptCompletionModel !== undefined) {
             appStore.setState('promptCompletionModel', payload.promptCompletionModel);
+          }
+          if (payload.followupsEnabled !== undefined) {
+            appStore.setState('followupsEnabled', payload.followupsEnabled);
+          }
+          if (payload.followupModel !== undefined) {
+            appStore.setState('followupModel', payload.followupModel);
           }
           if (payload.debugShowQuotaWarning !== undefined) {
             appStore.setState('debugShowQuotaWarning', payload.debugShowQuotaWarning);

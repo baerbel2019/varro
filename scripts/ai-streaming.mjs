@@ -136,9 +136,39 @@ export function inspectCapture(capture, timing = {}) {
   const boundaries = [];
   const seen = new Set();
   const toolStates = new Map();
+  const nativeTools = new Map();
   for (const [index, entry] of timeline.entries()) {
     scheduledMs += entry.delayMs;
     const { type, properties } = entry.event;
+    const native =
+      /^session\.next\.(text|reasoning|tool)\.(started|input\.started|called|success|failed)$/.exec(
+        type
+      );
+    if (native) {
+      const partType = native[1];
+      const phase = native[2];
+      const partID =
+        properties.callID ?? properties.textID ?? properties.reasoningID ?? properties.id;
+      if (partType === 'tool' && phase === 'input.started')
+        nativeTools.set(partID, properties.name);
+      const states = {
+        'input.started': 'pending',
+        called: 'running',
+        success: 'completed',
+        failed: 'error',
+      };
+      boundaries.push({
+        afterEvents: index + 1,
+        scheduledMs,
+        type,
+        messageID: properties.assistantMessageID,
+        partID,
+        partType,
+        tool: partType === 'tool' ? nativeTools.get(partID) : undefined,
+        state: partType === 'tool' ? states[phase] : undefined,
+      });
+      continue;
+    }
     const part = properties?.part;
     const state = part?.state?.status;
     const firstPart = part && !seen.has(part.id);
@@ -347,10 +377,64 @@ export function isSidebarContext(context) {
 }
 
 export function readRouteEvidence() {
-  const context = globalThis.__initialWebviewState?.webviewContext ?? null;
+  const initial = globalThis.__initialWebviewState;
+  const context = initial?.webviewContext ?? null;
+  const stored = globalThis.__vscodeWebviewState?.getState() ?? {};
+  const workspace = initial?.editorContext?.workspacePath;
+  // This function is serialized into the webview, so keep path normalization local.
+  // Match workspace-path.ts identities, not a session's (possibly nested) directory.
+  const identity = (workspacePath) => {
+    if (!workspacePath) return null;
+    let value = workspacePath;
+    const extended = value.match(/^(?:\\\\|\/\/)\?[\\/](.*)$/s);
+    if (extended) {
+      value = extended[1];
+      if (/^UNC[\\/]/i.test(value)) value = `//${value.slice(4)}`;
+      else if (!/^(?:[a-z]:[\\/]|Volume\{[^\\/]+\}[\\/])/i.test(value)) return null;
+    } else if (/^(?:\\\\|\/\/)\.[\\/]/.test(value) || /^[\\/]+\?\?[\\/]/.test(value)) return null;
+    let pathRoot = '';
+    let lower = false;
+    const drive = value.match(/^([a-z]):[\\/](.*)$/is);
+    const volume = extended && value.match(/^(Volume\{[^\\/]+\})[\\/](.*)$/is);
+    const unc = value.match(/^(?:\\\\|\/\/)([^\\/]+)[\\/]([^\\/]+)(?:[\\/](.*))?$/s);
+    if (drive || volume) {
+      const match = drive || volume;
+      pathRoot = drive ? `${match[1].toLowerCase()}:/` : `//?/${match[1].toLowerCase()}/`;
+      value = match[2];
+      lower = true;
+    } else if (unc) {
+      if ([unc[1], unc[2]].some((part) => ['.', '..', '?'].includes(part))) return null;
+      pathRoot = `//${unc[1].toLowerCase()}/${unc[2].toLowerCase()}`;
+      value = unc[3] ?? '';
+      lower = true;
+    } else if (value.startsWith('//') || value.startsWith('\\\\')) return null;
+    else if (value.startsWith('/')) {
+      pathRoot = '/';
+      value = value.slice(1);
+    }
+    const parts = [];
+    for (const part of value.split(lower ? /[\\/]+/ : /\/+/)) {
+      if (!part || part === '.') continue;
+      if (part === '..') {
+        if (parts.length > 0 && parts.at(-1) !== '..') parts.pop();
+        else if (!pathRoot) parts.push(part);
+      } else parts.push(lower ? part.toLowerCase() : part);
+    }
+    const suffix = parts.join('/');
+    return pathRoot
+      ? `${pathRoot}${suffix && !pathRoot.endsWith('/') ? '/' : ''}${suffix}`
+      : suffix || '.';
+  };
+  const hasScopedRoutes = Object.keys(stored).some((key) =>
+    key.startsWith('varro.lastOpenedView:')
+  );
+  // Sidebar routes are folder-scoped. Do not mistake a stale shared route for the
+  // selected session, or pick another folder when several scoped routes exist.
   const route =
-    globalThis.__vscodeWebviewState?.getState()?.['varro.lastOpenedView'] ??
-    JSON.parse(localStorage.getItem('varro.lastOpenedView') ?? 'null');
+    context?.surface === 'sidebar' && hasScopedRoutes
+      ? (stored[`varro.lastOpenedView:${identity(workspace)}`] ?? null)
+      : (stored['varro.lastOpenedView'] ??
+        JSON.parse(localStorage.getItem('varro.lastOpenedView') ?? 'null'));
   return {
     context,
     route,

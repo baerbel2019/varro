@@ -1068,6 +1068,29 @@ describe('parseExtensionMessage', () => {
     ).toBeNull();
   });
 
+  it.each([true, false, 'false', undefined])(
+    'accepts only boolean follow-up enablement values: %s',
+    (followupsEnabled) => {
+      const parsed = parseExtensionMessage({
+        type: 'config/update',
+        payload: {
+          followupsEnabled,
+          desktopSessionPaneSide: 'left',
+          defaultPermissionMode: 'default',
+          chatFontSize: 13,
+          chatEditorFontSize: 12,
+          chatFontFamily: 'default',
+        },
+      });
+      if (parsed?.type !== 'config/update') throw new Error('Expected a config update');
+      if (followupsEnabled === true || followupsEnabled === false) {
+        expect(parsed.payload.followupsEnabled).toBe(followupsEnabled);
+      } else {
+        expect(parsed.payload).not.toHaveProperty('followupsEnabled');
+      }
+    }
+  );
+
   it.each([true, false, 'true', undefined])(
     'accepts only boolean histogram opt-in values: %s',
     (showEmptyStateHistogram) => {
@@ -1104,7 +1127,8 @@ describe('parseExtensionMessage', () => {
           showEmptyStateHistogram: true,
           remoteImages: 'ask',
           debugShowQuotaWarning: true,
-          enableProblemsContext: false,
+          autoAttachProblems: false,
+          autoAttachActiveFile: false,
           desktopSessionPaneSide: 'left',
           defaultPermissionMode: 'full',
           chatFontSize: 13,
@@ -1122,7 +1146,8 @@ describe('parseExtensionMessage', () => {
         showEmptyStateHistogram: true,
         remoteImages: 'ask',
         debugShowQuotaWarning: true,
-        enableProblemsContext: false,
+        autoAttachProblems: false,
+        autoAttachActiveFile: false,
         desktopSessionPaneSide: 'left',
         defaultPermissionMode: 'full',
         chatFontSize: 13,

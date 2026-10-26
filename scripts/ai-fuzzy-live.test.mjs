@@ -52,6 +52,44 @@ const ready = {
   nestedActivityScroller: { hasRange: true },
 };
 
+test('AI-18 defaults to the current pinned fixture layout', async () => {
+  const { DEFAULT_AI18_FIXTURE_EDIT_PATH } = await import('./ai-fuzzy-live.mjs');
+  assert.equal(DEFAULT_AI18_FIXTURE_EDIT_PATH, 'packages/util/src/bom.ts');
+});
+
+test('composer replacement uses native select-all and verifies the exact input before Enter', async () => {
+  const controller = Object.create(CdpController.prototype);
+  const calls = [];
+  let value = '@old-file.ts ';
+  let selected = false;
+  controller.click = async () => true;
+  controller.readComposerText = async () => value;
+  controller.call = async (method, params) => {
+    calls.push({ method, params });
+    if (params.commands?.includes('selectAll')) selected = true;
+    if (method === 'Input.insertText') value = selected ? params.text : value + params.text;
+  };
+  assert.equal(await controller.sendComposerPrompt('/thinking'), true);
+  assert.equal(value, '/thinking');
+  assert.ok(calls.some((call) => call.params.commands?.includes('selectAll')));
+  assert.equal(calls.filter((call) => call.params.key === 'Enter').length, 2);
+});
+
+test('composer replacement never submits a contaminated or restored draft', async () => {
+  const controller = Object.create(CdpController.prototype);
+  const calls = [];
+  controller.click = async () => true;
+  controller.readComposerText = async () => 'old draft /thinking';
+  controller.call = async (method, params) => {
+    calls.push({ method, params });
+  };
+  await assert.rejects(controller.sendComposerPrompt('/thinking'), /composer.*match/i);
+  assert.equal(
+    calls.some((call) => call.params.key === 'Enter'),
+    false
+  );
+});
+
 test('awaits asynchronous frame observations before returning their values', async () => {
   const controller = Object.create(CdpController.prototype);
   controller.contextId = 7;
@@ -60,6 +98,127 @@ test('awaits asynchronous frame observations before returning their values', asy
     return { result: { value: params.awaitPromise ? await value : undefined } };
   };
   assert.deepEqual(await controller.evaluate('Promise.resolve(42)'), 42);
+});
+
+test('live snapshots use the folder-scoped sidebar route in a fresh profile', async () => {
+  const controller = Object.create(CdpController.prototype);
+  controller.mainContextId = 1;
+  controller.evaluate = async () => ({ title: 'wanted' });
+  controller.call = async (_method, params) => ({
+    result: {
+      value: vm.runInNewContext(params.expression, {
+        __initialWebviewState: {
+          webviewContext: { surface: 'sidebar', viewId: 'sidebar' },
+          editorContext: { workspacePath: '/repo' },
+        },
+        __vscodeWebviewState: {
+          getState: () => ({
+            'varro.lastOpenedView:/repo': {
+              type: 'session',
+              sessionId: 'wanted',
+              directory: '/repo/nested',
+            },
+          }),
+        },
+        localStorage: { getItem: () => null },
+        document: { querySelectorAll: () => [] },
+      }),
+    },
+  });
+  assert.equal((await controller.snapshot()).routeSessionId, 'wanted');
+});
+
+test('diff toggles require a rendered visibility transition, not just command dispatch', () => {
+  assert.deepEqual(
+    verifyActionEffect(
+      { action: 'show file diffs' },
+      { inlineDiffCount: 0 },
+      { inlineDiffCount: 1 },
+      { dispatched: true }
+    ),
+    { verified: true }
+  );
+  assert.deepEqual(
+    verifyActionEffect(
+      { action: 'hide file diffs' },
+      { inlineDiffCount: 1 },
+      { inlineDiffCount: 0 },
+      { dispatched: true }
+    ),
+    { verified: true }
+  );
+  assert.equal(
+    verifyActionEffect(
+      { action: 'show file diffs' },
+      { inlineDiffCount: 0 },
+      { inlineDiffCount: 0 },
+      { dispatched: true }
+    ).verified,
+    false
+  );
+});
+
+test('held scrollbar actions require pointer ownership, boundary arrival, and painted content', () => {
+  const before = {};
+  const after = {
+    transcript: {
+      scrollTop: 800,
+      scrollHeight: 1000,
+      clientHeight: 200,
+      visibleRows: [{ messageId: 'last', top: 0 }],
+    },
+  };
+  const action = { action: 'held scrollbar to bottom' };
+  assert.deepEqual(verifyActionEffect(action, before, after, { dispatched: true, held: true }), {
+    verified: true,
+  });
+  assert.equal(
+    verifyActionEffect(action, before, after, { dispatched: true, held: false }).verified,
+    false
+  );
+  assert.equal(
+    verifyActionEffect(
+      action,
+      before,
+      { transcript: { ...after.transcript, visibleRows: [] } },
+      { dispatched: true, held: true }
+    ).verified,
+    false
+  );
+});
+
+test('held native scrollbar input releases the button even if an intermediate move fails', async () => {
+  const controller = Object.create(CdpController.prototype);
+  controller.evaluate = async () => ({ x: 490, start: 20, end: 400 });
+  const calls = [];
+  controller.call = async (_method, params) => {
+    calls.push(params.type);
+    if (params.type === 'mouseMoved') throw new Error('lost target');
+  };
+  await assert.rejects(controller.dragTranscriptScrollbar(1), /lost target/);
+  assert.deepEqual(calls, ['mousePressed', 'mouseMoved', 'mouseReleased']);
+});
+
+test('native thumb targeting re-grabs once only after observed range growth with painted content', async () => {
+  const controller = Object.create(CdpController.prototype);
+  controller.evaluate = async (expression) =>
+    expression.includes('hasAttribute') ? true : { x: 490, start: 20, end: 1, range: 1000 };
+  let releases = 0;
+  controller.call = async (_method, params) => {
+    if (params.type === 'mouseReleased') releases++;
+  };
+  controller.captureActionState = async () => ({
+    transcript: {
+      scrollTop: releases === 1 ? 100 : 0,
+      scrollHeight: 1300,
+      clientHeight: 200,
+      visibleRows: [{ messageId: 'visible', top: 0 }],
+    },
+  });
+  const result = await controller.dragTranscriptScrollbar(0);
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[1].reached, true);
+  assert.equal(releases, 2);
 });
 
 test('retries an exhausted live tool window without retrying a scrolling failure', () => {
@@ -385,6 +544,40 @@ test('dispatches editable-control keys to the composer during AI-08', async () =
     ['[aria-label="Message composer"]', 'Space'],
     ['[aria-label="Message composer"]', 'Shift+Space'],
   ]);
+  assert.equal(
+    results.every(({ executed }) => executed),
+    true
+  );
+});
+
+test('dispatches both native scrollbar destinations through the AI-08 executor', async () => {
+  const destinations = [];
+  let fraction = 0;
+  const cdp = {
+    dragTranscriptScrollbar: async (next) => {
+      destinations.push(next);
+      fraction = next;
+      return { dispatched: true, held: true };
+    },
+    captureActionState: async () => ({
+      transcript: {
+        scrollTop: fraction * 800,
+        scrollHeight: 1000,
+        clientHeight: 200,
+        visibleRows: [{ messageId: fraction ? 'last' : 'first', top: 0 }],
+      },
+    }),
+  };
+  const results = await executeActionPlan(
+    cdp,
+    [
+      { step: 1, action: 'held scrollbar to top' },
+      { step: 2, action: 'held scrollbar to bottom' },
+    ],
+    'session',
+    0
+  );
+  assert.deepEqual(destinations, [0, 1]);
   assert.equal(
     results.every(({ executed }) => executed),
     true
@@ -868,6 +1061,32 @@ test('atomically records fixture evidence and controller failures on exit', asyn
   assert.deepEqual(saved.livePreparation['AI-07'].fixtureExitEvidence.changedPaths, ['source.ts']);
   assert.equal(saved.livePreparation['AI-07'].prepared, false);
   assert.match(saved.livePreparation['AI-07'].failures[0], /CDP disconnected/);
+});
+
+test('cleanup aggregation retains the original controller failure and nested cleanup cause', async () => {
+  const manifest = {};
+  await persistFixtureExitEvidence({
+    manifest,
+    manifestPath: '/manifest.json',
+    scenario: 'AI-08',
+    workspace: '/fixture',
+    error: new AggregateError(
+      [
+        new Error('original action target disappeared'),
+        new AggregateError(
+          [new Error('observer context was destroyed')],
+          'observer cleanup failed'
+        ),
+      ],
+      'frame observation cleanup failed'
+    ),
+    readFixture: async () => ({ commit: 'abc', status: '', changedPaths: [] }),
+    writeManifest: async () => {},
+  });
+  const failure = manifest.livePreparation['AI-08'].controllerFailure;
+  assert.match(failure, /original action target disappeared/);
+  assert.match(failure, /observer cleanup failed/);
+  assert.match(failure, /observer context was destroyed/);
 });
 
 test('records only verified action effects', () => {

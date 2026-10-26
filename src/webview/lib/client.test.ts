@@ -84,6 +84,53 @@ afterEach(() => {
 });
 
 describe('client', () => {
+  it('hides moved links through a host-owned endpoint scoped to the list folder', async () => {
+    const { client } = await loadClient();
+    bridgeMocks.apiCall.mockResolvedValue(true);
+    expect(await client.varro.session.hideTransfer('moved', { directory: '/old repo' })).toBe(true);
+    expect(bridgeMocks.apiCall).toHaveBeenCalledExactlyOnceWith(
+      'POST',
+      '/varro/session-transfer/hide?directory=%2Fold+repo',
+      { sessionID: 'moved' }
+    );
+  });
+  it('routes saved-permission edits through the scoped host-owned endpoint', async () => {
+    const { client } = await loadClient();
+    await client.varro.updateServerMemoryPermission(
+      'session-1',
+      'saved-1',
+      {
+        permission: 'bash',
+        pattern: 'git diff *',
+      },
+      { directory: '/repo one' }
+    );
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'PATCH',
+      '/varro/permission/server-memory?directory=%2Frepo+one',
+      {
+        sessionId: 'session-1',
+        id: 'saved-1',
+        permission: 'bash',
+        pattern: 'git diff *',
+      }
+    );
+  });
+
+  it('keeps archive changes in the common session update contract', async () => {
+    const { client } = await loadClient();
+    await client.session.update(
+      'session one',
+      { time: { archived: null } },
+      { directory: '/repo' }
+    );
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'PATCH',
+      '/session/session%20one?directory=%2Frepo',
+      { time: { archived: null } }
+    );
+  });
+
   it('encodes and scopes service choices and stops to a specific session process', async () => {
     const { client } = await loadClient();
     const controller = new AbortController();
@@ -1618,6 +1665,64 @@ describe('client', () => {
         timeoutMs: 10_000,
         retries: 0,
       }
+    );
+  });
+  it('keeps the follow-up bridge deadline longer than generation and forwards cancellation without retries', async () => {
+    const { client } = await loadClient();
+    const signal = new AbortController().signal;
+    const source = {
+      assistantMessageId: 'answer',
+      userMessageId: 'user',
+      userPrompt: 'Review the changes',
+      answer: 'Found two actionable defects.',
+    };
+    bridgeMocks.apiCall.mockResolvedValue({ summary: '', actions: [] });
+    expect(
+      await client.varro.followups('session-1', source, { signal, directory: '/fixture' })
+    ).toEqual({ summary: '', actions: [] });
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'POST',
+      '/varro/session/session-1/followups?directory=%2Ffixture',
+      { ...source, allowGenerate: false, model: undefined },
+      {
+        signal,
+        timeoutMs: 35_000,
+        retries: 0,
+      }
+    );
+  });
+  it('forwards the session follow-up model and reasoning as plain data', async () => {
+    const { client } = await loadClient();
+    const signal = new AbortController().signal;
+    const source = {
+      assistantMessageId: 'answer',
+      userMessageId: 'user',
+      userPrompt: 'Review',
+      answer: 'One bug remains.',
+    };
+    const model = { providerID: 'openai', modelID: 'sol', variant: 'high' };
+    await client.varro.followups('s', source, { signal, model, allowGenerate: true });
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'POST',
+      '/varro/session/s/followups',
+      { ...source, allowGenerate: true, model },
+      { signal, timeoutMs: 35_000, retries: 0 }
+    );
+  });
+  it('persists follow-up dismissal through the scoped host route without retries', async () => {
+    const { client } = await loadClient();
+    const source = {
+      assistantMessageId: 'a',
+      userMessageId: 'u',
+      userPrompt: 'Review',
+      answer: 'One bug remains',
+    };
+    await client.varro.dismissFollowups('s', source, '/fixture');
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'POST',
+      '/varro/session/s/followups/dismiss?directory=%2Ffixture',
+      source,
+      { retries: 0 }
     );
   });
   it('queries prompt completion eligibility without sending any credentials', async () => {

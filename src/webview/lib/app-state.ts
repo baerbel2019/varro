@@ -123,8 +123,11 @@ export interface AppState {
   emptyStateLogoUri: string;
   currentDocumentEnabled: boolean;
   issuesEnabled: boolean;
-  enableProblemsContext: boolean;
+  autoAttachProblems: boolean;
+  autoAttachActiveFile: boolean;
   promptCompletionModel: string;
+  followupsEnabled: boolean;
+  followupModel: string;
   remoteImages: RemoteImageMode;
   debugShowQuotaWarning: boolean;
   debugResetWarningDays?: number;
@@ -195,6 +198,7 @@ export interface AppState {
   pinnedModels: string[];
   modelDisplayNames: Record<string, string>;
   lastSeenSessions: Record<string, number>;
+  followupOpening: { sessionId: string; seenAt: number } | null;
   completedSessionResponses: Record<string, number>;
   interruptedSessionResponses: Record<string, number>;
   skippedPlanSessions: Record<string, number>;
@@ -392,8 +396,11 @@ export function createAppState(): AppStateInstance {
       !discardQueuedEditDraft && Array.isArray(storedInlineProblems)
         ? storedInlineProblems.filter(isInlineProblem)
         : [],
-    enableProblemsContext: initialWebviewState.enableProblemsContext ?? true,
+    autoAttachProblems: initialWebviewState.autoAttachProblems ?? true,
+    autoAttachActiveFile: initialWebviewState.autoAttachActiveFile ?? true,
     promptCompletionModel: initialWebviewState.promptCompletionModel ?? '',
+    followupsEnabled: initialWebviewState.followupsEnabled ?? true,
+    followupModel: initialWebviewState.followupModel ?? '',
     remoteImages: parseRemoteImageMode(initialWebviewState.remoteImages),
     debugShowQuotaWarning: initialWebviewState.debugShowQuotaWarning ?? false,
     debugResetWarningDays: initialWebviewState.debugResetWarningDays,
@@ -485,6 +492,7 @@ export function createAppState(): AppStateInstance {
     modelDisplayNames:
       modelPreferences?.modelDisplayNames ?? readStoredStringRecord(STORAGE_KEYS.modelDisplayNames),
     lastSeenSessions: initialLastSeenSessions,
+    followupOpening: null,
     completedSessionResponses: initialCompletedSessionResponses,
     interruptedSessionResponses: initialInterruptedSessionResponses,
     skippedPlanSessions: initialSkippedPlanSessions,

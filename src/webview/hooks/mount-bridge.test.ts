@@ -910,9 +910,11 @@ describe('mount bridge helpers', () => {
         showChangedFiles: true,
         showTurnTimer: true,
         showEmptyStateHistogram: true,
+        followupsEnabled: false,
         remoteImages: 'ask',
         debugShowQuotaWarning: true,
-        enableProblemsContext: false,
+        autoAttachProblems: false,
+        autoAttachActiveFile: false,
         desktopSessionPaneSide: 'right',
         defaultPermissionMode: 'full',
         chatFontSize: 16,
@@ -936,8 +938,10 @@ describe('mount bridge helpers', () => {
     expect(setShowChangedFiles).toHaveBeenCalledWith(true);
     expect(setShowTurnTimer).toHaveBeenCalledWith(true);
     expect(setShowEmptyStateHistogram).toHaveBeenCalledWith(true);
+    expect(setState).toHaveBeenCalledWith('followupsEnabled', false);
     expect(setState).toHaveBeenCalledWith('debugShowQuotaWarning', true);
-    expect(setState).toHaveBeenCalledWith('enableProblemsContext', false);
+    expect(setState).toHaveBeenCalledWith('autoAttachProblems', false);
+    expect(setState).toHaveBeenCalledWith('autoAttachActiveFile', false);
     expect(document.documentElement.style.getPropertyValue('--varro-chat-font-size')).toBe('16px');
     expect(document.documentElement.style.getPropertyValue('--varro-chat-editor-font-size')).toBe(
       '15px'
@@ -962,6 +966,7 @@ describe('mount bridge helpers', () => {
       type: 'config/update',
       payload: {
         showEmptyStateHistogram: false,
+        followupsEnabled: true,
         desktopSessionPaneSide: 'right',
         defaultPermissionMode: 'full',
         chatFontSize: 13,
@@ -970,6 +975,7 @@ describe('mount bridge helpers', () => {
       },
     });
     expect(setShowEmptyStateHistogram).toHaveBeenLastCalledWith(false);
+    expect(setState).toHaveBeenCalledWith('followupsEnabled', true);
     document.documentElement.style.removeProperty('--varro-chat-font-size');
     document.documentElement.style.removeProperty('--varro-chat-editor-font-size');
   });

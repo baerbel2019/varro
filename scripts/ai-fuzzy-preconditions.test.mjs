@@ -33,7 +33,9 @@ function turn(number, tall = false) {
 }
 
 test('validates reusable history against scenario-specific static gates', () => {
-  const messages = Array.from({ length: 110 }, (_, index) => turn(index + 1, (index + 1) % 10 === 0)).flat();
+  const messages = Array.from({ length: 110 }, (_, index) =>
+    turn(index + 1, (index + 1) % 10 === 0)
+  ).flat();
   const summary = inspectGoldenMessages(messages);
   const report = buildPreconditionReport(summary);
 
@@ -65,7 +67,37 @@ test('creates a stable 50-step mixed-ownership action plan', () => {
     first.slice(4, 7).map(({ action }) => action),
     ['PageDown in composer', 'Space in composer', 'Shift+Space in composer']
   );
-  assert.equal(first.some(({ action }) => action.includes('inline editor')), false);
+  assert.equal(
+    first.some(({ action }) => action.includes('inline editor')),
+    false
+  );
+  assert.deepEqual(
+    first.slice(13, 19).map(({ action }) => action),
+    [
+      'hide file diffs',
+      'held scrollbar to top',
+      'held scrollbar to bottom',
+      'show file diffs',
+      'held scrollbar to top',
+      'held scrollbar to bottom',
+    ]
+  );
+});
+
+test('both planned diff toggles change the enabled AI-08 starting state', () => {
+  let enabled = true;
+  const transitions = [];
+  for (const step of buildActionPlan('visibility-regression')) {
+    if (!['show file diffs', 'hide file diffs'].includes(step.action)) continue;
+    const next = step.action === 'show file diffs';
+    assert.notEqual(next, enabled, `step ${step.step} requests an already-active setting`);
+    transitions.push([enabled, next]);
+    enabled = next;
+  }
+  assert.deepEqual(transitions, [
+    [true, false],
+    [false, true],
+  ]);
 });
 
 test('rejects AI workspaces outside the canonical fixture', async () => {

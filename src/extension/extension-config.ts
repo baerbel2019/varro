@@ -22,9 +22,12 @@ export function readExtensionConfigState(
     // Never let a repository opt the user into network requests through workspace settings.
     remoteImages: parseRemoteImageMode(config.inspect?.('chat.remoteImages')?.globalValue),
     promptCompletionModel: config.get<string>('chat.promptCompletionModel', ''),
+    followupsEnabled: readFollowupsEnabled(config),
+    followupModel: readFollowupModel(config),
     debugShowQuotaWarning: config.get<boolean>('debug.showQuotaWarning', false),
     debugResetWarningDays: readResetWarningDays(config),
-    enableProblemsContext: config.get<boolean>('chat.enableProblemsContext', true),
+    autoAttachProblems: config.get<boolean>('chat.autoAttachProblems', true),
+    autoAttachActiveFile: config.get<boolean>('chat.autoAttachActiveFile', true),
     desktopSessionPaneSide: config.get<'left' | 'right'>('chat.desktopSessionPaneSide', 'left'),
     defaultPermissionMode: readDefaultPermissionMode(config),
     chatFontSize: readChatFontSize(config, chatConfig),
@@ -34,6 +37,20 @@ export function readExtensionConfigState(
     ),
     chatFontFamily: readChatFontFamily(chatConfig),
   };
+}
+
+/** Repository settings must not override the user's follow-up preferences. */
+export function readFollowupsEnabled(
+  config: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration('varro')
+): boolean {
+  return config.inspect?.<boolean>('chat.followupsEnabled')?.globalValue !== false;
+}
+
+export function readFollowupModel(
+  config: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration('varro')
+): string {
+  const value = config.inspect?.<string>('chat.followupModel')?.globalValue;
+  return isString(value) ? value.trim() : '';
 }
 
 function readResetWarningDays(config: vscode.WorkspaceConfiguration): number {

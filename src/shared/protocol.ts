@@ -468,6 +468,7 @@ export const VARRO_API_ENDPOINTS = {
   session: `${VARRO_API_NAMESPACE}/session`,
   sessionTrash: `${VARRO_API_NAMESPACE}/session-trash`,
   sessionHistoryScope: `${VARRO_API_NAMESPACE}/session-history-scope`,
+  sessionTransferHide: `${VARRO_API_NAMESPACE}/session-transfer/hide`,
   workspaceFile: `${VARRO_API_NAMESPACE}/workspace-file`,
   workspaceFilePick: `${VARRO_API_NAMESPACE}/workspace-file/pick`,
   workspaceProblems: `${VARRO_API_NAMESPACE}/workspace-problems`,
@@ -533,6 +534,8 @@ export const SERVER_EVENT_NAMES = [
   'project.updated',
   'session.created',
   'session.updated',
+  'session.archived',
+  'session.unarchived',
   'session.deleted',
   'session.status',
   'session.error',
@@ -882,9 +885,12 @@ export type InitialWebviewState = {
   showEmptyStateHistogram?: boolean;
   remoteImages?: RemoteImageMode;
   promptCompletionModel?: string;
+  followupsEnabled?: boolean;
+  followupModel?: string;
   debugShowQuotaWarning?: boolean;
   debugResetWarningDays?: number;
-  enableProblemsContext?: boolean;
+  autoAttachProblems?: boolean;
+  autoAttachActiveFile?: boolean;
   desktopSessionPaneSide?: DesktopSessionPaneSide;
   defaultPermissionMode?: PermissionMode;
   chatFontSize: number;

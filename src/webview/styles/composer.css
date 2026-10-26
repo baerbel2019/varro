@@ -1458,8 +1458,22 @@
   vertical-align: -2px;
 }
 
-.model-speed-icons > .model-speed-icon + .model-speed-icon {
-  margin-left: -3px;
+.model-speed-icons-ultrafast {
+  isolation: isolate;
+}
+
+.model-speed-icons-ultrafast > .model-speed-icon {
+  position: relative;
+  z-index: 2;
+}
+
+.model-speed-icons-ultrafast > .model-speed-icon + .model-speed-icon {
+  margin-left: -8px;
+}
+
+.model-speed-icons-ultrafast > .model-speed-icon:nth-child(2) {
+  z-index: 1;
+  opacity: 0.4;
 }
 
 .model-speed-label {
@@ -2221,6 +2235,29 @@
   flex-shrink: 0;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+.chat-subagent-waiting {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 4px;
+  padding: 6px 10px;
+  border: 1px solid var(--color-vscode-border-soft);
+  border-radius: var(--radius-card);
+  background: var(--color-vscode-surface-soft);
+  font-size: 12px;
+}
+
+.chat-subagent-waiting-label {
+  color: var(--color-vscode-fg);
+}
+
+.chat-subagent-waiting-titles {
+  color: var(--color-vscode-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-queue-container {

@@ -12,6 +12,7 @@ import { asRecord, isString, type UnknownRecord } from '../shared/type-utils';
 import { parseServerEvent } from '../shared/protocol';
 import { parseHealthResponse } from '../shared/health';
 import { OpenCodeTransport } from './open-code-transport';
+import { getOpenCodeApiCapabilities } from './opencode-api-capabilities';
 import { compareVersions } from './server-utils';
 import { basicAuthorization, OpenCodeStartupOutput } from './opencode-connection';
 import { tryGenerateOneShot } from './one-shot-generation';
@@ -276,6 +277,7 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
       OPENCODE_DISABLE_AUTOUPDATE: 'true',
     };
     if (/^(?:opencode\s+v?)?2\./.test(version)) {
+      env.OPENCODE_DISABLE_FREE_MODELS = 'true';
       env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
         providers: { openai: { settings: { chunkTimeout: 300000 } } },
       });
@@ -800,6 +802,56 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
     );
   });
 
+  it('does not restore free models hidden by the native v2 catalog', async (context) => {
+    const health = await transport.readHealthInfo();
+    if (transport.version !== 2 || compareVersions(health.version ?? '0', '2.1.2') < 0)
+      return context.skip();
+    const directory = join(root, 'native-free-models');
+    await mkdir(directory);
+    await writeFile(
+      join(directory, 'opencode.json'),
+      JSON.stringify({
+        providers: Object.fromEntries(
+          ['opencode', 'opencode-go'].map((id) => [
+            id,
+            {
+              package: '@opencode/ai/providers/openai-compatible',
+              settings: { baseURL: 'http://127.0.0.1:1/v1', apiKey: 'fixture-only' },
+              models: {
+                'free-fixture': { cost: { input: 0, output: 0 } },
+              },
+            },
+          ])
+        ),
+      })
+    );
+    const native = asRecord(
+      await transport.request(
+        'GET',
+        `/api/model?location[directory]=${encodeURIComponent(directory)}`
+      )
+    );
+    expect(native?.data).toEqual(expect.any(Array));
+    expect(native?.data).toEqual(
+      expect.arrayContaining([expect.objectContaining({ providerID: 'fixture', id: 'fixture' })])
+    );
+    for (const id of ['opencode', 'opencode-go']) {
+      expect(native?.data).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ providerID: id, id: 'free-fixture' })])
+      );
+    }
+    for (const route of ['/provider', '/config/providers']) {
+      const catalog = asRecord(await transport.request('GET', route, undefined, { directory }));
+      const providers = catalog?.all ?? catalog?.providers;
+      expect(providers).toEqual(expect.any(Array));
+      if (!Array.isArray(providers)) throw new Error('Missing provider catalog');
+      for (const id of ['opencode', 'opencode-go']) {
+        const provider = providers.map(asRecord).find((entry) => entry?.id === id);
+        expect(asRecord(provider?.models) ?? {}).not.toHaveProperty('free-fixture');
+      }
+    }
+  });
+
   it('creates, updates, and reads a session through the common API', async () => {
     const session = asRecord(
       await transport.request('POST', '/session', {
@@ -819,6 +871,142 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
     expect(updated?.title).toBe('Adapter renamed');
     expect(updated?.metadata).toEqual({ varro: { permissionMode: 'full' } });
     expect(updated?.permission).toEqual([{ permission: '*', pattern: '*', action: 'allow' }]);
+  }, 30000);
+
+  it('archives and restores through native V2 state or the older-server annotation fallback', async (context) => {
+    if (transport.version !== 2) return context.skip();
+    const native = getOpenCodeApiCapabilities(
+      await transport.request('GET', '/openapi.json')
+    ).sessionArchiving;
+    const created = asRecord(
+      await transport.request('POST', '/session', { title: 'Archive parity fixture' })
+    );
+    if (!isString(created?.id)) throw new Error('Missing isolated archive fixture');
+    const id = created.id;
+    const beforeEvents = events.length;
+    try {
+      const archived = asRecord(
+        await transport.request('PATCH', `/session/${id}`, { time: { archived: 123 } })
+      );
+      expect(asRecord(archived?.time)?.archived).toEqual(expect.any(Number));
+      const canonical = asRecord(
+        asRecord(await transport.request('GET', `/api/session/${id}`))?.data
+      );
+      expect(asRecord(canonical?.time)?.archived).toEqual(native ? expect.any(Number) : undefined);
+      const included = await transport.request(
+        'GET',
+        '/experimental/session?archived=true&limit=1000'
+      );
+      expect(included).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id }),
+          expect.objectContaining({ id: sessionID }),
+        ])
+      );
+      if (native) {
+        await vi.waitFor(
+          () =>
+            expect(events.slice(beforeEvents).map(parseServerEvent)).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  type: 'session.archived',
+                  properties: expect.objectContaining({ sessionID: id }),
+                }),
+              ])
+            ),
+          { timeout: 5000 }
+        );
+        // Simulate another client restoring the session directly on the native API.
+        await transport.request('PATCH', `/api/session/${id}`, { archived: false });
+        await vi.waitFor(
+          () =>
+            expect(events.slice(beforeEvents).map(parseServerEvent)).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  type: 'session.unarchived',
+                  properties: expect.objectContaining({ sessionID: id }),
+                }),
+              ])
+            ),
+          { timeout: 5000 }
+        );
+      } else {
+        await transport.request('PATCH', `/session/${id}`, { time: { archived: null } });
+      }
+      const restored = asRecord(await transport.request('GET', `/session/${id}`));
+      expect(asRecord(restored?.time)?.archived ?? undefined).toBeUndefined();
+      await writeFile(
+        join(root, 'archive-parity.json'),
+        JSON.stringify({ native, archived, canonical, restored }, null, 2)
+      );
+    } finally {
+      await transport.request('DELETE', `/session/${id}`);
+    }
+  }, 30000);
+
+  it('edits native saved permissions and rejects duplicate scopes', async (context) => {
+    if (transport.version !== 2) return context.skip();
+    if (
+      !getOpenCodeApiCapabilities(await transport.request('GET', '/openapi.json'))
+        .savedPermissionEditing
+    )
+      return context.skip();
+    const created = asRecord(
+      await transport.request('POST', '/session', {
+        title: 'Saved permission edit fixture',
+        permission: [{ permission: '*', pattern: '*', action: 'ask' }],
+      })
+    );
+    if (!isString(created?.id)) throw new Error('Missing isolated saved-permission fixture');
+    const id = created.id;
+    const resources = ['varro saved edit fixture one', 'varro saved edit fixture two'];
+    const savedIDs: string[] = [];
+    try {
+      for (const resource of resources) {
+        const waiting = transport.request('POST', `/api/session/${id}/permission`, {
+          action: 'shell',
+          resources: [resource],
+          save: [resource],
+        });
+        let requestID: string | undefined;
+        await vi.waitFor(
+          async () => {
+            const pending = (await transport.request('GET', '/permission')) as UnknownRecord[];
+            const request = pending.find((entry) => entry.sessionID === id);
+            expect(request?.id).toEqual(expect.any(String));
+            requestID = String(request?.id);
+          },
+          { timeout: 5000 }
+        );
+        await transport.request('POST', `/permission/${requestID}/reply`, { reply: 'always' });
+        await waiting;
+      }
+      const saved = asRecord(await transport.request('GET', '/api/permission/saved'))
+        ?.data as UnknownRecord[];
+      for (const resource of resources) {
+        const rule = saved.find(
+          (entry) => entry.resource === resource && entry.projectID === created.projectID
+        );
+        if (!isString(rule?.id)) throw new Error('Missing saved fixture allowance');
+        savedIDs.push(rule.id);
+      }
+      const response = await transport.request('PATCH', `/api/permission/saved/${savedIDs[0]}`, {
+        resource: 'varro saved edit fixture narrowed',
+      });
+      expect(response).toMatchObject({
+        data: { id: savedIDs[0], action: 'shell', resource: 'varro saved edit fixture narrowed' },
+      });
+      await expect(
+        transport.request('PATCH', `/api/permission/saved/${savedIDs[0]}`, {
+          resource: resources[1],
+        })
+      ).rejects.toThrow('409');
+      await writeFile(join(root, 'saved-permission-edit.json'), JSON.stringify(response, null, 2));
+    } finally {
+      for (const savedID of savedIDs)
+        await transport.request('DELETE', `/api/permission/saved/${savedID}`);
+      await transport.request('DELETE', `/session/${id}`);
+    }
   }, 30000);
 
   it('rejects new v1 share links but keeps local link cleanup available', async (context) => {

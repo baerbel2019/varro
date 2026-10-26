@@ -145,6 +145,10 @@ import {
 
 const originalPlatform = process.platform;
 
+// Native/legacy path fixtures already isolate homedir and tmpdir. Exercise those paths rather
+// than the shared test setup's explicit state root; individual AI-isolation cases can override it.
+beforeEach(() => vi.stubEnv('VARRO_TEST_STATE_ROOT', undefined));
+
 async function requireFileSymlink(context: TestContext, target: string, link: string) {
   try {
     await symlink(target, link);
@@ -1266,6 +1270,54 @@ describe('OpenCodeProcess server ownership leases', () => {
       };
     }
 
+    it.each(['active', 'relinquished'] as const)(
+      'recovers original Varro ownership after transient inspection with an %s lease',
+      async (state) => {
+        const { root, path, lease, listeners, authorization, manager } = await fixture(
+          'linux',
+          51197,
+          42424
+        );
+        await writeFile(path, JSON.stringify({ ...lease, state }), { mode: 0o600 });
+        listeners.mockResolvedValue([]);
+        try {
+          await expect(manager.refreshStartupRegistration()).resolves.toBe(true);
+          expect(manager.hasCredentialVerifiedConnection).toBe(true);
+          expect(manager.serverOwnership).toBe('unmanaged');
+
+          listeners.mockResolvedValue([lease.pid]);
+          vi.spyOn(processInspection, 'readProcessExecutable').mockResolvedValue(lease.executable);
+          await manager.prepareForHealthyExistingServer();
+
+          expect(manager.hasCredentialVerifiedConnection).toBe(false);
+          expect(manager.serverOwnership).toBe(state === 'active' ? 'other-host' : 'current-host');
+          expect(manager.serverAuthorization).toBe(authorization);
+          expect(vi.mocked(process.kill).mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    );
+
+    it('does not report a live managed process as replaced after one empty listener observation', async () => {
+      const { root, path, lease, raw, listeners, manager } = await fixture('linux', 51197, 42424);
+      listeners.mockResolvedValue([lease.pid]);
+      vi.spyOn(processInspection, 'readProcessExecutable').mockResolvedValue(lease.executable);
+      try {
+        await expect(manager.refreshStartupRegistration()).resolves.toBe(true);
+        listeners.mockResolvedValueOnce([]);
+        await expect(manager.verifyManagedServerConnection(true)).rejects.toMatchObject({
+          name: 'Error',
+          message: expect.stringContaining('observed listening PIDs: none'),
+        });
+        await expect(manager.verifyManagedServerConnection(true)).resolves.toBeUndefined();
+        expect(manager.hasCredentialVerifiedConnection).toBe(false);
+        expect(await readFile(path, 'utf8')).toBe(raw);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
     it.each(['lease', 'marker'] as const)(
       'retains private-service selection after reloading a verified %s',
       async (record) => {
@@ -1407,6 +1459,52 @@ describe('OpenCodeProcess server ownership leases', () => {
       }
     });
 
+    it.each(['lease', 'connection'] as const)(
+      'keeps concurrent credential verification valid after refreshing the same %s',
+      async (source) => {
+        const { root, path, lease, manager, fetchMock } = await fixture();
+        if (source === 'connection') {
+          await writeFile(`${path}.credentials`, JSON.stringify(lease), { mode: 0o600 });
+          await rm(path);
+          await rm(`${path}.managed`);
+        }
+        let release = () => {};
+        const pending = new Promise<void>((done) => {
+          release = done;
+        });
+        let entered = () => {};
+        const started = new Promise<void>((done) => {
+          entered = done;
+        });
+        try {
+          await manager.refreshStartupRegistration();
+          expect(manager.hasCredentialVerifiedConnection).toBe(true);
+          const fetch = fetchMock.getMockImplementation()!;
+          let paused = false;
+          fetchMock.mockImplementation(async (...args) => {
+            if (!paused) {
+              paused = true;
+              entered();
+              await pending;
+            }
+            return fetch(...args);
+          });
+          const verification = manager.verifyManagedServerConnection(true);
+          const verified = expect(verification).resolves.toBeUndefined();
+          await started;
+          await manager.prepareForHealthyExistingServer();
+          release();
+          await verified;
+          expect(manager.hasCredentialVerifiedConnection).toBe(true);
+          expect(manager.managedProcess).toBe(false);
+          expect(manager.connectionIdentity).toBeUndefined();
+        } finally {
+          release();
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    );
+
     it('invalidates same-port credentials on endpoint or saved-password changes', async () => {
       const { root, path, lease, manager } = await fixture();
       try {
@@ -1424,6 +1522,49 @@ describe('OpenCodeProcess server ownership leases', () => {
         await rm(root, { recursive: true, force: true });
       }
     });
+
+    it.each(['reset', 'password', 'username', 'endpoint'] as const)(
+      'rejects concurrent credential verification after a real %s change',
+      async (change) => {
+        const { root, path, lease, manager, fetchMock } = await fixture();
+        let release = () => {};
+        const pending = new Promise<void>((done) => {
+          release = done;
+        });
+        let entered = () => {};
+        const started = new Promise<void>((done) => {
+          entered = done;
+        });
+        try {
+          await manager.refreshStartupRegistration();
+          const fetch = fetchMock.getMockImplementation()!;
+          let paused = false;
+          fetchMock.mockImplementation(async (...args) => {
+            if (!paused) {
+              paused = true;
+              entered();
+              await pending;
+            }
+            return fetch(...args);
+          });
+          const verification = manager.verifyManagedServerConnection(true);
+          const rejected = expect(verification).rejects.toThrow('credentials changed');
+          await started;
+          if (change === 'reset') await manager.disposeProcess({ stopProcess: false });
+          else if (change === 'endpoint') manager.port += 1;
+          else
+            await writeFile(path, JSON.stringify({ ...lease, [change]: `changed-${change}` }), {
+              mode: 0o600,
+            });
+          release();
+          await rejected;
+          expect(manager.managedProcess).toBe(false);
+        } finally {
+          release();
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    );
 
     it.each(['missing', 'html', 'public-html'] as const)(
       'verifies V1 credentials with %s obsolete health routes',
@@ -3819,7 +3960,7 @@ describe('OpenCodeProcess server ownership leases', () => {
 
     expect(manager.isAdoptedManagedServer).toBe(false);
     expect(manager.managedProcess).toBe(false);
-    expect(kill).not.toHaveBeenCalled();
+    expect(kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
     await expect(stat(leasePath)).rejects.toMatchObject({ code: 'ENOENT' });
     kill.mockRestore();
     await rm(directory, { recursive: true, force: true });
@@ -4053,6 +4194,69 @@ describe('OpenCodeProcess server ownership leases', () => {
     kill.mockRestore();
     await rm(directory, { recursive: true, force: true });
   });
+
+  it.each([
+    { missing: 'executable', alive: false },
+    { missing: 'birth', alive: false },
+    { missing: 'executable', alive: true },
+    { missing: 'birth', alive: true },
+  ] as const)(
+    'handles identity disappearing after SIGTERM without trusting a live PID: %j',
+    async ({ missing, alive }) => {
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+      const root = await mkdtemp(join(tmpdir(), 'ownership-stop-race-'));
+      const leasePath = join(root, 'lease.json');
+      const manager = new OpenCodeProcess(4096, true, 'opencode', false, leasePath);
+      const lease = await setAdoptedOwnership(manager, leasePath, 'linux:100');
+      let stopping = false;
+      let staleListenerRead = false;
+      vi.spyOn(processInspection, 'findListeningPids').mockImplementation(async () => {
+        // lsof can observe the listener just before SIGTERM finishes exiting it.
+        if (!stopping || alive || !staleListenerRead) {
+          staleListenerRead = stopping;
+          return [lease.pid];
+        }
+        return [];
+      });
+      vi.spyOn(processInspection, 'readProcessExecutable').mockImplementation(async () =>
+        stopping && missing === 'executable' ? '' : lease.executable
+      );
+      vi.spyOn(processInspection, 'readProcessBirthIdentity').mockImplementation(async () =>
+        stopping && missing === 'birth' ? '' : lease.birthIdentity
+      );
+      const kill = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+        expect(pid).toBe(lease.pid);
+        if (signal === 0) {
+          if (!alive && stopping) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+          return true;
+        }
+        expect(signal).toBe('SIGTERM');
+        stopping = true;
+        return true;
+      });
+      try {
+        const stopped = manager.stopManagedProcessForRestart();
+        if (alive) {
+          await expect(stopped).rejects.toThrow(
+            missing === 'executable'
+              ? 'Cannot verify executable identity'
+              : 'Cannot verify process start identity'
+          );
+          expect(JSON.parse(await readFile(leasePath, 'utf8'))).toEqual(lease);
+          expect(manager.managedProcess).toBe(true);
+        } else {
+          await expect(stopped).resolves.toBeUndefined();
+          await expect(stat(leasePath)).rejects.toMatchObject({ code: 'ENOENT' });
+          expect(manager.managedProcess).toBe(false);
+        }
+        expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([
+          [lease.pid, 'SIGTERM'],
+        ]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  );
 
   it('does not signal a POSIX listener whose executable does not match the lease', async () => {
     Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });

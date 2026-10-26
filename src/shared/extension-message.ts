@@ -373,6 +373,8 @@ export function parseExtensionMessage<T>(value: T): ExtensionMessage | null {
         config.remoteImages = payload.remoteImages;
       if (isString(payload.promptCompletionModel))
         config.promptCompletionModel = payload.promptCompletionModel;
+      if (isBoolean(payload.followupsEnabled)) config.followupsEnabled = payload.followupsEnabled;
+      if (isString(payload.followupModel)) config.followupModel = payload.followupModel;
       if (isBoolean(payload.debugShowQuotaWarning))
         config.debugShowQuotaWarning = payload.debugShowQuotaWarning;
       if (
@@ -381,8 +383,10 @@ export function parseExtensionMessage<T>(value: T): ExtensionMessage | null {
         payload.debugResetWarningDays >= 5
       )
         config.debugResetWarningDays = payload.debugResetWarningDays;
-      if (isBoolean(payload.enableProblemsContext))
-        config.enableProblemsContext = payload.enableProblemsContext;
+      if (isBoolean(payload.autoAttachProblems))
+        config.autoAttachProblems = payload.autoAttachProblems;
+      if (isBoolean(payload.autoAttachActiveFile))
+        config.autoAttachActiveFile = payload.autoAttachActiveFile;
       return { type, payload: config };
     }
 
