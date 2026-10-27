@@ -612,6 +612,12 @@ Direct input acquires ownership only when it can affect the transcript:
   alone, an idle read-history load, or a virtual row mount must never admit inference.
   Cache-only retrieval restores current suggestions without model calls. The host persists admission
   before inference and caches results, abstentions, failures, and explicit dismissals across reloads.
+  Completed results committed to the cache survive reloads; a pending admission is not a durable
+  generation job. Once admitted, closing the originating editor does not cancel the bounded attempt
+  while its extension host remains alive. Unfinished generation is not guaranteed to recover after
+  whole-host shutdown, even if the backend survives. Readers stop waiting after a bounded interval and
+  may return empty. Expiry of the pending-wait grace period must not release admission or trigger
+  regeneration: the original request may already have consumed tokens or subscription quota.
   Navigation and invalidation do not persist dismissal; closing the card or an accepted action does.
   An accepted new turn clears prior suggestion contents and retires pending results for that session,
   retaining compact admission metadata. Rejected sends do not clear the cache.

@@ -1468,6 +1468,54 @@ describe('session-send helpers', () => {
     });
   });
 
+  it('rejects a stale follow-up after asynchronous send preparation', async () => {
+    const sendAsync = vi.fn(async () => {});
+    const syncSessionMcps = vi.fn(async () => {});
+    const validateBeforeSend = vi.fn(async () => false);
+    const publish = vi.fn();
+    const result = await sendMessageWithDependencies(
+      {
+        getActiveSessionId: () => 'session-1',
+        getDefaultPermissionMode: () => 'default',
+        createSession: vi.fn(async () => null),
+        clearPendingAbort: vi.fn(),
+        syncSessionMcps,
+        buildSendPayload: () => ({
+          body: { parts: [{ type: 'text', text: 'hello' }] },
+          effectiveModel: null,
+        }),
+        requestMessageListScrollToBottom: vi.fn(),
+        startLoading: vi.fn(),
+        setError: vi.fn(),
+        applyEffectiveModel: vi.fn(),
+        resetTodoSync: vi.fn(),
+        clearTodos: vi.fn(),
+        clearSessionUsageLimit: vi.fn(),
+        setSessionFailed: vi.fn(),
+        sendAsync,
+        getMessageCount: () => 0,
+        clearDroppedFiles: vi.fn(),
+        clearTerminalSelection: vi.fn(),
+        clearClipboardImages: vi.fn(),
+        postFilesClear: vi.fn(),
+        postTerminalSelectionClear: vi.fn(),
+        syncSession: vi.fn(async () => {}),
+        syncSessionMessages: vi.fn(async () => {}),
+        recheckSessionStatus: vi.fn(async () => {}),
+        stopLoading: vi.fn(),
+        shouldClearComposerAfterSend: () => false,
+      },
+      'hello',
+      { validateBeforeSend, onOptimisticPublish: publish }
+    );
+    expect(result).toBe(false);
+    expect(syncSessionMcps.mock.invocationCallOrder[0]).toBeLessThan(
+      validateBeforeSend.mock.invocationCallOrder[0]!
+    );
+    expect(sendAsync).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('creates a session when needed and sends the built payload', async () => {
     let activeSessionId: string | null = null;
     const sendAsync = vi.fn(async () => {});

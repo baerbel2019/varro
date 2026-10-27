@@ -197,6 +197,7 @@ export interface OpenCodeRuntime {
       newSessionWorkspace?: SessionWorkspaceTarget;
       queuedMessageDispatch?: { itemId: string; lease: number };
       onOptimisticPublish?: () => void;
+      validateBeforeSend?: () => Promise<boolean>;
     }
   ): Promise<boolean>;
   retryMessage(messageId: string, sessionId?: string | null): Promise<void>;
@@ -3220,6 +3221,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
       newSessionWorkspace?: SessionWorkspaceTarget;
       queuedMessageDispatch?: { itemId: string; lease: number };
       onOptimisticPublish?: () => void;
+      validateBeforeSend?: () => Promise<boolean>;
     }
   ): Promise<boolean> {
     const sessionId =

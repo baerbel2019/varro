@@ -143,6 +143,16 @@ while retaining admission records so it cannot be generated again. At most 512 t
 text; older turns retain only admission and dismissal metadata. Tests redirect this directory through
 `VARRO_TEST_STATE_ROOT`, with no fallback to the normal state root.
 
+Saved, still-current suggestion results survive reloads and can be restored without another model call.
+Once generation is admitted, closing the originating chat editor does not cancel its bounded attempt
+while the extension host remains alive. This differs from shutting down the whole host: unfinished
+generation is not guaranteed to recover after the extension host exits, even if OpenCode keeps running.
+Other windows wait only a bounded time for a saved result and may receive no suggestions.
+
+Varro retains the admission record and does not automatically retry the same turn, even after the
+pending-wait grace period expires. The original request may already have consumed tokens or subscription
+quota; retrying could charge for the same turn again. A pending admission is not a recoverable job.
+
 Existing annotation directories at `$XDG_STATE_HOME/varro/opencode-v2/` and quota
 directories at `~/.varro-provider-quota-v2/` remain intact. When needed, Varro creates
 a symbolic link at the native path, or a directory junction on Windows, pointing

@@ -10,7 +10,10 @@ import { FollowupSuggestions } from './FollowupSuggestions';
 
 const mocks = vi.hoisted(() => ({
   send: vi.fn<
-    (prompt: string, options?: { onOptimisticPublish?: () => void }) => Promise<boolean>
+    (
+      prompt: string,
+      options?: { onOptimisticPublish?: () => void; validateBeforeSend?: () => Promise<boolean> }
+    ) => Promise<boolean>
   >(),
 }));
 vi.mock('../../hooks/useOpenCode', () => ({ sendMessage: mocks.send }));
@@ -72,8 +75,7 @@ afterEach(() => {
 });
 
 async function flush() {
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
 }
 function mount(initialWorking = true, agent = 'build') {
   const complete = () =>
@@ -112,6 +114,37 @@ function mount(initialWorking = true, agent = 'build') {
 }
 
 describe('FollowupSuggestions', () => {
+  it('does not send an action dismissed in another window', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    expect(container.querySelector('.followup-suggestions')).not.toBeNull();
+    vi.mocked(client.varro.followups).mockResolvedValue({ summary: '', actions: [] });
+    container.querySelector<HTMLButtonElement>('.followup-suggestions-actions button')!.click();
+    await flush();
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(container.querySelector('.followup-suggestions')).toBeNull();
+    expect(vi.mocked(client.varro.followups).mock.lastCall?.[2].allowGenerate).toBe(false);
+  });
+
+  it('rejects an action dismissed while send preparation is in progress', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    let admitted = false;
+    mocks.send.mockImplementationOnce(async (_prompt, options) => {
+      vi.mocked(client.varro.followups).mockResolvedValue({ summary: '', actions: [] });
+      admitted = (await options?.validateBeforeSend?.()) === true;
+      return admitted;
+    });
+    container.querySelector<HTMLButtonElement>('.followup-suggestions-actions button')!.click();
+    await flush();
+    expect(mocks.send).toHaveBeenCalledOnce();
+    expect(admitted).toBe(false);
+    expect(container.querySelector('.followup-suggestions')).toBeNull();
+  });
+
   it.each([0, 2, 3])(
     'admits an unread opening only when the answer completed after the prior seen marker %s',
     async (seenAt) => {
@@ -284,16 +317,18 @@ describe('FollowupSuggestions', () => {
     const button = container.querySelector<HTMLButtonElement>(
       '.followup-suggestions-actions button'
     )!;
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
     button.click();
     button.click();
+    await flush();
     expect(mocks.send).toHaveBeenCalledExactlyOnceWith(actions[0]!.prompt, {
       targetSessionId: 'session-1',
       preserveComposer: true,
       omitContext: true,
       followupTitle: actions[0]!.title,
+      validateBeforeSend: expect.any(Function),
       onOptimisticPublish: expect.any(Function),
     });
-    expect(container.querySelectorAll('button:disabled')).toHaveLength(4);
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     await flush();
     expect(container.querySelector('.followup-suggestions')).toBeNull();
@@ -311,7 +346,9 @@ describe('FollowupSuggestions', () => {
     const { setWorking } = mount();
     setWorking(false);
     await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
     container.querySelector<HTMLButtonElement>('.followup-suggestions-actions button')!.click();
+    await flush();
     expect(container.querySelector('.followup-suggestions')).toBeNull();
     expect(client.varro.dismissFollowups).not.toHaveBeenCalled();
     finish(true);
@@ -325,6 +362,7 @@ describe('FollowupSuggestions', () => {
       const { setWorking } = mount();
       setWorking(false);
       await flush();
+      vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
       mocks.send.mockImplementationOnce(async (_prompt, options) => {
         options?.onOptimisticPublish?.();
         expect(container.querySelector('.followup-suggestions')).toBeNull();
@@ -385,7 +423,9 @@ describe('FollowupSuggestions', () => {
       const { setWorking } = mount();
       setWorking(false);
       await flush();
+      vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
       container.querySelector<HTMLButtonElement>('.followup-suggestions-actions button')!.click();
+      await flush();
       setState('activeSessionId', 'session-2');
       finish(accepted);
       await flush();

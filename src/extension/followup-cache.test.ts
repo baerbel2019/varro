@@ -70,6 +70,17 @@ afterEach(async () => {
 });
 
 describe('FollowupCache', () => {
+  it('distinguishes a pending admission from a completed empty result across cache instances', async () => {
+    const writer = new FollowupCache();
+    const reader = new FollowupCache();
+    const key = hash('pending-turn');
+    await writer.claim(key, digest, sessionKey);
+    expect(await reader.getState(key, digest)).toBe('pending');
+    await writer.complete(key, digest, EMPTY_FOLLOWUP_SUGGESTIONS);
+    expect(await reader.getState(key, digest)).toEqual(EMPTY_FOLLOWUP_SUGGESTIONS);
+    expect(await reader.claim(key, digest, sessionKey)).toBe(false);
+  });
+
   it.each(['EPERM', 'EACCES', 'EBUSY'])(
     'retries transient Windows %s replacement failures without losing dismissal',
     async (code) => {
