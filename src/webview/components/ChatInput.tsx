@@ -6761,6 +6761,10 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
               if (completionSelection.type === 'set-slash') {
                 if (completion?.type !== 'slash') return;
                 applySlashCompletionValue(completion, completionSelection.value);
+                setSuppressCompletion(
+                  item.type !== 'slash' ||
+                    (item.name !== SKILLS_COMMAND_NAME && item.name !== PROBLEMS_COMMAND_NAME)
+                );
                 return;
               }
 
