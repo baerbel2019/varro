@@ -25,7 +25,7 @@ update does not block later deletion. Cancelled updates check their signal befor
 reading, and before replacing the annotation file, so cancellation while queued or preparing a write
 does not commit that update.
 
-`npm run test:compatibility:adapters` installs published binaries into isolated directories and tests the production adapters. The current tested versions are v1 `1.19.4` and v2 `2.1.4`, alongside the v1 `1.16.0` and v2 `2.0.5` support floors. Release-specific results are recorded below. The checks cover managed startup, credential recovery in a second window, restart, multi-window recovery after process exit, bootstrap, workspace path encoding, v2 configuration precedence, session updates, deterministic streamed model responses, actual fixture-only tool execution, message pagination, tail editing, helper generation, fork/revert, deletion, and native v2 permissions/forms. The generated report is `artifacts/opencode-adapters/verified.json`.
+`npm run test:compatibility:adapters` installs published binaries into isolated directories and tests the production adapters. The current tested versions are v1 `1.19.4` and v2 `2.2.0`, alongside the v1 `1.16.0` and v2 `2.0.5` support floors. Release-specific results are recorded below. The checks cover managed startup, credential recovery in a second window, restart, multi-window recovery after process exit, bootstrap, workspace path encoding, v2 configuration precedence, session updates, deterministic streamed model responses, actual fixture-only tool execution, message pagination, tail editing, helper generation, fork/revert, deletion, and native v2 permissions/forms. The generated report is `artifacts/opencode-adapters/verified.json`.
 
 Fresh VS Code sandbox windows passed `v2-first-run` and the existing `healthy-first-run` scenario. These editor checks verify activation, ownership, health, and event-stream connection. `test:compatibility:ui` additionally exercises the actual composer, successful replies, pre-turn failures, HTTP 401 handling, recovery through a working provider, and reopening history. Full visual streaming performance remains a separate verification task.
 
@@ -83,6 +83,64 @@ resolve to `literal/directory`. V2 location queries retain their normal URL enco
 The released-server adapter tests cover exact workspace resolution for Japanese text, emoji,
 and literal percent escapes. Unit tests also cover header construction with embedded newlines
 and preservation of Windows separators and casing.
+
+### 2.2.0 compatibility review
+
+Reviewed v2.1.4 to v2.2.0, `2a3e7c0f34` through `86976449c4`. The complete
+upstream diff is retained in `artifacts/opencode-2.2.0-upstream.diff`. Consumed
+session/message/inbox shapes, permission/form payloads, and SSE names remain
+compatible. One-shot generation now also recognizes v2.2.0's exact selected-model
+admission error, `404 Model not found: provider/model`, so unavailable base models
+can still fall back to a location-scoped helper without duplicate generation.
+Unrelated errors remain non-retryable. V1 `1.19.4` and both support floors remain
+unchanged.
+
+The OpenAPI document grows from 124 to 130 paths. It adds optional SSE type
+filtering, chat-default model-type filtering, GUI plugin bundles, usage limits,
+file watching, image/decision generation, and media-blob retrieval. Text generation
+moves to `/api/experimental/generate/text`, retaining Varro's existing path as a
+deprecated alias. The removed experimental voice-instructions route is not used
+by Varro. Media references require a capability header that Varro does not send;
+ordinary message/inbox reads still return inline attachments, including when the
+server's opt-in blob storage is enabled.
+
+Server-owned changes include integration-supplied configuration, prompt-cache
+settings, catalog updates, compaction accounting, event ordering, and session
+operations that no longer initialize inactive locations unnecessarily. CLI
+`serve`/upgrade arguments remain compatible. Desktop/TUI and GUI plugin changes
+are optional parity work.
+
+The initial published-server matrix passed 148 checks and failed one on v2.2.0:
+the unavailable-base-model case threw the new 404 error instead of offering the
+helper fallback. It skipped 47 family/platform cases and leaked no processes.
+Evidence is `artifacts/opencode-2.2.0-adapters.log` and
+`artifacts/opencode-adapters/run-UKFnuB/`. Regression tests cover both released
+admission errors and reject generic, mismatched-model, provider-status, and
+implicit-model failures. Logs use the `artifacts/opencode-2.2.0-` prefix. The
+lockfile also synchronizes the existing manifest edits to Varro's version and
+oxfmt/oxlint versions.
+
+After the fallback fix, the full published-server matrix passed all 149 applicable
+checks, with 47 family/platform skips and no leaked or recovered processes.
+Evidence is `artifacts/opencode-2.2.0-adapters-final.log` and
+`artifacts/opencode-adapters/run-TR5aTg/`.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 19 | None in tested cases | Yes, applicable automated cases |
+| v1.19.4 | 31 | 18 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 42 | 7 | None in tested cases | Yes, applicable automated cases |
+| v2.2.0 | 46 | 3 | Model-admission fallback mismatch fixed; none remaining in tested cases | Yes, applicable automated cases |
+
+All 845 focused tests and five compatibility-summary tests passed after the fix.
+`npm run lint`, `npm run fmt`, `npm run lint:check`, `npm run typecheck`,
+`npm run typecheck:suggestions`, and `npm run build` passed. Both lint runs reported
+eight enum-assignment warnings in unchanged test files with the existing oxlint
+update. No further product fixes are indicated by these checks.
+
+The v1 dependency is unchanged, so the Docker v1 support-range matrix was not
+rerun. Real-editor, visual streaming, live-model action parity, and native Windows
+checks were not run for this bump.
 
 ### 2.1.4 compatibility review
 

@@ -32,7 +32,7 @@ Server startup is deferred: activation only constructs `OpenCodeServer`; `Sideba
 
 Registers the VS Code command surface that surrounds the chat UI.
 
-- `varro.chat.focus`
+- `varro.chat.focusInput` focuses the composer after revealing its saved location; VS Code owns the generated `varro.chat.focus` view command
 - `varro.chat.statusBarClick`
 - `varro.chat.newSession`
 - `varro.chat.searchSessions`

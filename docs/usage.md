@@ -4,9 +4,9 @@ This guide covers the current Varro workflow inside VS Code.
 
 ## Open Varro
 
-- Click the `Varro` icon in the Activity Bar.
+- Select `Varro` in its sidebar, or run `Varro: Focus Chat` from the Command Palette.
 - In VS Code and VSCodium, Varro defaults to the `Secondary Side Bar` so you can keep the editor visible while chatting.
-- In Cursor, Windsurf, and Devin, Varro attempts a one-time move to the `Primary Side Bar` instead.
+- In Cursor, Windsurf, Devin, Trae, and Trae CN, new installations attempt a one-time move to the `Primary Side Bar` instead. Navigation preserves a working saved location and recovers inaccessible views in the Primary Side Bar.
 
 VS Code forks have limited support. See [VS Code Fork Compatibility](vscode-forks.md) for details.
 
@@ -71,7 +71,7 @@ For WSL, open the project in a VS Code WSL window, then install and authenticate
 
 | Version | Minimum supported | Tested with this release | npm package |
 | --- | --- | --- | --- |
-| v2, recommended | 2.0.5 | 2.1.4 | `@opencode/cli` |
+| v2, recommended | 2.0.5 | 2.2.0 | `@opencode/cli` |
 | v1, still supported | 1.16.0 | 1.19.4 | `opencode-ai` |
 
 To keep using v1, retain your installation or run `npm install -g opencode-ai`. Set `varro.server.command` to its executable path. Setting it to `opencode` selects v1 only if that command resolves to a v1 installation. Varro detects the API automatically.
@@ -889,7 +889,7 @@ There are also deprecated debug-only settings used for development and recovery 
 ## Troubleshooting
 
 - OpenCode CLI missing: install v2 with `npm install -g @opencode/cli` on macOS, Linux, or WSL, or download the native Windows CLI from the [v2 install page](https://opencode.ai/v2/docs/). V1 remains available with `npm install -g opencode-ai`.
-- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.4` and v2 `2.1.4`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
+- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.4` and v2 `2.2.0`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
 - OpenCode v2 authentication: Varro captures managed-server credentials automatically and redacts them from output. Existing local services use their registered credentials. An externally managed server can also use `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` from the extension host's environment.
 - OpenCode v2 session settings: Varro stores mutable session annotations locally because the released v2 API cannot update session metadata. Session sharing is unavailable through this API, so its menu action is disabled. Existing v1-format configuration remains supported.
 - CLI not on `PATH`: set `varro.server.command` to the executable path.

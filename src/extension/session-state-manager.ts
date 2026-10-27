@@ -2024,7 +2024,7 @@ export class SessionStateManager {
 
     void vscode.window.showWarningMessage(message, 'Open Chat').then((action) => {
       if (action === 'Open Chat') {
-        void vscode.commands.executeCommand('varro.chat.focus');
+        void vscode.commands.executeCommand('varro.chat.focusInput');
       }
     });
   }
@@ -2036,7 +2036,7 @@ export class SessionStateManager {
     const message = `Varro has a plan ready for review${this.describeSessionSuffix(sessionID)}.`;
     void vscode.window.showInformationMessage(message, 'Open Chat').then((action) => {
       if (action === 'Open Chat') {
-        void vscode.commands.executeCommand('varro.chat.focus');
+        void vscode.commands.executeCommand('varro.chat.focusInput');
       }
     });
   }
@@ -2050,7 +2050,7 @@ export class SessionStateManager {
       : `Varro hit an error${suffix}.`;
     void vscode.window.showErrorMessage(message, 'Open Chat').then((action) => {
       if (action === 'Open Chat') {
-        void vscode.commands.executeCommand('varro.chat.focus');
+        void vscode.commands.executeCommand('varro.chat.focusInput');
       }
     });
   }

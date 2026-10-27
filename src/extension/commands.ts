@@ -108,12 +108,13 @@ export function registerCommands(
       }
     }),
 
-    vscode.commands.registerCommand('varro.chat.focus', async () => {
+    // Leave varro.chat.focus to VS Code so revealing a moved view never resets its location.
+    vscode.commands.registerCommand('varro.chat.focusInput', async () => {
       try {
         await revealSidebar();
         sidebar.requestInputFocus();
       } catch (err) {
-        logger.error(`varro.chat.focus: ${err instanceof Error ? err.message : String(err)}`);
+        logger.error(`varro.chat.focusInput: ${err instanceof Error ? err.message : String(err)}`);
       }
     }),
 

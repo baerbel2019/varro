@@ -1614,7 +1614,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   async openSessionInSidebar(sessionId: string, directory?: string) {
-    await vscode.commands.executeCommand(`${SidebarProvider.viewType}.focus`);
+    await vscode.commands.executeCommand('varro.chat.focusInput');
     const sidebarEndpoint = [...this.endpoints].find((endpoint) => endpoint.surface === 'sidebar');
     if (directory) {
       const workspacePath = this.contextProvider.getOpenWorkspaceRoot(directory);

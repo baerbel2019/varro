@@ -14,9 +14,7 @@ const CONTEXT_RESCOPE_RETRY_MS = 50;
 const CONTEXT_RESTART_GRACE_MS = 3000;
 const INITIAL_SIDEBAR_REVEAL_KEY = 'layout.initialSidebarReveal.v1';
 const PRIMARY_SIDEBAR_MIGRATION_KEY = 'layout.cursorPrimarySidebar.v1';
-const SECONDARY_SIDEBAR_MIGRATION_KEY = 'layout.standardSecondarySidebar.v1';
 const PRIMARY_SIDEBAR_CONTAINER = 'workbench.view.extension.varro-primary';
-const SECONDARY_SIDEBAR_CONTAINER = 'workbench.view.extension.varro';
 const PRIMARY_SIDEBAR_HOSTS = ['cursor', 'windsurf', 'devin', 'trae', 'traecn'];
 const SHOW_FILE_DIFFS_CONTEXT = 'varro:showFileDiffs';
 
@@ -53,14 +51,12 @@ function usesPrimarySidebarForExtensions(): boolean {
   );
 }
 
-async function placeViewInSidebar(
-  context: vscode.ExtensionContext,
-  destinationId: string
-): Promise<void> {
-  const primary = destinationId === PRIMARY_SIDEBAR_CONTAINER;
-  const migrationKey = primary ? PRIMARY_SIDEBAR_MIGRATION_KEY : SECONDARY_SIDEBAR_MIGRATION_KEY;
-  const sidebarName = primary ? 'Primary Sidebar' : 'Secondary Sidebar';
-  if (!context.globalState || context.globalState.get<boolean>(migrationKey)) {
+async function placeViewInPrimarySidebar(context: vscode.ExtensionContext): Promise<void> {
+  if (
+    !context.globalState ||
+    context.globalState.get<boolean>(PRIMARY_SIDEBAR_MIGRATION_KEY) ||
+    context.globalState.get<boolean>(INITIAL_SIDEBAR_REVEAL_KEY)
+  ) {
     return;
   }
 
@@ -68,41 +64,40 @@ async function placeViewInSidebar(
     const commandIds = await vscode.commands.getCommands();
     if (!commandIds.includes('vscode.moveViews')) {
       logger.warn(
-        `The host does not expose the command required to move Varro to the ${sidebarName}`
+        'The host does not expose the command required to move Varro to the Primary Sidebar'
       );
       return;
     }
 
     await vscode.commands.executeCommand('vscode.moveViews', {
       viewIds: [SidebarProvider.viewType],
-      destinationId,
+      destinationId: PRIMARY_SIDEBAR_CONTAINER,
     });
   } catch (err) {
     logger.warn(
-      `Failed to move Varro to the ${sidebarName}: ${err instanceof Error ? err.message : String(err)}`
+      `Failed to move Varro to the Primary Sidebar: ${err instanceof Error ? err.message : String(err)}`
     );
     return;
   }
 
   try {
-    await context.globalState.update(migrationKey, true);
+    await context.globalState.update(PRIMARY_SIDEBAR_MIGRATION_KEY, true);
   } catch (err) {
     logger.warn(
-      `Failed to remember Varro's ${sidebarName} placement: ${err instanceof Error ? err.message : String(err)}`
+      `Failed to remember Varro's Primary Sidebar placement: ${err instanceof Error ? err.message : String(err)}`
     );
   }
 }
 
 async function revealSidebarOnFirstActivation(
   context: vscode.ExtensionContext,
-  destinationId: string
+  revealSidebar: () => Promise<void>
 ): Promise<void> {
   const globalState = context.globalState;
   if (!globalState || globalState.get<boolean>(INITIAL_SIDEBAR_REVEAL_KEY)) return;
 
   try {
-    await vscode.commands.executeCommand(destinationId);
-    await vscode.commands.executeCommand(`${SidebarProvider.viewType}.focus`);
+    await revealSidebar();
   } catch (err) {
     logger.warn(
       `Failed to reveal Varro after installation: ${err instanceof Error ? err.message : String(err)}`
@@ -119,18 +114,31 @@ async function revealSidebarOnFirstActivation(
   }
 }
 
-function createSidebarRevealer(destinationId: string): () => Promise<void> {
+function createSidebarRevealer(
+  sidebar: SidebarProvider,
+  primarySidebarFallback: boolean
+): () => Promise<void> {
   return async () => {
     try {
-      await vscode.commands.executeCommand('vscode.moveViews', {
-        viewIds: [SidebarProvider.viewType],
-        destinationId,
-      });
+      // The host's view-focus command follows saved moves to either sidebar or the panel.
+      await vscode.commands.executeCommand(`${SidebarProvider.viewType}.focus`);
+      if (!primarySidebarFallback || sidebar.view?.visible) return;
     } catch (err) {
+      if (!primarySidebarFallback) throw err;
       logger.warn(
-        `Failed to restore Varro's sidebar placement: ${err instanceof Error ? err.message : String(err)}`
+        `Failed to reveal Varro in its saved location: ${err instanceof Error ? err.message : String(err)}`
       );
-      await vscode.commands.executeCommand(`${SidebarProvider.viewType}.resetViewLocation`);
+    }
+
+    // Restricted forks can hide third-party secondary views, even after an earlier migration.
+    // Recover only an inaccessible view; do not move a working user-selected location.
+    await vscode.commands.executeCommand('vscode.moveViews', {
+      viewIds: [SidebarProvider.viewType],
+      destinationId: PRIMARY_SIDEBAR_CONTAINER,
+    });
+    await vscode.commands.executeCommand(`${SidebarProvider.viewType}.focus`);
+    if (!sidebar.view?.visible) {
+      throw new Error('The host did not reveal Varro in the Primary Sidebar');
     }
   };
 }
@@ -304,23 +312,15 @@ async function activateExtension(context: vscode.ExtensionContext) {
     })
   );
 
-  // Register in primary so restricted forks expose the view, then place normal hosts in secondary.
-  const sidebarDestination = usesPrimarySidebarForExtensions()
-    ? PRIMARY_SIDEBAR_CONTAINER
-    : SECONDARY_SIDEBAR_CONTAINER;
-  registerCommands(
-    context,
-    sidebarProvider!,
-    contextProvider!,
-    server!,
-    createSidebarRevealer(sidebarDestination)
-  );
+  const primarySidebarFallback = usesPrimarySidebarForExtensions();
+  const revealSidebar = createSidebarRevealer(sidebarProvider, primarySidebarFallback);
+  registerCommands(context, sidebarProvider!, contextProvider!, server!, revealSidebar);
   // View commands can wait for this extension's activation before resolving.
   // Do not make activation wait for its own first-run reveal or placement.
   void (async () => {
     try {
-      await placeViewInSidebar(context, sidebarDestination);
-      await revealSidebarOnFirstActivation(context, sidebarDestination);
+      if (primarySidebarFallback) await placeViewInPrimarySidebar(context);
+      await revealSidebarOnFirstActivation(context, revealSidebar);
     } catch (err) {
       logger.warn(
         `Failed to initialize Varro's sidebar placement: ${err instanceof Error ? err.message : String(err)}`

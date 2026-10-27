@@ -61,7 +61,9 @@ export async function tryGenerateOneShot(
     if (
       input.model &&
       error instanceof Error &&
-      error.message === `400 Model unavailable: ${input.model.providerID}/${input.model.modelID}`
+      (error.message ===
+        `400 Model unavailable: ${input.model.providerID}/${input.model.modelID}` ||
+        error.message === `404 Model not found: ${input.model.providerID}/${input.model.modelID}`)
     )
       return null;
     throw error;

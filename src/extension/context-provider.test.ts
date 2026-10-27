@@ -1,5 +1,6 @@
 /* oxlint-disable anti-slop/no-known-value-widening, anti-slop/no-module-mocking, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion -- These tests exercise the VS Code import boundary with partial editor, terminal, and workspace fixtures. */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { DiagnosticSeverity } from 'vscode';
 import type * as FsPromises from 'node:fs/promises';
 import type { Diagnostic } from 'vscode';
 
@@ -1910,12 +1911,12 @@ describe('ContextProvider', () => {
     const selectedMessage = 'Selected warning\nwith full detail';
     vscodeMock.languages.getDiagnostics.mockReturnValue([
       ...Array.from({ length: 25 }, (_, line) => ({
-        severity: 0,
+        severity: DiagnosticSeverity.Error,
         message: `Error ${line}`,
         range: { start: { line, character: 0 }, end: { line, character: 1 } },
       })),
       {
-        severity: 1,
+        severity: DiagnosticSeverity.Warning,
         message: selectedMessage,
         source: 'eslint',
         code: 'rule-name',
@@ -1984,7 +1985,7 @@ describe('ContextProvider', () => {
     vscodeMock.workspace.asRelativePath = vi.fn(() => 'src/app.ts');
     vscodeMock.languages.getDiagnostics.mockReturnValue([
       {
-        severity: 0,
+        severity: DiagnosticSeverity.Error,
         message: 'bad',
         range: { start: { line: 6 } },
       },
@@ -2212,7 +2213,11 @@ describe('ContextProvider', () => {
     vscodeMock.workspace.workspaceFolders = [first, second];
     vscodeMock.workspace.getWorkspaceFolder.mockReturnValue(first);
     vscodeMock.languages.getDiagnostics.mockReturnValue([
-      { severity: 0, message: 'first-root error', range: { start: { line: 1 } } },
+      {
+        severity: DiagnosticSeverity.Error,
+        message: 'first-root error',
+        range: { start: { line: 1 } },
+      },
     ]);
     vscodeMock.window.activeTextEditor = {
       document: { uri, isUntitled: false, isDirty: false, languageId: 'typescript' },
