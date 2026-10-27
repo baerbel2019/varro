@@ -2849,7 +2849,13 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
       if (e.key === 'Tab') {
         e.preventDefault();
+        const items = composerCompletions();
+        const item = items[Math.min(completionIndex(), items.length - 1)];
         void applyActiveCompletion();
+        setSuppressCompletion(
+          item?.type !== 'slash' ||
+            (item.name !== SKILLS_COMMAND_NAME && item.name !== PROBLEMS_COMMAND_NAME)
+        );
         return;
       }
 

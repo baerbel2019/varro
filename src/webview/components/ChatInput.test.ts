@@ -4440,89 +4440,112 @@ describe('ChatInput', () => {
     expect(sendMessageMock).not.toHaveBeenCalled();
   });
 
-  it('dismisses overlapping slash completions after clicking so Enter runs the selected command', async () => {
-    setState('commands', [
-      { name: 'a-helper', description: 'Run zzvarrotest checks', template: 'Run checks' },
-      { name: 'zzvarrotest', description: 'Run tests', template: 'Run tests' },
-    ]);
-    setInputText('/zzv');
-
-    cleanup = render(() => ChatInput(), container!);
-
-    const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
-    if (!editor?.firstChild) throw new Error('Expected populated composer editor');
-    editor.focus();
-    setCollapsedSelection(editor.firstChild, '/zzv'.length);
-    editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'v', bubbles: true }));
-    await flushAsyncWork();
-
-    const items = [...container!.querySelectorAll<HTMLButtonElement>('.completion-slash')];
-    expect(
-      items.map((item) => item.querySelector('.composer-completion-title')?.textContent)
-    ).toEqual(['/a-helper', '/zzvarrotest']);
-    items[1]!.click();
-    await flushAsyncWork();
-
-    expect(inputText()).toBe('/zzvarrotest');
-    expect(container?.querySelector('.composer-completion-menu')).toBeNull();
-    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
-    expect(sendMessageMock).not.toHaveBeenCalled();
-
-    editor.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
-    );
-    await flushAsyncWork();
-
-    expect(inputText()).toBe('');
-    expect(runSlashCommandByNameMock).toHaveBeenCalledExactlyOnceWith('zzvarrotest', '');
-    expect(sendMessageMock).not.toHaveBeenCalled();
-  });
-
-  it.each(['skills', 'problems'])(
-    'keeps the /%s picker open after clicking its completion',
-    async (name) => {
+  it.each(['click', 'Tab', 'Enter'])(
+    'dismisses overlapping slash completions after %s so Enter runs the selected command',
+    async (selection) => {
       setState('commands', [
-        {
-          name: 'browser-bridge',
-          description: 'Control a browser',
-          template: 'Control a browser',
-          source: 'skill',
-        },
+        { name: 'a-helper', description: 'Run zzvarrotest checks', template: 'Run checks' },
+        { name: 'zzvarrotest', description: 'Run tests', template: 'Run tests' },
       ]);
-      vi.mocked(client.varro.workspaceProblems).mockResolvedValue({
-        total: 1,
-        diagnostics: [{ path: '/repo/a.ts', line: 1, severity: 'error', message: 'A error' }],
-      });
-      const draft = `/${name.slice(0, 3)}`;
-      setInputText(draft);
+      setInputText('/zzv');
 
       cleanup = render(() => ChatInput(), container!);
 
       const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
       if (!editor?.firstChild) throw new Error('Expected populated composer editor');
       editor.focus();
-      setCollapsedSelection(editor.firstChild, draft.length);
-      editor.dispatchEvent(new KeyboardEvent('keyup', { key: draft.at(-1), bubbles: true }));
+      setCollapsedSelection(editor.firstChild, '/zzv'.length);
+      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'v', bubbles: true }));
       await flushAsyncWork();
 
-      const item = [...container!.querySelectorAll<HTMLButtonElement>('.completion-slash')].find(
-        (button) => button.querySelector('.composer-completion-title')?.textContent === `/${name}`
-      );
-      if (!item) throw new Error(`Expected /${name} completion`);
-      item.click();
+      const items = [...container!.querySelectorAll<HTMLButtonElement>('.completion-slash')];
+      expect(
+        items.map((item) => item.querySelector('.composer-completion-title')?.textContent)
+      ).toEqual(['/a-helper', '/zzvarrotest']);
+      if (selection === 'click') items[1]!.click();
+      else {
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+        );
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: selection, bubbles: true, cancelable: true })
+        );
+      }
       await flushAsyncWork();
 
-      expect(inputText()).toBe(`/${name} `);
-      expect(container?.querySelector('.composer-completion-header')?.textContent).toBe(
-        name === 'skills' ? 'Skills' : 'Problems'
-      );
-      expect(container?.querySelector('.composer-completion-title')?.textContent).toBe(
-        name === 'skills' ? 'browser-bridge' : 'All'
-      );
+      expect(inputText()).toBe('/zzvarrotest');
+      expect(container?.querySelector('.composer-completion-menu')).toBeNull();
       expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      );
+      await flushAsyncWork();
+
+      expect(inputText()).toBe('');
+      expect(runSlashCommandByNameMock).toHaveBeenCalledExactlyOnceWith('zzvarrotest', '');
       expect(sendMessageMock).not.toHaveBeenCalled();
     }
   );
+
+  it.each(
+    ['skills', 'problems'].flatMap((name) =>
+      ['click', 'Tab', 'Enter'].map((selection) => ({ name, selection }))
+    )
+  )('keeps the /$name picker open after $selection completion', async ({ name, selection }) => {
+    setState('commands', [
+      {
+        name: 'browser-bridge',
+        description: 'Control a browser',
+        template: 'Control a browser',
+        source: 'skill',
+      },
+    ]);
+    vi.mocked(client.varro.workspaceProblems).mockResolvedValue({
+      total: 1,
+      diagnostics: [{ path: '/repo/a.ts', line: 1, severity: 'error', message: 'A error' }],
+    });
+    const draft = `/${name.slice(0, 3)}`;
+    setInputText(draft);
+
+    cleanup = render(() => ChatInput(), container!);
+
+    const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+    if (!editor?.firstChild) throw new Error('Expected populated composer editor');
+    editor.focus();
+    setCollapsedSelection(editor.firstChild, draft.length);
+    editor.dispatchEvent(new KeyboardEvent('keyup', { key: draft.at(-1), bubbles: true }));
+    await flushAsyncWork();
+
+    const items = [...container!.querySelectorAll<HTMLButtonElement>('.completion-slash')];
+    const item = items.find(
+      (button) => button.querySelector('.composer-completion-title')?.textContent === `/${name}`
+    );
+    if (!item) throw new Error(`Expected /${name} completion`);
+    if (selection === 'click') item.click();
+    else {
+      for (let index = 0; index < items.indexOf(item); index++) {
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+        );
+      }
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: selection, bubbles: true, cancelable: true })
+      );
+    }
+    await flushAsyncWork();
+
+    expect(inputText()).toBe(`/${name} `);
+    expect(container?.querySelector('.composer-completion-header')?.textContent).toBe(
+      name === 'skills' ? 'Skills' : 'Problems'
+    );
+    expect(container?.querySelector('.composer-completion-title')?.textContent).toBe(
+      name === 'skills' ? 'browser-bridge' : 'All'
+    );
+    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
 
   it('selects /stats from the completion menu before sending it', async () => {
     // SAFETY: The fixture provides the unknown fields read by this statement.
