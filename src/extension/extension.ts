@@ -14,7 +14,9 @@ const CONTEXT_RESCOPE_RETRY_MS = 50;
 const CONTEXT_RESTART_GRACE_MS = 3000;
 const INITIAL_SIDEBAR_REVEAL_KEY = 'layout.initialSidebarReveal.v1';
 const PRIMARY_SIDEBAR_MIGRATION_KEY = 'layout.cursorPrimarySidebar.v1';
+const SECONDARY_SIDEBAR_REGISTRATION_KEY = 'layout.secondarySidebarRegistration.v2';
 const PRIMARY_SIDEBAR_CONTAINER = 'workbench.view.extension.varro-primary';
+const SECONDARY_SIDEBAR_CONTAINER = 'workbench.view.extension.varro';
 const PRIMARY_SIDEBAR_HOSTS = ['cursor', 'windsurf', 'devin', 'trae', 'traecn'];
 const SHOW_FILE_DIFFS_CONTEXT = 'varro:showFileDiffs';
 
@@ -85,6 +87,46 @@ async function placeViewInPrimarySidebar(context: vscode.ExtensionContext): Prom
   } catch (err) {
     logger.warn(
       `Failed to remember Varro's Primary Sidebar placement: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+// TODO(v0.34.0): Remove this temporary migration, its marker, and its activation call for release.
+async function migrateSecondarySidebarRegistration(
+  context: vscode.ExtensionContext,
+  sidebar: SidebarProvider
+): Promise<void> {
+  const globalState = context.globalState;
+  if (!globalState || globalState.get<boolean>(SECONDARY_SIDEBAR_REGISTRATION_KEY)) return;
+
+  try {
+    if (globalState.get<boolean>(INITIAL_SIDEBAR_REVEAL_KEY)) {
+      // Older releases could save Primary placement automatically. Correct existing profiles once,
+      // including a relocated Secondary container, then leave subsequent user moves alone.
+      await vscode.commands.executeCommand(
+        `${SECONDARY_SIDEBAR_CONTAINER}.resetViewContainerLocation`
+      );
+      await vscode.commands.executeCommand('vscode.moveViews', {
+        viewIds: [SidebarProvider.viewType],
+        destinationId: SECONDARY_SIDEBAR_CONTAINER,
+      });
+      await vscode.commands.executeCommand(`${SidebarProvider.viewType}.focus`);
+      if (!sidebar.view?.visible) {
+        throw new Error('The host did not reveal Varro in the Secondary Sidebar');
+      }
+    }
+  } catch (err) {
+    logger.warn(
+      `Failed to migrate Varro to the Secondary Sidebar: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return;
+  }
+
+  try {
+    await globalState.update(SECONDARY_SIDEBAR_REGISTRATION_KEY, true);
+  } catch (err) {
+    logger.warn(
+      `Failed to remember Varro's Secondary Sidebar registration: ${err instanceof Error ? err.message : String(err)}`
     );
   }
 }
@@ -320,6 +362,7 @@ async function activateExtension(context: vscode.ExtensionContext) {
   void (async () => {
     try {
       if (primarySidebarFallback) await placeViewInPrimarySidebar(context);
+      else await migrateSecondarySidebarRegistration(context, sidebarProvider!);
       await revealSidebarOnFirstActivation(context, revealSidebar);
     } catch (err) {
       logger.warn(
