@@ -12041,12 +12041,9 @@ describe('ChatInput', () => {
     }
   });
 
-  it('pins the active-context chip so the file stays attached on focus change', async () => {
-    const bridgeWindow = fixture<{ __sendToExtension?: (message: WebviewMessage) => void }>(window);
-    const originalSend = bridgeWindow.__sendToExtension;
-    const sent: WebviewMessage[] = [];
-    bridgeWindow.__sendToExtension = (message) => sent.push(message);
-    try {
+  it.each([null, { startLine: 101, endLine: 108 }])(
+    'pins the active context with its selected lines: %j',
+    async (selection) => {
       setState('activeSessionId', 'session-1');
       setState('editorContext', {
         workspacePath: '/repo',
@@ -12055,7 +12052,7 @@ describe('ChatInput', () => {
           relativePath: 'src/app.ts',
           language: 'typescript',
         },
-        selection: null,
+        selection,
         diagnostics: [],
       });
       cleanup = render(() => ChatInput(), container!);
@@ -12067,15 +12064,34 @@ describe('ChatInput', () => {
       if (!pinButton) throw new Error('Expected the active-context attachment pin button');
       pinButton.click();
 
-      expect(sent).toContainEqual({
-        type: 'files/drop',
-        payload: { paths: ['/repo/src/app.ts'] },
+      expect(state.droppedFiles).toEqual([
+        expect.objectContaining({
+          path: '/repo/src/app.ts',
+          relativePath: 'src/app.ts',
+          type: 'file',
+          lineRanges: selection ? [selection] : undefined,
+        }),
+      ]);
+      expect(container?.querySelectorAll('.chat-attachment-chip')).toHaveLength(1);
+      expect(container?.querySelector('.chip-pin')).toBeNull();
+
+      setState('editorContext', 'activeFile', {
+        path: '/repo/src/other.ts',
+        relativePath: 'src/other.ts',
+        language: 'typescript',
       });
-    } finally {
-      if (originalSend) bridgeWindow.__sendToExtension = originalSend;
-      else delete bridgeWindow.__sendToExtension;
+      setState('editorContext', 'selection', null);
+      await flushAsyncWork();
+
+      expect(state.droppedFiles[0]?.path).toBe('/repo/src/app.ts');
+      expect(state.droppedFiles[0]?.lineRanges).toEqual(selection ? [selection] : undefined);
+      const attachment = [...container!.querySelectorAll('.chat-attachment-chip')].find((chip) =>
+        chip.querySelector('.chip-remove')
+      );
+      expect(attachment?.textContent).toContain('app.ts');
+      if (selection) expect(attachment?.textContent).toContain('L101-108');
     }
-  });
+  );
 
   it('automatically enables and stores a non-vision image without a vision mention', async () => {
     const fileReader = installControllableFileReader();

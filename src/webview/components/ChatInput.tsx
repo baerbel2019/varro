@@ -2198,8 +2198,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (
       explicitFile &&
       selectedLines.length > 0 &&
-      formatContextLineRanges(explicitFile.lineRanges) === formatContextLineRanges(selectedLines) &&
-      inputText().includes(`@${explicitFile.relativePath || explicitFile.path}`)
+      subtractContextLineRanges(selectedLines, explicitFile.lineRanges).length === 0
     ) {
       return null;
     }
@@ -2234,12 +2233,26 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     const context = activeContext();
     if (!context || context.icon === 'table') return false;
     if (!composerActiveFile()?.path) return false;
-    return !explicitContextForActiveFile();
+    const explicitFile = explicitContextForActiveFile();
+    if (!explicitFile) return true;
+    return (
+      !!explicitFile.lineRanges?.length &&
+      subtractContextLineRanges(
+        getSelectionRangesFromEditorContext(composerSelection()),
+        explicitFile.lineRanges
+      ).length > 0
+    );
   };
   const pinActiveContext = () => {
-    const path = composerActiveFile()?.path;
-    if (!path) return;
-    postMessage({ type: 'files/drop', payload: { paths: [path] } });
+    const file = composerActiveFile();
+    if (!file?.path) return;
+    const lineRanges = getSelectionRangesFromEditorContext(composerSelection());
+    addContextFile({
+      path: file.path,
+      relativePath: file.relativePath,
+      type: 'file',
+      lineRanges: lineRanges.length > 0 ? lineRanges : undefined,
+    });
   };
   const hasAttachmentStripItems = () =>
     !!composerExtensionContexts()?.length ||
