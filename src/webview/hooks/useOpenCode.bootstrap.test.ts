@@ -430,7 +430,7 @@ describe('useOpenCode initialization', () => {
     }
   });
 
-  it.each(['ask', 'plan'])('defaults to build on startup after using %s', async (savedAgent) => {
+  it.each(['ask', 'plan', 'custom'])('restores %s on startup', async (savedAgent) => {
     let bridgeHandler: Parameters<BridgeOnMessage>[0] | undefined;
     bridgeOnMessage.mockImplementation((handler) => {
       bridgeHandler = handler;
@@ -453,7 +453,7 @@ describe('useOpenCode initialization', () => {
         tools: {},
       },
       {
-        name: 'plan',
+        name: savedAgent,
         mode: 'primary',
         builtIn: true,
         permission: { edit: 'ask', bash: {} },
@@ -478,7 +478,7 @@ describe('useOpenCode initialization', () => {
       });
 
       await vi.waitFor(() => expect(stateModule.connectionInitialized()).toBe(true));
-      expect(stateModule.state.selectedAgent).toBe('build');
+      expect(stateModule.state.selectedAgent).toBe(savedAgent);
       expect(stateModule.getPersistedSelectedAgent()).toBe(savedAgent);
     } finally {
       dispose();

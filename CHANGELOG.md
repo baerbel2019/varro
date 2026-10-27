@@ -10,6 +10,7 @@ This changelog summarizes the main user-facing improvements in each Varro minor 
 - Added live background-process logs and non-blocking services with wait and stop controls.
 - Preserved conversations and drafts across folder transfers, with read-only history for unavailable destinations.
 - Added unread interruption markers, persistent workspace chat views, and full-resolution image copying.
+- Remembered the last selected agent for new chats, including custom primary agents.
 - Improved startup and server recovery; isolated managed v2 servers from OpenCode Desktop.
 - Fixed steering queues, model selection, failed edits, image sends, scrolling, and composer behavior.
 

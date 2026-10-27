@@ -176,16 +176,20 @@ describe('data loaders', () => {
     expect(logError).not.toHaveBeenCalled();
   });
 
-  it('defaults the toolbar agent to build when no draft agent is selected', async () => {
+  it.each([
+    [null, 'build'],
+    ['custom', 'custom'],
+    ['missing', 'build'],
+  ])('restores the toolbar agent from persisted %s as %s', async (persisted, expected) => {
     const setSelectedAgent = vi.fn();
 
     await loadAgentsWithDependencies(
       {
-        listAgents: async () => [buildAgent('plan'), buildAgent('build')],
+        listAgents: async () => [buildAgent('plan'), buildAgent('build'), buildAgent('custom')],
         getActiveSessionId: () => null,
         getSelectedAgent: () => null,
         getSelectedAgentForSession: () => null,
-        getPersistedSelectedAgent: () => null,
+        getPersistedSelectedAgent: () => persisted,
         setAllAgents: vi.fn(),
         setPrimaryAgents: vi.fn(),
         setSelectedAgent,
@@ -193,7 +197,7 @@ describe('data loaders', () => {
       vi.fn()
     );
 
-    expect(setSelectedAgent).toHaveBeenCalledWith('build', { persistGlobal: false });
+    expect(setSelectedAgent).toHaveBeenCalledWith(expected, { persistGlobal: false });
   });
 
   it('hydrates connected mcps into the active session when none are selected', async () => {
