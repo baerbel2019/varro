@@ -5424,7 +5424,7 @@ describe('OpenCodeProcess server ownership leases', () => {
     const manager = new OpenCodeProcess(4096, true, 'opencode', false, leasePath);
 
     await expect(manager.recoverManagedServerOwnership()).rejects.toThrow(
-      'ownership evidence were retained'
+      'ownership evidence was retained'
     );
 
     expect(
@@ -5435,6 +5435,46 @@ describe('OpenCodeProcess server ownership leases', () => {
     await Promise.all([
       rm(directory, { recursive: true, force: true }),
       rm(victimDirectory, { recursive: true, force: true }),
+    ]);
+  });
+
+  it('recovers a Varro server after macOS removes its temporary runtime config', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    const directory = await mkdtemp(join(tmpdir(), 'varro-server-lease-test-'));
+    const configDirectory = await mkdtemp(join(tmpdir(), 'varro-opencode-config-'));
+    const leasePath = join(directory, 'lease.json');
+    const configPath = join(configDirectory, 'opencode.json');
+    const lease: ManagedServerOwnershipLease = {
+      version: 1,
+      pid: MOCK_LINUX_PID,
+      port: 4096,
+      executable: '/usr/bin/opencode',
+      birthIdentity: 'darwin:Fri Jul 10 12:00:00 2026',
+      owner: 'removed-config-owner',
+      host: 'exited-host',
+      state: 'relinquished',
+      createdAt: Date.now(),
+      configPath,
+    };
+    await writeFile(leasePath, JSON.stringify(lease), 'utf-8');
+    await writeFile(`${leasePath}.managed`, JSON.stringify(lease), 'utf-8');
+    vi.spyOn(processInspection, 'findListeningPids').mockResolvedValue([lease.pid]);
+    vi.spyOn(processInspection, 'readProcessExecutable').mockResolvedValue(lease.executable);
+    vi.spyOn(processInspection, 'readProcessBirthIdentity').mockResolvedValue(lease.birthIdentity);
+    vi.spyOn(process, 'kill').mockReturnValue(true);
+    const manager = new OpenCodeProcess(4096, true, 'opencode', false, leasePath);
+
+    await expect(manager.recoverManagedServerOwnership()).resolves.toBe(true);
+
+    expect(manager.serverOwnership).toBe('current-host');
+    expect(manager.needsRuntimeConfigRecovery).toBe(true);
+    expect(JSON.parse(await readFile(leasePath, 'utf-8'))).not.toHaveProperty('configPath');
+    expect(JSON.parse(await readFile(`${leasePath}.managed`, 'utf-8'))).not.toHaveProperty(
+      'configPath'
+    );
+    await Promise.all([
+      rm(directory, { recursive: true, force: true }),
+      rm(configDirectory, { recursive: true, force: true }),
     ]);
   });
 });

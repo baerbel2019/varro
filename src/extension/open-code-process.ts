@@ -2155,12 +2155,6 @@ export class OpenCodeProcess {
       this.foreignActiveOwnership = true;
       return false;
     }
-    if (lease.configPath && !(await this.matchesInjectedConfigOwner(lease))) {
-      throw new Error(
-        'The live OpenCode server has lost its managed configuration; its endpoint and ownership evidence were retained'
-      );
-    }
-
     return this.claimManagedServerOwnership(lease, true);
   }
 
@@ -2352,12 +2346,6 @@ export class OpenCodeProcess {
       this.foreignActiveOwnership = true;
       return false;
     }
-    if (lease.configPath && !(await this.matchesInjectedConfigOwner(lease))) {
-      throw new Error(
-        'The live OpenCode server has lost its managed configuration; its ownership evidence was retained'
-      );
-    }
-
     return this.claimManagedServerOwnership(lease, false);
   }
 
@@ -3331,6 +3319,44 @@ export class OpenCodeProcess {
     }
   }
 
+  private async isMissingManagedInjectedConfig(configPath: string): Promise<boolean> {
+    const parent = dirname(configPath);
+    const directoryName = basename(parent);
+    if (
+      basename(configPath) !== 'opencode.json' ||
+      !directoryName.startsWith(INJECTED_CONFIG_DIRECTORY_PREFIX) ||
+      directoryName.length === INJECTED_CONFIG_DIRECTORY_PREFIX.length
+    ) {
+      return false;
+    }
+
+    const temporaryDirectory = await realpath(tmpdir());
+    try {
+      const [parentInfo, realParent] = await Promise.all([lstat(parent), realpath(parent)]);
+      if (
+        !parentInfo.isDirectory() ||
+        parentInfo.isSymbolicLink() ||
+        dirname(realParent) !== temporaryDirectory
+      ) {
+        return false;
+      }
+    } catch (error) {
+      if (!isMissingPathError(error) || dirname(resolvePath(parent)) !== temporaryDirectory) {
+        return false;
+      }
+    }
+
+    for (const path of [configPath, join(parent, INJECTED_CONFIG_OWNER_FILE)]) {
+      try {
+        await lstat(path);
+        return false;
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+    }
+    return true;
+  }
+
   private async findInjectedConfigOwner(
     pid: number,
     executable: string,
@@ -3632,15 +3658,31 @@ export class OpenCodeProcess {
         return null;
       }
       if (!(await this.matchesOwnershipLease(current))) return null;
+      let recoveredMissingConfig = false;
+      if (current.configPath && !(await this.matchesInjectedConfigOwner(current))) {
+        if (!(await this.isMissingManagedInjectedConfig(current.configPath))) {
+          throw new Error(
+            'The live OpenCode server has lost its managed configuration; its ownership evidence was retained'
+          );
+        }
+        recoveredMissingConfig = true;
+      }
       const claimed: ManagedServerOwnershipLease = {
         ...current,
         host: this.hostOwner,
         state: 'active',
       };
+      if (recoveredMissingConfig) delete claimed.configPath;
       delete claimed.hostPid;
       delete claimed.hostBirthIdentity;
       Object.assign(claimed, await this.readOwnershipHostIdentity());
+      if (recoveredMissingConfig) await this.writeOwnershipMarker(claimed);
       await this.writeOwnershipLease(claimed);
+      if (recoveredMissingConfig) {
+        logger.info(
+          `Recovered Varro ownership of OpenCode PID ${claimed.pid} after its temporary runtime configuration was removed`
+        );
+      }
       return claimed;
     } finally {
       await this.releaseOwnershipClaim(claim);
