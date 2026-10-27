@@ -4,7 +4,7 @@ import { asRecord, isString } from '../shared/type-utils';
 
 type GenerationServer = Pick<OpenCodeServer, 'request'> &
   Partial<Pick<OpenCodeServer, 'apiVersion'>>;
-const GENERATE_PATH = '/api/experimental/generate';
+const GENERATE_PATHS = ['/api/experimental/generate/text', '/api/experimental/generate'];
 
 /** Null means no generation was admitted and the caller can use a helper session. */
 export async function tryGenerateOneShot(
@@ -30,7 +30,8 @@ export async function tryGenerateOneShot(
     throw error;
   }
   const paths = asRecord(asRecord(specification)?.paths);
-  if (!asRecord(asRecord(paths?.[GENERATE_PATH])?.post)) return null;
+  const generatePath = GENERATE_PATHS.find((path) => asRecord(asRecord(paths?.[path])?.post));
+  if (!generatePath) return null;
   input.signal.throwIfAborted();
   let response;
   try {
@@ -41,7 +42,7 @@ export async function tryGenerateOneShot(
     if (input.maxResponseBytes) options.maxResponseBytes = input.maxResponseBytes;
     response = await server.request(
       'POST',
-      GENERATE_PATH,
+      generatePath,
       {
         prompt: input.prompt,
         model: input.model

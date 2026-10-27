@@ -10,6 +10,38 @@ const input = () => ({
 });
 
 describe('one-shot generation dispatch', () => {
+  it.each([false, true])(
+    'prefers the text route when the legacy alias exists: %s',
+    async (legacy) => {
+      const paths = {
+        '/api/experimental/generate/text': { post: {} },
+      };
+      if (legacy) Object.assign(paths, specification.paths);
+      const request = vi
+        .fn()
+        .mockResolvedValueOnce({
+          paths,
+        })
+        .mockResolvedValueOnce({ data: { text: 'Done' } });
+      expect(await tryGenerateOneShot({ apiVersion: 2, request }, input())).toEqual({
+        text: 'Done',
+      });
+      expect(request.mock.calls[1]?.[1]).toBe('/api/experimental/generate/text');
+    }
+  );
+  it('does not retry through the legacy alias after a canonical-route failure', async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        paths: {
+          ...specification.paths,
+          '/api/experimental/generate/text': { post: {} },
+        },
+      })
+      .mockRejectedValueOnce(new Error('503 Provider failed'));
+    await expect(tryGenerateOneShot({ apiVersion: 2, request }, input())).rejects.toThrow('503');
+    expect(request).toHaveBeenCalledTimes(2);
+  });
   it.each(['400 Model unavailable: test/small', '404 Model not found: test/small'])(
     'falls back only for the exact selected model admission error %s',
     async (message) => {

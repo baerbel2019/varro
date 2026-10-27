@@ -4757,6 +4757,11 @@ function setExplicitWorkspaceDirectory(path: string, workspaceDirectory: string)
 
 function parseDecisionProviderRequest(value: unknown): DecisionProviderRequest {
   const body = asRecord(value);
+  if (body?.action === 'native') {
+    if (typeof body.model !== 'string' || body.model.length > 500)
+      throw new Error('Invalid decision model');
+    return { action: 'native', model: body.model };
+  }
   if (body?.action === 'connect' || body?.action === 'disconnect') return { action: body.action };
   if (body?.action !== 'update') throw new Error('Unsupported decision provider request');
   const request: DecisionProviderRequest = { action: 'update' };

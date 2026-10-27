@@ -621,6 +621,12 @@ Successful snapshots are cached for `30` seconds; provider errors and rate limit
 
 Adapter coverage currently includes Antigravity, Anthropic, OpenAI/Codex, OpenCode Go, GitHub Copilot, Gemini, OpenRouter, Z.AI, MiniMax, Kimi, Ollama Cloud, and xAI SuperGrok, plus metadata-header probes for compatible OpenAI, GitHub Copilot, and xAI API-key configurations. Availability depends on the provider and credential type; unsupported providers simply do not show quota details.
 
+On OpenCode 2.2.0+, Console-routed providers use the server's workspace-scoped usage endpoint,
+including in attach-only mode. Varro shows applicable Console dollar budgets and Go's separate
+5-hour, weekly, and monthly allowances. Per-model budgets use the selected model's spend; shared
+budgets keep their shared totals. This path never reads local credentials. Only a missing endpoint
+permits the older managed-server adapter; signed-out responses and errors do not switch accounts.
+
 To retrieve quota metadata, the extension host can:
 
 - Read the OpenCode authentication store and provider/model metadata. The default is `${XDG_DATA_HOME:-~/.local/share}/opencode/auth.json` on macOS, Linux, and WSL, and `%USERPROFILE%\.local\share\opencode\auth.json` on native Windows.
@@ -752,7 +758,18 @@ Switching away from `Auto` prevents an unfinished judge request from granting pe
 When automatic review falls back to manual approval, the prompt shows a concise action summary when
 available, the full request metadata with copy actions, and the judge's reason under `AI check`.
 
-The judge uses `varro.chat.autoApproveModel` first, then OpenCode's `small_model`, OpenAI GPT Luna, GitHub Copilot GPT Luna, and the selected Varro session model. Right-click a model in the Models view to set the VS Code user setting.
+The chat judge uses `varro.chat.autoApproveModel` first, then OpenCode's `small_model`, OpenAI GPT Luna, GitHub Copilot GPT Luna, and the selected Varro session model. Right-click a model in the Models view to set the VS Code user setting.
+
+The experimental **OpenCode decision model** selector is temporarily hidden. Enable
+`varro.debug.showNativeDecisionModels` to show it on OpenCode 2.2.0+. Native review is off by
+default. Selecting a model sets `varro.chat.autoApproveDecisionModel` and sends unresolved Auto-mode
+permission details to the server's native decisions API before the chat judge. This API uses the
+server's base configuration and credentials, not arbitrary workspace configuration. Allow requires
+probability at least 0.8, confidence at least 0.75, and destructive-action and approval-steering
+probabilities below 0.2. Reject requires probability at least 0.9 and a prior user rejection.
+Other valid answers show the manual prompt. Errors fall back to explicitly enabled legacy TypeSafe
+Jev, then the chat judge. External-directory requests remain local-only. Select **Off** to disable
+native reviews without changing legacy Jev settings.
 
 `Full access` updates the session permission rules and auto-approves pending permission prompts for that session. Select it only when the session can operate without confirmation.
 
@@ -866,6 +883,7 @@ Chat view:
 
 - `varro.chat.defaultPermissionMode` - initial permission mode when no saved project or global selection exists; defaults to `auto`
 - `varro.chat.autoApproveModel` - provider/model used by the auto-approve judge; stored in VS Code user settings and selected from Varro's Models view
+- `varro.chat.autoApproveDecisionModel` - optional native OpenCode decision reviewer in provider/model form; off by default and selected in the Models view
 - `varro.chat.showFileDiffs` - show line-by-line edits in file-change tool cards; defaults to `false`
 - `varro.chat.expandThinking` - expand thinking details after two seconds while reasoning is active, collapse finished thinking into rows, and return it to `Explored` when the turn finishes; defaults to `false`
 - `varro.chat.fontSize` - chat text size from `6` through `100`; defaults to `null`, which uses VS Code's `chat.fontSize`. Tool and diff editor content follows `chat.editor.fontSize`

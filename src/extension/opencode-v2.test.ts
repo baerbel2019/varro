@@ -1366,6 +1366,61 @@ describe('v2 configured model catalogs', () => {
   const tier = { tier: { type: 'context', size: 128_000 }, input: 4, output: 16 };
   const base = { input: 2, output: 8, cache: { read: 0.5, write: 1 } };
 
+  it('keeps modern native catalogs authoritative for chat models and defaults', async () => {
+    const adapter = new OpenCodeV2Adapter(async (_method, path) => {
+      if (path === '/api/provider') return { data: [{ id: 'custom', name: 'Custom' }] };
+      if (path === '/api/integration') return { data: [] };
+      if (path === '/api/model')
+        return {
+          data: [
+            {
+              id: 'chat',
+              modelID: 'chat',
+              providerID: 'custom',
+              name: 'Chat',
+              capabilities: { tools: true, input: ['text'], output: ['text'] },
+              variants: [],
+              time: { released: 0 },
+              cost: [base],
+              enabled: true,
+              limit: { context: 32000, output: 1000 },
+            },
+          ],
+        };
+      if (path === '/api/config')
+        return [
+          {
+            info: {
+              providers: {
+                custom: {
+                  models: {
+                    picture: { type: 'image' },
+                    judge: { type: 'decision' },
+                    excluded: {},
+                    chat: { limit: { context: 999 } },
+                  },
+                },
+                unavailable: { models: { hidden: {} } },
+              },
+            },
+          },
+        ];
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    adapter.setServerVersion('2.2.0');
+    for (const route of ['/provider', '/config/providers']) {
+      const catalog = asRecord(await adapter.request('GET', route, undefined));
+      const providers = catalog?.all ?? catalog?.providers;
+      expect(providers).toHaveLength(1);
+      if (!Array.isArray(providers)) throw new Error('Missing provider catalog');
+      const models = asRecord(asRecord(providers[0])?.models);
+      expect(asRecord(providers[0])?.source).toBe('config');
+      expect(Object.keys(models ?? {})).toEqual(['chat']);
+      expect(models?.chat).toMatchObject({ limit: { context: 32000 } });
+      expect(catalog?.default).toEqual({ custom: 'chat' });
+    }
+  });
+
   it.each([
     [undefined, false],
     ['2.0.5', false],
@@ -1374,7 +1429,6 @@ describe('v2 configured model catalogs', () => {
     ['2.1.2-beta.1', false],
     ['2.1.2', true],
     ['opencode v2.1.2', true],
-    ['2.2.0', true],
   ] as const)(
     'respects native OpenCode model exclusions on %s while retaining custom providers',
     async (version, nativeExclusions) => {
@@ -1425,7 +1479,9 @@ describe('v2 configured model catalogs', () => {
         for (const id of ids) {
           const provider = providers.map(asRecord).find((entry) => entry?.id === id);
           const models = asRecord(provider?.models);
-          expect(models?.available).toMatchObject({ limit: { context: 64000, output: 1000 } });
+          expect(models?.available).toMatchObject({
+            limit: { context: 64000, output: 1000 },
+          });
           const excluded = id !== 'custom' && nativeExclusions;
           expect(Object.hasOwn(models ?? {}, 'hidden')).toBe(!excluded);
         }
@@ -1436,6 +1492,34 @@ describe('v2 configured model catalogs', () => {
       });
     }
   );
+
+  it('does not restore image, decision, excluded models or unavailable providers on 2.2.0', async () => {
+    const adapter = new OpenCodeV2Adapter(async (_method, path) => {
+      if (path === '/api/provider') return { data: [{ id: 'custom', name: 'Custom' }] };
+      if (path === '/api/integration' || path === '/api/model') return { data: [] };
+      if (path === '/api/config')
+        return [
+          {
+            info: {
+              providers: {
+                custom: {
+                  models: { picture: { type: 'image' }, judge: { type: 'decision' }, excluded: {} },
+                },
+                unavailable: { models: { hidden: {} } },
+              },
+            },
+          },
+        ];
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    adapter.setServerVersion('2.2.0');
+    expect(await adapter.request('GET', '/config/providers', undefined)).toMatchObject({
+      providers: [{ id: 'custom', models: {} }],
+      default: { custom: '' },
+    });
+    const catalog = asRecord(await adapter.request('GET', '/provider', undefined));
+    expect(catalog?.all).toHaveLength(1);
+  });
 
   it('forwards the Claude CLI limits descriptors and polls its renamed provider endpoint', async () => {
     const settings = {

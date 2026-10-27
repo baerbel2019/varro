@@ -8,6 +8,7 @@ import { withStartupDeadline } from '../shared/startup';
 import { fetchProviderLimitFromAdapter } from './provider-limits';
 import { ProviderQuotaCoordinator } from './provider-quota-coordinator';
 import { readOpenCodeV2AuthStore } from './provider-v2-auth-store';
+import { projectOpenCodeUsageLimits } from './opencode-usage-limits';
 import type { OpenCodeServer } from './server';
 import {
   extractOpenCodeConsoleLimit,
@@ -206,7 +207,7 @@ export class ProviderLimitService {
     const checkedAt = Date.now();
     const attachedOpenAI =
       this.server.isAttachOnly && this.server.apiVersion === 2 && providerID === 'openai';
-    if (this.server.isAttachOnly && !attachedOpenAI) {
+    if (this.server.isAttachOnly && this.server.apiVersion !== 2) {
       return createProviderLimitLoadResult({
         providerID,
         modelID,
@@ -239,6 +240,59 @@ export class ProviderLimitService {
       });
     }
     const provider = providers.find((item) => item.id === providerID);
+
+    if (
+      this.server.apiVersion === 2 &&
+      (providerID === 'opencode' ||
+        providerID === 'opencode-go' ||
+        provider?.integrationID === 'opencode')
+    ) {
+      try {
+        const response = asRecord(
+          await this.server.request('GET', '/api/experimental/usage/limits', undefined, {
+            directory: this.directory,
+            signal,
+            maxResponseBytes: 1024 * 1024,
+          })
+        );
+        signal.throwIfAborted();
+        if (response?.data === null)
+          return createProviderLimitLoadResult({
+            providerID,
+            modelID,
+            checkedAt,
+            source: 'opencode',
+            status: 'unsupported',
+            note: 'This OpenCode location is not signed in to a Console workspace.',
+          });
+        return this.withLastKnownGoodFallback(
+          cacheKey,
+          projectOpenCodeUsageLimits(response?.data, providerID, modelID, checkedAt)
+        );
+      } catch (error) {
+        signal.throwIfAborted();
+        // A missing location is also a 404, but must never switch credential owners.
+        // Only the generic missing-route response permits the old local adapter.
+        if (!(error instanceof Error && /^404 Not found$/i.test(error.message)))
+          return this.withLastKnownGoodFallback(cacheKey, {
+            providerID,
+            modelID,
+            checkedAt,
+            source: 'opencode',
+            status: 'error',
+            note: `OpenCode Console limits failed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+      }
+    }
+    if (this.server.isAttachOnly && !attachedOpenAI)
+      return createProviderLimitLoadResult({
+        providerID,
+        modelID,
+        checkedAt,
+        status: 'unsupported',
+        source: 'provider',
+        note: 'Provider quota checks are not supported in attach-only mode without a server-owned limits endpoint.',
+      });
 
     if (!provider) {
       if (generation === this.providerSnapshotGeneration) {

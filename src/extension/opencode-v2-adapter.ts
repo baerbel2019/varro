@@ -1781,6 +1781,9 @@ export class OpenCodeV2Adapter {
       ...annotations,
       time,
     };
+    // Timing belongs to transcript restoration, not session results. Including it
+    // across full history can exceed the transport's projected-response budget.
+    delete session.generationTiming;
     if (value.parentID) session.parentID = value.parentID;
     return session;
   }
@@ -1848,6 +1851,7 @@ export class OpenCodeV2Adapter {
       ...(Array.isArray(experimentalPolicies) ? experimentalPolicies : []),
       ...(Array.isArray(config?.policies) ? config.policies : []),
     ];
+    const nativeCatalog = this.serverVersion && compareVersions(this.serverVersion, '2.2.0') >= 0;
     for (const [id, entry] of Object.entries(configured)) {
       // Do not restore configured models that the native provider policy removed.
       if (
@@ -1865,6 +1869,9 @@ export class OpenCodeV2Adapter {
       if (!provider) continue;
       let target = all.find((item) => item.id === id);
       if (target?.source === 'custom') target.source = 'config';
+      // Keep source labels and deny filtering above, but never restore native omissions.
+      // Modern model catalogs exclude non-chat models and unavailable packages.
+      if (nativeCatalog) continue;
       if (!target) {
         target = {
           id,
@@ -1882,6 +1889,7 @@ export class OpenCodeV2Adapter {
       for (const [modelID, definition] of Object.entries(asRecord(provider.models) ?? {})) {
         const model = asRecord(definition);
         if (!model) continue;
+        if (model.type !== undefined && model.type !== 'chat') continue;
         const existing = target.models[modelID];
         // Recent OpenCode/Go catalogs filter models server-side, including free-model exclusions.
         // Keep the old-server/custom-provider fallback without undoing those exclusions.

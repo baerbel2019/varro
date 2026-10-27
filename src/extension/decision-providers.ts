@@ -8,15 +8,17 @@ import {
   type JevSettings,
 } from './jev-decisions';
 import { logger } from './logger';
+import type { NativeDecisions } from './native-decisions';
 
 const JEV_SETTINGS_SECTION = 'varro.decisions.jev';
 
-/** Owns the TypeSafe credential and the opt-in settings for Jev decisions. */
+/** Owns the TypeSafe credential and explicit native/legacy decision-model opt-ins. */
 export class DecisionProviders {
   constructor(
     private readonly secrets: vscode.SecretStorage | undefined,
     private readonly createClient: (apiKey: string) => JevClient = (apiKey) =>
-      new JevClient(async () => apiKey)
+      new JevClient(async () => apiKey),
+    private readonly native?: Pick<NativeDecisions, 'status'>
   ) {}
 
   readonly getApiKey = async (): Promise<string | undefined> => {
@@ -43,7 +45,16 @@ export class DecisionProviders {
         ? 'environment'
         : null;
     const settings = this.readSettings();
+    const native = await this.native?.status();
     return {
+      native: native
+        ? {
+            ...native,
+            visible: vscode.workspace
+              .getConfiguration('varro')
+              .get<boolean>('debug.showNativeDecisionModels', false),
+          }
+        : undefined,
       jev: {
         connected: credentialSource !== null,
         credentialSource,
@@ -54,7 +65,19 @@ export class DecisionProviders {
   }
 
   async handle(request: DecisionProviderRequest): Promise<DecisionProviderStatus> {
-    if (request.action === 'connect') await this.connect();
+    if (request.action === 'native') {
+      if (request.model) {
+        const status = await this.native?.status();
+        if (
+          !status?.supported ||
+          !status.models.some((model) => `${model.providerID}/${model.modelID}` === request.model)
+        )
+          throw new Error('Select an available OpenCode decision model');
+      }
+      await vscode.workspace
+        .getConfiguration('varro')
+        .update('chat.autoApproveDecisionModel', request.model, vscode.ConfigurationTarget.Global);
+    } else if (request.action === 'connect') await this.connect();
     else if (request.action === 'disconnect') await this.disconnect();
     else {
       const config = vscode.workspace.getConfiguration(JEV_SETTINGS_SECTION);

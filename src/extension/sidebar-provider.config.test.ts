@@ -547,6 +547,19 @@ describe('SidebarProvider local config routing', () => {
       });
     }
   );
+  it.each(['varro.chat.autoApproveDecisionModel', 'varro.debug.showNativeDecisionModels'])(
+    'notifies the Models view when %s changes externally',
+    async (setting) => {
+      const { provider } = await createSidebarProviderInstance();
+      const { posted } = attachTestView(provider);
+      const listener = vscodeMock.workspace.onDidChangeConfiguration.mock.calls.at(-1)?.[0];
+      posted.length = 0;
+      listener?.({
+        affectsConfiguration: (key: string) => key === setting,
+      });
+      expect(posted).toContainEqual({ type: 'config/update', payload: expect.any(Object) });
+    }
+  );
   it.each(['varro.chat.fontSize', 'chat.fontSize', 'chat.editor.fontSize', 'chat.fontFamily'])(
     'broadcasts font configuration when %s changes',
     async (changedKey) => {

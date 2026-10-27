@@ -87,6 +87,7 @@ import { MacOSTray, projectTraySessions } from './macos-tray';
 import type { TrayProject, TraySession } from './macos-tray';
 import { DecisionProviders } from './decision-providers';
 import { JevClient, JevDecisions } from './jev-decisions';
+import { NativeDecisions } from './native-decisions';
 import { CommitMessageService } from './commit-message-service';
 import type { ContextProvider } from './context-provider';
 import { DroppedFilesService } from './dropped-files-service';
@@ -396,7 +397,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.sessionReadState = new SessionReadStateStore(globalPersistence);
     this.draftImages = new DraftImageStore(persistence);
     this.hiddenSessions = new HiddenSessionManager();
-    this.decisionProviders = new DecisionProviders(secrets);
+    const nativeDecisions = new NativeDecisions(server, () =>
+      vscode.workspace.getConfiguration('varro').get<string>('chat.autoApproveDecisionModel', '')
+    );
+    this.decisionProviders = new DecisionProviders(secrets, undefined, nativeDecisions);
     this.jevDecisions = new JevDecisions(
       new JevClient(this.decisionProviders.getApiKey),
       this.decisionProviders.readSettings,
@@ -408,7 +412,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       isOpenAIPro,
       () => vscode.workspace.getConfiguration('varro').get<string>('chat.autoApproveModel', ''),
       undefined,
-      this.jevDecisions
+      this.jevDecisions,
+      nativeDecisions
     );
     this.sessionTitleFallback = new SessionTitleFallback(server, this.hiddenSessions, () =>
       vscode.workspace
@@ -681,9 +686,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         event.affectsConfiguration('varro.chat.showEmptyStateHistogram') ||
         event.affectsConfiguration('varro.chat.remoteImages') ||
         event.affectsConfiguration('varro.chat.promptCompletionModel') ||
+        event.affectsConfiguration('varro.chat.autoApproveDecisionModel') ||
         event.affectsConfiguration('varro.chat.followupsEnabled') ||
         event.affectsConfiguration('varro.chat.followupModel') ||
         event.affectsConfiguration('varro.debug.showQuotaWarning') ||
+        event.affectsConfiguration('varro.debug.showNativeDecisionModels') ||
         event.affectsConfiguration('varro.debug.resetWarningDays') ||
         event.affectsConfiguration('varro.chat.autoAttachProblems') ||
         event.affectsConfiguration('varro.chat.autoAttachActiveFile') ||

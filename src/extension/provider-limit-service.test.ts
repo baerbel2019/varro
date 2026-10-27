@@ -143,7 +143,14 @@ describe('ProviderLimitService', () => {
       expect(mocks.readFileMock).not.toHaveBeenCalled();
       expect(mocks.readV2AuthStoreMock).not.toHaveBeenCalled();
       expect(mocks.fetchProviderLimitFromAdapterMock).not.toHaveBeenCalled();
-      expect(server.request).not.toHaveBeenCalled();
+      if (apiVersion === 1) expect(server.request).not.toHaveBeenCalled();
+      else
+        expect(server.request).toHaveBeenCalledWith(
+          'GET',
+          '/config/providers',
+          undefined,
+          expect.anything()
+        );
       service.dispose();
     }
   );
@@ -163,6 +170,98 @@ describe('ProviderLimitService', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it.each([false, true])(
+    'uses native Console limits without local credentials, attach-only=%s',
+    async (isAttachOnly) => {
+      const server = { ...createServer(), apiVersion: 2 as const, isAttachOnly };
+      server.request.mockImplementation(async (_method, path) => {
+        if (path === '/config/providers') return { providers: [{ id: 'opencode-go', models: {} }] };
+        if (path === '/api/experimental/usage/limits')
+          return {
+            data: {
+              workspace: { id: 'org_test', name: 'Team' },
+              budgets: [],
+              go: Object.fromEntries(
+                ['rolling', 'weekly', 'monthly'].map((key) => [
+                  key,
+                  { percent: 25, limited: false, resetsAt: 2000 },
+                ])
+              ),
+            },
+          };
+        throw new Error(`Unexpected path: ${path}`);
+      });
+      const service = new ProviderLimitService(server);
+      expect(await service.get('opencode-go', 'chat', '/workspace')).toMatchObject({
+        status: 'available',
+        source: 'opencode',
+        planName: 'Go',
+        windows: [
+          { id: 'five_hour', remaining: 75 },
+          { id: 'weekly', remaining: 75 },
+          { id: 'monthly', remaining: 75 },
+        ],
+      });
+      expect(mocks.readV2AuthStoreMock).not.toHaveBeenCalled();
+      expect(mocks.readFileMock).not.toHaveBeenCalled();
+      expect(mocks.fetchProviderLimitFromAdapterMock).not.toHaveBeenCalled();
+      expect(server.request).toHaveBeenCalledWith(
+        'GET',
+        '/api/experimental/usage/limits',
+        undefined,
+        expect.objectContaining({ directory: '/workspace' })
+      );
+      service.dispose();
+    }
+  );
+
+  it.each([
+    '401 Unauthorized',
+    '503 unavailable',
+    '404 Location not found: /missing',
+    'malformed',
+    'signed-out',
+  ])('does not switch accounts after native limits return %s', async (failure) => {
+    const server = { ...createServer(), apiVersion: 2 as const };
+    server.request.mockImplementation(async (_method, path) => {
+      if (path === '/config/providers') return { providers: [{ id: 'opencode', models: {} }] };
+      if (path === '/api/experimental/usage/limits') {
+        if (failure === 'malformed') return { data: {} };
+        if (failure === 'signed-out') return { data: null };
+        throw new Error(failure);
+      }
+      throw new Error(`Unexpected path: ${path}`);
+    });
+    const service = new ProviderLimitService(server);
+    expect(await service.get('opencode', null)).toMatchObject({
+      status: failure === 'signed-out' ? 'unsupported' : 'error',
+    });
+    expect(mocks.readV2AuthStoreMock).not.toHaveBeenCalled();
+    expect(mocks.fetchProviderLimitFromAdapterMock).not.toHaveBeenCalled();
+    service.dispose();
+  });
+
+  it('retains local adapters only when the native route is absent', async () => {
+    const server = {
+      ...createProviderServer([{ id: 'opencode-go', models: {} }]),
+      apiVersion: 2 as const,
+      url: 'http://127.0.0.1:4096',
+    };
+    server.request.mockImplementation(async (_method, path) => {
+      if (path === '/config/providers') return { providers: [{ id: 'opencode-go', models: {} }] };
+      throw new Error('404 Not found');
+    });
+    mocks.fetchProviderLimitFromAdapterMock.mockResolvedValue({
+      ...createStatus('available'),
+      providerID: 'opencode-go',
+    });
+    const service = new ProviderLimitService(server);
+    expect(await service.get('opencode-go', null)).toMatchObject({ status: 'available' });
+    expect(mocks.readV2AuthStoreMock).toHaveBeenCalled();
+    expect(mocks.fetchProviderLimitFromAdapterMock).toHaveBeenCalled();
+    service.dispose();
   });
 
   it('restores OpenAI limits on a credential-only V2 reconnection using only the active server account', async () => {

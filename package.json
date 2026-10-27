@@ -625,6 +625,13 @@
           "patternErrorMessage": "Use provider/model, or leave the setting empty.",
           "markdownDescription": "Provider/model used by the auto-approve judge. Leave empty to let Varro select a suitable model automatically. Select a configured model from Varro's Models view."
         },
+        "varro.chat.autoApproveDecisionModel": {
+          "type": "string",
+          "scope": "application",
+          "default": "",
+          "pattern": "^$|^[^/\\s]+/[^\\s]+$",
+          "markdownDescription": "Optional server-hosted decision model in provider/model form. Requires OpenCode 2.2.0 decision generation. Uses the server's base configuration and credentials, including for remote servers. Permission details are sent to this model in Auto mode. Varro applies probability gates; errors fall back to the configured legacy Jev or chat judge. Leave empty to disable. Select a native decision model in the Models view."
+        },
         "varro.chat.promptCompletionModel": {
           "type": "string",
           "scope": "application",
@@ -690,6 +697,13 @@
           "default": false,
           "description": "Debug only: show the quota warning for available provider quotas regardless of remaining allowance or saved dismissals. Closing this preview does not save a dismissal."
         },
+        "varro.debug.showNativeDecisionModels": {
+          "deprecationMessage": "Debug only setting. Not intended for regular use.",
+          "type": "boolean",
+          "scope": "application",
+          "default": false,
+          "description": "Debug only: show the experimental OpenCode decision-model section in the Models view. Hiding the section does not disable an explicitly configured decision reviewer."
+        },
         "varro.debug.resetWarningDays": {
           "deprecationMessage": "Debug only setting. Not intended for regular use.",
           "type": "number",
@@ -713,7 +727,6 @@
   },
   "activationEvents": [
     "onCommand:varro.chat.focus",
-    "onCommand:varro.chat.focusInput",
     "onCommand:varro.chat.statusBarClick",
     "onUri",
     "onWebviewPanel:varro.editor"

@@ -142,6 +142,66 @@ The v1 dependency is unchanged, so the Docker v1 support-range matrix was not
 rerun. Real-editor, visual streaming, live-model action parity, and native Windows
 checks were not run for this bump.
 
+### 2.2.0 integration catch-ups
+
+Varro now treats the native chat-model catalog as authoritative on 2.2.0+. Configuration fallback
+cannot restore image/decision models, excluded models, unavailable providers, or override the
+server's projected model limits. Older V2 keeps its configuration fallback but skips explicit
+non-chat model types. Existing configured-provider source labels and explicit provider-deny filters
+still apply before skipping configuration model fallback. Text generation prefers the advertised `/api/experimental/generate/text`
+route, falling back to the legacy path only during discovery. A failed generation is never retried
+through the alias.
+
+Console/Go quota reads use `/api/experimental/usage/limits` with the workspace directory and a 1 MiB
+response budget before any credential access. This also works in attach-only mode. Only route 404
+allows legacy local adapters; malformed, signed-out, and other error responses do not switch
+accounts. Projection keeps Go allowances separate from Console-wide budgets and uses the selected
+model's spend for per-model budgets, including zero when the server omits that counter.
+A location-specific 404 is an error, not a reason to read local credentials.
+
+Native decision models are an explicit opt-in through `varro.chat.autoApproveDecisionModel` or the
+Models view. The experimental section is temporarily hidden unless
+`varro.debug.showNativeDecisionModels` is enabled. Hiding it does not disable a configured reviewer.
+Varro discovers the experimental endpoint and decision catalog, submits evidence using
+the server's base configuration and credentials, and reuses the legacy Jev questions and probability
+gates. Native errors fall back to opted-in legacy Jev, then the chat judge; `ask` remains terminal.
+No legacy credentials/settings are migrated. V1 and older-V2 fallbacks and support floors remain
+unchanged. Media references, SSE filtering, file watching, and desktop GUI plugins remain deferred.
+
+The first catch-up matrix found two adapter regressions: skipping configuration model fallback also
+skipped configured-provider source labels and deny filtering. Both are fixed without restoring any
+omitted models. A third failure was an overly strict test that omitted the signed-out endpoint's
+workspace-location envelope. The targeted published v2.2.0 adapter rerun passed all 38 applicable
+cases, with three platform/family skips. Evidence is
+`artifacts/opencode-2.2.0-catchup-v2-recheck.log`.
+
+The 1,135 focused unit/component regressions pass. `npm run lint`, `npm run fmt`,
+`npm run lint:check`, `npm run typecheck`, `npm run typecheck:suggestions`, and `npm run build` pass.
+Signed-in Console/Go accounts, live decision-model generation, real-editor visuals, and native
+Windows behavior are not verified by these automated checks.
+
+The final published-server matrix passed all 151 applicable checks with 53 family/platform skips
+and no leaked or recovered processes. The five compatibility-summary tests passed afterward.
+Evidence is `artifacts/opencode-2.2.0-catchup-adapters-final.log`,
+`artifacts/opencode-adapters/run-7vmyey/`, and the other `artifacts/opencode-2.2.0-catchup-` logs.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 21 | None in tested cases | Yes, applicable automated cases |
+| v1.19.4 | 31 | 20 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 42 | 9 | None in tested cases | Yes, applicable automated cases |
+| v2.2.0 | 48 | 3 | Source-label and deny-filter regressions fixed; none remaining in tested cases | Yes, applicable automated cases |
+
+No further fixes are indicated by the automated results. Before claiming live-account coverage,
+verify signed-in Console/Go limits and actual native reviewer responses in an isolated editor.
+
+A local real-editor check subsequently verified the four catch-ups with the published 2.2.0 backend
+and loopback chat, decision, and Console HTTP fixtures. No live account was used. Catalog filtering,
+native text success/error behavior, Console/Go displays, native allow/ask/manual rejection/Off, and
+the temporary debug visibility gate passed. This does not establish live-account or model-quality
+coverage. Evidence and controller recovery details are in
+`artifacts/ai-fuzzy/catchup-editor-20261027-a.md`.
+
 ### 2.1.4 compatibility review
 
 Reviewed v2.1.3 to v2.1.4, `e965774fa` through `2a3e7c0f3`. All 121 existing

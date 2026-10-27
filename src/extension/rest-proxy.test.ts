@@ -1962,6 +1962,31 @@ describe('RestProxy handleRequest', () => {
     });
     expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 935, data: status });
     expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 936, data: status });
+    await proxy.handleRequest(
+      makePayload(937, 'POST', '/varro/decision-providers', {
+        action: 'native',
+        model: 'typesafe-ai/jev',
+        ignored: true,
+      })
+    );
+    expect(decisionProviders.handle).toHaveBeenLastCalledWith({
+      action: 'native',
+      model: 'typesafe-ai/jev',
+    });
+    decisionProviders.handle.mockClear();
+    for (const model of [null, 42, 'x'.repeat(501)]) {
+      await proxy.handleRequest(
+        makePayload(938, 'POST', '/varro/decision-providers', {
+          action: 'native',
+          model,
+        })
+      );
+    }
+    expect(decisionProviders.handle).not.toHaveBeenCalled();
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 938,
+      error: expect.stringContaining('Invalid decision model'),
+    });
   });
 
   it('allows a leased queued prompt to target another open workspace', async () => {

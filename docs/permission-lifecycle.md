@@ -302,7 +302,7 @@ session ID, title, and metadata, so requests from different sessions are not gro
 
 ## Automatic Judging
 
-Auto mode has two decision stages.
+Auto mode applies local rules first, then opted-in decision providers, then the chat-model judge.
 
 ### Local Rules
 
@@ -339,6 +339,25 @@ External-directory requests are never delegated to the model judge. Ambiguous pa
 mixed approved and unapproved path sets, and approvals made with `Once` must ask the user. This keeps
 prior approvals from being generalized to unrelated or sensitive directories.
 
+### Native decision provider
+
+`varro.chat.autoApproveDecisionModel` explicitly opts in to a server-hosted decision model. It defaults
+to empty and the Models view validates selections against `/api/model?types=decision`. V1 stays
+inactive; V2 must advertise `/api/experimental/generate/decisions` in its OpenAPI document. Native
+generation uses the server's base configuration and credentials, with no session or workspace
+override. Permission evidence is JSON-encoded text and remains untrusted data.
+
+Native reviews run after local rules and before legacy Jev. They share Jev's questions and probability
+gates below. The decoder requires exactly three uniquely named, correctly typed answers with finite
+probabilities in [0, 1]. Invalid, refused, or failed reviews fall through to opted-in legacy Jev, then
+the chat judge. A valid `ask` is terminal, not a reason to try another reviewer. Discovery and generation
+share a five-second abort deadline and generation has a 64 KiB response limit.
+
+Native verdicts retain the actual `reviewerModel` and cache under that route. Failed decision
+reviewers must never be selected as chat fallback models. External-directory requests never reach
+either decision transport. A decision is not a permission acknowledgement; all visibility, ownership,
+late-result, and reply-acknowledgement rules still apply.
+
 ### Jev Decision Provider
 
 When `varro.decisions.jev.autoApprove` is on and a TypeSafe API key is available (VS Code secret
@@ -358,12 +377,12 @@ External-directory requests remain local-only and never reach Jev. Jev verdicts 
 same key and TTL as model verdicts, using `typesafe/<model>` as the model component, and
 `resolveModel` reports that route so the composer shows TypeSafe as the reviewer.
 
-Every model verdict (Jev or model judge) carries `reviewerModel`, and cached verdicts keep it. The
+Every model verdict (native decision, Jev, or model judge) carries `reviewerModel`, and cached verdicts keep it. The
 auto-approve activity tooltip shows it on its own `Reviewer:` line; local-rule verdicts have none.
 
 ### Model Judge
 
-Requests not decided locally or by Jev may be sent to a temporary hidden OpenCode session. That session denies
+Requests not decided locally or by an opted-in decision provider may be sent to a temporary hidden OpenCode session. That session denies
 all tools except structured output. Permission text, command text, paths, metadata, and prior user
 decisions are untrusted input to the judge, never instructions. A confirmed `always` response is
 strong preference evidence for materially similar or narrower non-destructive actions in the same
@@ -606,6 +625,7 @@ Also run `npm run lint:check` and `npm run typecheck` when implementation or typ
 | Local and model judge policy | `src/extension/auto-approve-judge.ts` |
 | Judge model fallback order | `src/extension/helper-model-selection.ts` |
 | Jev decision gate, credentials, and opt-in settings | `src/extension/jev-decisions.ts`, `src/extension/decision-providers.ts` |
+| Native decision discovery, transport, and strict answer decoding | `src/extension/native-decisions.ts` |
 | Host attention, persistence, and recovery | `src/extension/session-state-manager.ts` |
 | Workspace filtering plus internal helper-session identification, hiding, and stale cleanup | `src/extension/rest-proxy.ts`, `src/extension/hidden-session-manager.ts` |
 | Inline and session-tree prompt placement | `src/webview/components/message-list/pending-prompts.ts` |
