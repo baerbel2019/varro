@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'solid-js/web';
 import { Show } from 'solid-js';
 import { TodoList } from './TodoList';
+import { DEFAULT_TOOLTIP_DELAY } from './Tooltip';
 import { resetDefaultAppState, setState, state } from '../lib/state';
 import { createTodoSyncOperations } from '../hooks/todo-sync';
 import { STORAGE_KEYS, readStored, writeStored } from '../lib/state-storage';
@@ -328,7 +329,50 @@ describe('TodoList', () => {
     );
   });
 
-  it('sets a native title only when the collapsed todo text is truncated', () => {
+  it.each(['pending', 'in_progress', 'completed', 'cancelled'])(
+    'shows a styled tooltip only for truncated %s todo rows',
+    async (status) => {
+      vi.useFakeTimers();
+      setState('todos', [
+        { id: 'todo-1', content: 'Task details', status, priority: 'high' },
+        { id: 'todo-2', content: 'Next task', status: 'pending', priority: 'low' },
+      ]);
+      cleanup = render(() => TodoList(), container!);
+
+      const row = container!.querySelector('[data-todo-id="todo-1"]')!;
+      const text = row.querySelector('.todo-block-item-text')!;
+      Object.defineProperty(text, 'scrollWidth', { configurable: true, value: 100 });
+      Object.defineProperty(text, 'clientWidth', { configurable: true, value: 100 });
+
+      row.dispatchEvent(new MouseEvent('mouseenter'));
+      await vi.advanceTimersByTimeAsync(DEFAULT_TOOLTIP_DELAY);
+      expect(document.querySelector('[role="tooltip"]')).toBeNull();
+      row.dispatchEvent(new MouseEvent('mouseleave'));
+
+      Object.defineProperty(text, 'clientWidth', { configurable: true, value: 50 });
+      row.dispatchEvent(new MouseEvent('mouseenter'));
+      await vi.advanceTimersByTimeAsync(DEFAULT_TOOLTIP_DELAY - 1);
+      expect(document.querySelector('[role="tooltip"]')).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+
+      const tooltip = document.querySelector('[role="tooltip"]');
+      expect(tooltip?.textContent).toBe('Task details');
+      expect(tooltip?.classList.contains('themed-tooltip')).toBe(true);
+      expect(row.getAttribute('title')).toBeNull();
+      expect(text.getAttribute('title')).toBeNull();
+      expect(row.getAttribute('aria-describedby')).toBe(tooltip?.id);
+
+      row.dispatchEvent(new MouseEvent('mouseleave'));
+      expect(document.querySelector('[role="tooltip"]')).toBeNull();
+      Object.defineProperty(text, 'clientWidth', { configurable: true, value: 150 });
+      row.dispatchEvent(new MouseEvent('mouseenter'));
+      await vi.advanceTimersByTimeAsync(DEFAULT_TOOLTIP_DELAY);
+      expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    }
+  );
+
+  it('shows a styled tooltip only when the collapsed todo text is truncated', async () => {
+    vi.useFakeTimers();
     setState('todos', [
       { id: 'todo-1', content: 'Working task', status: 'in_progress', priority: 'high' },
     ]);
@@ -344,12 +388,20 @@ describe('TodoList', () => {
     Object.defineProperty(text, 'clientWidth', { configurable: true, value: 100 });
 
     active?.dispatchEvent(new MouseEvent('mouseenter'));
+    await vi.advanceTimersByTimeAsync(DEFAULT_TOOLTIP_DELAY);
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
     expect(active?.getAttribute('title')).toBeNull();
+    active?.dispatchEvent(new MouseEvent('mouseleave'));
 
     Object.defineProperty(text, 'clientWidth', { configurable: true, value: 50 });
     active?.dispatchEvent(new MouseEvent('mouseenter'));
+    await vi.advanceTimersByTimeAsync(DEFAULT_TOOLTIP_DELAY);
 
-    expect(active?.getAttribute('title')).toBe('Working task');
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe('Working task');
+    expect(active?.getAttribute('title')).toBeNull();
+
+    container?.querySelector<HTMLButtonElement>('.todo-block-header')?.click();
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
   });
 
   it('scrolls to the active todo when it changes', async () => {
