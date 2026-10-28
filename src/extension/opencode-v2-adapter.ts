@@ -938,9 +938,10 @@ export class OpenCodeV2Adapter {
         if (shell.metadata.sessionID !== sessionID)
           throw new Error('404 Background process not found');
         if (method === 'DELETE') {
-          // TODO: Recheck future OpenCode releases for silent process cancellation that suppresses
-          // completion notifications and agent resumption without injecting a chat message.
-          await raw('DELETE', shellEndpoint);
+          await raw(
+            'DELETE',
+            `${shellEndpoint}${shellEndpoint.includes('?') ? '&' : '?'}reason=user`
+          );
           this.cancelBackgroundReview(shellID);
           this.backgroundWork.observe('shell.deleted', { id: shellID }, directory);
           this.notifyBackgroundChange(sessionID, directory);

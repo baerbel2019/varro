@@ -4,7 +4,7 @@ import type { BackgroundProcess, BackgroundProcessOutput } from '../../shared/ba
 import { client } from '../lib/client';
 import { BackgroundProcessDialog } from './BackgroundProcessDialog';
 import { recheckSessionStatus, sendMessage } from '../hooks/useOpenCode';
-import { error, resetDefaultAppState, setState } from '../lib/state';
+import { resetDefaultAppState } from '../lib/state';
 import { sessionStore } from '../lib/stores/session-store';
 
 /* oxlint-disable anti-slop/no-module-mocking -- Dialog action tests isolate the status-refresh orchestration while exercising the real controls. */
@@ -76,7 +76,7 @@ afterEach(() => {
 });
 
 describe('BackgroundProcessDialog', () => {
-  it('opens the clicked process and groups the stop buttons together', async () => {
+  it('opens the clicked process with only the direct stop action', async () => {
     vi.mocked(client.session.backgroundProcesses).mockResolvedValue([
       process,
       { ...process, id: 'shell-2', command: 'npm run build', pid: 43 },
@@ -91,7 +91,8 @@ describe('BackgroundProcessDialog', () => {
       [...dialog().querySelectorAll('.background-process-actions button')].map(
         (button) => button.textContent
       )
-    ).toEqual(['Stop process', 'Steer stop']);
+    ).toEqual(['Stop process']);
+    expect(dialog().textContent).not.toContain('Steer stop');
     expect(client.session.backgroundProcessOutput).toHaveBeenCalledWith(
       'ses_own',
       'shell-2',
@@ -99,122 +100,32 @@ describe('BackgroundProcessDialog', () => {
     );
   });
 
-  it('steers the owning session to stop the selected process and closes without killing directly', async () => {
+  it.each([43, undefined])('stops the selected process directly with PID %s', async (pid) => {
     vi.mocked(client.session.backgroundProcesses).mockResolvedValue([
       process,
-      { ...process, id: 'shell-2', command: 'npm run build', pid: 43 },
+      { ...process, id: 'shell-2', command: 'npm run build', pid },
     ]);
     const onClose = mount();
     await settle();
     dialog().querySelectorAll<HTMLButtonElement>('.background-process-list-item')[1]!.click();
-    const steer = [...dialog().querySelectorAll<HTMLButtonElement>('button')].find(
-      (button) => button.textContent === 'Steer stop'
-    )!;
-    steer.click();
+    const stop = dialog().querySelector<HTMLButtonElement>('.background-process-actions button')!;
+    stop.click();
+    stop.click();
     await settle();
-    expect(sendMessage).toHaveBeenCalledWith(
-      'Stop the background process with PID 43 running this command:\nnpm run build\nProcess ID: shell-2\nWorking directory: /repo',
+    expect(client.session.stopBackgroundProcess).toHaveBeenCalledExactlyOnceWith(
+      'ses_own',
+      'shell-2',
       {
-        delivery: 'steer',
-        targetSessionId: 'ses_own',
-        workspaceDirectory: '/repo',
-        preserveComposer: true,
-        omitContext: true,
+        directory: '/repo',
+        signal: expect.any(AbortSignal),
       }
     );
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(client.session.stopBackgroundProcess).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
     expect(client.session.setBackgroundProcessService).not.toHaveBeenCalled();
   });
 
-  it('identifies processes without a PID by command and process ID', async () => {
-    vi.mocked(client.session.backgroundProcesses).mockResolvedValue([
-      { ...process, pid: undefined },
-    ]);
-    const onClose = mount();
-    await settle();
-    [...dialog().querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent === 'Steer stop')!
-      .click();
-    await settle();
-    expect(sendMessage).toHaveBeenCalledWith(
-      'Stop the background process running this command:\nnpm test\nProcess ID: shell-1\nWorking directory: /repo',
-      expect.anything()
-    );
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([false, true])(
-    'closes immediately and reports failed steering in chat, throws=%s',
-    async (throws) => {
-      if (throws) vi.mocked(sendMessage).mockRejectedValue(new Error('Steering failed'));
-      else vi.mocked(sendMessage).mockResolvedValue(false);
-      setState('activeSessionId', 'ses_own');
-      const onClose = mount();
-      await settle();
-      const steer = [...dialog().querySelectorAll<HTMLButtonElement>('button')].find(
-        (button) => button.textContent === 'Steer stop'
-      )!;
-      steer.focus();
-      steer.click();
-      expect(onClose).toHaveBeenCalledTimes(1);
-      cleanup?.();
-      cleanup = undefined;
-      await settle();
-      expect(error()).toContain(throws ? 'Steering failed' : 'Could not send the stop request');
-    }
-  );
-
-  it('closes before sending finishes and does not close twice after unmount', async () => {
-    let resolveSend!: (value: boolean) => void;
-    vi.mocked(sendMessage).mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveSend = resolve;
-        })
-    );
-    const onClose = mount();
-    await settle();
-    const steer = [...dialog().querySelectorAll<HTMLButtonElement>('button')].find(
-      (button) => button.textContent === 'Steer stop'
-    )!;
-    steer.focus();
-    steer.click();
-    steer.click();
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(steer.disabled).toBe(true);
-    expect(onClose).toHaveBeenCalledTimes(1);
-    cleanup?.();
-    cleanup = undefined;
-    resolveSend(true);
-    await settle();
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not report a late steering failure in a different session', async () => {
-    let rejectSend!: (error: Error) => void;
-    vi.mocked(sendMessage).mockImplementation(
-      () =>
-        new Promise((_resolve, reject) => {
-          rejectSend = reject;
-        })
-    );
-    setState('activeSessionId', 'ses_own');
-    const onClose = mount();
-    await settle();
-    [...dialog().querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent === 'Steer stop')!
-      .click();
-    expect(onClose).toHaveBeenCalledTimes(1);
-    cleanup?.();
-    cleanup = undefined;
-    setState('activeSessionId', 'ses_other');
-    rejectSend(new Error('Steering failed'));
-    await settle();
-    expect(error()).toBeNull();
-  });
-
-  it('disables steer stop for completed and removed processes', async () => {
+  it('disables stop for completed and removed processes', async () => {
     mount();
     await settle();
     vi.mocked(client.session.backgroundProcesses).mockResolvedValue([
@@ -222,16 +133,12 @@ describe('BackgroundProcessDialog', () => {
     ]);
     await vi.advanceTimersByTimeAsync(1000);
     expect(
-      [...dialog().querySelectorAll<HTMLButtonElement>('button')].find(
-        (button) => button.textContent === 'Steer stop'
-      )!.disabled
+      dialog().querySelector<HTMLButtonElement>('.background-process-actions button')!.disabled
     ).toBe(true);
     vi.mocked(client.session.backgroundProcesses).mockResolvedValue([]);
     await vi.advanceTimersByTimeAsync(1000);
     expect(
-      [...dialog().querySelectorAll<HTMLButtonElement>('button')].find(
-        (button) => button.textContent === 'Steer stop'
-      )!.disabled
+      dialog().querySelector<HTMLButtonElement>('.background-process-actions button')!.disabled
     ).toBe(true);
     expect(sendMessage).not.toHaveBeenCalled();
   });

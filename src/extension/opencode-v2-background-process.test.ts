@@ -331,30 +331,31 @@ describe('v2 background process inspection', () => {
     ).rejects.toThrow('no longer running');
   });
 
-  it('stops only the selected owned process and retains tracking on a failed stop', async () => {
-    const own = shell('own', 'ses_own');
-    const wire = vi.fn(async (method: string) => {
-      if (method === 'DELETE') throw new Error('Stop failed');
-      return { data: own };
-    });
-    const adapter = new OpenCodeV2Adapter(wire);
-    await adapter.request('PATCH', '/session/ses_own/background-process/own', { service: true });
-    await expect(
-      adapter.request('DELETE', '/session/ses_own/background-process/own', undefined)
-    ).rejects.toThrow('Stop failed');
-    expect(adapter.eventContext('ses_own')?.backgroundServices).toBe(1);
-    wire.mockImplementation(async () => ({ data: own }));
-    await adapter.request('DELETE', '/session/ses_own/background-process/own', undefined, {
-      directory: '/repo',
-    });
-    expect(wire).toHaveBeenLastCalledWith(
-      'DELETE',
-      '/api/shell/own?location%5Bdirectory%5D=%2Frepo',
-      undefined,
-      expect.anything()
-    );
-    expect(adapter.eventContext('ses_own')?.backgroundServices).toBe(0);
-  });
+  it.each([
+    [undefined, '/api/shell/own?reason=user'],
+    ['/repo', '/api/shell/own?location%5Bdirectory%5D=%2Frepo&reason=user'],
+  ])(
+    'stops only the selected owned process and retains tracking on failure (%s)',
+    async (directory, endpoint) => {
+      const own = shell('own', 'ses_own');
+      const wire = vi.fn(async (method: string) => {
+        if (method === 'DELETE') throw new Error('Stop failed');
+        return { data: own };
+      });
+      const adapter = new OpenCodeV2Adapter(wire);
+      await adapter.request('PATCH', '/session/ses_own/background-process/own', { service: true });
+      await expect(
+        adapter.request('DELETE', '/session/ses_own/background-process/own', undefined)
+      ).rejects.toThrow('Stop failed');
+      expect(adapter.eventContext('ses_own')?.backgroundServices).toBe(1);
+      wire.mockImplementation(async () => ({ data: own }));
+      await adapter.request('DELETE', '/session/ses_own/background-process/own', undefined, {
+        directory,
+      });
+      expect(wire).toHaveBeenLastCalledWith('DELETE', endpoint, undefined, expect.anything());
+      expect(adapter.eventContext('ses_own')?.backgroundServices).toBe(0);
+    }
+  );
   it('lists only session-owned processes and excludes private metadata and log paths', async () => {
     const wire = vi.fn(async () => ({
       data: [shell('own', 'ses_own'), shell('other', 'ses_other')],
