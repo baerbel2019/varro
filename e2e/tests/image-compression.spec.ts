@@ -7,7 +7,7 @@ test('compresses a real pasted PNG, restores it and sends the smaller image', as
   await expect(page.getByLabel('OpenAI / GPT-4.1')).toBeVisible();
   const composer = page.locator('.rich-composer').first();
   await composer.fill('Describe ');
-  await composer.evaluate(async (node) => {
+  const originalSize = await composer.evaluate(async (node) => {
     const canvas = document.createElement('canvas');
     canvas.width = 3000;
     canvas.height = 1500;
@@ -35,6 +35,7 @@ test('compresses a real pasted PNG, restores it and sends the smaller image', as
     node.dispatchEvent(
       new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: clipboard })
     );
+    return blob.size;
   });
   const indicator = page.locator('.chip-image-size').first();
   await expect(indicator).toBeVisible();
@@ -94,14 +95,21 @@ test('compresses a real pasted PNG, restores it and sends the smaller image', as
   expect(footer.transparencyDisplay).toBe('block');
   expect(footer.transparencyTop).toBeGreaterThan(footer.noteTop);
   await menu.getByRole('menuitem', { name: /^Recommended/ }).click();
-  await expect(chip).not.toHaveClass(/image-size-warning/);
+  await expect(menu).not.toBeVisible();
   await chip.hover();
   await expect(preview).toBeVisible();
   await expect
     .poll(() => preview.evaluate((image: HTMLImageElement) => image.naturalWidth))
     .toBe(2048);
   await expect(preview).not.toHaveAttribute('src', originalUrl!);
+  const recommendedUrl = (await preview.getAttribute('src'))!;
+  const recommendedSize = Buffer.byteLength(recommendedUrl.split(',')[1]!, 'base64');
+  expect(recommendedSize).toBeLessThan(originalSize);
   await chip.click({ button: 'right' });
+  // Recommended remains above 2 MB. Wait for reanalysis, which offers further savings.
+  await expect(menu).toContainText(/Current image: 2048 × 1024 · .* MB/);
+  await expect(menu.getByRole('menuitem', { name: /^Smaller size/ })).toBeVisible();
+  await expect(chip).toHaveClass(/image-size-warning/);
   await menu.getByRole('menuitem', { name: 'Restore original' }).click();
   await chip.hover();
   await expect(preview).toHaveAttribute('src', originalUrl!);
@@ -112,6 +120,8 @@ test('compresses a real pasted PNG, restores it and sends the smaller image', as
     .poll(() => preview.evaluate((image: HTMLImageElement) => image.naturalWidth))
     .toBe(1280);
   const smallerUrl = await preview.getAttribute('src');
+  expect(Buffer.byteLength(smallerUrl!.split(',')[1]!, 'base64')).toBeLessThan(recommendedSize);
+  await expect(chip).not.toHaveClass(/image-size-warning/);
   await composer.press('ControlOrMeta+z');
   await chip.hover();
   await expect(preview).toHaveAttribute('src', originalUrl!);

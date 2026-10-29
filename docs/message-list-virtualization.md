@@ -112,6 +112,14 @@ the shared invariants below remain true.
 
 - `measuredHeights` is keyed by message ID and contains the current rendered block size for that
   message.
+- Reopening a previously measured transcript may bootstrap virtualization from retained numeric
+  estimates, bounded to 2,000 rows across four session/window generations. Restore only an identical
+  ordered message window. Explicit history resets invalidate that scope. Retain no DOM, message
+  bodies, or reactive owners. Estimates survive appends within the mounted session but never count
+  as exact measurements; fresh mounted measurements win, and current projection alone certifies
+  zero height. Layout invalidation removes both exact measurements and retained estimates.
+  `session-remount.spec.ts` checks transient mount/read counts, changed-width reopening, native
+  Home/End, viewport coverage, and integer row boxes.
 - `knownZeroHeightMessageIds` may override `measuredHeights` only while the complete row projection is
   known to render no message content, transition content, model-change chrome, dialog summary, or
   other row-local UI. The CSS row box and virtual prefix must agree on that zero.

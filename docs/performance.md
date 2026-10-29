@@ -106,6 +106,11 @@ any saving described here.
 
 ## Memory
 
+- Session reopening reuses bounded numeric row-height estimates to avoid mounting the whole loaded
+  transcript for bootstrap. Keep estimates separate from exact mounted measurements, invalidate
+  them with row layout changes, and scope them to the session's ordered message window and reset
+  generation. The AI-08 remount comparison and native-action evidence are retained under
+  `artifacts/ai-fuzzy/ai08-remount/`. Check transient mount counts, not just settled DOM size.
 - Finalized Markdown caches share a 2 MiB byte budget, with at most 256 entries per cache. The entry
   cap must accommodate a 200-message history page: the old 100-entry cap evicted a large rendered
   response during native scrolling even with most of the byte budget free, adding a parse/sanitize

@@ -879,6 +879,50 @@ describe('virtualized editing', () => {
   });
 });
 
+describe('retained row estimates', () => {
+  it('keeps a reopened and appended window virtualized but reboots after an explicit reset', async () => {
+    const frames = installQueuedAnimationFrameMocks();
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: HTMLElement
+    ) {
+      return new DOMRect(0, 0, 500, this.hasAttribute('data-msg-id') ? 100 : 400);
+    });
+    const messages = Array.from({ length: 60 }, (_, index) => {
+      const id = `retained-${index}`;
+      return {
+        info: assistantMessage(id),
+        parts: [{ ...textPart(`text-${index}`, `Response ${index}`), messageID: id }],
+      };
+    });
+    setState('activeSessionId', 'session-1');
+    replaceMessages(messages);
+    cleanup = render(() => MessageList(), container!);
+    for (let frame = 0; frame < 4; frame += 1) {
+      await Promise.resolve();
+      frames.flush();
+    }
+    expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
+    cleanup();
+    cleanup = render(() => MessageList(), container!);
+    expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
+    expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
+    replaceMessages([
+      ...messages,
+      { info: assistantMessage('appended'), parts: [textPart('appended-text', 'New response')] },
+    ]);
+    expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
+    expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
+    cleanup();
+    resetSessionMessageWindowForRefetch('session-1');
+    cleanup = render(() => MessageList(), container!);
+    expect(container?.querySelector('.interactive-list-track.virtualized')).toBeNull();
+    expect(container?.querySelectorAll('[data-msg-id]').length).toBe(61);
+    await Promise.resolve();
+    frames.flush();
+    frames.restore();
+  });
+});
+
 describe('MessageList history pagination', () => {
   async function mountDeferredHistory(
     initialMessages: MessageEntry[] = [
