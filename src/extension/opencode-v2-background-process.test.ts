@@ -332,10 +332,10 @@ describe('v2 background process inspection', () => {
   });
 
   it.each([
-    [undefined, '/api/shell/own?reason=user'],
-    ['/repo', '/api/shell/own?location%5Bdirectory%5D=%2Frepo&reason=user'],
+    [undefined, '/api/shell/own'],
+    ['/repo', '/api/shell/own?location%5Bdirectory%5D=%2Frepo'],
   ])(
-    'stops only the selected owned process and retains tracking on failure (%s)',
+    'uses the supported delete route for only the selected owned process and retains tracking on failure (%s)',
     async (directory, endpoint) => {
       const own = shell('own', 'ses_own');
       const wire = vi.fn(async (method: string) => {

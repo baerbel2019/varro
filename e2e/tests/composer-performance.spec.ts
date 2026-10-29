@@ -95,7 +95,6 @@ for (const count of [20, 10_000]) {
     const editor = page.locator('[role="textbox"][aria-multiline="true"]').first();
     await expect(editor).toBeVisible();
     await page.waitForTimeout(500);
-    const measurements = [];
 
     for (const streaming of [false, true]) {
       await editor.fill('');
@@ -158,18 +157,20 @@ for (const count of [20, 10_000]) {
       expect(samples).toHaveLength(text.length);
       samples.sort((left, right) => left - right);
       const p95 = samples[Math.floor(samples.length * 0.95)]!;
-      measurements.push({ count, streaming, p95, max: samples.at(-1), samples });
+      // Attach before asserting so a failed CI run retains the phase and its distribution.
+      await testInfo.attach(`typing-latency-${streaming ? 'streaming' : 'idle'}.json`, {
+        body: JSON.stringify({ count, streaming, p95, max: samples.at(-1), samples }),
+        contentType: 'application/json',
+      });
       // Catch history-sized stalls, allowing normal frame scheduling and shared-CI jitter.
-      expect(p95).toBeLessThan(50);
+      expect
+        .soft(p95, `${count} messages, ${streaming ? 'streaming' : 'idle'} input-to-frame p95`)
+        .toBeLessThan(50);
       await editor.press('ControlOrMeta+z');
       await expect(editor).not.toHaveText(text);
       await editor.press('ControlOrMeta+Shift+z');
       await expect(editor).toHaveText(text);
     }
     expect(errors).toEqual([]);
-    await testInfo.attach('typing-latency.json', {
-      body: JSON.stringify(measurements),
-      contentType: 'application/json',
-    });
   });
 }

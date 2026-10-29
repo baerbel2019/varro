@@ -1631,8 +1631,11 @@ test.describe('auto-scroll', () => {
     await page.goto('/e2e/harness/index.html?scenario=large-transcript');
     const list = page.locator('.interactive-list');
     await expect(list).toBeVisible();
+    await expect(page.locator('[data-msg-id="message-large-assistant-239"]')).toBeInViewport();
+    await waitForAnimationFrames(page, 12);
 
     await list.evaluate((element) => {
+      element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
       element.scrollTop = Math.floor(element.scrollHeight / 2);
       element.dispatchEvent(new Event('scroll'));
     });

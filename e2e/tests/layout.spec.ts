@@ -2254,7 +2254,9 @@ for (const singleImage of [false, true]) {
   });
 }
 
-test('keeps the entire sticky prompt footprint opaque through resize', async ({ page }) => {
+test('keeps the sticky prompt opaque with a fading bottom edge through resize', async ({
+  page,
+}, testInfo) => {
   await page.setViewportSize({ width: 486, height: 900 });
   await page.goto('/e2e/harness/index.html?scenario=sticky-preview');
   await page.locator('.interactive-list').evaluate((element) => {
@@ -2271,15 +2273,30 @@ test('keeps the entire sticky prompt footprint opaque through resize', async ({ 
       ).backgroundColor;
       return {
         expected: background,
-        overlay: getComputedStyle(element).backgroundColor,
+        overlay: getComputedStyle(element).backgroundImage,
+        overlayColor: getComputedStyle(element).backgroundColor,
+        solid: getComputedStyle(element.querySelector('.latest-user-message-sticky-bottom-solid')!)
+          .backgroundColor,
         tail: getComputedStyle(element.querySelector('.latest-user-message-sticky-bottom-fade')!)
           .backgroundColor,
+        tailHeight: element
+          .querySelector('.latest-user-message-sticky-bottom-fade')!
+          .getBoundingClientRect().height,
       };
     });
-    expect(backgrounds.overlay).toBe(backgrounds.expected);
-    expect(backgrounds.tail).toBe(backgrounds.expected);
-    expect(backgrounds.overlay).not.toMatch(/rgba\(/);
+    expect(backgrounds.solid).toBe(backgrounds.expected);
+    expect(backgrounds.solid).not.toMatch(/rgba\(/);
+    expect(backgrounds.tailHeight).toBeGreaterThan(0);
+    expect(backgrounds.overlay).toBe(
+      `linear-gradient(${backgrounds.expected} calc(100% - ${backgrounds.tailHeight}px), rgba(0, 0, 0, 0))`
+    );
+    expect(backgrounds.overlayColor).toBe('rgba(0, 0, 0, 0)');
+    expect(backgrounds.tail).toBe('rgba(0, 0, 0, 0)');
   }
+  await testInfo.attach('sticky-prompt-fade.png', {
+    body: await overlay.screenshot({ path: testInfo.outputPath('sticky-prompt-fade.png') }),
+    contentType: 'image/png',
+  });
 });
 
 test('dot hover highlights the visible text bubble of an image prompt', async ({ page }) => {

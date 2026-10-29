@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { TaskSessionInfo } from '../../lib/task-session';
 import type { AssistantMessage, MessageEntry, UserMessage } from '../../types';
 import { flushesAssistantDialog, getAssistantDialogSummaryMap } from './assistant-dialog';
@@ -60,6 +60,48 @@ function incompleteAssistantMessage(
 }
 
 describe('getAssistantDialogSummaryMap', () => {
+  it('does not copy the history lookup until the trailing dialog can produce a summary', () => {
+    const history = Array.from({ length: 10_000 }, (_, index) =>
+      assistantMessage(`history-${index}`, 'session-1', 'old-prompt', index, index + 1)
+    );
+    const entriesById = new Map(history.map((entry) => [entry.info.id, entry]));
+    const iterateHistory = vi.spyOn(entriesById, Symbol.iterator);
+    const prompt = userMessage('prompt', 'session-1', 20_000);
+    const response = incompleteAssistantMessage('response', 'session-1', 'prompt', 20_001);
+    const messages = [...history, prompt, response];
+    const options = {
+      entriesById,
+      primarySessionId: 'session-1',
+      range: { start: history.length, end: messages.length },
+    };
+
+    for (let delta = 0; delta < 10; delta += 1) {
+      response.parts = [
+        {
+          id: 'text',
+          sessionID: 'session-1',
+          messageID: 'response',
+          type: 'text',
+          text: 'More text. '.repeat(delta + 1),
+        },
+      ];
+      expect(getAssistantDialogSummaryMap(messages, undefined, options).size).toBe(0);
+    }
+    expect(iterateHistory).not.toHaveBeenCalled();
+
+    response.info.time.completed = 21_000;
+    expect(
+      getAssistantDialogSummaryMap(messages, undefined, options).get('response')
+    ).toMatchObject({
+      promptMessageId: 'prompt',
+      durationMs: 1_000,
+      inputTokens: 10,
+      outputTokens: 5,
+    });
+    expect(iterateHistory).toHaveBeenCalledTimes(1);
+    iterateHistory.mockRestore();
+  });
+
   it('calculates weighted generation TPS without initial latency, tool waits, or child tokens', () => {
     const first = assistantMessage('first', 'session-1', 'user-1', 1_000, 5_000);
     first.info.tokens.output = 100;

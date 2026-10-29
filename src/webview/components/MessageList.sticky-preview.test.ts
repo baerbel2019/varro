@@ -31,8 +31,10 @@ import {
   markSessionHistoryLoadFailed,
   resetSessionMessageWindowForRefetch,
   setSessionHistoryCursor,
+  setSessionHistoryPromptCursor,
   setSessionHistoryPrompts,
 } from '../lib/message-window';
+import { loadOlderSessionPrompts } from '../hooks/useOpenCode';
 import { client } from '../lib/client';
 import {
   assistantMessage,
@@ -41,6 +43,7 @@ import {
   installControllableIntersectionObserver,
   installMessageListTestEnvironment,
   installQueuedAnimationFrameMocks,
+  measureTranscriptRows,
   settleBottomFollow,
   session,
   textPart,
@@ -511,6 +514,69 @@ describe('shouldShowStickyUserMessagePreview', () => {
     expect(stickyText?.textContent).toContain('Prompt 2');
     expect(stickyText?.getAttribute('title')).toBeNull();
 
+    animationFrames.restore();
+  });
+
+  it('shows the original sticky prompt after prefetch crosses a steering page in a long turn', async () => {
+    const animationFrames = installQueuedAnimationFrameMocks();
+    let list: HTMLDivElement | null = null;
+    setState('activeSessionId', 'session-1');
+    setSessionHistoryCursor('session-1', 'cursor-steer');
+    setSessionHistoryPromptCursor('session-1', 'cursor-steer');
+    replaceMessages(
+      Array.from({ length: 200 }, (_, index) => ({
+        info: assistantMessage(`response-${index}`, { parentID: 'steer' }),
+        parts: [textPart(`response-text-${index}`, `Response step ${index}`)],
+      }))
+    );
+    const steeringPage: MessageEntry[] & { nextCursor?: string } = [
+      {
+        info: { ...userMessage('steer'), delivery: 'steer' },
+        parts: [textPart('steer-text', 'Additional instruction')],
+      },
+    ];
+    steeringPage.nextCursor = 'cursor-root';
+    const messagesSpy = vi
+      .spyOn(client.session, 'messages')
+      .mockResolvedValueOnce(steeringPage)
+      .mockResolvedValueOnce([
+        { info: userMessage('root'), parts: [textPart('root-text', 'Original long-turn prompt')] },
+      ]);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: HTMLElement
+    ) {
+      if (this.hasAttribute('data-msg-id')) {
+        const index = Number(this.dataset.msgId?.replace('response-', ''));
+        return new DOMRect(0, index * 120 - (list?.scrollTop ?? 0), 500, 120);
+      }
+      if (this.classList.contains('interactive-list-track')) {
+        return new DOMRect(0, -(list?.scrollTop ?? 0), 500, 24_000);
+      }
+      return new DOMRect(0, 0, 500, 500);
+    });
+    cleanup = render(() => MessageList(), container!);
+    await Promise.resolve();
+    list = container!.querySelector<HTMLDivElement>('.interactive-list')!;
+    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 500 });
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 24_000 });
+    list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
+    list.scrollTop = 12_000;
+    list.dispatchEvent(new Event('scroll'));
+    animationFrames.flush();
+    await Promise.resolve();
+
+    expect(container?.querySelector('.latest-user-message-sticky')).toBeNull();
+    await loadOlderSessionPrompts('session-1');
+    animationFrames.flush();
+    await Promise.resolve();
+
+    expect(container?.querySelector('.latest-user-message-sticky-text')?.textContent).toContain(
+      'Original long-turn prompt'
+    );
+    expect(messagesSpy).toHaveBeenCalledTimes(2);
+    expect(state.messages).toHaveLength(200);
+    expect(container?.querySelector('[data-msg-id="root"]')).toBeNull();
+    expect(container?.querySelectorAll('.interactive-item-container').length).toBeLessThan(50);
     animationFrames.restore();
   });
 
@@ -3096,6 +3162,9 @@ describe('MessageList sticky prompt preview', () => {
     Object.defineProperty(list!, 'scrollHeight', { configurable: true, value: 10_000 });
     Object.defineProperty(list!, 'scrollTop', { configurable: true, writable: true, value: 0 });
 
+    list!.dispatchEvent(new WheelEvent('wheel', { deltaY: -120 }));
+    list!.dispatchEvent(new Event('scroll'));
+    await Promise.resolve();
     const firstRenderedMessageIdBeforeScroll =
       container?.querySelector<HTMLElement>('[data-msg-id]')?.dataset.msgId;
     expect(firstRenderedMessageIdBeforeScroll).toBe('assistant-0');
@@ -3499,6 +3568,7 @@ describe('MessageList sticky prompt preview', () => {
     animationFrames.flush();
     await Promise.resolve();
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }));
     scrollTopValue = 42 * 120;
     list.dispatchEvent(new Event('scroll'));

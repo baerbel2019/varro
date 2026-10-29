@@ -24,6 +24,7 @@ import {
   hasAssistantModelChangeBetween,
   installMessageListTestEnvironment,
   installQueuedAnimationFrameMocks,
+  measureTranscriptRows,
   settleBottomFollow,
   reasoningPart,
   testDiffOverlayOwner,
@@ -586,6 +587,7 @@ describe('MessageList auto-scroll', () => {
         await Promise.resolve();
         animationFrames.flush();
       }
+      if (messageCount >= 50) await measureTranscriptRows(list, animationFrames);
       const previousBottom = initialHeight - 400;
       expect(list.scrollTop).toBe(previousBottom);
 
@@ -1304,6 +1306,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 2000;
     list.dispatchEvent(new Event('scroll'));
@@ -1804,6 +1807,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 20 * rowHeight;
     list.dispatchEvent(new Event('scroll'));
@@ -1903,6 +1907,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 20 * 300;
     list.dispatchEvent(new Event('scroll'));
@@ -1992,6 +1997,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -720 }));
     top = 6000;
     list.dispatchEvent(new Event('scroll'));
@@ -2124,6 +2130,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     const userIndex = 20;
     const assistantIndex = 21;
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
@@ -2288,6 +2295,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 1976;
     list.dispatchEvent(new Event('scroll'));
@@ -2901,6 +2909,7 @@ describe('MessageList auto-scroll', () => {
           await Promise.resolve();
           animationFrames.flush();
         }
+        if (mount === 0) await measureTranscriptRows(list, animationFrames);
       }
       list!.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
       scrollTopValue = 4000;
@@ -3010,6 +3019,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 2000;
     list.dispatchEvent(new Event('scroll'));
@@ -3158,6 +3168,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 1998;
     list.dispatchEvent(new Event('scroll'));
@@ -3254,6 +3265,7 @@ describe('MessageList auto-scroll', () => {
       container?.querySelector('.interactive-list-track')?.classList.contains('virtualized')
     ).toBe(true);
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 3000;
     list.dispatchEvent(new Event('scroll'));
@@ -3330,6 +3342,12 @@ describe('MessageList auto-scroll', () => {
         scrollTopValue = value;
       },
     });
+    await measureTranscriptRows(list, animationFrames);
+    list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
+    list.scrollTop = 0;
+    list.dispatchEvent(new Event('scroll'));
+    await Promise.resolve();
+    animationFrames.flush();
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     const firstRow = container?.querySelector('[data-msg-id="assistant-0"]') as HTMLDivElement;
     const rowObserver = observers.find((observer) => observer.targets.has(firstRow));
@@ -3425,6 +3443,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -3530,6 +3549,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -3628,6 +3648,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -3721,6 +3742,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -5705,6 +5727,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
     scrollTopValue = messageTrackHeight - list.clientHeight - 220;
     list.dispatchEvent(new Event('scroll'));

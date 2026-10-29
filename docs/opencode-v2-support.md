@@ -41,6 +41,20 @@ The editor profile is disposable, and its OpenCode database is isolated under `a
 
 The released v2 API has no session-sharing route or arbitrary single-message deletion. OpenCode has discontinued sharing across both families; Varro offers only local cleanup of existing v1 links. Varro implements inline-edit tail deletion through file-preserving staged revert and commit. V2 also has no LSP service. Metadata annotations are local to Varro; they are not synchronized to other OpenCode clients. Switching CLI families does not perform a data migration.
 
+Stopping a background process directly uses `DELETE /api/shell/{id}`. The served v2.2.0
+OpenAPI contract and published client expose no cancellation-reason or silent-stop option;
+`reason=user` is not supported. The process stops, but a background shell job can emit a
+synthetic `Shell.NotFoundError` completion notice and resume its owning agent. Varro does
+not inject a steering prompt or interrupt unrelated session work to suppress that backend
+continuation. Silent cancellation requires an upstream API and job-notification change.
+
+The upstream removal path fails pending shell waiters with `Shell.NotFoundError`; the
+background tool converts that failed job into a synthetic session input. Filtering that
+input in Varro would only hide it, not prevent backend execution. An upstream fix must
+carry an explicit user-cancellation outcome through shell/job removal and suppress its
+background notification. Interrupting the entire session or racing to cancel the new
+inbox item is not a safe substitute for cancelling one process.
+
 ### Configuration discovery and provider connection lifecycle
 
 Project configuration reads now follow v2's documented discovery order through the filesystem

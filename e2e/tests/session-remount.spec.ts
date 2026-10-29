@@ -1,13 +1,98 @@
 import { expect, test } from '@playwright/test';
 
-type RemountWork = { peakRows: number; rowReads: number };
+type RemountWork = { peakRows: number; rowReads: number; mountedIds: string[] };
 declare global {
   interface Window {
     finishRemountWork?: () => RemountWork;
   }
 }
 
+function observeMountWork() {
+  const mounted = new Set<Element>();
+  const mountedIds = new Set<string>();
+  let peakRows = 0;
+  let rowReads = 0;
+  const rect = HTMLElement.prototype.getBoundingClientRect;
+  HTMLElement.prototype.getBoundingClientRect = function () {
+    if (this.hasAttribute('data-msg-id')) rowReads += 1;
+    return rect.call(this);
+  };
+  const rows = (node: Node) =>
+    node instanceof Element
+      ? [
+          ...(node.matches('[data-msg-id]') ? [node] : []),
+          ...node.querySelectorAll('[data-msg-id]'),
+        ]
+      : [];
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of record.removedNodes) for (const row of rows(node)) mounted.delete(row);
+      for (const node of record.addedNodes) {
+        for (const row of rows(node)) {
+          mounted.add(row);
+          mountedIds.add(row.getAttribute('data-msg-id')!);
+        }
+      }
+      peakRows = Math.max(peakRows, mounted.size);
+    }
+  });
+  observer.observe(document, { childList: true, subtree: true });
+  window.finishRemountWork = () => {
+    observer.disconnect();
+    HTMLElement.prototype.getBoundingClientRect = rect;
+    delete window.finishRemountWork;
+    return { peakRows, rowReads, mountedIds: [...mountedIds] };
+  };
+}
+
 for (const width of [486, 360]) {
+  test(`cold transcript at ${width}px measures a bounded tail and reconciles unseen rows`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.addInitScript(observeMountWork);
+    await page.goto('/e2e/harness/index.html?scenario=large-transcript');
+    const list = page.locator('.interactive-list');
+    const latest = page.locator('[data-msg-id="message-large-assistant-239"]');
+    await expect(latest).toBeInViewport();
+    await expect
+      .poll(() =>
+        list.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop)
+      )
+      .toBeLessThanOrEqual(1);
+    const work = await page.evaluate(() => window.finishRemountWork!());
+    await test.info().attach('cold-mount-work', {
+      body: JSON.stringify(work),
+      contentType: 'application/json',
+    });
+    expect(work.peakRows, JSON.stringify(work)).toBeLessThan(90);
+    expect(work.rowReads, JSON.stringify(work)).toBeLessThan(500);
+    expect(work.mountedIds).not.toContain('message-large-user-0');
+    const measuredTailHeight = await latest.evaluate(
+      (element) => element.getBoundingClientRect().height
+    );
+    expect(measuredTailHeight).toBeGreaterThan(0);
+    expect(measuredTailHeight).toBe(Math.round(measuredTailHeight));
+
+    // Home enters rows that have never mounted. Their estimates must be replaced by exact
+    // measurements without losing the native destination; returning retains the measured tail.
+    await list.click({ position: { x: 2, y: 20 } });
+    await list.press('Home');
+    await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(1);
+    await expect(page.locator('[data-msg-id="message-large-user-0"]')).toBeInViewport();
+    await expect(latest).toHaveCount(0);
+    await list.press('End');
+    await expect(latest).toBeInViewport();
+    await expect
+      .poll(() =>
+        list.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop)
+      )
+      .toBeLessThanOrEqual(1);
+    expect(await latest.evaluate((element) => element.getBoundingClientRect().height)).toBe(
+      measuredTailHeight
+    );
+  });
+
   test(`reopening a measured transcript at ${width}px avoids a full-page remount`, async ({
     page,
   }) => {
@@ -25,37 +110,7 @@ for (const width of [486, 360]) {
     await page.getByLabel('Back to sessions').click();
     await expect(list).toHaveCount(0);
     await page.setViewportSize({ width, height: 900 });
-    await page.evaluate(() => {
-      const mounted = new Set<Element>();
-      let peakRows = 0;
-      let rowReads = 0;
-      const rect = HTMLElement.prototype.getBoundingClientRect;
-      HTMLElement.prototype.getBoundingClientRect = function () {
-        if (this.hasAttribute('data-msg-id')) rowReads += 1;
-        return rect.call(this);
-      };
-      const rows = (node: Node) =>
-        node instanceof Element
-          ? [
-              ...(node.matches('[data-msg-id]') ? [node] : []),
-              ...node.querySelectorAll('[data-msg-id]'),
-            ]
-          : [];
-      const observer = new MutationObserver((records) => {
-        for (const record of records) {
-          for (const node of record.removedNodes) for (const row of rows(node)) mounted.delete(row);
-          for (const node of record.addedNodes) for (const row of rows(node)) mounted.add(row);
-          peakRows = Math.max(peakRows, mounted.size);
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-      window.finishRemountWork = () => {
-        observer.disconnect();
-        HTMLElement.prototype.getBoundingClientRect = rect;
-        delete window.finishRemountWork;
-        return { peakRows, rowReads };
-      };
-    });
+    await page.evaluate(observeMountWork);
     await page.locator('.session-item').filter({ hasText: 'Large transcript' }).click();
     await expect(list).toBeVisible();
     await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);

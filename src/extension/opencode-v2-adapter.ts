@@ -938,10 +938,9 @@ export class OpenCodeV2Adapter {
         if (shell.metadata.sessionID !== sessionID)
           throw new Error('404 Background process not found');
         if (method === 'DELETE') {
-          await raw(
-            'DELETE',
-            `${shellEndpoint}${shellEndpoint.includes('?') ? '&' : '?'}reason=user`
-          );
+          // Released v2 APIs have no cancellation-reason parameter. Deletion can still
+          // notify the owning session; do not imply that it silently cancels its job.
+          await raw('DELETE', shellEndpoint);
           this.cancelBackgroundReview(shellID);
           this.backgroundWork.observe('shell.deleted', { id: shellID }, directory);
           this.notifyBackgroundChange(sessionID, directory);

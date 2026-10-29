@@ -22,6 +22,7 @@ import {
   getErrorDetailsLayoutSignatures,
   getInlinePreviewLayoutSignatures,
   getMessageBlockBoundaryMap,
+  sameMessageBlockBoundaries,
   getThinkingLayoutSignatures,
 } from './message-list/row-layout';
 import { startEditingMessage } from '../lib/message-edit-state';
@@ -39,6 +40,7 @@ import {
   filePart,
   installMessageListTestEnvironment,
   installQueuedAnimationFrameMocks,
+  measureTranscriptRows,
   settleBottomFollow,
   reasoningPart,
   textPart,
@@ -394,6 +396,41 @@ describe('error-details virtualization signatures', () => {
 });
 
 describe('bordered message projection', () => {
+  it('keeps equivalent tail boundaries equal as prose streams but detects layout and membership changes', () => {
+    const message = {
+      info: assistantMessage('answer'),
+      parts: [textPart('answer-text', 'Prose')],
+    };
+    const options = {
+      expandedActivityGroup: () => false,
+      renderEmptyMessageIds: new Set<string>(),
+      showThinking: true,
+    };
+    const original = getMessageBlockBoundaryMap([message], new Map(), options);
+    message.parts = [textPart('answer-text', 'Prose with more streamed text')];
+    const streamed = getMessageBlockBoundaryMap([message], new Map(), options);
+    expect(original.get('answer')).not.toBe(streamed.get('answer'));
+    expect(sameMessageBlockBoundaries(original, streamed)).toBe(true);
+
+    const empty = getMessageBlockBoundaryMap([message], new Map(), {
+      ...options,
+      renderEmptyMessageIds: new Set(['answer']),
+    });
+    expect(sameMessageBlockBoundaries(original, empty)).toBe(false);
+    expect(sameMessageBlockBoundaries(original, new Map())).toBe(false);
+    const boundary = original.get('answer')!;
+    expect(sameMessageBlockBoundaries(original, new Map([['other', boundary]]))).toBe(false);
+    for (const change of [
+      { startsBordered: true },
+      { endsBordered: true },
+      { signature: 'changed' },
+    ]) {
+      expect(
+        sameMessageBlockBoundaries(original, new Map([['answer', { ...boundary, ...change }]]))
+      ).toBe(false);
+    }
+  });
+
   it('treats follow-up labels as unbordered action chrome without changing message or part identities', () => {
     const message = {
       info: { ...userMessage('followup'), followupTitle: 'Fix parser failures' },
@@ -642,12 +679,12 @@ describe('virtualized editing', () => {
     await Promise.resolve();
 
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
-    expect(container?.querySelector('[data-msg-id="user-59"]')).toBeNull();
+    expect(container?.querySelector('[data-msg-id="user-0"]')).toBeNull();
 
-    startEditingMessage('user-59', 'session-1', 'Prompt 59');
+    startEditingMessage('user-0', 'session-1', 'Prompt 0');
     await Promise.resolve();
 
-    const editedRow = container?.querySelector<HTMLElement>('[data-msg-id="user-59"]');
+    const editedRow = container?.querySelector<HTMLElement>('[data-msg-id="user-0"]');
     expect(editedRow).not.toBeNull();
     expect(editedRow?.classList).toContain('interactive-request-editing');
     expect(editedRow?.classList).not.toContain('interactive-item-virtual-placeholder');
@@ -711,15 +748,34 @@ describe('virtualized editing', () => {
         })
       );
       cleanup = render(() => MessageList(), container!);
+      const list = container!.querySelector<HTMLElement>('.interactive-list')!;
+      Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
+      Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 5900 });
+      await measureTranscriptRows(list, animationFrames);
+      // Keep the viewport at the head so editing the tail creates the pinned placeholder gap.
+      list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
+      list.scrollTop = 0;
+      list.dispatchEvent(new Event('scroll'));
       for (let frame = 0; frame < 4; frame += 1) {
         await Promise.resolve();
         animationFrames.flush();
       }
 
+      // Measurement returns to the tail. Detach at the head so editing the last row
+      // creates an inert pinned gap containing the zero-height assistant under test.
+      list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -5900 }));
+      list.scrollTop = 0;
+      list.dispatchEvent(new Event('scroll'));
+      await Promise.resolve();
+      animationFrames.flush();
+      expect(container?.querySelector('[data-msg-id="message-0"]')).not.toBeNull();
+      expect(container?.querySelector('[data-msg-id="message-59"]')).toBeNull();
       expect(container?.querySelector('[data-msg-id="message-30"]')).toBeNull();
       startEditingMessage('message-59', 'session-1', 'Prompt 59');
       await Promise.resolve();
       expect(container?.querySelector('[data-msg-id="message-59"]')).not.toBeNull();
+      expect(container?.querySelector('.virtual-pinned-gap')).not.toBeNull();
+      expect(container?.querySelector('[data-msg-id="message-30"]')).toBeNull();
 
       replaceMessages(
         state.messages.map((message) =>
@@ -880,7 +936,7 @@ describe('virtualized editing', () => {
 });
 
 describe('retained row estimates', () => {
-  it('keeps a reopened and appended window virtualized but reboots after an explicit reset', async () => {
+  it('keeps cold, reopened, appended, and explicitly reset windows bounded', async () => {
     const frames = installQueuedAnimationFrameMocks();
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
       this: HTMLElement
@@ -915,8 +971,14 @@ describe('retained row estimates', () => {
     cleanup();
     resetSessionMessageWindowForRefetch('session-1');
     cleanup = render(() => MessageList(), container!);
-    expect(container?.querySelector('.interactive-list-track.virtualized')).toBeNull();
-    expect(container?.querySelectorAll('[data-msg-id]').length).toBe(61);
+    expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
+    expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
+    // Reset discards retained measurements, so the unseen prefix uses cold 160px estimates.
+    const firstRow = container!.querySelector<HTMLElement>('[data-msg-id]')!;
+    const firstIndex = Number(firstRow.dataset.msgId!.slice('retained-'.length));
+    expect(container!.querySelector<HTMLElement>('.virtual-spacer-top')!.style.height).toBe(
+      `${firstIndex * 160}px`
+    );
     await Promise.resolve();
     frames.flush();
     frames.restore();
@@ -1093,6 +1155,7 @@ describe('MessageList history pagination', () => {
       return Math.max(0, Math.min(10, index - 90)) * growth;
     });
     Object.defineProperty(harness.list, 'scrollHeight', { configurable: true, value: 20_000 });
+    await measureTranscriptRows(harness.list, harness.animationFrames);
     for (let frame = 0; frame < 4; frame += 1) {
       await Promise.resolve();
       harness.animationFrames.flush();
