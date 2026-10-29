@@ -87,6 +87,12 @@ Only fresh matching PID, executable, birth identity, and ordinary ownership chec
 can restore the original managed connection. A changed or unverifiable process
 remains attach-only. Diagnostics include the specific identity mismatch.
 
+If credential discovery already followed a replacement to another port, background
+preparation revalidates that selected endpoint and its saved credentials in place.
+It must not temporarily select the retired record's port while SSE admission or
+ordinary requests are in flight. Same-port preparation still rechecks process
+identity so transient inspection failures can recover genuine ownership.
+
 Commit-message preparation has a separate bounded deadline from model generation.
 Git history and server preparation run concurrently, and model selection is reused
 when one-shot generation falls back to a helper session. Preparation timeout reports

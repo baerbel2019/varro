@@ -2,11 +2,50 @@
 
 ## Status
 
+The October 28 host investigation found an upstream Chromium repair for the reduced
+reproduction. Chromium commit
+[`9e4f33e7`](https://chromium.googlesource.com/chromium/src/+/9e4f33e7f601a78bcc545d37537b02e461920089),
+"Fix stale OOPIF compositor viewport during resize", refreshes the remote frame's
+compositing rectangle before propagating resized geometry. Without it, an
+out-of-process iframe can receive new layout bounds with an old compositor viewport.
+The installed Chromium 150 source lacks that update. Chromium Dash lists the repair
+in stable `152.0.7977.42` and later.
+
+This is a verified fix for the reduced reproduction, **not a complete real-chat fix**.
+The same VS Code 1.143.1 application code was tested in disposable native hosts on
+its installed Electron 43.7.7 / Chromium 150.0.7871.250 and on official Electron
+44.7.0 / Chromium 152.0.7977.130. The plain HTML comparison recorded 10 cropped
+frames in 170 on the installed engine, versus zero in 123 on the newer engine.
+Both ran six maximize/restore cycles, ten width steps, and a held-sash drag.
+Repeated real-chat maximize and editor transitions improved, but brief sidebar
+crops still occurred after resizing. They also occurred with the host clip removed.
+Do not mark native clipping fully resolved.
+
+The [retained upstream source patch](patches/chromium-oopif-resize.patch) includes
+Chromium's regression test and applies cleanly to the exact installed Chromium source
+tag. It belongs in an Electron/Chromium source build, not in Varro or an installed
+VS Code JavaScript bundle. No extension API can update that native compositor code.
+An Electron backport or a VS Code runtime upgrade is the feasible upstream repair.
+The disposable runtime replacement was a diagnostic build, not a supported editor
+distribution, and was not installed over the user's editor. The stable 1.144.0 and
+Insiders 1.145.0 manifests checked during this investigation still select Electron
+43.8.3 with Chromium 150; updating to those versions is not a verified solution.
+
+Removing the host `OverlayLayoutElement` clip, replacing `content-box` with
+`inset(0)`, promoting host layers, replacing anchor sizing with immediate pixel
+sizing, and changing the preload's inner iframe positioning did not fix the installed
+engine. Those experiments were rolled back. Root sizing remains CSS-driven, with no
+resize delay restored. See
+`artifacts/ai-streaming/image-prompt-native-20261028/host-ledger.md` for the comparisons,
+remaining cropped frames, isolation, patch checks, and cleanup records.
+
+## Earlier application fixes and investigations
+
 Reproduced in VS Code 1.139.1 arm64 on macOS 15.7.7, at a 1440 x 900 workbench size
 and scale 1. The defect also occurs with plain HTML replacing the entire Varro
 body. No message rows, virtualization, Solid rendering, or scroll measurement is
-needed. This isolates the observed horizontal clipping to the host webview path;
-it does not identify the responsible VS Code/Electron component.
+needed. This originally isolated the observed horizontal clipping to the host webview
+path. The host investigation above identifies a matching Chromium defect and its repair.
 
 Promoting the plain root with `translateZ(0)`, `will-change: transform`, and
 `contain: layout paint`, while allowing visible overflow, did not eliminate it.
@@ -14,8 +53,8 @@ The former four-frame expansion delay in `src/webview/index.tsx` has been remove
 held the centered chat at its previous width after expansion, leaving prompt bubbles
 inset from their final right edge before they jumped into place. The resize regression
 in `e2e/tests/layout.spec.ts` reproduced this across 486 to 700, 700 to 950, and 980 to
-1280 px expansions. Visible host width changes now apply immediately, while hidden
-viewport changes and temporary unsized iframe dimensions remain ignored.
+1280 px expansions. CSS now owns responsive root sizing, so hidden viewport changes
+and temporary unsized iframe dimensions cannot become retained pixel constraints.
 
 The follow-up native retest on VS Code 1.143.1 found a separate one-frame race in the
 remaining resize-event pixel cap, plus a retained 10 px inset on a short single-image

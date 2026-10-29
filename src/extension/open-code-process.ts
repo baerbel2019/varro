@@ -2087,6 +2087,14 @@ export class OpenCodeProcess {
 
   async prepareForHealthyExistingServer(signal?: AbortSignal) {
     signal?.throwIfAborted();
+    if (this.credentialRegistration?.discovered) {
+      // This attachment already followed a replacement to another port. Rechecking
+      // the retired record via startup temporarily selects its old port and races
+      // SSE admission. Verify the selected endpoint without claiming ownership.
+      await this.verifyManagedServerConnection(true);
+      signal?.throwIfAborted();
+      return;
+    }
     if (this.credentialRegistration) {
       // Credential fallback can follow one missed OS observation of our original
       // process. Recheck its private lease before making attachment permanent.

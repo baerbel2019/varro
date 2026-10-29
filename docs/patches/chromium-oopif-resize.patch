@@ -1,0 +1,86 @@
+From 9e4f33e7f601a78bcc545d37537b02e461920089 Mon Sep 17 00:00:00 2001
+From: Helmut Januschka <helmut@januschka.com>
+Date: Thu, 23 Jul 2026 21:47:25 +0000
+Subject: [PATCH] Fix stale OOPIF compositor viewport during resize
+
+Refresh the remote frame compositing rect before propagating resized frame
+geometry so visual properties carry coherent layout and viewport sizes.
+
+Upstream: https://chromium.googlesource.com/chromium/src/+/9e4f33e7f601a78bcc545d37537b02e461920089
+Bug: https://crbug.com/519655838
+Review: https://chromium-review.googlesource.com/c/chromium/src/+/8130409
+
+Retained for an Electron/Chromium source build, not for applying to Varro or
+an installed VS Code bundle. See ../webview-resize-clipping.md for native
+verification and the remaining real-chat clipping limitation.
+
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.cc b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+index 167da2fc..72a5d04 100644
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+@@ -316,6 +316,11 @@
+ void RemoteFrameView::SetFrameRect(const gfx::Rect& rect) {
++  const std::optional<gfx::Size> old_frozen_size = frozen_size_;
+   UpdateFrozenSize();
++  const bool frame_rect_changed = FrameRect() != rect;
+   EmbeddedContentView::SetFrameRect(rect);
++  if (frame_rect_changed || old_frozen_size != frozen_size_) {
++    UpdateCompositingRect();
++  }
+   if (needs_frame_rect_propagation_)
+     PropagateFrameRects();
+ }
+diff --git a/third_party/blink/renderer/core/frame/web_frame_test.cc b/third_party/blink/renderer/core/frame/web_frame_test.cc
+index a0204ad3..b4392e5bd 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_test.cc
++++ b/third_party/blink/renderer/core/frame/web_frame_test.cc
+@@ -159,6 +159,7 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_view.h"
+ #include "third_party/blink/renderer/core/frame/remote_frame.h"
++#include "third_party/blink/renderer/core/frame/remote_frame_view.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/frame/viewport_data.h"
+ #include "third_party/blink/renderer/core/frame/visual_viewport.h"
+@@ -14458,3 +14459,41 @@
++TEST_F(WebFrameTest, RemoteFrameCompositingRectUpdatesWithFrameRect) {
++  frame_test_helpers::WebViewHelper web_view_helper;
++  web_view_helper.Initialize();
++
++  WebViewImpl* web_view = web_view_helper.GetWebView();
++  web_view->Resize(gfx::Size(800, 800));
++  InitializeWithHTML(*web_view->MainFrameImpl()->GetFrame(), R"HTML(
++      <!DOCTYPE html>
++      <style>
++        iframe {
++          width: 120px;
++          height: 120px;
++          border: none;
++        }
++      </style>
++      <iframe></iframe>
++  )HTML");
++
++  WebRemoteFrameImpl* remote_frame = frame_test_helpers::CreateRemote();
++  frame_test_helpers::SwapRemoteFrame(
++      web_view_helper.LocalMainFrame()->FirstChild(), remote_frame);
++  remote_frame->SetReplicatedOrigin(
++      WebSecurityOrigin(SecurityOrigin::CreateUniqueOpaque()), false);
++
++  web_view->MainFrameImpl()
++      ->GetFrame()
++      ->View()
++      ->UpdateAllLifecyclePhasesForTest();
++  RunPendingTasks();
++
++  RemoteFrameView* remote_frame_view = remote_frame->GetFrame()->View();
++  ASSERT_EQ(remote_frame_view->GetCompositingRect(), gfx::Rect(0, 0, 120, 120));
++
++  remote_frame_view->SetFrameRect(gfx::Rect(0, 0, 520, 320));
++
++  EXPECT_EQ(remote_frame_view->GetCompositingRect(), gfx::Rect(0, 0, 520, 320));
++}
++
+ TEST_F(WebFrameTest, RemoteFrameCompositingScaleFactor) {
+   frame_test_helpers::WebViewHelper web_view_helper;
+   web_view_helper.Initialize();

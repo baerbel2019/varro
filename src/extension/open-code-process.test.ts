@@ -1762,6 +1762,94 @@ describe('OpenCodeProcess server ownership leases', () => {
       }
     );
 
+    it.each(['unchanged', 'changed-password'] as const)(
+      'keeps changed-port credential preparation on the selected endpoint with %s evidence during SSE admission',
+      async (evidence) => {
+        const { root, path, lease, manager, fetchMock, authorization } = await fixture();
+        const discoveredUrl = 'http://127.0.0.1:63516';
+        let release = () => {};
+        const pending = new Promise<void>((done) => {
+          release = done;
+        });
+        let entered = () => {};
+        const started = new Promise<void>((done) => {
+          entered = done;
+        });
+        let preparation: Promise<void> | undefined;
+        try {
+          await writeFile(`${path}.credentials`, JSON.stringify(lease), { mode: 0o600 });
+          await rm(path);
+          await rm(`${path}.managed`);
+          const raw = await readFile(`${path}.credentials`, 'utf8');
+          vi.mocked(Service.discover).mockResolvedValue({
+            url: discoveredUrl,
+            auth: {
+              type: 'basic',
+              username: lease.username!,
+              password: lease.password!,
+            },
+          });
+          fetchMock.mockImplementation(async (url, options) => {
+            if (!String(url).startsWith(discoveredUrl)) throw new Error('Old listener is gone');
+            return new Headers(options?.headers).get('Authorization') === authorization
+              ? new Response(JSON.stringify({ version: '2.0.5', pid: 16616 }))
+              : new Response(null, { status: 401 });
+          });
+          await expect(manager.refreshStartupRegistration()).resolves.toBe(true);
+          expect(manager.url).toBe(discoveredUrl);
+          const fetch = fetchMock.getMockImplementation()!;
+          fetchMock.mockClear();
+          let paused = false;
+          fetchMock.mockImplementation(async (...args) => {
+            if (!paused) {
+              paused = true;
+              entered();
+              await pending;
+            }
+            return fetch(...args);
+          });
+
+          preparation = manager.prepareForHealthyExistingServer();
+          await started;
+          const pendingUrl = manager.url;
+          const expectedRecord =
+            evidence === 'unchanged'
+              ? raw
+              : JSON.stringify({ ...lease, password: 'changed-password' });
+          if (evidence !== 'unchanged')
+            await writeFile(`${path}.credentials`, expectedRecord, { mode: 0o600 });
+          // The stream's fresh admission runs while background preparation is in flight.
+          const verification = manager.verifyManagedServerConnection(true);
+          const verified =
+            evidence === 'unchanged'
+              ? expect(verification).resolves.toBeUndefined()
+              : expect(verification).rejects.toThrow('credentials changed');
+          const prepared =
+            evidence === 'unchanged'
+              ? expect(preparation).resolves.toBeUndefined()
+              : expect(preparation).rejects.toThrow('credentials changed');
+          release();
+          await Promise.all([prepared, verified]);
+
+          expect(pendingUrl).toBe(discoveredUrl);
+          expect(manager.url).toBe(discoveredUrl);
+          expect(fetchMock.mock.calls.every(([url]) => String(url).startsWith(discoveredUrl))).toBe(
+            true
+          );
+          expect(manager.hasCredentialVerifiedConnection).toBe(true);
+          expect(manager.managedProcess).toBe(false);
+          expect(manager.connectionIdentity).toBeUndefined();
+          expect(await readFile(`${path}.credentials`, 'utf8')).toBe(expectedRecord);
+          expect(vi.mocked(process.kill).mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+        } finally {
+          release();
+          // Settle the operation before removing its fixture, including expected rejection.
+          await Promise.allSettled(preparation ? [preparation] : []);
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    );
+
     it('keeps the discovered endpoint when an older registered listener is still alive', async () => {
       const { root, path, lease, raw, listeners, manager } = await fixture('linux');
       try {
