@@ -2756,7 +2756,9 @@ describe('ChatInput', () => {
     expect(warning?.textContent).toContain('Weekly limit: 8% left');
     expect(warning?.textContent).not.toContain('5-hour limit');
     expect(warning?.nextElementSibling?.classList.contains('chat-input-shell')).toBe(true);
-    expect(container?.querySelector<HTMLAnchorElement>('.chat-quota-warning-usage')?.href).toBe(
+    container?.querySelector<HTMLButtonElement>('.chat-quota-warning-usage')?.click();
+    expect(container?.querySelector('.provider-limit-reset-rows')).not.toBeNull();
+    expect(container?.querySelector<HTMLAnchorElement>('.provider-limit-reset-link')?.href).toBe(
       'https://chatgpt.com/settings/usage?tab=overview'
     );
 
@@ -2772,6 +2774,7 @@ describe('ChatInput', () => {
       modelID: 'gpt-4o',
     });
     expect(container?.querySelector('.chat-quota-warning')).toBeNull();
+    expect(container?.querySelector('.provider-limit-popup')).toBeNull();
     expect(container?.querySelector('.chat-usage-limit-banner')).not.toBeNull();
   });
 

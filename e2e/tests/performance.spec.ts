@@ -706,7 +706,8 @@ test('narrowing after PageDown preserves a short response below a clipped prompt
   expect(before.userTop).toBeCloseTo(-46, 0);
   const samples = [];
   await shell.evaluate((element) => {
-    element.style.width = '430px';
+    // Cross a wrapping boundary with both macOS and Linux font metrics.
+    element.style.width = '360px';
   });
   for (let frame = 0; frame < 16; frame++) {
     await waitForAnimationFrame(page);

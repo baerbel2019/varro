@@ -210,6 +210,9 @@ the shared invariants below remain true.
   When an unloaded diff remounts, reserve its last measured row height until details replace the
   summary. Unloading may save content, but must preserve exactly the same layout space; loading
   placeholders are not new exact row measurements.
+  A mounted running diff retains its preview when completion replaces the streamed body with a
+  deferred summary. Keep the latest tool status and replace the preview when details arrive;
+  a reserved row height alone does not prevent the painted diff from disappearing.
   Establish that reservation before mount measurement, and publish hydrated heights before the
   next virtual-range reconciliation. Waiting for ResizeObserver can repeatedly evict and remount
   a boundary row, replacing its cached diff height with its shorter summary on each pass.
