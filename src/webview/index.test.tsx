@@ -137,27 +137,29 @@ describe('webview bootstrap', () => {
     );
   });
 
-  it('keeps cards within the previous host width during expansion without starving a drag', () => {
+  it('leaves root sizing to CSS instead of pinning it to resize-event pixels', () => {
     vi.useFakeTimers();
     let width = 360;
     const widthSpy = vi.spyOn(window, 'innerWidth', 'get').mockImplementation(() => width);
     root.style.maxWidth = '90%';
     try {
       cleanup = bootstrap(root);
-      expect(root.style.maxWidth).toBe('360px');
+      expect(root.style.maxWidth).toBe('90%');
       width = 486;
       window.dispatchEvent(new Event('resize'));
+      expect(root.style.maxWidth).toBe('90%');
       vi.advanceTimersToNextFrame();
-      expect(root.style.maxWidth).toBe('360px');
+      expect(root.style.maxWidth).toBe('90%');
       width = 720;
       window.dispatchEvent(new Event('resize'));
+      expect(root.style.maxWidth).toBe('90%');
       vi.advanceTimersToNextFrame();
       vi.advanceTimersToNextFrame();
       vi.advanceTimersToNextFrame();
-      expect(root.style.maxWidth).toBe('720px');
+      expect(root.style.maxWidth).toBe('90%');
       width = 360;
       window.dispatchEvent(new Event('resize'));
-      expect(root.style.maxWidth).toBe('360px');
+      expect(root.style.maxWidth).toBe('90%');
       width = 486;
       window.dispatchEvent(new Event('resize'));
       cleanup();
@@ -174,7 +176,7 @@ describe('webview bootstrap', () => {
   });
 
   it.each(['sidebar', 'editor'] as const)(
-    'applies %s layout breakpoint changes immediately in both directions',
+    'does not introduce a pixel width cap across %s layout breakpoints',
     (surface) => {
       vi.useFakeTimers();
       let width = 486;
@@ -185,24 +187,24 @@ describe('webview bootstrap', () => {
       try {
         cleanup = bootstrap(root);
         for (const expandedWidth of [1280, 1670]) {
-          // Start an ordinary drag delay before maximizing. The breakpoint change must cancel it.
+          // Ordinary drags and breakpoint changes must both use the current host width.
           width = 600;
           window.dispatchEvent(new Event('resize'));
-          expect(root.style.maxWidth).toBe('486px');
+          expect(root.style.maxWidth).toBe('');
           width = expandedWidth;
           window.dispatchEvent(new Event('resize'));
-          expect(root.style.maxWidth).toBe(`${expandedWidth}px`);
+          expect(root.style.maxWidth).toBe('');
           width = 486;
           window.dispatchEvent(new Event('resize'));
-          expect(root.style.maxWidth).toBe('486px');
+          expect(root.style.maxWidth).toBe('');
           vi.runAllTimers();
-          expect(root.style.maxWidth).toBe('486px');
+          expect(root.style.maxWidth).toBe('');
         }
         width = 1280;
         window.dispatchEvent(new Event('resize'));
         width = 1670;
         window.dispatchEvent(new Event('resize'));
-        expect(root.style.maxWidth).toBe('1670px');
+        expect(root.style.maxWidth).toBe('');
       } finally {
         cleanup?.();
         cleanup = undefined;
@@ -213,7 +215,7 @@ describe('webview bootstrap', () => {
   );
 
   it.each(['sidebar', 'editor'] as const)(
-    'restores the full %s width immediately after hidden viewport changes',
+    'does not pin %s CSS sizing to hidden viewport widths',
     (surface) => {
       vi.useFakeTimers();
       let width = 420;
@@ -233,18 +235,18 @@ describe('webview bootstrap', () => {
         for (const hiddenWidth of [270, 0]) {
           width = hiddenWidth;
           window.dispatchEvent(new Event('resize'));
-          expect(root.style.maxWidth).toBe('420px');
+          expect(root.style.maxWidth).toBe('90%');
         }
 
         width = 486;
         window.dispatchEvent(new Event('resize'));
         visibilityState = 'visible';
         document.dispatchEvent(new Event('visibilitychange'));
-        expect(root.style.maxWidth).toBe('486px');
+        expect(root.style.maxWidth).toBe('90%');
         window.dispatchEvent(new Event('resize'));
-        expect(root.style.maxWidth).toBe('486px');
+        expect(root.style.maxWidth).toBe('90%');
         vi.runAllTimers();
-        expect(root.style.maxWidth).toBe('486px');
+        expect(root.style.maxWidth).toBe('90%');
 
         cleanup();
         cleanup = undefined;
@@ -260,7 +262,7 @@ describe('webview bootstrap', () => {
     }
   );
 
-  it('cancels pending width expansion when hidden and resyncs without a resize event', () => {
+  it('keeps CSS sizing on reveal without requiring a resize event', () => {
     vi.useFakeTimers();
     let width = 270;
     let visibilityState: DocumentVisibilityState = 'visible';
@@ -273,18 +275,18 @@ describe('webview bootstrap', () => {
       width = 420;
       window.dispatchEvent(new Event('resize'));
       vi.advanceTimersToNextFrame();
-      expect(root.style.maxWidth).toBe('270px');
+      expect(root.style.maxWidth).toBe('');
 
       visibilityState = 'hidden';
       document.dispatchEvent(new Event('visibilitychange'));
       width = 0;
       vi.runAllTimers();
-      expect(root.style.maxWidth).toBe('270px');
+      expect(root.style.maxWidth).toBe('');
 
       width = 420;
       visibilityState = 'visible';
       document.dispatchEvent(new Event('visibilitychange'));
-      expect(root.style.maxWidth).toBe('420px');
+      expect(root.style.maxWidth).toBe('');
     } finally {
       cleanup?.();
       cleanup = undefined;
@@ -295,7 +297,7 @@ describe('webview bootstrap', () => {
   });
 
   it.each([420, 486])(
-    'restores width %i immediately after iframe reattachment without a visibility event',
+    'does not retain an unsized iframe width when reattached at %i without a visibility event',
     (restoredWidth) => {
       vi.useFakeTimers();
       let width = 420;
@@ -308,24 +310,24 @@ describe('webview bootstrap', () => {
         width = 300;
         height = 150;
         window.dispatchEvent(new Event('resize'));
-        expect(root.style.maxWidth).toBe('420px');
+        expect(root.style.maxWidth).toBe('');
 
         width = restoredWidth;
         height = 794;
         window.dispatchEvent(new Event('resize'));
-        expect(root.style.maxWidth).toBe(`${restoredWidth}px`);
+        expect(root.style.maxWidth).toBe('');
         vi.runAllTimers();
-        expect(root.style.maxWidth).toBe(`${restoredWidth}px`);
+        expect(root.style.maxWidth).toBe('');
 
         // A real narrow sidebar is not the browser's unsized iframe viewport.
         width = 300;
         window.dispatchEvent(new Event('resize'));
-        expect(root.style.maxWidth).toBe('300px');
+        expect(root.style.maxWidth).toBe('');
         width = 420;
         window.dispatchEvent(new Event('resize'));
-        expect(root.style.maxWidth).toBe('300px');
+        expect(root.style.maxWidth).toBe('');
         vi.runAllTimers();
-        expect(root.style.maxWidth).toBe('420px');
+        expect(root.style.maxWidth).toBe('');
       } finally {
         cleanup?.();
         cleanup = undefined;
@@ -337,7 +339,7 @@ describe('webview bootstrap', () => {
     }
   );
 
-  it('cancels an expansion during iframe reattachment and restores an initially unsized view', () => {
+  it('never pins expansion or initial attachment to the unsized iframe width', () => {
     vi.useFakeTimers();
     let width = 300;
     let height = 150;
@@ -348,23 +350,23 @@ describe('webview bootstrap', () => {
       width = 420;
       height = 794;
       window.dispatchEvent(new Event('resize'));
-      expect(root.style.maxWidth).toBe('420px');
+      expect(root.style.maxWidth).toBe('');
 
       width = 486;
       window.dispatchEvent(new Event('resize'));
       vi.advanceTimersToNextFrame();
-      expect(root.style.maxWidth).toBe('420px');
+      expect(root.style.maxWidth).toBe('');
       width = 300;
       height = 150;
       window.dispatchEvent(new Event('resize'));
       document.dispatchEvent(new Event('visibilitychange'));
       vi.runAllTimers();
-      expect(root.style.maxWidth).toBe('420px');
+      expect(root.style.maxWidth).toBe('');
 
       width = 486;
       height = 794;
       window.dispatchEvent(new Event('resize'));
-      expect(root.style.maxWidth).toBe('486px');
+      expect(root.style.maxWidth).toBe('');
     } finally {
       cleanup?.();
       cleanup = undefined;
@@ -374,7 +376,7 @@ describe('webview bootstrap', () => {
     }
   });
 
-  it('applies zoom width immediately and cancels a pending expansion', () => {
+  it('does not pin CSS sizing during zoom after expansion', () => {
     vi.useFakeTimers();
     let width = 360;
     let ratio = 1;
@@ -388,9 +390,9 @@ describe('webview bootstrap', () => {
       ratio = 0.8;
       width = 607;
       window.dispatchEvent(new Event('resize'));
-      expect(root.style.maxWidth).toBe('607px');
+      expect(root.style.maxWidth).toBe('');
       vi.runAllTimers();
-      expect(root.style.maxWidth).toBe('607px');
+      expect(root.style.maxWidth).toBe('');
     } finally {
       cleanup?.();
       cleanup = undefined;
@@ -430,7 +432,7 @@ describe('webview bootstrap', () => {
           window.dispatchEvent(new Event('resize'));
           vi.advanceTimersByTime(20);
           expect(isPending()).toBe(true);
-          expect(root.style.maxWidth).toBe(`${width}px`);
+          expect(root.style.maxWidth).toBe('');
         }
         vi.advanceTimersByTime(10);
         expect(isPending()).toBe(false);
@@ -440,7 +442,7 @@ describe('webview bootstrap', () => {
           window.dispatchEvent(new Event('resize'));
           vi.advanceTimersByTime(20);
           expect(isPending()).toBe(false);
-          expect(root.style.maxWidth).toBe(`${width}px`);
+          expect(root.style.maxWidth).toBe('');
         }
       } finally {
         cleanup?.();

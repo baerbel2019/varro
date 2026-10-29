@@ -242,12 +242,15 @@ the shared invariants below remain true.
 - A resize batch is a pure width reflow only when every reported inline size changed or the container
   font changed. Concurrent streaming, expansion, or content mutation makes it a content resize and
   uses normal height-correction ownership.
-- The webview root caps expansion within one responsive layout for four animation frames while the
-  VS Code painted surface catches up. During that interval, `window.innerWidth` can exceed the content
-  width. Measure the actual container for reflow and anchor calculations. Shrinking, zoom, and crossing
-  the 960px content or 1400px session-sidebar breakpoint bypass the delay and cancel pending expansion.
-  Viewport media queries and the root width must switch together; a desktop sidebar inside the old
-  narrow cap can squeeze the transcript to one character per line.
+- CSS owns the webview root's responsive width. Never pin it to pixels read in a resize event:
+  native iframe layout can precede that event, leaving a stale cap for a painted frame and retaining
+  incorrect shrink-to-fit prompt margins after reflow. Hidden or temporary 300 x 150 iframe viewports
+  must not become stored width constraints that survive reveal. Measure the actual container for
+  reflow and anchor calculations. Viewport media queries and root sizing must switch together;
+  a desktop sidebar inside an old narrow cap can squeeze the transcript to one character per line.
+- The sticky prompt's whole reserved footprint, including its lower gap, is opaque. Rewrapping the
+  preview on restore must not reveal transcript text through a transparent tail while its height
+  changes. The preview's own text may still fade when truncated.
 - Width measurements may be deferred only while the mounted range still brackets the viewport.
   Publish pending metrics early if stale prefixes could leave uncovered space above or below the
   rendered range.
@@ -671,8 +674,9 @@ Direct input acquires ownership only when it can affect the transcript:
 ### Animated Row Transitions
 
 - A compact activity part follows `delayed -> visible active/completed -> retained -> exiting -> grouped`.
-  Tool previews skip `exiting`: after retention, group them immediately without a disappearing or
-  height-collapse animation. Reserve their disappearing flow space before publishing removal, and
+  Tool previews appear at full height and opacity without an entrance animation and skip `exiting`:
+  after retention, group them immediately without a disappearing or height-collapse animation.
+  Reserve their disappearing flow space before publishing removal, and
   admit the next queued tool in the same update. When one preview replaces another, reuse its tray
   and skip the replacement's entrance animation, including completed previews waiting to group.
   Reasoning retains its animated exit lifecycle.

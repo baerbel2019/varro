@@ -10,14 +10,34 @@ it does not identify the responsible VS Code/Electron component.
 
 Promoting the plain root with `translateZ(0)`, `will-change: transform`, and
 `contain: layout paint`, while allowing visible overflow, did not eliminate it.
-Varro limits root expansion within one responsive layout for four animation frames in `src/webview/index.tsx`.
-The content remains inside the previous painted width while the host surface catches up.
-Shrinking and browser zoom apply immediately; repeated drag events do not restart the
-pending expansion. Message-list anchoring and transcript visibility remain independent.
-Hidden-tab resize events do not update the cap, and hiding cancels a pending expansion.
-Returning to a retained sidebar or editor tab resynchronizes the cap immediately, even
-without a resize event. This avoids briefly squeezing the view to a stale hidden width;
-the four-frame delay still applies to ordinary visible expansion within one responsive layout.
+The former four-frame expansion delay in `src/webview/index.tsx` has been removed. It
+held the centered chat at its previous width after expansion, leaving prompt bubbles
+inset from their final right edge before they jumped into place. The resize regression
+in `e2e/tests/layout.spec.ts` reproduced this across 486 to 700, 700 to 950, and 980 to
+1280 px expansions. Visible host width changes now apply immediately, while hidden
+viewport changes and temporary unsized iframe dimensions remain ignored.
+
+The follow-up native retest on VS Code 1.143.1 found a separate one-frame race in the
+remaining resize-event pixel cap, plus a retained 10 px inset on a short single-image
+text bubble after maximizing. Removing numeric root sizing entirely and letting CSS
+own the iframe width eliminated both in same-input native experiments. The sticky
+overlay's full reserved footprint is now opaque, rather than revealing transcript text
+through its lower fade while the preview changes height.
+
+The host clipping remains reproducible on this version with plain HTML replacing the
+entire app body. Promoting the root and removing nested sticky transform layers did
+not eliminate it. Do not treat the application alignment and opaque-mask fixes as a
+repair to VS Code's compositor. Native evidence and the isolated reproducer are under
+`artifacts/ai-streaming/image-prompt-native-20261028/`, including the current-version
+plain control in `research-opaque-control/`. Message-list anchoring and transcript
+visibility remain independent.
+
+The built fixes passed two further interactive native runs, including retained editor
+tabs and a painted sticky-mask probe. Prompt right-edge error and root-width error
+were both zero in the recorded layout samples. The mask probe exposed the previous
+transparent tail and found no probe pixels through the opaque replacement. The host
+still clipped some transition paints. See that evidence directory's `fix-ledger.md`
+for the separate application results and unresolved host defect.
 
 Editor startup and tab reveal have a separate 50 ms layout-settling hold that hides the root.
 Continuous resize events may restart that debounce, but must not extend root hiding beyond
@@ -71,9 +91,8 @@ card samples. The real long-history AI-02 resize/zoom sequence also passed its a
 checks. Evidence is under `artifacts/ai-fuzzy/20260928-94312/`, including
 `all-cards-resize-comparison.json` and `resize-source-four/`.
 
-This is an application mitigation, not a repair to VS Code's compositor. Expansion within one
-responsive layout intentionally follows the host by four frames. The host-level plain-body reproduction
-remains useful when changing or removing the mitigation.
+The former delay was an application mitigation, not a repair to VS Code's compositor.
+The host-level plain-body reproduction remains useful when investigating the remaining clipping.
 
 ## Reduced reproduction
 
