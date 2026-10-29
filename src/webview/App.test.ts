@@ -145,8 +145,7 @@ describe('AppRoot', () => {
     expect(dots?.classList).toContain('gap-[8px]');
     expect(Array.from(dots?.children ?? [])).toHaveLength(3);
     for (const dot of Array.from(dots?.children ?? [])) {
-      expect(dot.classList).toContain('h-[8px]');
-      expect(dot.classList).toContain('w-[8px]');
+      expect(dot.classList).toContain('loading-dot');
     }
     expect(container?.textContent?.trim()).toBe('');
     expect(container?.textContent).not.toContain('New Chat');
