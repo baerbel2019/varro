@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import vm from 'node:vm';
+import { JSDOM } from 'jsdom';
 
 import {
   beginLivePreparationRun,
@@ -55,6 +56,27 @@ const ready = {
 test('AI-18 defaults to the current pinned fixture layout', async () => {
   const { DEFAULT_AI18_FIXTURE_EDIT_PATH } = await import('./ai-fuzzy-live.mjs');
   assert.equal(DEFAULT_AI18_FIXTURE_EDIT_PATH, 'packages/util/src/bom.ts');
+});
+
+test('composer verification preserves line breaks and logical attachment markers', async () => {
+  const dom = new JSDOM('<div aria-label="Message composer"></div>');
+  try {
+    const editor = dom.window.document.querySelector('[aria-label="Message composer"]');
+    const controller = Object.create(CdpController.prototype);
+    controller.evaluate = async (expression) =>
+      vm.runInNewContext(expression, {
+        document: dom.window.document,
+        Node: dom.window.Node,
+      });
+    editor.innerHTML = 'first<br>second\u200B';
+    assert.equal(await controller.readComposerText(), 'first\nsecond');
+    editor.innerHTML = '<br>';
+    assert.equal(await controller.readComposerText(), '');
+    editor.innerHTML = '<span data-chip-marker="@src/file.ts">file.ts</span>\u200B tail';
+    assert.equal(await controller.readComposerText(), '@src/file.ts tail');
+  } finally {
+    dom.window.close();
+  }
 });
 
 test('composer replacement uses native select-all and verifies the exact input before Enter', async () => {

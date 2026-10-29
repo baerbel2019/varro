@@ -951,6 +951,53 @@ describe('automatic-port migration and admission', () => {
     await server.disconnect();
   });
 
+  it.each(['running', 'SSE admission error'] as const)(
+    'preserves credential-only lifecycle restrictions after %s',
+    async (connection) => {
+      const server = new OpenCodeServer('auto', true);
+      const { api, children } = configureManagedStartup(server);
+      const { processManager } = server as unknown as { processManager: OpenCodeProcess };
+      vi.mocked(processManager.refreshStartupRegistration).mockResolvedValue(true);
+      vi.mocked(api.readHealthInfo).mockResolvedValue({ healthy: true, version: '2.0.5' });
+      vi.mocked(inspectLocalServerAccount).mockResolvedValue({ kind: 'unknown' });
+      vi.spyOn(processManager, 'hasCredentialVerifiedConnection', 'get').mockReturnValue(true);
+      vi.spyOn(processManager, 'verifyManagedServerAdmission').mockResolvedValue(true);
+      vi.spyOn(processManager, 'prepareForHealthyExistingServer').mockResolvedValue(undefined);
+      const stop = vi.spyOn(processManager, 'stopServerForRestart').mockResolvedValue(undefined);
+      const claim = vi
+        .spyOn(processManager, 'acquireManagedServerRestartOwnership')
+        .mockResolvedValue(async () => {});
+      const stream = deferred<void>();
+      vi.mocked(api.startEventStream).mockReturnValueOnce(stream.promise);
+
+      await expect(server.start()).resolves.toBe(server.url);
+      expect(server.status).toMatchObject({ state: 'running', eventStream: 'degraded' });
+      const start = vi.spyOn(server, 'start');
+      if (connection === 'SSE admission error') {
+        stream.reject(new ManagedServerConnectionChangedError('Credential endpoint changed'));
+        await flushMicrotasks();
+        expect(server.status).toEqual({ state: 'error', message: 'Credential endpoint changed' });
+        await expect(server.restart({ force: true })).resolves.toBe(server.url);
+        expect(start).toHaveBeenCalledOnce();
+        expect(api.startEventStream).toHaveBeenCalledTimes(2);
+      } else {
+        stream.resolve();
+        await flushMicrotasks();
+        await expect(server.restart({ force: true })).rejects.toThrow('attach-only');
+        expect(start).not.toHaveBeenCalled();
+        expect(api.startEventStream).toHaveBeenCalledOnce();
+      }
+      expect(server.status.state).toBe('running');
+      expect(server.isAttachOnly).toBe(true);
+      expect(processManager.managedProcess).toBe(false);
+      expect(claim).not.toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
+      expect(children).toHaveLength(0);
+      expect(vscodeMock.window.showWarningMessage).not.toHaveBeenCalled();
+      await server.disconnect();
+    }
+  );
+
   it('keeps a late recovered registration managed after shared-service admission', async () => {
     stubPlatform('win32');
     const server = new OpenCodeServer('auto', true);

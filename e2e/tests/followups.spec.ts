@@ -131,11 +131,23 @@ for (const width of [480, 1280]) {
             return;
           }
           if (message.type === 'api/request' && /\/followups(?:\?|$)/.test(message.payload.path)) {
-            document.documentElement.dataset.followupRequestId = String(message.payload.id);
             // SAFETY: This intercepted request is emitted only by the typed follow-ups client.
-            document.documentElement.dataset.followupGenerate = String(
-              (message.payload.body as { allowGenerate?: boolean }).allowGenerate
-            );
+            const allowGenerate = (message.payload.body as { allowGenerate?: boolean })
+              .allowGenerate;
+            const cached = document.documentElement.dataset.followupCachedSuggestions;
+            if (cached && !allowGenerate) {
+              window.dispatchEvent(
+                new MessageEvent('message', {
+                  data: {
+                    type: 'api/response',
+                    payload: { id: message.payload.id, data: JSON.parse(cached) },
+                  },
+                })
+              );
+              return;
+            }
+            document.documentElement.dataset.followupRequestId = String(message.payload.id);
+            document.documentElement.dataset.followupGenerate = String(allowGenerate);
             return;
           }
           send?.(message);
@@ -212,37 +224,40 @@ for (const width of [480, 1280]) {
         );
         return { id: row?.dataset.msgId, top: row?.getBoundingClientRect().top };
       });
-      await page.evaluate(() =>
+      await page.evaluate(() => {
+        const suggestions = {
+          summary:
+            'The empty-token parser issue is still unresolved, and focused regression coverage is missing. Investigating the failure and adding a test would address the reported gaps.',
+          actions: [
+            {
+              title: 'Inspect parser failures',
+              prompt:
+                'Investigate the reported empty-token parser issue without unrelated changes.',
+            },
+            {
+              title: 'Add regression coverage',
+              prompt: 'Add focused regression tests for empty tokens.',
+            },
+            {
+              title: 'Explain the blocker',
+              prompt: 'Explain the remaining parser blocker without editing.',
+            },
+          ],
+        };
+        // Send validation reads the same result without admitting another generation.
+        document.documentElement.dataset.followupCachedSuggestions = JSON.stringify(suggestions);
         window.dispatchEvent(
           new MessageEvent('message', {
             data: {
               type: 'api/response',
               payload: {
                 id: Number(document.documentElement.dataset.followupRequestId),
-                data: {
-                  summary:
-                    'The empty-token parser issue is still unresolved, and focused regression coverage is missing. Investigating the failure and adding a test would address the reported gaps.',
-                  actions: [
-                    {
-                      title: 'Inspect parser failures',
-                      prompt:
-                        'Investigate the reported empty-token parser issue without unrelated changes.',
-                    },
-                    {
-                      title: 'Add regression coverage',
-                      prompt: 'Add focused regression tests for empty tokens.',
-                    },
-                    {
-                      title: 'Explain the blocker',
-                      prompt: 'Explain the remaining parser blocker without editing.',
-                    },
-                  ],
-                },
+                data: suggestions,
               },
             },
           })
-        )
-      );
+        );
+      });
       const suggestions = page.getByRole('group', { name: 'Suggested next actions' });
       await expect(suggestions).toBeVisible();
       await expect(suggestions.locator('.followup-suggestions-actions button')).toHaveCount(3);

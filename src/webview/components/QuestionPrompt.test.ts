@@ -24,6 +24,7 @@ vi.mock('../hooks/useOpenCode', async () => {
 
 let container: HTMLDivElement | null = null;
 let cleanup: (() => void) | undefined;
+let consoleWarn: ReturnType<typeof vi.spyOn>;
 
 describe('native QuestionPrompt', () => {
   let nextID = 0;
@@ -794,6 +795,7 @@ function renderQuestionPrompt(activeRequest: QuestionRequest) {
 }
 
 beforeEach(() => {
+  consoleWarn = vi.spyOn(console, 'warn');
   container = document.createElement('div');
   document.body.appendChild(container);
   setState('questions', []);
@@ -809,6 +811,13 @@ afterEach(() => {
   container?.remove();
   container = null;
   setState('questions', []);
+  try {
+    expect(consoleWarn).not.toHaveBeenCalledWith(
+      'computations created outside a `createRoot` or `render` will never be disposed'
+    );
+  } finally {
+    consoleWarn.mockRestore();
+  }
 });
 
 describe('QuestionPrompt draft retention', () => {

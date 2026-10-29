@@ -557,12 +557,26 @@ describe('ProviderQuotaWarning', () => {
   it.each([
     ['openai', 'https://chatgpt.com/settings/usage?tab=overview'],
     ['anthropic', 'https://claude.ai/settings/usage'],
-  ])('opens %s usage in the external browser', (providerID, url) => {
+  ])('opens reset details before linking to %s usage', (providerID, url) => {
+    const expiresAt = NOW + HOUR;
     mount({
       ...snapshot([quota('extra_usage', 4), quota('five_hour', 90)], providerID),
-      usageLimitResets: { availableCount: 2, credits: null },
+      usageLimitResets: {
+        availableCount: 2,
+        credits: [{ title: 'Full reset', expiresAt }],
+      },
     });
-    const link = container.querySelector<HTMLAnchorElement>('.chat-quota-warning-usage')!;
+    const button = container.querySelector<HTMLButtonElement>('.chat-quota-warning-usage')!;
+    button.click();
+    expect(sendToExtension).not.toHaveBeenCalled();
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    const popup = container.querySelector('.provider-limit-popup')!;
+    expect(popup.querySelector('.provider-limit-reset-rows')?.textContent).toContain(
+      `Expires ${new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'short' }).format(expiresAt)}`
+    );
+    expect(popup.textContent).toContain('Expiration details unavailable for 1 reset.');
+    expect(popup.querySelector('.provider-limit-popup-rows')).toBeNull();
+    const link = popup.querySelector<HTMLAnchorElement>('.provider-limit-reset-link')!;
     expect(link.href).toBe(url);
     link.click();
     expect(sendToExtension).toHaveBeenCalledWith({
@@ -570,6 +584,16 @@ describe('ProviderQuotaWarning', () => {
       payload: { url },
     });
     expect(sendToExtension).toHaveBeenCalledTimes(1);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    expect(container.querySelector('.provider-limit-popup')).toBeNull();
+    expect(document.activeElement).toBe(button);
+    button.click();
+    expect(container.querySelector('.provider-limit-popup')).not.toBeNull();
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(container.querySelector('.provider-limit-popup')).toBeNull();
+    button.click();
+    button.click();
+    expect(button.getAttribute('aria-expanded')).toBe('false');
     expect(container.querySelector('.provider-limit-popup')).toBeNull();
   });
 
@@ -590,7 +614,11 @@ describe('ProviderQuotaWarning', () => {
       usageLimitResets: { availableCount: 2, credits: null },
     });
     expect(banner()?.textContent).toContain('2 resets available');
-    expect(container.querySelector('.chat-quota-warning-usage')).toBeNull();
+    container.querySelector<HTMLButtonElement>('.chat-quota-warning-usage')!.click();
+    expect(container.querySelector('.provider-limit-popup')?.textContent).toContain(
+      'Expiration details unavailable for 2 resets.'
+    );
+    expect(container.querySelector('.provider-limit-reset-link')).toBeNull();
     expect(banner()?.textContent).not.toContain('View usage');
   });
 

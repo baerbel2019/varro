@@ -901,7 +901,10 @@ describe('sendMessage', () => {
     expect(stateModule.state.selectedModel).toEqual(draftModel);
   });
 
-  it('defaults new sessions to the build agent', async () => {
+  it.each([
+    ['plan', 'plan'],
+    ['missing', 'build'],
+  ])('creates new sessions using persisted %s as %s', async (savedAgent, expectedAgent) => {
     const { stateModule, hookModule } = await loadModules();
 
     stateModule.setState('agents', [
@@ -920,16 +923,16 @@ describe('sendMessage', () => {
         tools: {},
       },
     ]);
-    stateModule.setSelectedAgent('plan');
+    stateModule.setSelectedAgent(savedAgent);
 
     clientMocks.sessionCreate.mockResolvedValue(session('session-2'));
 
     await hookModule.createSession();
 
     expect(stateModule.state.activeSessionId).toBe('session-2');
-    expect(stateModule.state.selectedAgent).toBe('build');
-    expect(stateModule.getSelectedAgentForSession('session-2')).toBe('build');
-    expect(stateModule.getPersistedSelectedAgent()).toBe('plan');
+    expect(stateModule.state.selectedAgent).toBe(expectedAgent);
+    expect(stateModule.getSelectedAgentForSession('session-2')).toBe(expectedAgent);
+    expect(stateModule.getPersistedSelectedAgent()).toBe(savedAgent);
   });
 
   it('sends the first message of a new chat with the selected agent', async () => {

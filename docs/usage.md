@@ -4,9 +4,9 @@ This guide covers the current Varro workflow inside VS Code.
 
 ## Open Varro
 
-- Click the `Varro` icon in the Activity Bar.
+- Select `Varro` in its sidebar, or run `Varro: Focus Chat` from the Command Palette.
 - In VS Code and VSCodium, Varro defaults to the `Secondary Side Bar` so you can keep the editor visible while chatting.
-- In Cursor, Windsurf, and Devin, Varro attempts a one-time move to the `Primary Side Bar` instead.
+- In Cursor, Windsurf, Devin, Trae, and Trae CN, new installations attempt a one-time move to the `Primary Side Bar` instead. Navigation preserves a working saved location and recovers inaccessible views in the Primary Side Bar.
 
 VS Code forks have limited support. See [VS Code Fork Compatibility](vscode-forks.md) for details.
 
@@ -71,8 +71,8 @@ For WSL, open the project in a VS Code WSL window, then install and authenticate
 
 | Version | Minimum supported | Tested with this release | npm package |
 | --- | --- | --- | --- |
-| v2, recommended | 2.0.5 | 2.1.4 | `@opencode/cli` |
-| v1, still supported | 1.16.0 | 1.19.4 | `opencode-ai` |
+| v2, recommended | 2.0.5 | 2.2.1 | `@opencode/cli` |
+| v1, still supported | 1.16.0 | 1.19.5 | `opencode-ai` |
 
 To keep using v1, retain your installation or run `npm install -g opencode-ai`. Set `varro.server.command` to its executable path. Setting it to `opencode` selects v1 only if that command resolves to a v1 installation. Varro detects the API automatically.
 
@@ -142,6 +142,16 @@ older suggestions. Closing a card, accepting its action, or accepting a new prom
 while retaining admission records so it cannot be generated again. At most 512 turns retain suggestion
 text; older turns retain only admission and dismissal metadata. Tests redirect this directory through
 `VARRO_TEST_STATE_ROOT`, with no fallback to the normal state root.
+
+Saved, still-current suggestion results survive reloads and can be restored without another model call.
+Once generation is admitted, closing the originating chat editor does not cancel its bounded attempt
+while the extension host remains alive. This differs from shutting down the whole host: unfinished
+generation is not guaranteed to recover after the extension host exits, even if OpenCode keeps running.
+Other windows wait only a bounded time for a saved result and may receive no suggestions.
+
+Varro retains the admission record and does not automatically retry the same turn, even after the
+pending-wait grace period expires. The original request may already have consumed tokens or subscription
+quota; retrying could charge for the same turn again. A pending admission is not a recoverable job.
 
 Existing annotation directories at `$XDG_STATE_HOME/varro/opencode-v2/` and quota
 directories at `~/.varro-provider-quota-v2/` remain intact. When needed, Varro creates
@@ -611,6 +621,12 @@ Successful snapshots are cached for `30` seconds; provider errors and rate limit
 
 Adapter coverage currently includes Antigravity, Anthropic, OpenAI/Codex, OpenCode Go, GitHub Copilot, Gemini, OpenRouter, Z.AI, MiniMax, Kimi, Ollama Cloud, and xAI SuperGrok, plus metadata-header probes for compatible OpenAI, GitHub Copilot, and xAI API-key configurations. Availability depends on the provider and credential type; unsupported providers simply do not show quota details.
 
+On OpenCode 2.2.0+, Console-routed providers use the server's workspace-scoped usage endpoint,
+including in attach-only mode. Varro shows applicable Console dollar budgets and Go's separate
+5-hour, weekly, and monthly allowances. Per-model budgets use the selected model's spend; shared
+budgets keep their shared totals. This path never reads local credentials. Only a missing endpoint
+permits the older managed-server adapter; signed-out responses and errors do not switch accounts.
+
 To retrieve quota metadata, the extension host can:
 
 - Read the OpenCode authentication store and provider/model metadata. The default is `${XDG_DATA_HOME:-~/.local/share}/opencode/auth.json` on macOS, Linux, and WSL, and `%USERPROFILE%\.local\share\opencode\auth.json` on native Windows.
@@ -742,7 +758,18 @@ Switching away from `Auto` prevents an unfinished judge request from granting pe
 When automatic review falls back to manual approval, the prompt shows a concise action summary when
 available, the full request metadata with copy actions, and the judge's reason under `AI check`.
 
-The judge uses `varro.chat.autoApproveModel` first, then OpenCode's `small_model`, OpenAI GPT Luna, GitHub Copilot GPT Luna, and the selected Varro session model. Right-click a model in the Models view to set the VS Code user setting.
+The chat judge uses `varro.chat.autoApproveModel` first, then OpenCode's `small_model`, OpenAI GPT Luna, GitHub Copilot GPT Luna, and the selected Varro session model. Right-click a model in the Models view to set the VS Code user setting.
+
+The experimental **OpenCode decision model** selector is temporarily hidden. Enable
+`varro.debug.showNativeDecisionModels` to show it on OpenCode 2.2.0+. Native review is off by
+default. Selecting a model sets `varro.chat.autoApproveDecisionModel` and sends unresolved Auto-mode
+permission details to the server's native decisions API before the chat judge. This API uses the
+server's base configuration and credentials, not arbitrary workspace configuration. Allow requires
+probability at least 0.8, confidence at least 0.75, and destructive-action and approval-steering
+probabilities below 0.2. Reject requires probability at least 0.9 and a prior user rejection.
+Other valid answers show the manual prompt. Errors fall back to explicitly enabled legacy TypeSafe
+Jev, then the chat judge. External-directory requests remain local-only. Select **Off** to disable
+native reviews without changing legacy Jev settings.
 
 `Full access` updates the session permission rules and auto-approves pending permission prompts for that session. Select it only when the session can operate without confirmation.
 
@@ -856,6 +883,7 @@ Chat view:
 
 - `varro.chat.defaultPermissionMode` - initial permission mode when no saved project or global selection exists; defaults to `auto`
 - `varro.chat.autoApproveModel` - provider/model used by the auto-approve judge; stored in VS Code user settings and selected from Varro's Models view
+- `varro.chat.autoApproveDecisionModel` - optional native OpenCode decision reviewer in provider/model form; off by default and selected in the Models view
 - `varro.chat.showFileDiffs` - show line-by-line edits in file-change tool cards; defaults to `false`
 - `varro.chat.expandThinking` - expand thinking details after two seconds while reasoning is active, collapse finished thinking into rows, and return it to `Explored` when the turn finishes; defaults to `false`
 - `varro.chat.fontSize` - chat text size from `6` through `100`; defaults to `null`, which uses VS Code's `chat.fontSize`. Tool and diff editor content follows `chat.editor.fontSize`
@@ -879,7 +907,7 @@ There are also deprecated debug-only settings used for development and recovery 
 ## Troubleshooting
 
 - OpenCode CLI missing: install v2 with `npm install -g @opencode/cli` on macOS, Linux, or WSL, or download the native Windows CLI from the [v2 install page](https://opencode.ai/v2/docs/). V1 remains available with `npm install -g opencode-ai`.
-- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.4` and v2 `2.1.4`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
+- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.5` and v2 `2.2.1`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
 - OpenCode v2 authentication: Varro captures managed-server credentials automatically and redacts them from output. Existing local services use their registered credentials. An externally managed server can also use `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` from the extension host's environment.
 - OpenCode v2 session settings: Varro stores mutable session annotations locally because the released v2 API cannot update session metadata. Session sharing is unavailable through this API, so its menu action is disabled. Existing v1-format configuration remains supported.
 - CLI not on `PATH`: set `varro.server.command` to the executable path.

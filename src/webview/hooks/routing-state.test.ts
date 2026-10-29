@@ -119,16 +119,50 @@ describe('routing-state helpers', () => {
     ).toBeNull();
   });
 
-  it('defaults fresh drafts to build even when ask was persisted', () => {
+  it.each(['ask', 'plan', 'custom'])('restores the persisted %s agent for fresh drafts', (name) => {
     expect(
       reconcileLoadedAgents({
-        loadedAgents: [agent('ask'), agent('plan'), agent('build')],
+        loadedAgents: [agent(name), agent('build')],
         activeSessionId: null,
         selectedAgent: null,
         sessionSelectedAgent: null,
-        persistedSelectedAgent: 'ask',
+        persistedSelectedAgent: name,
       }).nextSelectedAgent
-    ).toEqual({ value: 'build', options: { persistGlobal: false } });
+    ).toEqual({ value: name, options: { persistGlobal: false } });
+  });
+
+  it.each(['missing', 'hidden', 'explore', null])(
+    'falls back to build when the persisted agent is %s',
+    (persistedSelectedAgent) => {
+      expect(
+        reconcileLoadedAgents({
+          loadedAgents: [
+            agent('plan'),
+            agent('build'),
+            agent('hidden', { hidden: true }),
+            agent('explore', { mode: 'subagent' }),
+          ],
+          activeSessionId: null,
+          selectedAgent: null,
+          sessionSelectedAgent: null,
+          persistedSelectedAgent,
+        }).nextSelectedAgent
+      ).toEqual({ value: 'build', options: { persistGlobal: false } });
+    }
+  );
+
+  it('uses only visible primary agents for default selection', () => {
+    const agents = [
+      agent('hidden', { hidden: true }),
+      agent('explore', { mode: 'subagent' }),
+      agent('plan'),
+      agent('build'),
+    ];
+    expect(getDefaultPrimaryAgentName(agents, 'plan')).toBe('plan');
+    expect(getDefaultPrimaryAgentName(agents, 'hidden')).toBe('build');
+    expect(getDefaultPrimaryAgentName(agents, 'explore')).toBe('build');
+    expect(getDefaultPrimaryAgentName(agents.slice(0, 3), 'missing')).toBe('plan');
+    expect(getDefaultPrimaryAgentName(agents.slice(0, 2), 'explore')).toBeNull();
   });
 
   it('preserves an explicit ask choice in the current draft', () => {

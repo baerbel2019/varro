@@ -1,5 +1,6 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/no-module-mocking, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/require-safety-comment-for-type-assertion -- These tests exercise command import boundaries with malformed VS Code and process results. */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { CodeActionTriggerKind, DiagnosticSeverity } from 'vscode';
 import type * as VSCode from 'vscode';
 import type { ReportedError } from './error-hub';
 
@@ -19,6 +20,7 @@ const { configInspectMock, configUpdateMock, registeredCommands, vscodeMock } = 
       ),
     },
     CodeActionKind: { QuickFix: { value: 'quickfix' } },
+    CodeActionTriggerKind: { Invoke: 1, Automatic: 2 },
     DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
     commands: {
       registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
@@ -183,7 +185,7 @@ describe('Problems Add to Context action', () => {
       providedCodeActionKinds: [vscodeMock.CodeActionKind.QuickFix],
     });
     const diagnostic = {
-      severity: 0,
+      severity: DiagnosticSeverity.Error,
       message: 'Missing module',
       source: 'ts',
       code: 2307,
@@ -192,7 +194,7 @@ describe('Problems Add to Context action', () => {
     const actions = await registration[1].provideCodeActions(
       { uri: { fsPath: '/repo/a.ts' } } as VSCode.TextDocument,
       diagnostic.range,
-      { diagnostics: [diagnostic], triggerKind: 1, only: undefined },
+      { diagnostics: [diagnostic], triggerKind: CodeActionTriggerKind.Invoke, only: undefined },
       { isCancellationRequested: false } as VSCode.CancellationToken
     );
     expect(actions).toHaveLength(1);
@@ -237,7 +239,11 @@ describe('Problems Add to Context action', () => {
     const actions = await provider.provideCodeActions(
       {} as VSCode.TextDocument,
       {} as VSCode.Range,
-      { diagnostics: [{} as VSCode.Diagnostic], triggerKind: 1, only: undefined },
+      {
+        diagnostics: [{} as VSCode.Diagnostic],
+        triggerKind: CodeActionTriggerKind.Invoke,
+        only: undefined,
+      },
       { isCancellationRequested: false } as VSCode.CancellationToken
     );
     expect(actions).toEqual([]);
@@ -1028,10 +1034,17 @@ describe('sidebar navigation commands', () => {
     configInspectMock.mockReturnValue(undefined);
   });
 
+  it('leaves the generated view-focus command registered by VS Code untouched', () => {
+    register();
+
+    expect(registeredCommands.has('varro.chat.focus')).toBe(false);
+    expect(registeredCommands.has('varro.chat.focusInput')).toBe(true);
+  });
+
   it('reveals the view and focuses the composer', async () => {
     const { sidebar } = register();
 
-    await runCommand('varro.chat.focus');
+    await runCommand('varro.chat.focusInput');
 
     expect(vscodeMock.commands.executeCommand).toHaveBeenCalledWith(
       'workbench.view.extension.varro'
@@ -1044,7 +1057,7 @@ describe('sidebar navigation commands', () => {
     register('/repo', {}, primaryContainer);
 
     for (const command of [
-      'varro.chat.focus',
+      'varro.chat.focusInput',
       'varro.chat.statusBarClick',
       'varro.chat.newSession',
       'varro.chat.searchSessions',
@@ -1085,7 +1098,7 @@ describe('sidebar navigation commands', () => {
     const { sidebar } = register();
     vscodeMock.commands.executeCommand.mockRejectedValueOnce(new Error('no such view'));
 
-    await expect(runCommand('varro.chat.focus')).resolves.toBeUndefined();
+    await expect(runCommand('varro.chat.focusInput')).resolves.toBeUndefined();
 
     expect(sidebar.requestInputFocus).not.toHaveBeenCalled();
     expect(vscodeMock.window.showErrorMessage).not.toHaveBeenCalled();

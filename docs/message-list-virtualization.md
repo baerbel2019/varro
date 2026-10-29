@@ -34,11 +34,12 @@ the shared invariants below remain true.
 - The current range constants are centralized: `VIRTUALIZE_THRESHOLD` is 50 rows,
   `DEFAULT_ITEM_HEIGHT` is 160 px, and `OVERSCAN` is 9 rows. Changing one requires range-boundary,
   viewport-coverage, mount-count, and performance verification.
-- Virtualization starts only after every nonzero row in the current window has an exact initial
-  measurement. Complete render-empty projections already supply an exact zero; bootstrap must not
-  wait for an observer to redeliver an unchanged empty row after grouping invalidates its cache.
-  After bootstrap, it remains active while the list is above the threshold; appends and prepends use
-  provisional heights rather than temporarily remounting the full transcript.
+- Virtualization starts at the threshold with a bounded mounted range. Initial bottom-follow selects
+  the tail directly and keeps it selected while measurements settle. Never mount the full initial
+  page to measure offscreen rows. Unmounted rows use provisional heights, never fabricated exact
+  measurements; mounted content receives exact, pixel-aligned measurements before paint. Complete
+  render-empty projections supply an exact zero without waiting for observer delivery. Appends and
+  prepends retain virtualization and use the same provisional-height and anchor-compensation rules.
 - Every unmeasured nonzero row uses the same aligned provisional height used to construct the prefix.
   Range lookup must skip zero-height runs at exact boundaries and must return physical coverage for a
   nonempty list.
@@ -112,6 +113,14 @@ the shared invariants below remain true.
 
 - `measuredHeights` is keyed by message ID and contains the current rendered block size for that
   message.
+- Reopening a previously measured transcript may bootstrap virtualization from retained numeric
+  estimates, bounded to 2,000 rows across four session/window generations. Restore only an identical
+  ordered message window. Explicit history resets invalidate that scope. Retain no DOM, message
+  bodies, or reactive owners. Estimates survive appends within the mounted session but never count
+  as exact measurements; fresh mounted measurements win, and current projection alone certifies
+  zero height. Layout invalidation removes both exact measurements and retained estimates.
+  `session-remount.spec.ts` checks cold and warm transient mount/read counts, changed-width reopening,
+  native Home/End through never-measured rows, viewport coverage, and exact integer row boxes.
 - `knownZeroHeightMessageIds` may override `measuredHeights` only while the complete row projection is
   known to render no message content, transition content, model-change chrome, dialog summary, or
   other row-local UI. The CSS row box and virtual prefix must agree on that zero.
@@ -210,6 +219,9 @@ the shared invariants below remain true.
   When an unloaded diff remounts, reserve its last measured row height until details replace the
   summary. Unloading may save content, but must preserve exactly the same layout space; loading
   placeholders are not new exact row measurements.
+  A mounted running diff retains its preview when completion replaces the streamed body with a
+  deferred summary. Keep the latest tool status and replace the preview when details arrive;
+  a reserved row height alone does not prevent the painted diff from disappearing.
   Establish that reservation before mount measurement, and publish hydrated heights before the
   next virtual-range reconciliation. Waiting for ResizeObserver can repeatedly evict and remount
   a boundary row, replacing its cached diff height with its shorter summary on each pass.
@@ -242,12 +254,15 @@ the shared invariants below remain true.
 - A resize batch is a pure width reflow only when every reported inline size changed or the container
   font changed. Concurrent streaming, expansion, or content mutation makes it a content resize and
   uses normal height-correction ownership.
-- The webview root caps expansion within one responsive layout for four animation frames while the
-  VS Code painted surface catches up. During that interval, `window.innerWidth` can exceed the content
-  width. Measure the actual container for reflow and anchor calculations. Shrinking, zoom, and crossing
-  the 960px content or 1400px session-sidebar breakpoint bypass the delay and cancel pending expansion.
-  Viewport media queries and the root width must switch together; a desktop sidebar inside the old
-  narrow cap can squeeze the transcript to one character per line.
+- CSS owns the webview root's responsive width. Never pin it to pixels read in a resize event:
+  native iframe layout can precede that event, leaving a stale cap for a painted frame and retaining
+  incorrect shrink-to-fit prompt margins after reflow. Hidden or temporary 300 x 150 iframe viewports
+  must not become stored width constraints that survive reveal. Measure the actual container for
+  reflow and anchor calculations. Viewport media queries and root sizing must switch together;
+  a desktop sidebar inside an old narrow cap can squeeze the transcript to one character per line.
+- The sticky prompt and its solid lower gap stay opaque while the preview rewraps on restore. Only
+  the final decorative tail fades into the transcript; keep the overlay background transparent at
+  that edge so it cannot flatten the gradient. The preview's own text may also fade when truncated.
 - Width measurements may be deferred only while the mounted range still brackets the viewport.
   Publish pending metrics early if stale prefixes could leave uncovered space above or below the
   rendered range.
@@ -305,6 +320,9 @@ the shared invariants below remain true.
 - Sticky navigation refreshes its remembered detached anchor after final alignment settles. Virtual
   core measurement can move the initial destination; retaining that earlier offset makes the next
   width resize restore a stale position. `scroll-sticky-reflow.spec.ts` covers this handoff.
+- Once navigation hides the sticky overlay for its source card, stale coalesced viewport geometry
+  must not recreate that overlay while navigation still owns scrolling. The terminal-attachment
+  navigation case in `layout.spec.ts` checks every frame of this handoff.
 - Deferred bottom corrections retain the direct-input epoch as well as the session/request identity.
   A newer gesture cancels a queued forced correction even when the original request ID is unchanged.
 - User interaction with the destination cancels navigation settling before editing or attachment
@@ -612,6 +630,12 @@ Direct input acquires ownership only when it can affect the transcript:
   alone, an idle read-history load, or a virtual row mount must never admit inference.
   Cache-only retrieval restores current suggestions without model calls. The host persists admission
   before inference and caches results, abstentions, failures, and explicit dismissals across reloads.
+  Completed results committed to the cache survive reloads; a pending admission is not a durable
+  generation job. Once admitted, closing the originating editor does not cancel the bounded attempt
+  while its extension host remains alive. Unfinished generation is not guaranteed to recover after
+  whole-host shutdown, even if the backend survives. Readers stop waiting after a bounded interval and
+  may return empty. Expiry of the pending-wait grace period must not release admission or trigger
+  regeneration: the original request may already have consumed tokens or subscription quota.
   Navigation and invalidation do not persist dismissal; closing the card or an accepted action does.
   An accepted new turn clears prior suggestion contents and retires pending results for that session,
   retaining compact admission metadata. Rejected sends do not clear the cache.
@@ -665,8 +689,9 @@ Direct input acquires ownership only when it can affect the transcript:
 ### Animated Row Transitions
 
 - A compact activity part follows `delayed -> visible active/completed -> retained -> exiting -> grouped`.
-  Tool previews skip `exiting`: after retention, group them immediately without a disappearing or
-  height-collapse animation. Reserve their disappearing flow space before publishing removal, and
+  Tool previews appear at full height and opacity without an entrance animation and skip `exiting`:
+  after retention, group them immediately without a disappearing or height-collapse animation.
+  Reserve their disappearing flow space before publishing removal, and
   admit the next queued tool in the same update. When one preview replaces another, reuse its tray
   and skip the replacement's entrance animation, including completed previews waiting to group.
   Reasoning retains its animated exit lifecycle.
@@ -926,6 +951,11 @@ Direct input acquires ownership only when it can affect the transcript:
 - Boundary prompt selection must consider all cached unloaded prompts in order and skip empty prompts.
   Prefetch must continue past an empty newest prompt until a previewable prompt or the beginning of
   history is reached.
+  Steering messages, generated follow-up actions, and automatic notices do not satisfy that boundary
+  either. Continue through those pages until the original prompt is cached, without inserting
+  those prefetched rows into the visible transcript or advancing its history cursor.
+  Verify cold open without wheel, keyboard, or scrollbar input. A prompt that appears only after
+  loading transcript pages does not satisfy the initial boundary-prefetch contract.
 - Wheel input consumed by a nested scroller inside the destination still cancels sticky settling.
   The outer transcript does not need to move for the user to have taken ownership.
 - Sticky navigation and its loading owner belong to one message-window version. Cancellation releases

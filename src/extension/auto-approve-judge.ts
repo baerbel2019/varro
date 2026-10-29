@@ -20,6 +20,7 @@ import {
 } from './hidden-session-manager';
 import { resolveHelperModel } from './helper-model-selection';
 import type { JevDecisions } from './jev-decisions';
+import type { NativeDecisions } from './native-decisions';
 import { logger } from './logger';
 
 type OpenCodeRequest = Pick<OpenCodeServer, 'request'>;
@@ -88,7 +89,8 @@ export class AutoApproveJudge {
     private readonly resolveGitWorkTree: (
       workspacePath: string
     ) => Promise<GitWorkTree | null> = probeGitWorkTree,
-    private readonly jev?: JevPermissionJudge
+    private readonly jev?: JevPermissionJudge,
+    private readonly native?: Pick<NativeDecisions, 'model' | 'judgePermission'>
   ) {}
 
   async judge(
@@ -115,10 +117,37 @@ export class AutoApproveJudge {
       return { decision: 'ask', reason: 'Permission request lacks enough detail to judge safely.' };
     }
 
-    let decisionSource = 'judge' as 'cache' | 'judge' | 'jev';
+    let decisionSource = 'judge' as 'cache' | 'judge' | 'jev' | 'native';
     let verdictCacheKey: string | null = null;
     const decision = await this.withTimeout(
       (async () => {
+        const nativeModel = this.native?.model;
+        if (this.native && nativeModel) {
+          verdictCacheKey = buildVerdictCacheKey(
+            permission,
+            approvedReferences,
+            workspacePath,
+            nativeModel
+          );
+          const cached = this.readCachedVerdict(verdictCacheKey);
+          if (cached) {
+            decisionSource = 'cache';
+            return cached;
+          }
+          try {
+            const result = await this.native.judgePermission(
+              nativeModel,
+              permission,
+              approvedReferences
+            );
+            decisionSource = 'native';
+            return { ...result, reviewerModel: nativeModel };
+          } catch (error) {
+            logger.warn(
+              `Native decision judge failed; using configured fallback: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        }
         if (this.jev && (await this.jev.isAutoApproveEnabled())) {
           verdictCacheKey = buildVerdictCacheKey(
             permission,
@@ -143,7 +172,7 @@ export class AutoApproveJudge {
             );
           }
         }
-        const model = await this.resolveModel(request.model, workspacePath);
+        const model = await this.resolveChatModel(request.model, workspacePath);
         verdictCacheKey = buildVerdictCacheKey(
           permission,
           approvedReferences,
@@ -205,7 +234,7 @@ export class AutoApproveJudge {
   }
 
   private audit(
-    source: 'local-rule' | 'cache' | 'judge' | 'jev',
+    source: 'local-rule' | 'cache' | 'judge' | 'jev' | 'native',
     permission: NormalizedJudgePermission,
     response: AutoApproveJudgeResponse
   ) {
@@ -299,7 +328,16 @@ export class AutoApproveJudge {
     fallbackModel: AutoApproveJudgeRequest['model'],
     workspacePath?: string
   ): Promise<JudgeModel | null> {
+    const nativeModel = this.native?.model;
+    if (nativeModel) return nativeModel;
     if (this.jev && (await this.jev.isAutoApproveEnabled())) return this.jev.model;
+    return this.resolveChatModel(fallbackModel, workspacePath);
+  }
+
+  private async resolveChatModel(
+    fallbackModel: AutoApproveJudgeRequest['model'],
+    workspacePath?: string
+  ) {
     return resolveHelperModel({
       configuredModel: this.getConfiguredModel(),
       loadSmallModel: async () => {

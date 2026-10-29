@@ -55,7 +55,7 @@ test('switches full-screen layouts without a capped or squeezed transcript frame
   });
   for (const width of [1670, 486, 1280, 1670, 486]) {
     await page.setViewportSize({ width, height: 900 });
-    await expect(page.locator('#root')).toHaveCSS('max-width', `${width}px`);
+    await expect(page.locator('#root')).toHaveCSS('max-width', 'none');
     await expect
       .poll(() => getScrollMetrics(page, '.interactive-list').then((m) => m.distanceFromBottom))
       .toBeLessThan(1);
@@ -422,47 +422,35 @@ test('keeps active-tray wheel input local before outer transcript movement', asy
   expect(await list.evaluate((element) => element.scrollTop)).toBe(outerDestination);
 });
 
-test('keeps the active tool gap fixed through its entrance animation', async ({ page }) => {
-  await page.addInitScript(() => {
-    document.addEventListener('animationstart', (event) => {
-      if (
-        !(event.target instanceof HTMLElement) ||
-        event.animationName !== 'assistant-active-activity-in'
-      ) {
-        return;
-      }
-      const animation = event.target
-        .getAnimations()
-        .find(
-          (candidate) =>
-            candidate instanceof CSSAnimation &&
-            candidate.animationName === 'assistant-active-activity-in'
-        );
-      if (animation) animation.pause();
-    });
-  });
+test('shows the active tool at full opacity with a fixed gap and no entrance animation', async ({
+  page,
+}) => {
   await page.goto('/e2e/harness/index.html?scenario=tool-cards&activeTray=1&activeTrayCount=1');
   const activeTool = page.locator('.assistant-active-activity-item .chat-tool-invocation-part');
   await expect(activeTool).toBeVisible();
-  const gaps = await activeTool.evaluate((element) => {
+  const frames = await activeTool.evaluate(async (element) => {
     const item = element.closest<HTMLElement>('.assistant-active-activity-item');
     const summary = document.querySelector<HTMLElement>('.assistant-activity-summary');
-    const animation = item
-      ?.getAnimations()
-      .find(
-        (candidate) =>
-          getComputedStyle(item).animationName === 'assistant-active-activity-in' &&
-          candidate.effect instanceof KeyframeEffect
-      );
-    if (!item || !summary || !animation) throw new Error('Active tool entrance is missing');
-    animation.pause();
-    return [0, 140, 280].map((currentTime) => {
-      animation.currentTime = currentTime;
-      return element.getBoundingClientRect().top - summary.getBoundingClientRect().bottom;
-    });
+    if (!item || !summary) throw new Error('Active tool geometry is missing');
+    const samples: Array<{ gap: number; opacity: string; animation: string; height: number }> = [];
+    for (let frame = 0; frame < 20; frame += 1) {
+      const style = getComputedStyle(item);
+      samples.push({
+        gap: element.getBoundingClientRect().top - summary.getBoundingClientRect().bottom,
+        opacity: style.opacity,
+        animation: style.animationName,
+        height: item.getBoundingClientRect().height,
+      });
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+    return samples;
   });
-  expect(Math.max(...gaps) - Math.min(...gaps)).toBeLessThanOrEqual(0.5);
-  for (const gap of gaps) expect(gap).toBeCloseTo(12, 0);
+  for (const sample of frames) {
+    expect(sample.gap).toBeCloseTo(12, 0);
+    expect(sample.opacity).toBe('1');
+    expect(sample.animation).toBe('none');
+    expect(sample.height).toBe(frames[0]!.height);
+  }
 });
 
 test('keeps a cross-message active tool adjacent to Explored after entrance', async ({ page }) => {
@@ -2199,6 +2187,117 @@ async function revealMixedImageTileRow(page: Page): Promise<Locator> {
   await expect(row).toBeVisible();
   return row;
 }
+
+for (const singleImage of [false, true]) {
+  test(`image prompt bubbles stay right-aligned on every resize frame, singleImage=${singleImage}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 486, height: 900 });
+    await page.goto(
+      `/e2e/harness/index.html?scenario=mixed-image-tiles${singleImage ? '&singleImage' : ''}`
+    );
+    const row = page.locator('[data-msg-id="message-mixed-image-tiles-user"]');
+    await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);
+    await expect(row).toBeVisible();
+    await expect(page.locator('#root')).toHaveCSS('max-width', 'none');
+    await row.evaluate((element) => {
+      const samples: Array<{
+        viewport: number;
+        rootWidth: number;
+        rowRight: number;
+        bubbleRight: number;
+      }> = [];
+      const testWindow = window as typeof window & { imagePromptResizeSamples?: typeof samples };
+      testWindow.imagePromptResizeSamples = samples;
+      const sample = () => {
+        const bubble = element.querySelector('.user-message-image-text-bubble')!;
+        samples.push({
+          viewport: window.innerWidth,
+          rootWidth: document.getElementById('root')!.getBoundingClientRect().width,
+          rowRight: element.getBoundingClientRect().right,
+          bubbleRight: bubble.getBoundingClientRect().right,
+        });
+        requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+
+    for (const width of [700, 950, 980, 1280, 1670, 1280, 980, 970, 960, 700, 486]) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.evaluate(async () => {
+        for (let frame = 0; frame < 16; frame += 1) {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        }
+      });
+    }
+
+    const samples = await page.evaluate(
+      () =>
+        (
+          window as typeof window & {
+            imagePromptResizeSamples?: Array<{
+              viewport: number;
+              rootWidth: number;
+              rowRight: number;
+              bubbleRight: number;
+            }>;
+          }
+        ).imagePromptResizeSamples ?? []
+    );
+    expect(samples.length).toBeGreaterThan(100);
+    const misaligned = samples.filter(
+      (sample) =>
+        Math.abs(sample.viewport - sample.rootWidth) > 1 ||
+        Math.abs(sample.rowRight - sample.bubbleRight) > 1
+    );
+    expect(misaligned).toEqual([]);
+  });
+}
+
+test('keeps the sticky prompt opaque with a fading bottom edge through resize', async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 486, height: 900 });
+  await page.goto('/e2e/harness/index.html?scenario=sticky-preview');
+  await page.locator('.interactive-list').evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    element.dispatchEvent(new Event('scroll'));
+  });
+  const overlay = page.locator('.latest-user-message-sticky-overlay');
+  await expect(overlay).toBeVisible();
+  for (const width of [1670, 486, 1280, 486]) {
+    await page.setViewportSize({ width, height: 900 });
+    const backgrounds = await overlay.evaluate((element) => {
+      const background = getComputedStyle(
+        element.querySelector('.latest-user-message-sticky-shell')!
+      ).backgroundColor;
+      return {
+        expected: background,
+        overlay: getComputedStyle(element).backgroundImage,
+        overlayColor: getComputedStyle(element).backgroundColor,
+        solid: getComputedStyle(element.querySelector('.latest-user-message-sticky-bottom-solid')!)
+          .backgroundColor,
+        tail: getComputedStyle(element.querySelector('.latest-user-message-sticky-bottom-fade')!)
+          .backgroundColor,
+        tailHeight: element
+          .querySelector('.latest-user-message-sticky-bottom-fade')!
+          .getBoundingClientRect().height,
+      };
+    });
+    expect(backgrounds.solid).toBe(backgrounds.expected);
+    expect(backgrounds.solid).not.toMatch(/rgba\(/);
+    expect(backgrounds.tailHeight).toBeGreaterThan(0);
+    expect(backgrounds.overlay).toBe(
+      `linear-gradient(${backgrounds.expected} calc(100% - ${backgrounds.tailHeight}px), rgba(0, 0, 0, 0))`
+    );
+    expect(backgrounds.overlayColor).toBe('rgba(0, 0, 0, 0)');
+    expect(backgrounds.tail).toBe('rgba(0, 0, 0, 0)');
+  }
+  await testInfo.attach('sticky-prompt-fade.png', {
+    body: await overlay.screenshot({ path: testInfo.outputPath('sticky-prompt-fade.png') }),
+    contentType: 'image/png',
+  });
+});
 
 test('dot hover highlights the visible text bubble of an image prompt', async ({ page }) => {
   await page.setViewportSize({ width: 1200, height: 900 });

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { editingMessage, resetMessageEditState, startEditingMessage } from './message-edit-state';
 import { newChatDraftKey, startNewChatDraft } from './new-chat-draft';
 import {
+  getPersistedSelectedAgent,
   getPersistedSelectedModel,
   getSelectedAgentForSession,
   getSelectedModelForSession,
@@ -124,19 +125,51 @@ describe('startNewChatDraft', () => {
     expect(editingMessage()).toBeNull();
   });
 
-  it.each(['ask', 'plan'])('starts in build without changing the previous %s session', (agent) => {
+  it.each(['ask', 'plan', 'custom'])(
+    'remembers %s without changing the previous session',
+    (agent) => {
+      setState('agents', [
+        { name: agent, mode: 'primary', builtIn: false, permission: {}, tools: {} },
+        { name: 'build', mode: 'primary', builtIn: true, permission: {}, tools: {} },
+      ]);
+      setState('activeSessionId', 'session-1');
+      setSelectedAgent(agent, { sessionId: 'session-1' });
+
+      startNewChatDraft();
+
+      expect(state.activeSessionId).toBeNull();
+      expect(state.selectedAgent).toBe(agent);
+      expect(getSelectedAgentForSession('session-1')).toBe(agent);
+      expect(getPersistedSelectedAgent()).toBe(agent);
+    }
+  );
+
+  it('restores the last explicit choice instead of a loaded session agent', () => {
     setState('agents', [
-      { name: 'ask', mode: 'primary', builtIn: false, permission: {}, tools: {} },
+      { name: 'custom', mode: 'primary', builtIn: false, permission: {}, tools: {} },
       { name: 'build', mode: 'primary', builtIn: true, permission: {}, tools: {} },
     ]);
+    setSelectedAgent('custom');
     setState('activeSessionId', 'session-1');
-    setSelectedAgent(agent, { sessionId: 'session-1' });
+    setSelectedAgent('build', { sessionId: 'session-1', persistGlobal: false });
 
     startNewChatDraft();
 
-    expect(state.activeSessionId).toBeNull();
+    expect(state.selectedAgent).toBe('custom');
+    expect(getSelectedAgentForSession('session-1')).toBe('build');
+    expect(getPersistedSelectedAgent()).toBe('custom');
+  });
+
+  it('falls back without overwriting an unavailable saved agent', () => {
+    setState('agents', [
+      { name: 'build', mode: 'primary', builtIn: true, permission: {}, tools: {} },
+    ]);
+    setSelectedAgent('custom');
+
+    startNewChatDraft();
+
     expect(state.selectedAgent).toBe('build');
-    expect(getSelectedAgentForSession('session-1')).toBe(agent);
+    expect(getPersistedSelectedAgent()).toBe('custom');
   });
 
   it('clears message loading immediately when a slow session load is abandoned', () => {
@@ -261,7 +294,7 @@ describe('startNewChatDraft', () => {
     expect(state.messagesLoading).toBe(false);
   });
 
-  it('focuses the composer and resets to build when reusing an untouched blank session', () => {
+  it('focuses the composer and remembers the agent when reusing an untouched blank session', () => {
     setState('agents', [
       { name: 'ask', mode: 'primary', builtIn: false, permission: {}, tools: {} },
       { name: 'build', mode: 'primary', builtIn: true, permission: {}, tools: {} },
@@ -284,8 +317,8 @@ describe('startNewChatDraft', () => {
     startNewChatDraft();
 
     expect(state.activeSessionId).toBe('session-1');
-    expect(state.selectedAgent).toBe('build');
-    expect(getSelectedAgentForSession('session-1')).toBe('build');
+    expect(state.selectedAgent).toBe('ask');
+    expect(getSelectedAgentForSession('session-1')).toBe('ask');
     expect(composerFocusKey()).toBe(previousFocusKey + 1);
   });
 

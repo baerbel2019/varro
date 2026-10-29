@@ -106,6 +106,159 @@ async function updateDiffPreviewWithPatch(
 }
 
 test.describe('diff preview anchoring', () => {
+  test('keeps the painted running diff through deferred completion hydration', async ({ page }) => {
+    await page.setViewportSize({ width: 486, height: 794 });
+    await page.goto(
+      '/e2e/harness/index.html?scenario=diff-preview-large-transcript&expandedActivity=1'
+    );
+    await expect(page.locator('.interactive-list')).toBeVisible();
+    const id = 'message-diff-completion';
+    await page.evaluate((messageID) => {
+      const sessionID = 'session-diff-preview-large-transcript';
+      const host = window as typeof window & {
+        __varroE2E: {
+          getSessionMessages: (id: string) => Array<{ info: Record<string, unknown> }>;
+          updateMessageInfo: (info: Record<string, unknown>) => void;
+          updateSessionStatus: (id: string, status: { type: 'busy' }) => void;
+        };
+      };
+      const info = {
+        ...host.__varroE2E.getSessionMessages(sessionID).at(-1)!.info,
+        id: messageID,
+        finish: undefined,
+        time: { created: Date.now() },
+      };
+      host.__varroE2E.updateMessageInfo(info);
+      host.__varroE2E.updateSessionStatus(sessionID, { type: 'busy' });
+      for (const payload of [
+        { type: 'message.updated', properties: { info } },
+        { type: 'session.status', properties: { sessionID, status: { type: 'busy' } } },
+      ])
+        window.postMessage({ type: 'server/event', payload }, '*');
+    }, id);
+    await updateDiffPreview(page, id, 2);
+    const row = page.locator(`[data-msg-id="${id}"]`);
+    await expect(row.locator('.file-change-inline-diffs').last()).toContainText('ready');
+    await waitForAnimationFrames(page, 30);
+    const result = await page.evaluate(async (messageID) => {
+      const host = window as typeof window & {
+        __sendToExtension: (message: WebviewMessage) => void;
+        __varroE2E: { updateMessagePart: (part: unknown) => void };
+      };
+      const selector = `[data-msg-id="${messageID}"] .file-change-inline-diffs`;
+      const originalNode = [...document.querySelectorAll(selector)].at(-1)!;
+      const original = host.__sendToExtension;
+      const deferred = '/completion-diff-details';
+      let responseAt = 0;
+      const requests: string[] = [];
+      const part = {
+        id: `${messageID}-patch`,
+        messageID,
+        sessionID: 'session-diff-preview-large-transcript',
+        type: 'tool',
+        tool: 'apply_patch',
+        callID: `${messageID}-patch-call`,
+        state: {
+          status: 'completed',
+          input: {},
+          output: 'Done',
+          title: 'apply_patch',
+          metadata: {
+            files: [0, 1].map((index) => ({
+              filePath: `src/async-report-${index}.ts`,
+              type: 'update',
+              additions: 1,
+              deletions: 1,
+            })),
+          },
+          deferredFiles: [0, 1].map((index) => ({
+            kind: 'edited',
+            path: `src/async-report-${index}.ts`,
+            dedupeKey: `edited:src/async-report-${index}.ts`,
+            additions: 1,
+            deletions: 1,
+          })),
+          time: { start: 1, end: 2 },
+        },
+      };
+      host.__sendToExtension = (rawMessage: unknown) => {
+        const message = rawMessage as WebviewMessage;
+        if (message.type !== 'api/request' || message.payload.path !== deferred)
+          return original(message);
+        requests.push(message.payload.path);
+        setTimeout(() => {
+          responseAt = performance.now();
+          window.postMessage(
+            {
+              type: 'api/response',
+              payload: {
+                id: message.payload.id,
+                data: {
+                  ...part,
+                  state: {
+                    ...part.state,
+                    deferredFiles: undefined,
+                    input: {
+                      patchText: [
+                        '*** Begin Patch',
+                        ...[0, 1].map(
+                          (index) =>
+                            `*** Update File: src/async-report-${index}.ts\n@@\n-export const value${index} = 'pending';\n+export const value${index} = 'confirmed';`
+                        ),
+                        '*** End Patch',
+                      ].join('\n'),
+                    },
+                  },
+                },
+              },
+            },
+            '*'
+          );
+        }, 450);
+      };
+      const summary = { ...part, deferred };
+      host.__varroE2E.updateMessagePart(summary);
+      const startedAt = performance.now();
+      window.postMessage(
+        {
+          type: 'server/event',
+          payload: { type: 'message.part.updated', properties: { part: summary } },
+        },
+        '*'
+      );
+      const frames: Array<{ sameNode: boolean; files: number; painted: boolean }> = [];
+      while (performance.now() - startedAt < 750) {
+        await new Promise(requestAnimationFrame);
+        const rect = originalNode.getBoundingClientRect();
+        const viewport = document.querySelector('.interactive-list')!.getBoundingClientRect();
+        frames.push({
+          sameNode:
+            originalNode.isConnected &&
+            [...document.querySelectorAll(selector)].includes(originalNode),
+          files: originalNode.querySelectorAll('.diff-view-file').length,
+          painted: rect.height > 0 && rect.bottom > viewport.top && rect.top < viewport.bottom,
+        });
+      }
+      host.__sendToExtension = original;
+      return {
+        frames,
+        delay: responseAt - startedAt,
+        requests,
+      };
+    }, id);
+    await test.info().attach('completion-diff-frames', {
+      body: JSON.stringify(result),
+      contentType: 'application/json',
+    });
+    expect(result.requests).toEqual(['/completion-diff-details']);
+    expect(result.delay).toBeGreaterThanOrEqual(350);
+    expect(result.frames.length).toBeGreaterThan(10);
+    expect(
+      result.frames.every((frame) => frame.sameNode && frame.files === 2 && frame.painted)
+    ).toBe(true);
+    await expect(row.locator('.file-change-inline-diffs').last()).toContainText('confirmed');
+  });
+
   test('keeps deferred diff row heights and anchors through wheel remounts and detached toggles', async ({
     page,
   }) => {

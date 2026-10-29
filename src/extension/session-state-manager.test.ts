@@ -122,6 +122,23 @@ describe('SessionStateManager notifications', () => {
     );
   });
 
+  it('opens notification actions through the placement-preserving composer command', async () => {
+    vscodeMock.window.showWarningMessage.mockResolvedValueOnce('Open Chat');
+    const manager = createManager();
+    manager.handleServerEvent({
+      type: 'permission.asked',
+      properties: { id: 'perm-1', sessionID: 'session-1', title: 'Use Bash' },
+    });
+
+    manager.revealPermission('perm-1');
+    await Promise.resolve();
+
+    expect(vscodeMock.commands.executeCommand).toHaveBeenCalledExactlyOnceWith(
+      'varro.chat.focusInput'
+    );
+    manager.dispose();
+  });
+
   it('tracks v2 permission events as blocking attention', () => {
     const manager = createManager();
 

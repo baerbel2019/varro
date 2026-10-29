@@ -16,6 +16,7 @@ import { getOpenCodeApiCapabilities } from './opencode-api-capabilities';
 import { compareVersions } from './server-utils';
 import { basicAuthorization, OpenCodeStartupOutput } from './opencode-connection';
 import { tryGenerateOneShot } from './one-shot-generation';
+import { NativeDecisions } from './native-decisions';
 import { SessionExportService } from './session-export-service';
 import { getAssistantDialogSummaryMap } from '../webview/components/message-list/assistant-dialog';
 import type { MessageEntry } from '../webview/types';
@@ -849,6 +850,60 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
         const provider = providers.map(asRecord).find((entry) => entry?.id === id);
         expect(asRecord(provider?.models) ?? {}).not.toHaveProperty('free-fixture');
       }
+    }
+  });
+
+  it('negotiates native decision and signed-out usage endpoints on 2.2.0', async (context) => {
+    if (
+      transport.version !== 2 ||
+      compareVersions((await transport.readHealthInfo()).version ?? '0', '2.2.0') < 0
+    )
+      return context.skip();
+    const before = modelRequests.length;
+    const native = new NativeDecisions(
+      { apiVersion: 2, request: transport.request.bind(transport) },
+      () => ''
+    );
+    expect(await native.status()).toMatchObject({
+      supported: true,
+      model: null,
+      models: expect.any(Array),
+    });
+    expect(
+      await transport.request('GET', '/api/experimental/usage/limits', undefined, {
+        directory: join(root, 'workspace'),
+        maxResponseBytes: 1024 * 1024,
+      })
+    ).toEqual({ data: null, location: { directory: join(root, 'workspace') } });
+    expect(modelRequests).toHaveLength(before);
+  });
+
+  it('does not restore configured non-chat models to modern chat catalogs', async (context) => {
+    if (
+      transport.version !== 2 ||
+      compareVersions((await transport.readHealthInfo()).version ?? '0', '2.2.0') < 0
+    )
+      return context.skip();
+    const directory = join(root, 'non-chat-models');
+    await mkdir(directory);
+    await writeFile(
+      join(directory, 'opencode.json'),
+      JSON.stringify({
+        providers: {
+          'non-chat-fixture': {
+            package: '@opencode/ai/providers/openai-compatible',
+            settings: { baseURL: 'http://127.0.0.1:1/v1', apiKey: 'fixture-only' },
+            models: { picture: { type: 'image' }, reviewer: { type: 'decision' } },
+          },
+        },
+      })
+    );
+    for (const route of ['/provider', '/config/providers']) {
+      const catalog = asRecord(await transport.request('GET', route, undefined, { directory }));
+      const providers = catalog?.all ?? catalog?.providers;
+      if (!Array.isArray(providers)) throw new Error('Missing provider catalog');
+      const provider = providers.map(asRecord).find((item) => item?.id === 'non-chat-fixture');
+      expect(Object.keys(asRecord(provider?.models) ?? {})).toEqual([]);
     }
   });
 

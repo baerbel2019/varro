@@ -67,9 +67,10 @@ describe('MacOSNotificationHelper', () => {
     await access(first);
     expect(await test.helper().executable()).toBe(first);
     expect(test.run.mock.calls.filter(([file]) => file === '/usr/bin/ditto')).toHaveLength(1);
-    expect(test.run.mock.calls.at(-1)?.[1]).toEqual([
-      '-f',
-      join(test.directory, 'notifications', test.checksum, 'Varro.app'),
+    expect(test.run.mock.calls.at(-1)).toEqual([
+      '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+      [join(test.directory, 'notifications', test.checksum, 'Varro.app')],
+      30_000,
     ]);
   });
 
@@ -78,6 +79,23 @@ describe('MacOSNotificationHelper', () => {
     const paths = await Promise.all([test.helper().executable(), test.helper().executable()]);
     expect(paths[0]).toBe(paths[1]);
     await access(paths[0]);
+  });
+
+  it('retries registration failures using the verified installed app', async () => {
+    const test = await fixture();
+    const install = test.run.getMockImplementation();
+    const error = new Error('Launch Services registration timed out');
+    let registrationAttempts = 0;
+    test.run.mockImplementation(async (file, args, timeout) => {
+      if (file.endsWith('/lsregister') && ++registrationAttempts === 1) throw error;
+      return install?.(file, args, timeout);
+    });
+    const helper = test.helper();
+
+    await expect(helper.executable()).rejects.toBe(error);
+    await access(await helper.executable());
+    expect(registrationAttempts).toBe(2);
+    expect(test.run.mock.calls.filter(([file]) => file === '/usr/bin/ditto')).toHaveLength(1);
   });
 
   it.each(['EEXIST', 'ENOTEMPTY', 'EPERM'])(

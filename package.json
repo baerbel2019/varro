@@ -1,7 +1,7 @@
 {
   "name": "varro",
   "displayName": "Varro: OpenCode Workbench",
-  "version": "0.33.22",
+  "version": "0.33.26",
   "description": "OpenCode agent workbench with project-aware chat, parallel sessions, plan and change review, model and permission controls, commit messages, and usage insights.",
   "categories": [
     "AI",
@@ -88,14 +88,14 @@
   },
   "dependencies": {
     "@imagemagick/magick-wasm": "0.0.45",
-    "@opencode-ai/sdk": "^1.19.4",
-    "@opencode/client": "^2.1.4",
+    "@opencode-ai/sdk": "^1.19.5",
+    "@opencode/client": "^2.2.1",
     "cross-spawn": "7.0.6",
     "dompurify": "3.4.17",
     "highlight.js": "11.12.0",
     "jsonc-parser": "3.3.1",
     "katex": "0.19.1",
-    "marked": "18.1.1",
+    "marked": "18.1.2",
     "mermaid": "^12.2.0",
     "solid-js": "^1.9.17"
   },
@@ -103,17 +103,17 @@
     "@playwright/test": "1.64.1",
     "@tailwindcss/vite": "4.3.3",
     "@types/css.escape": "1.5.2",
-    "@types/node": "26.6.5",
+    "@types/node": "26.6.6",
     "@types/vscode": "1.107.0",
     "@vitest/coverage-v8": "5.0.5",
-    "@vscode/vsce": "4.0.0",
+    "@vscode/vsce": "4.1.0",
     "css.escape": "1.5.1",
     "esbuild": "0.28.2",
     "iconoir": "7.12.1",
     "jsdom": "30.1.3",
-    "material-icon-theme": "5.39.0",
-    "oxfmt": "0.74.0",
-    "oxlint": "1.89.0",
+    "material-icon-theme": "5.40.0",
+    "oxfmt": "0.75.0",
+    "oxlint": "1.90.0",
     "oxlint-plugin-anti-slop": "github:dmmulroy/anti-slop#13909c9",
     "oxlint-tsgolint": "7.0.2005",
     "tailwindcss": "4.3.3",
@@ -125,7 +125,7 @@
   },
   "overrides": {
     "@azure/identity": {
-      "@azure/msal-node": "7.1.1"
+      "@azure/msal-node": "7.1.2"
     },
     "mermaid": {
       "katex": "0.19.1"
@@ -149,7 +149,7 @@
       ]
     },
     "views": {
-      "varro-primary": [
+      "varro": [
         {
           "icon": "assets/icon.png",
           "type": "webview",
@@ -159,6 +159,10 @@
       ]
     },
     "commands": [
+      {
+        "command": "varro.chat.focusInput",
+        "title": "Varro: Focus Chat"
+      },
       {
         "command": "varro.chat.newSession",
         "title": "Varro: New Session"
@@ -621,6 +625,13 @@
           "patternErrorMessage": "Use provider/model, or leave the setting empty.",
           "markdownDescription": "Provider/model used by the auto-approve judge. Leave empty to let Varro select a suitable model automatically. Select a configured model from Varro's Models view."
         },
+        "varro.chat.autoApproveDecisionModel": {
+          "type": "string",
+          "scope": "application",
+          "default": "",
+          "pattern": "^$|^[^/\\s]+/[^\\s]+$",
+          "markdownDescription": "Optional server-hosted decision model in provider/model form. Requires OpenCode 2.2.0 decision generation. Uses the server's base configuration and credentials, including for remote servers. Permission details are sent to this model in Auto mode. Varro applies probability gates; errors fall back to the configured legacy Jev or chat judge. Leave empty to disable. Select a native decision model in the Models view."
+        },
         "varro.chat.promptCompletionModel": {
           "type": "string",
           "scope": "application",
@@ -686,6 +697,13 @@
           "default": false,
           "description": "Debug only: show the quota warning for available provider quotas regardless of remaining allowance or saved dismissals. Closing this preview does not save a dismissal."
         },
+        "varro.debug.showNativeDecisionModels": {
+          "deprecationMessage": "Debug only setting. Not intended for regular use.",
+          "type": "boolean",
+          "scope": "application",
+          "default": false,
+          "description": "Debug only: show the experimental OpenCode decision-model section in the Models view. Hiding the section does not disable an explicitly configured decision reviewer."
+        },
         "varro.debug.resetWarningDays": {
           "deprecationMessage": "Debug only setting. Not intended for regular use.",
           "type": "number",
@@ -726,7 +744,7 @@
     "vscode": "^1.107.0"
   },
   "volta": {
-    "node": "24.22.1",
+    "node": "24.22.2",
     "npm": "12.2.1"
   },
   "allowScripts": {

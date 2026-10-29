@@ -7,6 +7,33 @@ async function getRenderedMessageRowCount(page: Page) {
   return getE2EState(page, () => document.querySelectorAll('[data-msg-id]').length);
 }
 
+async function mountHugeSection(page: Page, section: number) {
+  const list = page.locator('.interactive-list');
+  const heading = page.getByRole('heading', { name: `Huge section ${section}`, exact: true });
+  // Cold rows have provisional heights. Ratios of the changing total can skip the target
+  // completely, so walk beyond the mounted boundary toward its stable message index.
+  for (let step = 0; step < 80 && (await heading.count()) === 0; step += 1) {
+    await list.evaluate((element, target) => {
+      const rows = [...element.querySelectorAll<HTMLElement>('[data-msg-id]')].filter((row) =>
+        /^message-huge-(?:user|assistant)-\d+$/.test(row.dataset.msgId ?? '')
+      );
+      const first = rows[0];
+      const last = rows.at(-1);
+      if (!first || !last) throw new Error('Huge-content transcript has no mounted rows');
+      const viewport = element.getBoundingClientRect();
+      const before = target < Number(first.dataset.msgId!.split('-').at(-1));
+      const delta = before
+        ? first.getBoundingClientRect().top - viewport.top - element.clientHeight
+        : last.getBoundingClientRect().bottom - viewport.bottom + element.clientHeight;
+      element.dispatchEvent(new WheelEvent('wheel', { deltaY: Math.sign(delta), bubbles: true }));
+      element.scrollTop += delta;
+      element.dispatchEvent(new Event('scroll'));
+    }, section);
+    await waitForAnimationFrame(page);
+  }
+  await expect(heading).toBeAttached();
+}
+
 test('persistent status pulses visibly alternate between held states', async ({ page }) => {
   await page.goto('/e2e/harness/index.html?scenario=status-filters');
 
@@ -706,7 +733,8 @@ test('narrowing after PageDown preserves a short response below a clipped prompt
   expect(before.userTop).toBeCloseTo(-46, 0);
   const samples = [];
   await shell.evaluate((element) => {
-    element.style.width = '430px';
+    // Cross a wrapping boundary with both macOS and Linux font metrics.
+    element.style.width = '360px';
   });
   for (let frame = 0; frame < 16; frame++) {
     await waitForAnimationFrame(page);
@@ -730,19 +758,7 @@ for (const mainThreadWheel of [false, true]) {
     await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);
 
     const list = page.locator('.interactive-list');
-    const heading = page.getByRole('heading', { name: 'Huge section 45' });
-    await list.evaluate((element) => {
-      element.dispatchEvent(new WheelEvent('wheel', { deltaY: -400, bubbles: true }));
-    });
-    for (let step = 2; step < 19; step += 1) {
-      await list.evaluate((element, ratio) => {
-        element.scrollTop = Math.floor((element.scrollHeight - element.clientHeight) * ratio);
-        element.dispatchEvent(new Event('scroll'));
-      }, step / 20);
-      await waitForAnimationFrame(page);
-      if ((await heading.count()) > 0) break;
-    }
-    await expect(heading).toBeAttached();
+    await mountHugeSection(page, 45);
     await list.evaluate((element) => {
       const target = [...element.querySelectorAll<HTMLElement>('h2')]
         .find((candidate) => candidate.innerText === 'Huge section 45')
@@ -819,19 +835,7 @@ test('cold scrollbar positioning preserves an inner block during width reflow', 
   await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);
 
   const list = page.locator('.interactive-list');
-  const precedingHeading = page.getByRole('heading', { name: 'Huge section 45' });
-  await list.evaluate((element) => {
-    element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -180 }));
-  });
-  for (let step = 2; step < 19; step += 1) {
-    await list.evaluate((element, ratio) => {
-      element.scrollTop = Math.floor((element.scrollHeight - element.clientHeight) * ratio);
-      element.dispatchEvent(new Event('scroll'));
-    }, step / 20);
-    await waitForAnimationFrame(page);
-    if ((await precedingHeading.count()) > 0) break;
-  }
-  await expect(precedingHeading).toBeAttached();
+  await mountHugeSection(page, 45);
   await list.evaluate((element) => {
     const bounds = element.getBoundingClientRect();
     element.dispatchEvent(
@@ -938,9 +942,11 @@ test('width reflow after PageDown preserves a painted block in a tall response',
   await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);
 
   const list = page.locator('.interactive-list');
+  await mountHugeSection(page, 45);
   await list.evaluate((element) => {
-    element.dispatchEvent(new WheelEvent('wheel', { deltaY: -400, bubbles: true }));
-    element.scrollTop = Math.floor(element.scrollHeight / 2);
+    const target = element.querySelector<HTMLElement>('[data-msg-id="message-huge-assistant-45"]')!;
+    element.scrollTop +=
+      target.getBoundingClientRect().top - element.getBoundingClientRect().top + 700;
     element.dispatchEvent(new Event('scroll'));
   });
   await page.waitForTimeout(300);
@@ -1002,19 +1008,7 @@ test('width reflow preserves the PageDown destination after crossing tall respon
   await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);
 
   const list = page.locator('.interactive-list');
-  const heading = page.getByRole('heading', { name: 'Huge section 45' });
-  await list.evaluate((element) => {
-    element.dispatchEvent(new WheelEvent('wheel', { deltaY: -400, bubbles: true }));
-  });
-  for (let step = 2; step < 19; step += 1) {
-    await list.evaluate((element, ratio) => {
-      element.scrollTop = Math.floor((element.scrollHeight - element.clientHeight) * ratio);
-      element.dispatchEvent(new Event('scroll'));
-    }, step / 20);
-    await waitForAnimationFrame(page);
-    if ((await heading.count()) > 0) break;
-  }
-  await expect(heading).toBeAttached();
+  await mountHugeSection(page, 45);
   await list.evaluate((element) => {
     const target = [...element.querySelectorAll<HTMLElement>('h2')]
       .find((candidate) => candidate.innerText === 'Huge section 45')
@@ -1086,21 +1080,9 @@ test('viewport narrowing replaces a stale tall-row anchor after sticky navigatio
   await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);
 
   const list = page.locator('.interactive-list');
-  const heading = page.getByRole('heading', { name: 'Huge section 45' });
   const source = page.locator('[data-msg-id="message-huge-user-45"] .user-message-card');
   const sticky = page.locator('.latest-user-message-sticky');
-  await list.evaluate((element) => {
-    element.dispatchEvent(new WheelEvent('wheel', { deltaY: -400, bubbles: true }));
-  });
-  for (let step = 2; step < 19; step += 1) {
-    await list.evaluate((element, ratio) => {
-      element.scrollTop = Math.floor((element.scrollHeight - element.clientHeight) * ratio);
-      element.dispatchEvent(new Event('scroll'));
-    }, step / 20);
-    await waitForAnimationFrame(page);
-    if ((await heading.count()) > 0) break;
-  }
-  await expect(heading).toBeAttached();
+  await mountHugeSection(page, 45);
   await list.evaluate((element) => {
     const response = element.querySelector<HTMLElement>(
       '[data-msg-id="message-huge-assistant-45"]'

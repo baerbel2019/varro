@@ -74,8 +74,9 @@ recreate a rendering boundary already available in a capture.
    viewId, and session route. Re-read geometry when a target changes; do not keep retrying stale selectors.
    Select and verify the scenario's agent as well as its model. New chats can inherit the preceding
    test's Plan selection; configuring Build read permissions does not make a Plan read ask for approval.
-   After widening, wait for the measured content width before asserting settled layout. The root
-   deliberately delays expansion by four frames to avoid host-surface clipping; `innerWidth` changes first.
+    After widening, wait for measured content geometry before asserting settled layout, and inspect
+    transition paints separately. CSS owns root sizing; a resize-event pixel cap must not lag the native
+    iframe layout. DOM geometry alone cannot clear the host-surface clipping regression.
 4. Run independent cases even after another case fails. AI-08 establishes its own live gates. AI-18/19
    establish their own action state. None requires an AI-07 scrolling verdict. Dirty fixture reuse still
    requires exact commit, status, paths, and content hash from the latest exit evidence.

@@ -1013,6 +1013,18 @@ describe('MessageListChrome', () => {
 
     expect(wrapper?.getAttribute('aria-hidden')).toBe('true');
     expect(container?.querySelector('.interactive-list-bottom-fade-gradient')).not.toBeNull();
+    expect(container?.querySelector('.chat-content-fade-solid-gap')).toBeNull();
+  });
+
+  it('reuses only the gradient below content without a solid spacer', () => {
+    cleanup = render(() => <ChatContentBottomFade belowContent />, container!);
+    expect(
+      container
+        ?.querySelector('.interactive-list-bottom-fade-wrap.is-below-content')
+        ?.getAttribute('aria-hidden')
+    ).toBe('true');
+    expect(container?.querySelector('.interactive-list-bottom-fade-gradient')).not.toBeNull();
+    expect(container?.querySelector('.chat-content-fade-solid-gap')).toBeNull();
   });
 
   it('renders pending question and permission rows in interactive containers', () => {

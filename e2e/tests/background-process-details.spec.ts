@@ -18,7 +18,7 @@ type ProcessHarnessWindow = Window & {
 };
 
 for (const width of [486, 1100]) {
-  test(`clicked service details stay compact with equal adjacent stop buttons at ${width}px`, async ({
+  test(`clicked service details stay compact with a single direct stop button at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 794 });
@@ -83,36 +83,29 @@ for (const width of [486, 1100]) {
       await expect(duration).toBeHidden();
       await expect(list.getByRole('button')).toHaveCount(3);
     }
-    const stop = (await dialog
-      .getByRole('button', { name: 'Stop process', exact: true })
-      .boundingBox())!;
-    const steer = (await dialog
-      .getByRole('button', { name: 'Steer stop', exact: true })
-      .boundingBox())!;
-    expect(stop.width).toBeCloseTo(steer.width, 1);
-    expect(stop.y).toBeCloseTo(steer.y, 1);
-    expect(steer.x - (stop.x + stop.width)).toBeCloseTo(6, 1);
-    for (const name of ['Stop process', 'Steer stop']) {
-      const button = dialog.getByRole('button', { name, exact: true });
-      await expect(button).toHaveCSS('display', 'flex');
-      await expect(button).toHaveCSS('align-items', 'center');
-      await expect(button).toHaveCSS('justify-content', 'center');
-      await expect(button).toHaveCSS('line-height', '11px');
-      const centerOffset = await button.evaluate((element) => {
-        const range = document.createRange();
-        range.selectNodeContents(element);
-        const text = range.getBoundingClientRect();
-        const bounds = element.getBoundingClientRect();
-        const context = document.createElement('canvas').getContext('2d')!;
-        context.font = getComputedStyle(element).font;
-        const metrics = context.measureText(element.textContent ?? '');
-        const baseline = text.y + metrics.fontBoundingBoxAscent;
-        const inkCenter =
-          baseline + (metrics.actualBoundingBoxDescent - metrics.actualBoundingBoxAscent) / 2;
-        return Math.abs(inkCenter - (bounds.y + bounds.height / 2));
-      });
-      expect(centerOffset).toBeLessThanOrEqual(1);
-    }
+    await expect(dialog.locator('.background-process-actions button')).toHaveCount(1);
+    await expect(dialog.getByRole('button', { name: 'Steer stop', exact: true })).toHaveCount(0);
+    const button = dialog.getByRole('button', { name: 'Stop process', exact: true });
+    await expect(button).toBeVisible();
+    await expect(button).toBeEnabled();
+    await expect(button).toHaveCSS('display', 'flex');
+    await expect(button).toHaveCSS('align-items', 'center');
+    await expect(button).toHaveCSS('justify-content', 'center');
+    await expect(button).toHaveCSS('line-height', '11px');
+    const centerOffset = await button.evaluate((element) => {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      const text = range.getBoundingClientRect();
+      const bounds = element.getBoundingClientRect();
+      const context = document.createElement('canvas').getContext('2d')!;
+      context.font = getComputedStyle(element).font;
+      const metrics = context.measureText(element.textContent ?? '');
+      const baseline = text.y + metrics.fontBoundingBoxAscent;
+      const inkCenter =
+        baseline + (metrics.actualBoundingBoxDescent - metrics.actualBoundingBoxAscent) / 2;
+      return Math.abs(inkCenter - (bounds.y + bounds.height / 2));
+    });
+    expect(centerOffset).toBeLessThanOrEqual(1);
     // Crossing the breakpoint must preserve the selected process without reopening the dialog.
     await page.setViewportSize({ width: width <= 600 ? 1100 : 486, height: 794 });
     if (width <= 600) {
@@ -403,66 +396,23 @@ for (const width of [486, 1100]) {
       );
     });
     await page.getByRole('button', { name: 'View background process details' }).click();
-    await dialog.getByRole('button', { name: 'Steer stop', exact: true }).click();
-    await expect(dialog).toHaveCount(0);
-    await expect(page.getByRole('textbox', { name: 'Message composer' })).toHaveText(
-      'Keep this draft'
-    );
-    const stopAction = page.locator('.stop-process-action');
-    await expect(stopAction).toBeVisible();
-    await expect(stopAction).toHaveText('Stop process 42');
-    await expect(stopAction).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
-    await expect(stopAction).toHaveCSS('border-width', '0px');
-    await expect(stopAction.locator('.ui-icon')).toHaveCount(1);
-    await expect(
-      stopAction.locator(
-        '.user-message-text-scroll, .prompt-number-badge, .user-message-attachment'
-      )
-    ).toHaveCount(0);
-    const stopSend = await page.evaluate(() => {
-      // SAFETY: The isolated harness owns this synthetic request ledger.
-      return (window as ProcessHarnessWindow).__varroE2E!.requests.find(
-        (request) => request.path.includes('/prompt_async') && request.method === 'POST'
-      );
-    });
-    expect(stopSend?.body).toMatchObject({
-      parts: [
-        {
-          type: 'text',
-          text: 'Stop the background process with PID 42 running this command:\npython3 tools/serve.py 18765\nProcess ID: shell-server\nWorking directory: /workspace',
-        },
-      ],
-    });
-    expect(stopSend?.body).toHaveProperty('parts.length', 1);
-    const stopRequests = await page.evaluate(() => {
-      // SAFETY: The isolated harness records only synthetic API requests.
-      return (window as ProcessHarnessWindow).__varroE2E!.requests.filter(
-        (request) => request.path.includes('/background-process/') && request.method === 'DELETE'
-      );
-    });
-    expect(stopRequests).toHaveLength(0);
-    await page.evaluate((sessionID) => {
-      // SAFETY: The generic mock prompt handler drops background fields. Restore this
-      // synthetic running-process status to continue the independent direct-stop check.
-      (window as ProcessHarnessWindow).__varroE2E!.replayServerEvent({
-        type: 'session.status',
-        properties: {
-          sessionID,
-          status: {
-            type: 'busy',
-            background: true,
-            backgroundCommand: 'python3 tools/serve.py 18765',
-          },
-        },
-      });
-    }, session.id);
-    await page.getByRole('button', { name: 'View background process details' }).click();
     await wait.click();
     await expect(wait).not.toBeChecked();
     await expect(page.locator('.background-process')).toHaveCount(0);
     await dialog.getByRole('button', { name: 'Stop process' }).click();
     await expect(dialog).toHaveCount(0);
     await expect(serviceRow).toHaveCount(0);
+    await expect(page.getByRole('textbox', { name: 'Message composer' })).toHaveText(
+      'Keep this draft'
+    );
+    await expect(page.locator('.stop-process-action')).toHaveCount(0);
+    const stopSends = await page.evaluate(() => {
+      // SAFETY: The isolated harness owns this synthetic request ledger.
+      return (window as ProcessHarnessWindow).__varroE2E!.requests.filter(
+        (request) => request.path.includes('/prompt_async') && request.method === 'POST'
+      );
+    });
+    expect(stopSends).toHaveLength(0);
     const mutations = await page.evaluate(() => {
       // SAFETY: The harness owns this ledger and never connects to a real session.
       return (window as ProcessHarnessWindow).__varroE2E!.requests.filter(
@@ -475,6 +425,10 @@ for (const width of [486, 1100]) {
       'PATCH',
       'DELETE',
     ]);
+    expect(mutations.at(-1)).toMatchObject({
+      method: 'DELETE',
+      path: `/session/${session.id}/background-process/shell-server?directory=${encodeURIComponent(session.directory)}`,
+    });
   });
 
   test(`background process details keep read-only live logs through completion at ${width}px`, async ({

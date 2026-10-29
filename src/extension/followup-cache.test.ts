@@ -70,6 +70,17 @@ afterEach(async () => {
 });
 
 describe('FollowupCache', () => {
+  it('distinguishes a pending admission from a completed empty result across cache instances', async () => {
+    const writer = new FollowupCache();
+    const reader = new FollowupCache();
+    const key = hash('pending-turn');
+    await writer.claim(key, digest, sessionKey);
+    expect(await reader.getState(key, digest)).toBe('pending');
+    await writer.complete(key, digest, EMPTY_FOLLOWUP_SUGGESTIONS);
+    expect(await reader.getState(key, digest)).toEqual(EMPTY_FOLLOWUP_SUGGESTIONS);
+    expect(await reader.claim(key, digest, sessionKey)).toBe(false);
+  });
+
   it.each(['EPERM', 'EACCES', 'EBUSY'])(
     'retries transient Windows %s replacement failures without losing dismissal',
     async (code) => {
@@ -142,28 +153,28 @@ describe('FollowupCache', () => {
           env: { ...process.env, VARRO_FOLLOWUP_TEST_FILE: path },
           windowsHide: true,
           stdio: 'pipe',
+          // Bound fixture startup and release independently of Vitest's deadline.
+          timeout: 15_000,
+          killSignal: 'SIGKILL',
         }
       );
       let stderr = '';
       child.stderr.on('data', (chunk: Buffer) => {
         stderr += chunk.toString();
       });
+      let stdout = '';
       const acquired = new Promise<void>((done, reject) => {
         child.once('error', reject);
         child.stdout.on('data', (chunk: Buffer) => {
-          if (chunk.toString().includes('locked')) done();
+          stdout += chunk.toString();
+          if (stdout.includes('locked')) done();
         });
         child.once('exit', () =>
           reject(new Error(`Windows handle fixture exited before acquisition: ${stderr}`))
         );
       });
-      const exited = new Promise<void>((done, reject) => {
-        child.once('error', reject);
-        child.once('exit', (code) =>
-          code === 0
-            ? done()
-            : reject(new Error(`Windows handle fixture exited with ${String(code)}: ${stderr}`))
-        );
+      const exited = new Promise<number | null>((done) => {
+        child.once('close', done);
       });
       const actual = await vi.importActual<typeof FsPromises>('node:fs/promises');
       let sharingFailures = 0;
@@ -183,16 +194,18 @@ describe('FollowupCache', () => {
           }
         });
         await cache.dismiss(hash('turn'), digest);
-        await exited;
+        expect(await exited, `Windows handle fixture failed: ${stderr}`).toBe(0);
         expect(sharingFailures).toBeGreaterThan(0);
         expect(await new FollowupCache().get(hash('turn'), digest)).toEqual(
           EMPTY_FOLLOWUP_SUGGESTIONS
         );
       } finally {
         if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-        await Promise.allSettled([exited]);
+        await exited;
       }
-    }
+    },
+    // Cold PowerShell startup on hosted Windows runners can exceed five seconds.
+    20_000
   );
 
   it('admits each turn once across independent owners and reloads', async () => {

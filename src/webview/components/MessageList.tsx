@@ -139,6 +139,7 @@ import { Tooltip } from './Tooltip';
 import { UiIcon } from './UiIcon';
 import { StarterLogo } from './message-list/StarterLogo';
 import { StarterHistogram } from './message-list/StarterHistogram';
+import { SessionSearch } from './message-list/SessionSearch';
 import {
   getSubagentSessionIds,
   getStickyUserMessagePreview,
@@ -163,6 +164,7 @@ import {
   type VisibleRange,
   type VirtualMetrics,
 } from './message-list/virtualization';
+import { RetainedRowHeights } from './message-list/retained-row-heights';
 import {
   captureExpansionScrollAnchor,
   getDistanceFromBottom,
@@ -214,6 +216,7 @@ import {
   getErrorDetailsLayoutSignatures,
   getInlinePreviewLayoutSignatures,
   getMessageBlockBoundaryMap,
+  sameMessageBlockBoundaries,
   getRenderEmptyMessageIds,
   getThinkingLayoutSignatures,
   hasVisibleProjectedText,
@@ -438,6 +441,8 @@ export function getActiveTurnNavigationMessageId(
   const viewportIndex = turns.findIndex((turn) => turn.id === viewportTurnId);
   return viewportIndex > selectedIndex ? viewportTurnId : selectedTurnId;
 }
+
+const retainedRowHeights = new RetainedRowHeights();
 
 export function MessageList() {
   const pasteModifier = /Macintosh|Mac OS X/.test(navigator.userAgent) ? 'Cmd' : 'Ctrl';
@@ -711,7 +716,7 @@ export function MessageList() {
   let pendingInitialScrollSessionId: string | null = null;
   let pendingInitialHistoryFillSessionId: string | null = null;
   const [initialPositioningSessionId, setInitialPositioningSessionId] = createSignal<string | null>(
-    null
+    editingMessage() ? null : state.activeSessionId
   );
   let initialScrollRafId = 0;
   let appendScrollRafId = 0;
@@ -741,6 +746,13 @@ export function MessageList() {
   >(null);
   let pendingTurnNavigationAnimationMessageId: string | null = null;
   let turnNavigationAnimationEpoch = 0;
+  const [searchNavigationTargetId, setSearchNavigationTargetId] = createSignal<string | null>(null);
+  let searchDestination: HTMLElement | null = null;
+  let searchDestinationTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => {
+    clearTimeout(searchDestinationTimer);
+    searchDestination?.classList.remove('session-search-destination');
+  });
   let editRevealEpoch = 0;
   let historyOwnedEdit: { messageId: string; sessionId: string } | null = null;
   let pendingExpansionScrollAnchor:
@@ -863,7 +875,6 @@ export function MessageList() {
   const [activityExitBottomReserve, setActivityExitBottomReserve] = createSignal(0);
   const [measurementVersion, setMeasurementVersion] = createSignal(0);
   const [trackLayoutVersion, setTrackLayoutVersion] = createSignal(0);
-  const [hasBootstrappedVirtualization, setHasBootstrappedVirtualization] = createSignal(false);
   const [stickyPreviewGeometryVersion, setStickyPreviewGeometryVersion] = createSignal(0);
   const [stickyUserMessagePreview, setStickyUserMessagePreview] =
     createSignal<StickyUserMessagePreview | null>(null);
@@ -890,6 +901,18 @@ export function MessageList() {
   function stickyNavigationOwnsScroll() {
     return stickyNavigationInProgress() || pendingStickyJump() !== null;
   }
+  createEffect(
+    on(
+      () => {
+        const sessionId = state.activeSessionId;
+        return sessionId ? getSessionMessageWindowStateVersion(sessionId) : null;
+      },
+      () => {
+        if (untrack(searchNavigationTargetId)) cancelStickyNavigation();
+      },
+      { defer: true }
+    )
+  );
   const [stickyPreviewScrollTop, setStickyPreviewScrollTop] = createSignal(0);
   const [stickyPreviewViewportHeight, setStickyPreviewViewportHeight] = createSignal(0);
   const [reserveLoadingRow, setReserveLoadingRow] = createSignal(false);
@@ -1891,6 +1914,32 @@ export function MessageList() {
   });
 
   const messageIds = createMemo(() => messages().map((msg) => msg.info.id));
+  const rowHeightSessionKey = () => {
+    const sessionId = state.activeSessionId;
+    return sessionId ? `${sessionId}:${getSessionMessageWindowStateVersion(sessionId)}` : null;
+  };
+  let estimatedHeightSessionKey: string | null = null;
+  let restoredRowHeights: Map<string, number> | null = null;
+  const estimatedRowHeights = createMemo(() => {
+    const sessionKey = rowHeightSessionKey();
+    if (estimatedHeightSessionKey !== sessionKey) {
+      estimatedHeightSessionKey = sessionKey;
+      restoredRowHeights = null;
+    }
+    return (restoredRowHeights ??= retainedRowHeights.restore(sessionKey, messageIds()));
+  });
+  let lastVirtualSnapshot: {
+    sessionKey: string;
+    itemIds: string[];
+    metrics: VirtualMetrics;
+  } | null = null;
+  function retainVirtualSnapshot() {
+    if (!lastVirtualSnapshot) return;
+    const { sessionKey, itemIds, metrics } = lastVirtualSnapshot;
+    retainedRowHeights.remember(sessionKey, itemIds, metrics);
+    lastVirtualSnapshot = null;
+  }
+  onCleanup(retainVirtualSnapshot);
   const claimedEntranceMessageIds = new Set<string>();
   const revealedFlowItemKeys = new Map<string, Set<string>>();
 
@@ -2044,37 +2093,24 @@ export function MessageList() {
       };
     })
   );
-  // Bootstrap exact heights once, then keep virtualization active as new rows arrive. Newly added
-  // rows use provisional heights until mounted instead of remounting the full transcript.
+  // Unmounted rows remain provisional. Measure the mounted range exactly before paint rather
+  // than mounting the entire initial page just to establish its offscreen heights.
   const shouldMeasureRows = createMemo(() => messages().length >= VIRTUALIZE_THRESHOLD);
 
-  function hasMeasuredEveryMessage() {
-    if (!shouldMeasureRows()) return false;
+  function hasUnmeasuredMountedRows() {
     const zeroHeightIds = knownZeroHeightMessageIds();
-    for (const id of messageIds()) {
-      // Complete render-empty projections already have an exact zero in the prefix. Waiting for
-      // another observer delivery after grouping invalidates their cache can strand bootstrap.
-      if (!measuredHeights.has(id) && !zeroHeightIds.has(id)) return false;
+    for (const [id, row] of mountedMessageRows) {
+      if (
+        !measuredHeights.has(id) &&
+        !zeroHeightIds.has(id) &&
+        !row.classList.contains('interactive-item-virtual-placeholder')
+      )
+        return true;
     }
-    return true;
+    return false;
   }
 
-  const hasMeasuredAllRows = createMemo(() => {
-    measurementVersion();
-    return hasMeasuredEveryMessage();
-  });
-
-  createEffect(() => {
-    if (!shouldMeasureRows()) {
-      setHasBootstrappedVirtualization(false);
-      return;
-    }
-    if (hasMeasuredAllRows()) setHasBootstrappedVirtualization(true);
-  });
-
-  const shouldVirtualize = createMemo(
-    () => shouldMeasureRows() && (hasBootstrappedVirtualization() || hasMeasuredAllRows())
-  );
+  const shouldVirtualize = shouldMeasureRows;
 
   createEffect(() => {
     const currentMessageIds = messageIds();
@@ -2141,8 +2177,8 @@ export function MessageList() {
       mountedRows.push({ element: mountedRow, messageId });
     }
 
-    const invalidatedUnmountedHeight = unmountedMessageIds.some((messageId) =>
-      measuredHeights.has(messageId)
+    const invalidatedUnmountedHeight = unmountedMessageIds.some(
+      (messageId) => measuredHeights.has(messageId) || estimatedRowHeights()?.has(messageId)
     );
     const activeSessionId = state.activeSessionId;
     const invalidatedAnchorOwnershipEpoch = userScrollOwnershipEpoch;
@@ -2181,7 +2217,8 @@ export function MessageList() {
       setChangedLayoutAnchor(invalidatedAnchor);
     }
     for (const messageId of unmountedMessageIds) {
-      if (!measuredHeights.delete(messageId)) continue;
+      const removedEstimate = estimatedRowHeights()?.delete(messageId);
+      if (!measuredHeights.delete(messageId) && !removedEstimate) continue;
       zeroHeightRenderGeometrySignatures.delete(messageId);
       markVirtualMetricsDirty(messageId);
     }
@@ -2422,6 +2459,7 @@ export function MessageList() {
         getMessageRenderGeometrySignature(messageId, streaming);
       if (currentSignature === previousSignature) continue;
       measuredHeights.delete(messageId);
+      estimatedRowHeights()?.delete(messageId);
       zeroHeightRenderGeometrySignatures.delete(messageId);
       forcedVirtualContentMessageIds.add(messageId);
       markVirtualMetricsDirty(messageId);
@@ -2807,6 +2845,9 @@ export function MessageList() {
   });
 
   const virtualMetrics = createMemo(() => {
+    const sessionKey = rowHeightSessionKey();
+    if (lastVirtualSnapshot && lastVirtualSnapshot.sessionKey !== sessionKey)
+      retainVirtualSnapshot();
     if (!shouldVirtualize()) {
       cachedVirtualMetrics = null;
       cachedVirtualMetricsItemIds = null;
@@ -2823,6 +2864,7 @@ export function MessageList() {
     const result = buildVirtualMetrics({
       itemIds: ids,
       measuredHeights,
+      estimatedHeights: estimatedRowHeights() ?? undefined,
       knownZeroHeightIds: knownZeroHeightMessageIds(),
       previous,
       dirtyFromIndex: previous ? Math.min(dirtyVirtualMetricsFromIndex, ids.length) : undefined,
@@ -2830,6 +2872,7 @@ export function MessageList() {
     cachedVirtualMetrics = result;
     cachedVirtualMetricsItemIds = ids;
     dirtyVirtualMetricsFromIndex = ids.length;
+    if (sessionKey) lastVirtualSnapshot = { sessionKey, itemIds: ids, metrics: result };
     return result;
   });
 
@@ -2848,12 +2891,18 @@ export function MessageList() {
         };
       }
       const metrics = virtualMetrics();
+      const sessionId = state.activeSessionId;
+      // Initial follow opens at the tail. Keep its range there as provisional heights become
+      // exact; selecting against scrollTop=0 would mount the head before immediately discarding it.
+      const positioningAtBottom =
+        !!sessionId && initialPositioningSessionId() === sessionId && autoScroll();
       const range = calculateVirtualRangeFromMetrics({
         metrics,
-        scrollTop: getVirtualScrollTop(scrollTop()),
+        scrollTop: positioningAtBottom
+          ? Math.max(0, metrics.totalHeight - viewportHeight())
+          : getVirtualScrollTop(scrollTop()),
         viewportHeight: viewportHeight(),
       });
-      const sessionId = state.activeSessionId;
       const pendingAnchor = sessionId ? getCurrentPendingHistoryAnchor(sessionId) : undefined;
       const structuralAnchor =
         pendingStructuralScrollAnchor?.sessionId === sessionId &&
@@ -2937,6 +2986,7 @@ export function MessageList() {
         forcedVirtualContentMessageIds.has(messageId) ||
         viewportForcedVirtualContentMessageIds.has(messageId) ||
         displayedStickyUserMessagePreview()?.id === messageId ||
+        searchNavigationTargetId() === messageId ||
         activePermissionMessageId === messageId ||
         editingMessage()?.messageId === messageId
       );
@@ -4441,7 +4491,7 @@ export function MessageList() {
       pendingMeasurementAfterResize = false;
       pendingMeasurementAfterWidthResize = false;
       pendingMeasurementAfterContentResize = false;
-      if (shouldMeasureRows() && !hasMeasuredAllRows()) measureVisibleItems();
+      if (shouldMeasureRows() && hasUnmeasuredMountedRows()) measureVisibleItems();
       if (
         hadWidthResize &&
         !hadContentResize &&
@@ -5989,6 +6039,15 @@ export function MessageList() {
           ? BOTTOM_FOLLOW_SETTLE_FRAME_COUNT
           : 1;
       if (bottomFollowSettleFrames >= settleFrameCount) {
+        // The final cold-range rounding can add one pixel inside the normal follow tolerance.
+        // Finish initial positioning at the physical bottom before revealing the transcript.
+        if (
+          initialPositioningSessionId() === sessionId &&
+          !preservesNearBottomOffset &&
+          distanceFromBottom() > 0
+        ) {
+          performScroll({ force: true, immediate: true });
+        }
         bottomFollowResumePending = false;
         const shouldFillInitialViewport =
           pendingInitialHistoryFillSessionId === sessionId &&
@@ -6808,11 +6867,18 @@ export function MessageList() {
     pendingTurnNavigationAnimationMessageId = null;
     setActiveTurnNavigationTargetId(null);
     setPendingStickyJump(null);
+    setSearchNavigationTargetId(null);
   }
 
   function handlePointerDown(event: PointerEvent) {
     const pointerTarget = event.target;
-    if (pointerTarget instanceof Element && pointerTarget.closest('.user-message-card')) {
+    if (
+      pointerTarget instanceof Element &&
+      (pointerTarget.closest('.user-message-card') ||
+        (searchNavigationTargetId() &&
+          pointerTarget.closest('[data-msg-id]')?.getAttribute('data-msg-id') ===
+            searchNavigationTargetId()))
+    ) {
       cancelStickyNavigation();
     }
     if (
@@ -7777,6 +7843,10 @@ export function MessageList() {
     const candidate = stickyUserMessagePreviewCandidate();
     const current = untrack(stickyUserMessagePreview);
 
+    // Navigation already handed the overlay to its source. Coalesced viewport geometry can
+    // still nominate the old preview while measurements settle; do not paint it again.
+    if (!current && stickyNavigationOwnsScroll()) return;
+
     if (current && shouldDeferStickyDuringUpwardHandoff()) return;
 
     if (
@@ -7881,7 +7951,6 @@ export function MessageList() {
     resetPendingHistoryGeneration();
     cancelScheduledStickyPreviewFrame();
     cancelWidthResize();
-    setHasBootstrappedVirtualization(false);
     setAppendBottomReserve(0);
     if (appendReserveReconcileFrame) cancelAnimationFrame(appendReserveReconcileFrame);
     appendReserveReconcileFrame = 0;
@@ -7919,6 +7988,10 @@ export function MessageList() {
     resumeAutoScrollAfterDiffFocus = false;
     setPendingStickyJump(null);
     setStickyNavigationInProgress(false);
+    setSearchNavigationTargetId(null);
+    clearTimeout(searchDestinationTimer);
+    searchDestination?.classList.remove('session-search-destination');
+    searchDestination = null;
     setStickyUserMessagePreview(null);
     previousStickyPreviewId = null;
     previousStickyPreviewBounds = null;
@@ -8776,6 +8849,7 @@ export function MessageList() {
       const row = mountedMessageRows.get(messageId);
       if (!row?.classList.contains('interactive-item-virtual-placeholder')) continue;
       measuredHeights.delete(messageId);
+      estimatedRowHeights()?.delete(messageId);
       forcedVirtualContentMessageIds.add(messageId);
       markVirtualMetricsDirty(messageId);
       changed = true;
@@ -9272,19 +9346,18 @@ export function MessageList() {
       range: { start, end, nextUserRequestCreated },
     });
   });
-  const assistantDialogSummaryMap = createMemo(() => {
-    messageStructureVersion();
-    messageInfoVersion();
-    const suppressTrailingSummary = trailingSummaryMessageId() === null;
-    const sessions = projectDialogSessions();
-    const dialogMessages = assistantDialogMessages();
-    const collectLeadingSummaryStats = collectingLeadingDialogStats();
-    const pauses = readSessionPauses(
-      state.sessions.find((session) => session.id === state.activeSessionId)?.metadata
-    );
-    return untrack(() =>
-      mergeSegmentMaps(
-        mergeSegmentMaps(frozenDialogSummaries(), recentDialogSummaries()),
+  const tailAssistantDialogSummaryMap = createMemo(
+    () => {
+      messageStructureVersion();
+      messageInfoVersion();
+      const suppressTrailingSummary = trailingSummaryMessageId() === null;
+      const sessions = projectDialogSessions();
+      const dialogMessages = assistantDialogMessages();
+      const collectLeadingSummaryStats = collectingLeadingDialogStats();
+      const pauses = readSessionPauses(
+        state.sessions.find((session) => session.id === state.activeSessionId)?.metadata
+      );
+      return untrack(() =>
         getAssistantDialogSummaryMap(dialogMessages, undefined, {
           sessions,
           primarySessionId: state.activeSessionId ?? undefined,
@@ -9294,9 +9367,17 @@ export function MessageList() {
           entriesById: dialogHistoryEntriesById(),
           range: { start: dialogHistoryEnd(), end: dialogMessages.length },
         })
-      )
-    );
-  });
+      );
+    },
+    new Map<string, AssistantDialogSummaryInfo>(),
+    { equals: sameValues }
+  );
+  const historyDialogSummaries = createMemo(() =>
+    mergeSegmentMaps(frozenDialogSummaries(), recentDialogSummaries())
+  );
+  const assistantDialogSummaryMap = createMemo(() =>
+    mergeSegmentMaps(historyDialogSummaries(), tailAssistantDialogSummaryMap())
+  );
   const trailingAssistantDialogSummary = createMemo<{
     message: MessageEntry;
     summary: AssistantDialogSummaryInfo;
@@ -9431,6 +9512,7 @@ export function MessageList() {
       if (previous.has(messageId) === next.has(messageId)) continue;
       if (previous.has(messageId) && currentMessageIds.has(messageId)) {
         measuredHeights.delete(messageId);
+        estimatedRowHeights()?.delete(messageId);
         zeroHeightRenderGeometrySignatures.delete(messageId);
         forcedVirtualContentMessageIds.add(messageId);
         forcedContentChanged = true;
@@ -9503,9 +9585,10 @@ export function MessageList() {
   const historyMessageBlockBoundaryMap = mergeHistorySegmentMaps(
     historyMessageBlockBoundarySegments.map(({ boundaries }) => boundaries)
   );
-  const messageBlockBoundaryMap = createMemo(() =>
-    mergeSegmentMaps(
-      historyMessageBlockBoundaryMap(),
+  // Paced text can change without changing row boundaries. Compare the bounded tail before
+  // merging it with history, so those updates do not copy and invalidate the full transcript.
+  const tailMessageBlockBoundaryMap = createMemo(
+    () =>
       getMessageBlockBoundarySegment(
         tailCompactActivityMessages(),
         tailAssistantActivityGroupMap(),
@@ -9515,8 +9598,12 @@ export function MessageList() {
           modelChanges: new Set(modelChangeMap().keys()),
           dialogSummaries: new Set(rowAssistantDialogSummaryMap().keys()),
         }
-      )
-    )
+      ),
+    new Map(),
+    { equals: sameMessageBlockBoundaries }
+  );
+  const messageBlockBoundaryMap = createMemo(() =>
+    mergeSegmentMaps(historyMessageBlockBoundaryMap(), tailMessageBlockBoundaryMap())
   );
   const historyBorderedAdjacency = chainHistorySegments<
     ReturnType<typeof getBorderedAdjacencyLayoutSegment>
@@ -9635,7 +9722,7 @@ export function MessageList() {
   });
 
   async function waitForMessageRow(
-    preview: StickyUserMessagePreview,
+    preview: { id: string },
     isCurrent: () => boolean = () => true
   ): Promise<HTMLElement | null> {
     finishWidthResizeNow();
@@ -9647,19 +9734,10 @@ export function MessageList() {
       return row?.classList.contains('interactive-item-virtual-placeholder') ? undefined : row;
     };
     let previousMeasurementVersion = -1;
-    let bootstrapFrames = 0;
     let settleFrames = 0;
     while (state.activeSessionId === sessionId && isCurrent()) {
       const messageIndex = messages().findIndex((entry) => entry.info.id === preview.id);
       if (messageIndex < 0) return null;
-
-      if (shouldMeasureRows() && !shouldVirtualize()) {
-        previousMeasurementVersion = -1;
-        bootstrapFrames += 1;
-        if (bootstrapFrames >= 60) return null;
-        await waitForAnimationFrame();
-        continue;
-      }
 
       const row = findRow();
       if (!row) {
@@ -9694,10 +9772,10 @@ export function MessageList() {
     return null;
   }
 
-  function alignMountedMessage(preview: StickyUserMessagePreview): boolean {
+  function alignMountedMessage(preview: { id: string }): boolean {
     const row = mountedMessageRows.get(preview.id);
     if (!row || row.classList.contains('interactive-item-virtual-placeholder')) return false;
-    const target = row.querySelector<HTMLElement>('.user-message-card');
+    const target = row.querySelector<HTMLElement>('.user-message-card, .chat-turn-content') ?? row;
     if (containerRef && target) {
       const containerRect = containerRef.getBoundingClientRect();
       const targetRect = target.getBoundingClientRect();
@@ -9709,7 +9787,7 @@ export function MessageList() {
     return true;
   }
 
-  function navigateToMountedMessage(preview: StickyUserMessagePreview): boolean {
+  function navigateToMountedMessage(preview: { id: string }): boolean {
     disengageBottomFollow();
     const aligned = alignMountedMessage(preview);
     if (aligned) {
@@ -9811,7 +9889,7 @@ export function MessageList() {
   }
 
   async function settleMountedStickyPreviewJump(
-    preview: StickyUserMessagePreview,
+    preview: { id: string },
     sessionId: string,
     settleEpoch: number
   ) {
@@ -9851,7 +9929,7 @@ export function MessageList() {
   }
 
   async function waitAndNavigateToMessage(
-    preview: StickyUserMessagePreview,
+    preview: { id: string },
     isCurrent?: () => boolean
   ): Promise<boolean> {
     disengageBottomFollow();
@@ -9875,6 +9953,58 @@ export function MessageList() {
 
     if (isCurrent && !isCurrent()) return false;
     return navigateToMountedMessage(preview);
+  }
+
+  async function handleSearchNavigate(messageId: string) {
+    cancelStickyNavigation();
+    const sessionId = state.activeSessionId;
+    if (!sessionId) return;
+    const windowVersion = getSessionMessageWindowStateVersion(sessionId);
+    const epoch = ++stickyJumpSettleEpoch;
+    const isCurrent = () =>
+      !disposed &&
+      state.activeSessionId === sessionId &&
+      stickyJumpSettleEpoch === epoch &&
+      getSessionMessageWindowStateVersion(sessionId) === windowVersion;
+    setSearchNavigationTargetId(messageId);
+    setStickyNavigationInProgress(true);
+    pendingWheelResizeAnchor = null;
+    resumeAutoScrollAfterDiffFocus = false;
+    finishWidthResizeNow();
+    disengageBottomFollow();
+    const loadingOwner = { windowVersion };
+    try {
+      if (!messages().some((entry) => entry.info.id === messageId)) {
+        setLoadingOlderHistory(sessionId, true, loadingOwner);
+        while (isCurrent() && !messages().some((entry) => entry.info.id === messageId)) {
+          const cursor = getSessionHistoryCursor(sessionId);
+          if (!cursor) break;
+          const loaded = await loadOlderSessionHistoryPage(sessionId);
+          if (!loaded && getSessionHistoryCursor(sessionId) === cursor) break;
+        }
+      }
+      if (!isCurrent()) return;
+      if (!messages().some((entry) => entry.info.id === messageId)) {
+        throw new Error('Could not load this message. Reopen search to retry.');
+      }
+      const aligned = await waitAndNavigateToMessage({ id: messageId }, isCurrent);
+      if (!isCurrent()) return;
+      if (!aligned) throw new Error('Could not navigate to this message. Try again.');
+      clearTimeout(searchDestinationTimer);
+      searchDestination?.classList.remove('session-search-destination');
+      searchDestination = getStickyUserMessageSourceElement(messageId) ?? null;
+      searchDestination?.classList.add('session-search-destination');
+      searchDestinationTimer = setTimeout(() => {
+        searchDestination?.classList.remove('session-search-destination');
+        searchDestination = null;
+      }, 1000);
+    } finally {
+      setLoadingOlderHistory(sessionId, false, loadingOwner);
+      if (isCurrent()) {
+        setStickyNavigationInProgress(false);
+        setSearchNavigationTargetId(null);
+      }
+    }
   }
 
   async function loadAndScrollToStickyPreview(jump: {
@@ -10281,6 +10411,18 @@ export function MessageList() {
 
   return (
     <div class="interactive-list-shell min-h-0 flex-1">
+      <SessionSearch
+        sessionId={state.activeSessionId}
+        directory={
+          state.sessions.find((session) => session.id === state.activeSessionId)?.directory
+        }
+        messages={messages()}
+        loading={state.messagesLoading}
+        onNavigate={handleSearchNavigate}
+        onClose={() => {
+          if (searchNavigationTargetId()) cancelStickyNavigation();
+        }}
+      />
       <Show
         when={
           showEmptyStateHistogram() && !state.messagesLoading && shouldShowStarterLogo()
@@ -10467,6 +10609,7 @@ export function MessageList() {
                   forcedVirtualContentMessageIds.has(messageId) ||
                   viewportForcedVirtualContentMessageIds.has(messageId) ||
                   displayedStickyUserMessagePreview()?.id === messageId ||
+                  searchNavigationTargetId() === messageId ||
                   pendingPermissionSequence().activePermission?.messageID === messageId ||
                   editingMessage()?.messageId === messageId
                 );

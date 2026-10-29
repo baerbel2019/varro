@@ -1166,6 +1166,83 @@ describe('useOpenCode session state flows', () => {
     });
   });
 
+  it.each(['assistant', 'steer', 'inferred-steer', 'notice', 'followup'] as const)(
+    'finds the original prompt beyond full %s history pages without loading transcript rows',
+    async (kind) => {
+      const latest: MessageEntry[] & { nextCursor?: string } = Array.from(
+        { length: 200 },
+        (_, index) => ({ info: assistantMessage(`latest-${index}`, 'user-root'), parts: [] })
+      );
+      latest.nextCursor = 'cursor-middle';
+      const middle: MessageEntry[] & { nextCursor?: string } = Array.from(
+        { length: 200 },
+        (_, index) => ({ info: assistantMessage(`middle-${index}`, 'user-root'), parts: [] })
+      );
+      if (kind !== 'assistant') {
+        const info = userMessage('intervening-user');
+        if (info.role === 'user' && kind === 'steer') info.delivery = 'steer';
+        if (info.role === 'user' && kind === 'followup') {
+          info.followupTitle = 'Investigate the stall';
+          info.time.created = 2;
+          const previous = middle[99]!.info;
+          if (previous.role === 'assistant') {
+            previous.time.completed = 1;
+            previous.finish = 'stop';
+          }
+        }
+        middle[100] = {
+          info,
+          parts: [
+            {
+              id: 'intervening-text',
+              sessionID: 'session-1',
+              messageID: 'intervening-user',
+              type: 'text',
+              text:
+                kind === 'notice' ? 'Background command completed' : 'An additional instruction',
+              synthetic: kind === 'notice',
+            },
+          ],
+        };
+      }
+      middle.nextCursor = 'cursor-root';
+      const root: MessageEntry = {
+        info: userMessage('user-root'),
+        parts: [
+          {
+            id: 'root-text',
+            sessionID: 'session-1',
+            messageID: 'user-root',
+            type: 'text',
+            text: 'The original long-running request',
+          },
+        ],
+      };
+      clientMocks.sessionGet.mockResolvedValue(session('session-1'));
+      clientMocks.sessionMessages.mockImplementation(async (_id, options) => {
+        if (!options?.before) return latest;
+        if (options.before === 'cursor-middle') return middle;
+        if (options.before === 'cursor-root') return [root];
+        throw new Error(`Unexpected cursor ${options.before}`);
+      });
+      clientMocks.sessionStatus.mockResolvedValue({});
+      clientMocks.questionList.mockResolvedValue([]);
+
+      const { stateModule, hookModule } = await loadModules();
+      const messageWindow = await import('../lib/message-window');
+      await hookModule.selectSession('session-1');
+
+      await vi.waitFor(() => {
+        expect(messageWindow.getSessionHistoryPrompts('session-1')).toContainEqual(root);
+      });
+      expect(stateModule.state.messages.map((entry) => entry.info.id)).toEqual(
+        latest.map((entry) => entry.info.id)
+      );
+      expect(messageWindow.getSessionHistoryCursor('session-1')).toBe('cursor-middle');
+      expect(clientMocks.sessionMessages).toHaveBeenCalledTimes(3);
+    }
+  );
+
   it('restarts boundary prefetch after an active message invalidates its revision', async () => {
     const handlers = installServerEventHandlers();
     mockRuntimeBootstrap();

@@ -101,6 +101,16 @@ test.describe('viewport content coverage', () => {
     }));
     const samplesPending = list.evaluate(async (element) => {
       const samples = [];
+      let wheelAnchorTop: number | null = null;
+      element.addEventListener(
+        'wheel',
+        () => {
+          wheelAnchorTop = element
+            .querySelector('[data-msg-id="message-large-assistant-235"]')!
+            .getBoundingClientRect().top;
+        },
+        { once: true, capture: true }
+      );
       for (let index = 0; index < 16; index += 1) {
         await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
         const viewportRect = element.getBoundingClientRect();
@@ -125,10 +135,10 @@ test.describe('viewport content coverage', () => {
             '',
         });
       }
-      return samples;
+      return { samples, wheelAnchorTop };
     });
     await page.mouse.wheel(0, -720);
-    const samples = await samplesPending;
+    const { samples, wheelAnchorTop } = await samplesPending;
     await page.evaluate((timer) => clearInterval(timer), streamTimer);
     await cdp?.send('Page.stopScreencast');
     await cdp?.detach();
@@ -164,11 +174,15 @@ test.describe('viewport content coverage', () => {
     const anchor = before.rows.find((row) => row.id === 'message-large-assistant-235');
     if (!anchor) throw new Error('Destination anchor was not in the mounted overscan');
     expect(before.rows.every((row) => !row.placeholder)).toBe(true);
+    expect(wheelAnchorTop).not.toBeNull();
+    const detachedSamples = samples.filter((sample) => sample.anchorTop! > wheelAnchorTop! + 360);
+    expect(detachedSamples.length).toBeGreaterThan(0);
     for (const sample of samples) {
       expect(sample.anchorTop).not.toBeNull();
-      expect(
-        Math.abs(sample.anchorTop! + sample.scrollTop - anchor.top - before.scrollTop)
-      ).toBeLessThan(1.5);
+    }
+    // Overscan measurements change the provisional document prefix. Check the painted destination.
+    for (const sample of detachedSamples) {
+      expect(Math.abs(sample.anchorTop! - wheelAnchorTop! - 720)).toBeLessThan(1.5);
     }
     expect(Math.max(...gaps), JSON.stringify(gaps)).toBeLessThanOrEqual(80);
     expect((await getScrollMetrics(page, '.interactive-list')).distanceFromBottom).toBeGreaterThan(
@@ -630,9 +644,9 @@ test.describe('viewport content coverage', () => {
     }
   });
 
-  test('huge transcript has a measured scrollbar range', async ({ page }) => {
-    // Principle: dragging the native scrollbar in a huge chat must map to real message position.
-    // The range must be established from measured layout before virtualization owns the scrollbar.
+  test('huge transcript refines its cold scrollbar range through measured history', async ({
+    page,
+  }) => {
     await page.goto('/e2e/harness/index.html?scenario=huge-content-transcript');
     const list = page.locator('.interactive-list');
     await expect(list).toBeVisible();
@@ -647,8 +661,23 @@ test.describe('viewport content coverage', () => {
       renderedRowCount: element.querySelectorAll('[data-msg-id]').length,
     }));
 
-    expect(initial.scrollHeight).toBeGreaterThan(100_000);
+    expect(initial.scrollHeight).toBeGreaterThan(initial.viewportHeight);
     expect(initial.renderedRowCount).toBeLessThan(40);
+
+    // Cold offscreen rows are provisional. Visit history before asserting the exact scrollbar map.
+    await list.evaluate(async (element) => {
+      element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
+      element.scrollTop = 0;
+      element.dispatchEvent(new Event('scroll'));
+      for (let step = 0; step < 1000; step += 1) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        if (element.scrollTop >= element.scrollHeight - element.clientHeight - 1) return;
+        element.scrollTop += element.clientHeight;
+        element.dispatchEvent(new Event('scroll'));
+      }
+      throw new Error('History traversal did not reach the measured bottom');
+    });
+    expect(await list.evaluate((element) => element.scrollHeight)).toBeGreaterThan(100_000);
 
     const samples: Array<{ ratio: number; firstIndex: number; scrollTop: number }> = [];
     for (const ratio of [0.25, 0.5, 0.75]) {

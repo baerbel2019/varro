@@ -6,6 +6,7 @@ import { configDefaults, defineConfig } from 'vitest/config';
 
 const { version } = JSON.parse(readFileSync(resolve(import.meta.dirname, 'package.json'), 'utf8'));
 const nativeProcessTests = [
+  'src/extension/followup-cache.test.ts',
   'src/extension/windows-process-inspector.integration.test.ts',
   'src/extension/isolated-process.test.ts',
 ];

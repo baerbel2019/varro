@@ -747,6 +747,51 @@ describe('AssistantMessageContent', () => {
     expect(container?.querySelector('.assistant-activity-summary')).toBeNull();
   });
 
+  it.each(['pending', 'running', 'completed'] as const)(
+    'shows a %s tool preview without an entrance animation',
+    (status) => {
+      const tool = toolPart('tool-preview', 'grep', { pattern: 'activity' });
+      if (status === 'pending') {
+        tool.state = { status, input: { pattern: 'activity' }, raw: '' };
+      } else if (status === 'running') {
+        tool.state = { status, input: { pattern: 'activity' }, time: { start: 0 } };
+      }
+      const claimItemReveal = vi.fn(() => true);
+      renderAssistantMessageContent({
+        info: createAssistantMessage({ time: { created: 0 } }),
+        parts: [tool],
+        retainedActivityPartKeys:
+          status === 'completed' ? new Set([getAssistantActivityPartKey(tool)]) : undefined,
+        claimItemReveal,
+      });
+
+      const item = container?.querySelector('[data-activity-part-id="tool-preview"]');
+      expect(item).not.toBeNull();
+      expect(item?.classList).not.toContain('is-entering');
+      expect(item?.classList).not.toContain('is-exiting');
+      expect(claimItemReveal).toHaveBeenCalledWith('assistant-1', 'active-activity:tool-preview');
+    }
+  );
+
+  it('keeps the entrance animation for active reasoning', () => {
+    const reasoning: ReasoningPart = {
+      id: 'reasoning-preview',
+      sessionID: 'session-1',
+      messageID: 'assistant-1',
+      type: 'reasoning',
+      text: 'Inspecting activity',
+      time: { start: 0 },
+    };
+    renderAssistantMessageContent({
+      info: createAssistantMessage({ time: { created: 0 } }),
+      parts: [reasoning],
+    });
+
+    const item = container?.querySelector('[data-activity-part-id="reasoning-preview"]');
+    expect(item).not.toBeNull();
+    expect(item?.classList).toContain('is-entering');
+  });
+
   it('preserves a single active item viewport position through unrelated mutations', async () => {
     const running = toolPart('nested-scroll', 'grep', { pattern: 'activity' });
     running.state = {

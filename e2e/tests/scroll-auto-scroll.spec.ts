@@ -1631,8 +1631,11 @@ test.describe('auto-scroll', () => {
     await page.goto('/e2e/harness/index.html?scenario=large-transcript');
     const list = page.locator('.interactive-list');
     await expect(list).toBeVisible();
+    await expect(page.locator('[data-msg-id="message-large-assistant-239"]')).toBeInViewport();
+    await waitForAnimationFrames(page, 12);
 
     await list.evaluate((element) => {
+      element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
       element.scrollTop = Math.floor(element.scrollHeight / 2);
       element.dispatchEvent(new Event('scroll'));
     });
@@ -2162,8 +2165,36 @@ test.describe('auto-scroll', () => {
       await activeItems.last().evaluate(async (element) => {
         await Promise.all(element.getAnimations().map((animation) => animation.finished));
       });
-      // Sending a tall first turn also starts smooth bottom following. Establish
-      // its painted destination before measuring the unrelated activity exits.
+      // A zero bottom gap can precede the mock response's progressive text reveal.
+      // Wait for that text above Explored before measuring unrelated activity exits.
+      const assistantText = await page.evaluate(() => {
+        const harnessWindow = window as typeof window & {
+          firstTurnActivityFixture?: { info: { id?: string }; sessionId: string };
+          __varroE2E?: {
+            getSessionMessages?: (sessionId: string) => Array<{
+              info: { id: string };
+              parts: Array<{ type: string; text?: string }>;
+            }>;
+          };
+        };
+        const turn = harnessWindow.firstTurnActivityFixture;
+        const assistant =
+          turn &&
+          harnessWindow.__varroE2E
+            ?.getSessionMessages?.(turn.sessionId)
+            .find((entry) => entry.info.id === turn.info.id);
+        if (!assistant) throw new Error('First-turn response is missing');
+        return {
+          id: assistant.info.id,
+          text: assistant.parts
+            .filter((part) => part.type === 'text')
+            .map((part) => part.text)
+            .join(''),
+        };
+      });
+      await expect(
+        page.locator(`[data-msg-id="${assistantText.id}"] .rendered-markdown`)
+      ).toHaveText(assistantText.text);
       await expect
         .poll(() =>
           getScrollMetrics(page, '.interactive-list').then((metrics) => metrics.distanceFromBottom)

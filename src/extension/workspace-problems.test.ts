@@ -1,5 +1,6 @@
 /* oxlint-disable anti-slop/no-module-mocking, anti-slop/require-safety-comment-for-type-assertion -- These fixtures model the VS Code diagnostics boundary. */
 import { beforeEach, expect, it, vi } from 'vitest';
+import { DiagnosticSeverity } from 'vscode';
 import type { Diagnostic, Uri } from 'vscode';
 
 const mocks = vi.hoisted(() => ({
@@ -27,7 +28,7 @@ beforeEach(() => {
   mocks.getDiagnostics.mockReset();
 });
 
-const diagnostic = (severity: number): Diagnostic =>
+const diagnostic = (severity: DiagnosticSeverity): Diagnostic =>
   ({
     severity,
     message: 'Problem detail',
@@ -38,10 +39,16 @@ const diagnostic = (severity: number): Diagnostic =>
 
 it('collects all current-workspace errors and warnings, excluding other roots and external files', () => {
   mocks.getDiagnostics.mockReturnValue([
-    [{ fsPath: '/repo/a.ts' } as Uri, Array.from({ length: 25 }, () => diagnostic(0))],
-    [{ fsPath: '/repo/b.ts' } as Uri, [diagnostic(1), diagnostic(2)]],
-    [{ fsPath: '/sibling/c.ts' } as Uri, [diagnostic(0)]],
-    [{ fsPath: '/outside/d.ts' } as Uri, [diagnostic(0)]],
+    [
+      { fsPath: '/repo/a.ts' } as Uri,
+      Array.from({ length: 25 }, () => diagnostic(DiagnosticSeverity.Error)),
+    ],
+    [
+      { fsPath: '/repo/b.ts' } as Uri,
+      [diagnostic(DiagnosticSeverity.Warning), diagnostic(DiagnosticSeverity.Information)],
+    ],
+    [{ fsPath: '/sibling/c.ts' } as Uri, [diagnostic(DiagnosticSeverity.Error)]],
+    [{ fsPath: '/outside/d.ts' } as Uri, [diagnostic(DiagnosticSeverity.Error)]],
   ]);
   const snapshot = getWorkspaceProblems('/repo');
   expect(snapshot.total).toBe(26);

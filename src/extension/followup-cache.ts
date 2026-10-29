@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Persistence } from '../shared/persistence';
 import type { FollowupSuggestionSet } from '../shared/followups';
 import { EMPTY_FOLLOWUP_SUGGESTIONS, parseFollowupSuggestions } from '../shared/followups';
-import { asRecord, isString } from '../shared/type-utils';
+import { asRecord, isNumber, isString } from '../shared/type-utils';
 import { acquireFileLock } from './file-lock';
 import { getVarroStateDirectory } from './varro-state-paths';
 
@@ -16,6 +16,7 @@ type Entry = {
   sessionKey: string;
   digest: string;
   dismissed: boolean;
+  pendingSince?: number;
   suggestions: FollowupSuggestionSet;
 };
 type Entries = Record<string, Entry>;
@@ -31,9 +32,24 @@ export class FollowupCache {
   }
 
   async get(key: string, digest: string): Promise<FollowupSuggestionSet | undefined> {
+    const result = await this.getState(key, digest);
+    return result === 'pending' ? EMPTY_FOLLOWUP_SUGGESTIONS : result;
+  }
+
+  async getState(
+    key: string,
+    digest: string
+  ): Promise<FollowupSuggestionSet | 'pending' | undefined> {
     await this.migrate();
     const entry = (await this.read())[key];
     if (!entry) return undefined;
+    if (
+      entry.digest === digest &&
+      !entry.dismissed &&
+      entry.pendingSince !== undefined &&
+      Date.now() - entry.pendingSince < 35_000
+    )
+      return 'pending';
     return entry.digest === digest && !entry.dismissed
       ? entry.suggestions
       : EMPTY_FOLLOWUP_SUGGESTIONS;
@@ -47,6 +63,7 @@ export class FollowupCache {
         sessionKey,
         digest,
         dismissed: false,
+        pendingSince: Date.now(),
         suggestions: EMPTY_FOLLOWUP_SUGGESTIONS,
       };
       claimed = true;
@@ -60,6 +77,7 @@ export class FollowupCache {
       const entry = entries[key];
       if (!entry || entry.digest !== digest || entry.dismissed) return false;
       entry.suggestions = suggestions;
+      delete entry.pendingSince;
       return true;
     });
   }
@@ -69,6 +87,7 @@ export class FollowupCache {
       const entry = entries[key];
       if (!entry || entry.digest !== digest || entry.dismissed) return false;
       entry.dismissed = true;
+      delete entry.pendingSince;
       entry.suggestions = EMPTY_FOLLOWUP_SUGGESTIONS;
       return true;
     });
@@ -80,6 +99,7 @@ export class FollowupCache {
       for (const [key, entry] of Object.entries(entries)) {
         if (entry.sessionKey !== sessionKey || key === exceptKey || entry.dismissed) continue;
         entry.dismissed = true;
+        delete entry.pendingSince;
         entry.suggestions = EMPTY_FOLLOWUP_SUGGESTIONS;
         changed = true;
       }
@@ -169,6 +189,7 @@ export class FollowupCache {
       // Bound generated text, not admission. Evicting admission could bill an old turn again.
       for (const [, entry] of Object.entries(entries).slice(0, -MAX_PRESENTATIONS)) {
         entry.dismissed = true;
+        delete entry.pendingSince;
         entry.suggestions = EMPTY_FOLLOWUP_SUGGESTIONS;
       }
       await writeFile(
@@ -220,6 +241,7 @@ function parseEntries(storedValue: unknown) {
         sessionKey: entry.sessionKey,
         digest: entry.digest,
         dismissed: entry.dismissed === true,
+        pendingSince: isNumber(entry.pendingSince) ? entry.pendingSince : undefined,
         suggestions: entry.dismissed === true ? EMPTY_FOLLOWUP_SUGGESTIONS : suggestions,
       };
     } catch {

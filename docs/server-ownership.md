@@ -164,6 +164,12 @@ and temporary configuration when listener or executable verification fails but
 the original process is still alive or its retirement is uncertain. A failed
 inspection is not proof of retirement. Cleanup requires process exit or a changed
 birth identity; subsequent attachment still needs fresh complete verification.
+If the OS removes an entire managed temporary configuration while its server keeps
+running, a new host may recover lifecycle ownership from the matching private lease,
+marker, listener PID, executable, and birth identity. Recovery removes the missing
+configuration attribution from both records so runtime configuration repair can use
+the ordinary owned-server restart path. A surviving file, owner mismatch, unsafe
+path, symlink, or incomplete process identity still blocks this recovery.
 
 Reload recovery also retains its in-memory lease candidate until ownership is
 recovered or another live editor's ownership is verified. An inconclusive read

@@ -923,6 +923,27 @@ describe('RichComposerArea', () => {
     });
   });
 
+  it.each(['insertText', 'insertReplacementText', 'insertCompositionText'])(
+    'keeps multiline %s input in the controlled line-break format',
+    (inputType) => {
+      const onInput = vi.fn();
+      renderComposer({ value: 'before after', cursorOffset: 7, chips: [], onInput });
+      const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
+      setCollapsedSelection(editor.firstChild!, 7);
+      const text = 'first\nsecond\n\nlast';
+      const event = new InputEvent('beforeinput', {
+        inputType,
+        data: text,
+        bubbles: true,
+        cancelable: true,
+      });
+      editor.dispatchEvent(event);
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(onInput).toHaveBeenCalledWith(`before ${text}after`, 7 + text.length);
+    }
+  );
+
   it('inserts exactly one controlled newline on Shift+Enter', () => {
     const onInput = vi.fn();
     const value = 'something';

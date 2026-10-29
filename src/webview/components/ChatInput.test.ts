@@ -2756,7 +2756,9 @@ describe('ChatInput', () => {
     expect(warning?.textContent).toContain('Weekly limit: 8% left');
     expect(warning?.textContent).not.toContain('5-hour limit');
     expect(warning?.nextElementSibling?.classList.contains('chat-input-shell')).toBe(true);
-    expect(container?.querySelector<HTMLAnchorElement>('.chat-quota-warning-usage')?.href).toBe(
+    container?.querySelector<HTMLButtonElement>('.chat-quota-warning-usage')?.click();
+    expect(container?.querySelector('.provider-limit-reset-rows')).not.toBeNull();
+    expect(container?.querySelector<HTMLAnchorElement>('.provider-limit-reset-link')?.href).toBe(
       'https://chatgpt.com/settings/usage?tab=overview'
     );
 
@@ -2772,6 +2774,7 @@ describe('ChatInput', () => {
       modelID: 'gpt-4o',
     });
     expect(container?.querySelector('.chat-quota-warning')).toBeNull();
+    expect(container?.querySelector('.provider-limit-popup')).toBeNull();
     expect(container?.querySelector('.chat-usage-limit-banner')).not.toBeNull();
   });
 
@@ -4399,7 +4402,7 @@ describe('ChatInput', () => {
     expect(sendMessageMock).not.toHaveBeenCalled();
   });
 
-  it('runs a parameterless slash completion on the first Enter', async () => {
+  it('inserts a parameterless slash completion before running it', async () => {
     setState('commands', [
       {
         name: 'zzvarrotest',
@@ -4425,13 +4428,129 @@ describe('ChatInput', () => {
     );
     await flushAsyncWork();
 
-    expect(inputText()).toBe('');
+    expect(inputText()).toBe('/zzvarrotest');
     expect(container?.querySelector('.composer-completion-menu')).toBeNull();
+    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+
+    editor.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    );
+    await flushAsyncWork();
+
+    expect(inputText()).toBe('');
     expect(runSlashCommandByNameMock).toHaveBeenCalledWith('zzvarrotest', '');
     expect(sendMessageMock).not.toHaveBeenCalled();
   });
 
-  it('runs /stats from the completion menu on the first Enter', async () => {
+  it.each(['click', 'Tab', 'Enter'])(
+    'dismisses overlapping slash completions after %s so Enter runs the selected command',
+    async (selection) => {
+      setState('commands', [
+        { name: 'a-helper', description: 'Run zzvarrotest checks', template: 'Run checks' },
+        { name: 'zzvarrotest', description: 'Run tests', template: 'Run tests' },
+      ]);
+      setInputText('/zzv');
+
+      cleanup = render(() => ChatInput(), container!);
+
+      const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+      if (!editor?.firstChild) throw new Error('Expected populated composer editor');
+      editor.focus();
+      setCollapsedSelection(editor.firstChild, '/zzv'.length);
+      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'v', bubbles: true }));
+      await flushAsyncWork();
+
+      const items = [...container!.querySelectorAll<HTMLButtonElement>('.completion-slash')];
+      expect(
+        items.map((item) => item.querySelector('.composer-completion-title')?.textContent)
+      ).toEqual(['/a-helper', '/zzvarrotest']);
+      if (selection === 'click') items[1]!.click();
+      else {
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+        );
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: selection, bubbles: true, cancelable: true })
+        );
+      }
+      await flushAsyncWork();
+
+      expect(inputText()).toBe('/zzvarrotest');
+      expect(container?.querySelector('.composer-completion-menu')).toBeNull();
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      );
+      await flushAsyncWork();
+
+      expect(inputText()).toBe('');
+      expect(runSlashCommandByNameMock).toHaveBeenCalledExactlyOnceWith('zzvarrotest', '');
+      expect(sendMessageMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(
+    ['skills', 'problems'].flatMap((name) =>
+      ['click', 'Tab', 'Enter'].map((selection) => ({ name, selection }))
+    )
+  )('keeps the /$name picker open after $selection completion', async ({ name, selection }) => {
+    setState('commands', [
+      {
+        name: 'browser-bridge',
+        description: 'Control a browser',
+        template: 'Control a browser',
+        source: 'skill',
+      },
+    ]);
+    vi.mocked(client.varro.workspaceProblems).mockResolvedValue({
+      total: 1,
+      diagnostics: [{ path: '/repo/a.ts', line: 1, severity: 'error', message: 'A error' }],
+    });
+    const draft = `/${name.slice(0, 3)}`;
+    setInputText(draft);
+
+    cleanup = render(() => ChatInput(), container!);
+
+    const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+    if (!editor?.firstChild) throw new Error('Expected populated composer editor');
+    editor.focus();
+    setCollapsedSelection(editor.firstChild, draft.length);
+    editor.dispatchEvent(new KeyboardEvent('keyup', { key: draft.at(-1), bubbles: true }));
+    await flushAsyncWork();
+
+    const items = [...container!.querySelectorAll<HTMLButtonElement>('.completion-slash')];
+    const item = items.find(
+      (button) => button.querySelector('.composer-completion-title')?.textContent === `/${name}`
+    );
+    if (!item) throw new Error(`Expected /${name} completion`);
+    if (selection === 'click') item.click();
+    else {
+      for (let index = 0; index < items.indexOf(item); index++) {
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+        );
+      }
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: selection, bubbles: true, cancelable: true })
+      );
+    }
+    await flushAsyncWork();
+
+    expect(inputText()).toBe(`/${name} `);
+    expect(container?.querySelector('.composer-completion-header')?.textContent).toBe(
+      name === 'skills' ? 'Skills' : 'Problems'
+    );
+    expect(container?.querySelector('.composer-completion-title')?.textContent).toBe(
+      name === 'skills' ? 'browser-bridge' : 'All'
+    );
+    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('selects /stats from the completion menu before sending it', async () => {
     // SAFETY: The fixture provides the unknown fields read by this statement.
     const bridgeWindow = window as {
       __sendToExtension?: (message: WebviewMessage) => void;
@@ -4452,6 +4571,18 @@ describe('ChatInput', () => {
       await flushAsyncWork();
 
       expect(container?.querySelector('.composer-completion-menu')).not.toBeNull();
+
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      );
+      await flushAsyncWork();
+
+      expect(inputText()).toBe('/stats');
+      expect(sent).not.toContainEqual({
+        type: 'usage/report',
+        payload: { includeAllTime: false },
+      });
+      expect(sendMessageMock).not.toHaveBeenCalled();
 
       editor.dispatchEvent(
         new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
@@ -9923,6 +10054,13 @@ describe('ChatInput', () => {
       expect(suggestion).toBeDefined();
       suggestion!.click();
       await flushAsyncWork();
+      expect(sideQuestionView()).toBeNull();
+      expect(inputText()).toBe('/btw');
+
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      );
+      await flushAsyncWork();
       expect(sideQuestionView()).toMatchObject({ sessionID: 'session-1', question: '' });
       expect(inputText()).toBe('');
       expect(state.queuedMessages).toEqual([]);
@@ -11905,6 +12043,58 @@ describe('ChatInput', () => {
       else delete bridgeWindow.__sendToExtension;
     }
   });
+
+  it.each([null, { startLine: 101, endLine: 108 }])(
+    'pins the active context with its selected lines: %j',
+    async (selection) => {
+      setState('activeSessionId', 'session-1');
+      setState('editorContext', {
+        workspacePath: '/repo',
+        activeFile: {
+          path: '/repo/src/app.ts',
+          relativePath: 'src/app.ts',
+          language: 'typescript',
+        },
+        selection,
+        diagnostics: [],
+      });
+      cleanup = render(() => ChatInput(), container!);
+      await flushAsyncWork();
+
+      const pinButton = container?.querySelector<HTMLButtonElement>(
+        '.chat-attachments-container .chat-attachment-chip .chip-pin'
+      );
+      if (!pinButton) throw new Error('Expected the active-context attachment pin button');
+      pinButton.click();
+
+      expect(state.droppedFiles).toEqual([
+        expect.objectContaining({
+          path: '/repo/src/app.ts',
+          relativePath: 'src/app.ts',
+          type: 'file',
+          lineRanges: selection ? [selection] : undefined,
+        }),
+      ]);
+      expect(container?.querySelectorAll('.chat-attachment-chip')).toHaveLength(1);
+      expect(container?.querySelector('.chip-pin')).toBeNull();
+
+      setState('editorContext', 'activeFile', {
+        path: '/repo/src/other.ts',
+        relativePath: 'src/other.ts',
+        language: 'typescript',
+      });
+      setState('editorContext', 'selection', null);
+      await flushAsyncWork();
+
+      expect(state.droppedFiles[0]?.path).toBe('/repo/src/app.ts');
+      expect(state.droppedFiles[0]?.lineRanges).toEqual(selection ? [selection] : undefined);
+      const attachment = [...container!.querySelectorAll('.chat-attachment-chip')].find((chip) =>
+        chip.querySelector('.chip-remove')
+      );
+      expect(attachment?.textContent).toContain('app.ts');
+      if (selection) expect(attachment?.textContent).toContain('L101-108');
+    }
+  );
 
   it('automatically enables and stores a non-vision image without a vision mention', async () => {
     const fileReader = installControllableFileReader();

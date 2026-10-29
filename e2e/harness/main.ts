@@ -1552,6 +1552,7 @@ function createScenarioState(name: ScenarioName): ScenarioState {
   }
 
   if (name === 'mixed-image-tiles') {
+    const singleImage = new URLSearchParams(window.location.search).has('singleImage');
     const session = makeSession('session-mixed-image-tiles', 'Mixed image tiles', BASE_TIME - 500);
     const earlierMessages: ReturnType<typeof makeUserMessage>[] = [];
     for (let index = 1; index <= 26; index += 1) {
@@ -1575,10 +1576,14 @@ function createScenarioState(name: ScenarioName): ScenarioState {
     const user = makeUserMessage(
       session.id,
       'message-mixed-image-tiles-user',
-      ['Ten image tiles'],
+      [
+        singleImage
+          ? 'Single image prompt. Keep this bubble against the right edge.'
+          : 'Ten image tiles',
+      ],
       BASE_TIME - 2_000
     );
-    for (let index = 1; index <= 10; index += 1) {
+    for (let index = 1; index <= (singleImage ? 1 : 10); index += 1) {
       user.parts.push({
         id: `message-mixed-image-tiles-file-${index}`,
         sessionID: session.id,
@@ -1597,7 +1602,7 @@ function createScenarioState(name: ScenarioName): ScenarioState {
       session.id,
       'message-mixed-image-tiles-assistant',
       user.info.id,
-      'Received ten images.',
+      singleImage ? 'Received one image.' : 'Received ten images.',
       BASE_TIME - 1_000
     );
     state.sessions = [session];

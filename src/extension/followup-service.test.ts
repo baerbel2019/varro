@@ -4,6 +4,7 @@ import { join, resolve as resolvePath } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OpenCodeServer } from './server';
 import { FollowupService } from './followup-service';
+import { FollowupCache } from './followup-cache';
 import { logger } from './logger';
 import { EMPTY_FOLLOWUP_SUGGESTIONS } from '../shared/followups';
 import type { Persistence } from '../shared/persistence';
@@ -107,6 +108,102 @@ function setup() {
 }
 
 describe('FollowupService', () => {
+  it('waits for another host to complete a pending admission without generating twice', async () => {
+    const { server, request, input } = setup();
+    const original = request.getMockImplementation()!;
+    let finish!: (value: { data: { text: string } }) => void;
+    request.mockImplementation((...args) =>
+      args[1] === '/api/experimental/generate'
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : original(...args)
+    );
+    const first = new FollowupService(server).suggest(input);
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const reads = vi.spyOn(FollowupCache.prototype, 'getState');
+    const second = new FollowupService(server).suggest({ ...input, allowGenerate: false });
+    await vi.waitFor(async () => expect(await reads.mock.results[0]?.value).toBe('pending'));
+    finish({ data: { text: JSON.stringify(suggestions) } });
+    expect(await first).toEqual(suggestions);
+    expect(await second).toEqual(suggestions);
+    expect(
+      request.mock.calls.filter(([, path]) => path === '/api/experimental/generate')
+    ).toHaveLength(1);
+  });
+
+  it('finishes an admitted generation for another host after the originating editor closes', async () => {
+    const { server, request, input } = setup();
+    const original = request.getMockImplementation()!;
+    let finish!: (value: { data: { text: string } }) => void;
+    request.mockImplementation((...args) =>
+      args[1] === '/api/experimental/generate'
+        ? new Promise((resolve, reject) => {
+            finish = resolve;
+            args[3]?.signal?.addEventListener('abort', () => reject(args[3]?.signal?.reason), {
+              once: true,
+            });
+          })
+        : original(...args)
+    );
+    const controller = new AbortController();
+    const first = new FollowupService(server).suggest({ ...input, signal: controller.signal });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const reads = vi.spyOn(FollowupCache.prototype, 'getState');
+    reads.mockClear();
+    const second = new FollowupService({ ...server }).suggest({ ...input, allowGenerate: false });
+    await vi.waitFor(async () => expect(await reads.mock.results[0]?.value).toBe('pending'));
+    controller.abort();
+    const generation = request.mock.calls.find(([, path]) => path === '/api/experimental/generate');
+    expect(generation?.[3]?.signal?.aborted).toBe(false);
+    finish({ data: { text: JSON.stringify(suggestions) } });
+    expect(await first).toEqual(EMPTY_FOLLOWUP_SUGGESTIONS);
+    expect(await second).toEqual(suggestions);
+    expect(
+      request.mock.calls.filter(([, path]) => path === '/api/experimental/generate')
+    ).toHaveLength(1);
+  });
+
+  it('retries a turn when its only subscriber cancels before admission', async () => {
+    const { server, request, input } = setup();
+    const original = request.getMockImplementation()!;
+    let waiting = false;
+    request.mockImplementation((...args) => {
+      if (args[1] === '/session/status' && !waiting) {
+        waiting = true;
+        return new Promise((_resolve, reject) => {
+          args[3]?.signal?.addEventListener('abort', () => reject(args[3]?.signal?.reason), {
+            once: true,
+          });
+        });
+      }
+      return original(...args);
+    });
+    const service = new FollowupService(server);
+    const controller = new AbortController();
+    const first = service.suggest({ ...input, signal: controller.signal });
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    controller.abort();
+    const second = service.suggest(input);
+    expect(await first).toEqual(EMPTY_FOLLOWUP_SUGGESTIONS);
+    expect(await second).toEqual(suggestions);
+    expect(
+      request.mock.calls.filter(([, path]) => path === '/api/experimental/generate')
+    ).toHaveLength(1);
+  });
+
+  it('retries after a transient pre-admission source mismatch', async () => {
+    const { server, request, input, setAnswer } = setup();
+    const service = new FollowupService(server);
+    setAnswer('Temporarily out of date');
+    expect(await service.suggest(input)).toEqual(EMPTY_FOLLOWUP_SUGGESTIONS);
+    setAnswer(source.answer);
+    expect(await service.suggest(input)).toEqual(suggestions);
+    expect(
+      request.mock.calls.filter(([, path]) => path === '/api/experimental/generate')
+    ).toHaveLength(1);
+  });
+
   it('preserves the selected reasoning variant in stateless generation', async () => {
     const { server, request, input } = setup();
     expect(

@@ -18,6 +18,19 @@ An active shell is not a durable OS process. Native recovery reports a lost back
 
 Pending approval or a question still blocks work until the server acknowledges a reply. Child requests retain their child's session identity when displayed in the parent conversation. Native recovery can terminate after exhausting its retry budget. An idle status alone is not a successful outcome.
 
+### Follow-up suggestions
+
+Follow-up suggestion generation is a separate one-shot request, not a durable session execution.
+Completed suggestion results saved to the shared cache survive reloads and can be restored while their
+source remains current. Closing the originating chat editor does not cancel an admitted, bounded
+generation attempt while its extension host stays alive. Unfinished generation is not guaranteed to
+recover after the whole host shuts down, even if the OpenCode backend remains available.
+
+Other windows wait only a bounded time for the result and may receive no suggestions. The admission
+record survives shutdown and expiry of the pending-wait grace period. Varro does not automatically
+retry the same turn because the original request may already have consumed tokens or subscription
+quota. See [local state files](usage.md#local-state-files) for cache retention and dismissal behavior.
+
 ## Diagnostics and testing
 
 The recovery entry points remain separate:

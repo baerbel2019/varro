@@ -96,6 +96,7 @@ const {
       dispose: ReturnType<typeof vi.fn>;
       post: ReturnType<typeof vi.fn>;
       startProviderFileObservation: ReturnType<typeof vi.fn>;
+      view: { visible: boolean };
     },
   },
   loggerMock: {
@@ -157,12 +158,14 @@ vi.mock('./sidebar-provider', () => ({
     dispose = vi.fn(() => Promise.resolve());
     post = vi.fn();
     startProviderFileObservation = vi.fn();
+    view = { visible: true };
 
     constructor(...args: unknown[]) {
       latestSidebarProviderInstance.current = {
         dispose: this.dispose,
         post: this.post,
         startProviderFileObservation: this.startProviderFileObservation,
+        view: this.view,
       };
       sidebarProviderMock(...args);
     }
@@ -200,12 +203,24 @@ function readDefaultConfig(key: string, fallback?: unknown) {
   }
 }
 
+const primarySidebarHosts: [string, string][] = [
+  ['Cursor', 'cursor'],
+  ['Windsurf', 'windsurf'],
+  ['Devin', 'devin'],
+  ['Trae', 'trae'],
+  ['Trae CN', 'trae-cn'],
+  ['TraeCN', 'traecn'],
+  ['Cursor Insiders', 'cursor-insiders'],
+  ['Unbranded Editor', 'windsurf-next'],
+];
+
 describe('extension activation', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
     prepareProcessInspectionMock.mockReset().mockResolvedValue(undefined);
     executeCommandMock.mockImplementation(() => Promise.resolve());
+    getCommandsMock.mockReset().mockResolvedValue([]);
     latestContextProviderInstance.current = null;
     contextChangeCallback.current = null;
     latestServerInstance.current = null;
@@ -534,44 +549,40 @@ describe('extension activation', () => {
     expect(context.subscriptions).toHaveLength(3);
   });
 
-  it.each([
-    ['Cursor', 'cursor'],
-    ['Windsurf', 'windsurf'],
-    ['Devin', 'devin'],
-    ['Trae', 'trae'],
-    ['Trae CN', 'trae-cn'],
-    ['TraeCN', 'traecn'],
-  ])('moves the chat view to the primary sidebar once in %s', async (appName, uriScheme) => {
-    envMock.appName = appName;
-    envMock.uriScheme = uriScheme;
-    getCommandsMock.mockResolvedValueOnce(['vscode.moveViews']);
-    const globalState = {
-      get: vi.fn(() => false),
-      update: vi.fn(() => Promise.resolve()),
-    };
-    const { activate } = await import('./extension');
+  it.each(primarySidebarHosts)(
+    'moves a new installation to the primary sidebar in %s',
+    async (appName, uriScheme) => {
+      envMock.appName = appName;
+      envMock.uriScheme = uriScheme;
+      getCommandsMock.mockResolvedValueOnce(['vscode.moveViews']);
+      const globalState = {
+        get: vi.fn(() => false),
+        update: vi.fn(() => Promise.resolve()),
+      };
+      const { activate } = await import('./extension');
 
-    await activate({
-      extensionUri: {},
-      extension: { id: 'koltyakov.varro' },
-      globalState,
-      workspaceState: {},
-      subscriptions: [],
-    } as never);
+      await activate({
+        extensionUri: {},
+        extension: { id: 'koltyakov.varro' },
+        globalState,
+        workspaceState: {},
+        subscriptions: [],
+      } as never);
 
-    expect(executeCommandMock).toHaveBeenCalledWith('vscode.moveViews', {
-      viewIds: ['varro.chat'],
-      destinationId: 'workbench.view.extension.varro-primary',
-    });
-    expect(globalState.update).toHaveBeenCalledWith('layout.cursorPrimarySidebar.v1', true);
-    expect(registerCommandsMock).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.anything(),
-      expect.anything(),
-      expect.any(Function)
-    );
-  });
+      expect(executeCommandMock).toHaveBeenCalledWith('vscode.moveViews', {
+        viewIds: ['varro.chat'],
+        destinationId: 'workbench.view.extension.varro-primary',
+      });
+      expect(globalState.update).toHaveBeenCalledWith('layout.cursorPrimarySidebar.v1', true);
+      expect(registerCommandsMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.any(Function)
+      );
+    }
+  );
 
   it('skips startup migration after the marker but registers a repairing revealer', async () => {
     envMock.appName = 'Devin';
@@ -602,7 +613,7 @@ describe('extension activation', () => {
     );
   });
 
-  it('reapplies fork placement when revealing after a persisted migration', async () => {
+  it('preserves a working fork placement when revealing after a persisted migration', async () => {
     envMock.appName = 'Cursor';
     envMock.uriScheme = 'cursor';
     const globalState = {
@@ -623,23 +634,136 @@ describe('extension activation', () => {
     executeCommandMock.mockClear();
     await (reveal as () => Promise<void>)();
 
-    expect(executeCommandMock).toHaveBeenCalledWith('vscode.moveViews', {
-      viewIds: ['varro.chat'],
-      destinationId: 'workbench.view.extension.varro-primary',
-    });
+    expect(executeCommandMock.mock.calls).toEqual([['varro.chat.focus']]);
   });
 
-  it.each([
-    ['Visual Studio Code', 'vscode'],
-    ['VSCodium', 'vscodium'],
-  ])('moves the chat view to the secondary sidebar once in %s', async (appName, uriScheme) => {
-    envMock.appName = appName;
-    envMock.uriScheme = uriScheme;
-    getCommandsMock.mockResolvedValueOnce(['vscode.moveViews']);
+  it.each(primarySidebarHosts)(
+    'preserves an existing user placement in %s without requiring an old migration marker',
+    async (appName, uriScheme) => {
+      envMock.appName = appName;
+      envMock.uriScheme = uriScheme;
+      const globalState = {
+        get: vi.fn((key: string) => key === 'layout.initialSidebarReveal.v1'),
+        update: vi.fn(() => Promise.resolve()),
+      };
+      const { activate } = await import('./extension');
+      await activate({
+        extensionUri: {},
+        extension: { id: 'koltyakov.varro' },
+        globalState,
+        workspaceState: {},
+        subscriptions: [],
+      } as never);
+      const reveal = registerCommandsMock.mock.calls[0]?.[4] as () => Promise<void>;
+
+      expect(executeCommandMock.mock.calls.filter(([command]) => command !== 'setContext')).toEqual(
+        []
+      );
+      await reveal();
+
+      expect(executeCommandMock.mock.calls.filter(([command]) => command !== 'setContext')).toEqual(
+        [['varro.chat.focus']]
+      );
+      expect(globalState.update).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(primarySidebarHosts)(
+    'recovers a hidden secondary view in %s after a persisted migration',
+    async (appName, uriScheme) => {
+      envMock.appName = appName;
+      envMock.uriScheme = uriScheme;
+      const { activate } = await import('./extension');
+      await activate({
+        extensionUri: {},
+        extension: { id: 'koltyakov.varro' },
+        globalState: { get: () => true },
+        workspaceState: {},
+        subscriptions: [],
+      } as never);
+      const reveal = registerCommandsMock.mock.calls[0]?.[4] as () => Promise<void>;
+      const view = latestSidebarProviderInstance.current!.view;
+      view.visible = false;
+      executeCommandMock.mockClear();
+      executeCommandMock.mockImplementation((command: string) => {
+        if (command === 'vscode.moveViews') view.visible = true;
+        return Promise.resolve();
+      });
+
+      await reveal();
+
+      expect(executeCommandMock.mock.calls).toEqual([
+        ['varro.chat.focus'],
+        [
+          'vscode.moveViews',
+          { viewIds: ['varro.chat'], destinationId: 'workbench.view.extension.varro-primary' },
+        ],
+        ['varro.chat.focus'],
+      ]);
+      executeCommandMock.mockClear();
+      await reveal();
+      expect(executeCommandMock.mock.calls).toEqual([['varro.chat.focus']]);
+    }
+  );
+
+  it.each(['focus rejects', 'move rejects', 'move silently does nothing'])(
+    'handles fork recovery when %s without resetting to the unsupported secondary location',
+    async (failure) => {
+      envMock.appName = 'Cursor';
+      envMock.uriScheme = 'cursor';
+      const { activate } = await import('./extension');
+      await activate({
+        extensionUri: {},
+        extension: { id: 'koltyakov.varro' },
+        globalState: { get: () => true },
+        workspaceState: {},
+        subscriptions: [],
+      } as never);
+      const reveal = registerCommandsMock.mock.calls[0]?.[4] as () => Promise<void>;
+      const view = latestSidebarProviderInstance.current!.view;
+      view.visible = false;
+      executeCommandMock.mockClear();
+      executeCommandMock.mockImplementation((command: string) => {
+        if (command === 'varro.chat.focus' && failure === 'focus rejects' && !view.visible) {
+          return Promise.reject(new Error('secondary view unavailable'));
+        }
+        if (command === 'vscode.moveViews') {
+          if (failure === 'move rejects') return Promise.reject(new Error('move unavailable'));
+          if (failure !== 'move silently does nothing') view.visible = true;
+        }
+        return Promise.resolve();
+      });
+
+      if (failure === 'focus rejects') {
+        await expect(reveal()).resolves.toBeUndefined();
+      } else {
+        await expect(reveal()).rejects.toThrow(
+          failure === 'move rejects'
+            ? 'move unavailable'
+            : 'The host did not reveal Varro in the Primary Sidebar'
+        );
+      }
+      expect(executeCommandMock).toHaveBeenCalledWith('vscode.moveViews', {
+        viewIds: ['varro.chat'],
+        destinationId: 'workbench.view.extension.varro-primary',
+      });
+      expect(executeCommandMock).not.toHaveBeenCalledWith('varro.chat.resetViewLocation');
+    }
+  );
+
+  it('does not remember a failed first-run fork migration or reveal', async () => {
+    envMock.appName = 'Cursor';
+    envMock.uriScheme = 'cursor';
+    getCommandsMock.mockResolvedValue(['vscode.moveViews']);
     const globalState = {
-      get: vi.fn((key: string) => key === 'layout.initialSidebarReveal.v1'),
+      get: vi.fn(() => false),
       update: vi.fn(() => Promise.resolve()),
     };
+    executeCommandMock.mockImplementation((command: string) => {
+      if (command === 'vscode.moveViews') return Promise.reject(new Error('move unavailable'));
+      if (command === 'varro.chat.focus') return Promise.reject(new Error('view unavailable'));
+      return Promise.resolve();
+    });
     const { activate } = await import('./extension');
 
     await activate({
@@ -651,76 +775,131 @@ describe('extension activation', () => {
     } as never);
 
     await vi.waitFor(() => {
-      expect(globalState.update).toHaveBeenCalledWith('layout.standardSecondarySidebar.v1', true);
+      expect(loggerMock.warn).toHaveBeenCalledWith(
+        'Failed to reveal Varro after installation: move unavailable'
+      );
     });
-    expect(executeCommandMock).toHaveBeenCalledWith('vscode.moveViews', {
-      viewIds: ['varro.chat'],
-      destinationId: 'workbench.view.extension.varro',
-    });
-    expect(globalState.update).not.toHaveBeenCalledWith('layout.cursorPrimarySidebar.v1', true);
-    expect(executeCommandMock).not.toHaveBeenCalledWith('varro.chat.focus');
-    expect(registerCommandsMock).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.anything(),
-      expect.anything(),
-      expect.any(Function)
-    );
+    expect(globalState.update).not.toHaveBeenCalled();
+    expect(executeCommandMock).not.toHaveBeenCalledWith('varro.chat.resetViewLocation');
   });
 
-  it.each(['workbench.view.extension.varro', 'varro.chat.focus', 'vscode.moveViews'])(
-    'finishes first-run activation while %s waits for activation',
-    async (blockedCommand) => {
-      vi.useFakeTimers();
-      if (blockedCommand === 'vscode.moveViews') {
-        envMock.appName = 'Cursor';
-        envMock.uriScheme = 'cursor';
-        getCommandsMock.mockResolvedValueOnce(['vscode.moveViews']);
-      }
-      let releaseCommand!: () => void;
-      const commandPending = new Promise<void>((resolve) => {
-        releaseCommand = resolve;
-      });
-      executeCommandMock.mockImplementation((command: string) =>
-        command === blockedCommand ? commandPending : Promise.resolve()
-      );
+  it.each([
+    ['Visual Studio Code', 'vscode'],
+    ['VSCodium', 'vscodium'],
+    ['Cursorish Editor', 'vscode'],
+  ])(
+    'corrects legacy placement once in %s even when the old migration marker is set',
+    async (appName, uriScheme) => {
+      envMock.appName = appName;
+      envMock.uriScheme = uriScheme;
       const globalState = {
-        get: vi.fn(() => false),
+        get: vi.fn(
+          (key: string) =>
+            key === 'layout.initialSidebarReveal.v1' || key === 'layout.standardSecondarySidebar.v1'
+        ),
         update: vi.fn(() => Promise.resolve()),
       };
       const { activate } = await import('./extension');
-      let activated = false;
-      const activation = activate({
+
+      await activate({
         extensionUri: {},
         extension: { id: 'koltyakov.varro' },
         globalState,
         workspaceState: {},
         subscriptions: [],
-      } as never).then(() => {
-        activated = true;
+      } as never);
+
+      await vi.waitFor(() => {
+        expect(globalState.update).toHaveBeenCalledWith(
+          'layout.secondarySidebarRegistration.v2',
+          true
+        );
       });
-
-      await vi.advanceTimersByTimeAsync(50);
-      const finishedBeforeCommand = activated;
-      expect(executeCommandMock.mock.calls.some(([command]) => command === blockedCommand)).toBe(
-        true
+      expect(executeCommandMock.mock.calls.filter(([command]) => command !== 'setContext')).toEqual(
+        [
+          ['workbench.view.extension.varro.resetViewContainerLocation'],
+          [
+            'vscode.moveViews',
+            { viewIds: ['varro.chat'], destinationId: 'workbench.view.extension.varro' },
+          ],
+          ['varro.chat.focus'],
+        ]
       );
-      expect(globalState.update).not.toHaveBeenCalledWith('layout.initialSidebarReveal.v1', true);
-      releaseCommand();
-      await activation;
-      await vi.advanceTimersByTimeAsync(0);
-
-      expect(finishedBeforeCommand).toBe(true);
-      expect(globalState.update).toHaveBeenCalledWith('layout.initialSidebarReveal.v1', true);
-      expect(
-        latestSidebarProviderInstance.current?.startProviderFileObservation
-      ).toHaveBeenCalledOnce();
-      executeCommandMock.mockImplementation(() => Promise.resolve());
+      expect(executeCommandMock).not.toHaveBeenCalledWith('workbench.action.resetViewLocations');
+      expect(registerCommandsMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.any(Function)
+      );
     }
   );
 
-  it('places and reveals the secondary sidebar once after installation in VS Code', async () => {
-    getCommandsMock.mockResolvedValueOnce(['vscode.moveViews']);
+  it.each([
+    'varro.chat.focus',
+    'vscode.moveViews',
+    'workbench.view.extension.varro.resetViewContainerLocation',
+  ])('finishes first-run activation while %s waits for activation', async (blockedCommand) => {
+    vi.useFakeTimers();
+    if (blockedCommand === 'vscode.moveViews') {
+      envMock.appName = 'Cursor';
+      envMock.uriScheme = 'cursor';
+      getCommandsMock.mockResolvedValueOnce(['vscode.moveViews']);
+    }
+    let releaseCommand!: () => void;
+    const commandPending = new Promise<void>((resolve) => {
+      releaseCommand = resolve;
+    });
+    executeCommandMock.mockImplementation((command: string) =>
+      command === blockedCommand ? commandPending : Promise.resolve()
+    );
+    const globalState = {
+      get: vi.fn(
+        (key: string) =>
+          blockedCommand.endsWith('.resetViewContainerLocation') &&
+          key === 'layout.initialSidebarReveal.v1'
+      ),
+      update: vi.fn(() => Promise.resolve()),
+    };
+    const { activate } = await import('./extension');
+    let activated = false;
+    const activation = activate({
+      extensionUri: {},
+      extension: { id: 'koltyakov.varro' },
+      globalState,
+      workspaceState: {},
+      subscriptions: [],
+    } as never).then(() => {
+      activated = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(50);
+    const finishedBeforeCommand = activated;
+    expect(executeCommandMock.mock.calls.some(([command]) => command === blockedCommand)).toBe(
+      true
+    );
+    expect(globalState.update).not.toHaveBeenCalledWith('layout.initialSidebarReveal.v1', true);
+    releaseCommand();
+    await activation;
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(finishedBeforeCommand).toBe(true);
+    if (blockedCommand.endsWith('.resetViewContainerLocation')) {
+      expect(globalState.update).toHaveBeenCalledWith(
+        'layout.secondarySidebarRegistration.v2',
+        true
+      );
+    } else {
+      expect(globalState.update).toHaveBeenCalledWith('layout.initialSidebarReveal.v1', true);
+    }
+    expect(
+      latestSidebarProviderInstance.current?.startProviderFileObservation
+    ).toHaveBeenCalledOnce();
+    executeCommandMock.mockImplementation(() => Promise.resolve());
+  });
+
+  it('reveals the declared secondary view without moving it after installation in VS Code', async () => {
     const globalState = {
       get: vi.fn(() => false),
       update: vi.fn(() => Promise.resolve()),
@@ -738,20 +917,15 @@ describe('extension activation', () => {
     await vi.waitFor(() => {
       expect(globalState.update).toHaveBeenCalledWith('layout.initialSidebarReveal.v1', true);
     });
-    expect(executeCommandMock).toHaveBeenCalledWith('workbench.view.extension.varro');
     expect(executeCommandMock).toHaveBeenCalledWith('varro.chat.focus');
     expect(executeCommandMock.mock.calls.filter(([command]) => command !== 'setContext')).toEqual([
-      [
-        'vscode.moveViews',
-        { viewIds: ['varro.chat'], destinationId: 'workbench.view.extension.varro' },
-      ],
-      ['workbench.view.extension.varro'],
       ['varro.chat.focus'],
     ]);
     expect(globalState.update).toHaveBeenCalledWith('layout.initialSidebarReveal.v1', true);
+    expect(globalState.update).toHaveBeenCalledWith('layout.secondarySidebarRegistration.v2', true);
   });
 
-  it.each(['workbench.view.extension.varro', 'varro.chat.focus'])(
+  it.each(['varro.chat.focus'])(
     'does not remember the initial reveal when %s fails',
     async (failedCommand) => {
       executeCommandMock.mockImplementation((command: string) =>
@@ -787,7 +961,8 @@ describe('extension activation', () => {
     const globalState = {
       get: vi.fn(
         (key: string) =>
-          key === 'layout.initialSidebarReveal.v1' || key === 'layout.standardSecondarySidebar.v1'
+          key === 'layout.initialSidebarReveal.v1' ||
+          key === 'layout.secondarySidebarRegistration.v2'
       ),
       update: vi.fn(() => Promise.resolve()),
     };
@@ -809,27 +984,88 @@ describe('extension activation', () => {
     expect(globalState.update).not.toHaveBeenCalled();
   });
 
-  it('reapplies standard-host placement on every reveal', async () => {
+  it.each([
+    'workbench.view.extension.varro.resetViewContainerLocation',
+    'vscode.moveViews',
+    'varro.chat.focus',
+    'invisible view',
+  ])('does not mark the legacy migration complete when %s fails', async (failure) => {
+    const globalState = {
+      get: vi.fn((key: string) => key === 'layout.initialSidebarReveal.v1'),
+      update: vi.fn(() => Promise.resolve()),
+    };
+    if (failure === 'invisible view') {
+      sidebarProviderMock.mockImplementationOnce(() => {
+        latestSidebarProviderInstance.current!.view.visible = false;
+      });
+    }
+    executeCommandMock.mockImplementation((command: string) =>
+      command === failure ? Promise.reject(new Error('layout command failed')) : Promise.resolve()
+    );
     const { activate } = await import('./extension');
+
     await activate({
       extensionUri: {},
       extension: { id: 'koltyakov.varro' },
+      globalState,
       workspaceState: {},
       subscriptions: [],
     } as never);
-    const reveal = registerCommandsMock.mock.calls[0]?.[4];
 
-    expect(reveal).toBeTypeOf('function');
-    executeCommandMock.mockClear();
-    await (reveal as () => Promise<void>)();
+    await vi.waitFor(() => {
+      expect(loggerMock.warn).toHaveBeenCalledWith(
+        failure === 'invisible view'
+          ? 'Failed to migrate Varro to the Secondary Sidebar: The host did not reveal Varro in the Secondary Sidebar'
+          : 'Failed to migrate Varro to the Secondary Sidebar: layout command failed'
+      );
+    });
+    expect(globalState.update).not.toHaveBeenCalledWith(
+      'layout.secondarySidebarRegistration.v2',
+      true
+    );
+  });
 
-    expect(executeCommandMock).toHaveBeenCalledWith('vscode.moveViews', {
-      viewIds: ['varro.chat'],
-      destinationId: 'workbench.view.extension.varro',
+  it('logs a failed migration-marker write without reporting completion', async () => {
+    const globalState = {
+      get: vi.fn((key: string) => key === 'layout.initialSidebarReveal.v1'),
+      update: vi.fn(() => Promise.reject(new Error('storage unavailable'))),
+    };
+    const { activate } = await import('./extension');
+
+    await activate({
+      extensionUri: {},
+      extension: { id: 'koltyakov.varro' },
+      globalState,
+      workspaceState: {},
+      subscriptions: [],
+    } as never);
+
+    await vi.waitFor(() => {
+      expect(loggerMock.warn).toHaveBeenCalledWith(
+        "Failed to remember Varro's Secondary Sidebar registration: storage unavailable"
+      );
     });
   });
 
-  it('resets and opens the manifest view when placement cannot be reapplied', async () => {
+  it('reveals the saved standard-host location on every reveal without moving or resetting it', async () => {
+    const { activate } = await import('./extension');
+    await activate({
+      extensionUri: {},
+      extension: { id: 'koltyakov.varro' },
+      workspaceState: {},
+      subscriptions: [],
+    } as never);
+    const reveal = registerCommandsMock.mock.calls[0]?.[4];
+
+    expect(reveal).toBeTypeOf('function');
+    executeCommandMock.mockClear();
+    await (reveal as () => Promise<void>)();
+    await (reveal as () => Promise<void>)();
+
+    expect(executeCommandMock.mock.calls).toEqual([['varro.chat.focus'], ['varro.chat.focus']]);
+  });
+
+  it('does not reset a saved standard-host placement when revealing fails', async () => {
     const { activate } = await import('./extension');
     await activate({
       extensionUri: {},
@@ -840,22 +1076,11 @@ describe('extension activation', () => {
     const reveal = registerCommandsMock.mock.calls[0]?.[4];
     expect(reveal).toBeTypeOf('function');
     executeCommandMock.mockClear();
-    executeCommandMock
-      .mockRejectedValueOnce(new Error('move command unavailable'))
-      .mockResolvedValueOnce(undefined);
+    executeCommandMock.mockRejectedValueOnce(new Error('view unavailable'));
 
-    await (reveal as () => Promise<void>)();
+    await expect((reveal as () => Promise<void>)()).rejects.toThrow('view unavailable');
 
-    expect(executeCommandMock.mock.calls).toEqual([
-      [
-        'vscode.moveViews',
-        {
-          viewIds: ['varro.chat'],
-          destinationId: 'workbench.view.extension.varro',
-        },
-      ],
-      ['varro.chat.resetViewLocation'],
-    ]);
+    expect(executeCommandMock.mock.calls).toEqual([['varro.chat.focus']]);
   });
 
   it.each([0, -1, 1.5, 65_536, Number.NaN, Number.POSITIVE_INFINITY])(
@@ -1315,11 +1540,27 @@ describe('extension manifest', () => {
   });
 
   it('activates on Varro use instead of every VS Code startup', () => {
-    expect(packageJson.contributes.views['varro-primary']).toContainEqual(
+    expect(packageJson.contributes.views.varro).toContainEqual(
       expect.objectContaining({ id: 'varro.chat' })
     );
     expect(packageJson.activationEvents).not.toContain('onView:varro.chat');
     expect(packageJson.activationEvents).not.toContain('onStartupFinished');
+  });
+
+  it('declares the chat in Secondary before activation and retains a Primary fallback for restricted forks', () => {
+    expect(packageJson.contributes.viewsContainers.secondarySidebar).toContainEqual(
+      expect.objectContaining({ id: 'varro' })
+    );
+    expect(packageJson.contributes.viewsContainers.activitybar).toContainEqual(
+      expect.objectContaining({ id: 'varro-primary' })
+    );
+    expect(Object.keys(packageJson.contributes.views)).toEqual(['varro']);
+    expect(packageJson.contributes.commands).toContainEqual(
+      expect.objectContaining({ command: 'varro.chat.focusInput' })
+    );
+    expect(packageJson.contributes.commands).not.toContainEqual(
+      expect.objectContaining({ command: 'varro.chat.focus' })
+    );
   });
 
   it('contributes a disabled-by-default empty-state histogram setting', () => {

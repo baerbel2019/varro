@@ -105,7 +105,7 @@ export class NativeNotifications implements AttentionNotificationTransport {
       this.macOSHelper = new MacOSNotificationHelper(
         dirname(soundPath),
         storageDirectory,
-        (file, args) => this.run({ file, args }, this.abort.signal)
+        (file, args, timeout) => this.run({ file, args, timeout }, this.abort.signal)
       );
     }
   }

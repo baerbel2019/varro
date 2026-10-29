@@ -81,8 +81,27 @@ for (const theme of ['dark', 'light']) {
         .locator('.interactive-input-part')
         .screenshot({ path: testInfo.outputPath('quota-warning.png') });
 
-      const usage = warning.getByRole('link', { name: '3 resets available' });
+      const resets = warning.getByRole('button', { name: '3 resets available' });
+      await resets.click();
+      const popup = warning.locator('.provider-limit-popup');
+      await expect(popup).toBeVisible();
+      await expect(popup).toContainText('Expiration details unavailable for 3 resets.');
+      const usage = popup.locator('.provider-limit-reset-link');
       await expect(usage).toHaveAttribute('href', 'https://github.com/settings/billing');
+      await expect
+        .poll(() =>
+          usage.evaluate((element) => {
+            const rect = element.getBoundingClientRect();
+            return element.contains(
+              document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+            );
+          })
+        )
+        .toBe(true);
+      await page.screenshot({
+        path: testInfo.outputPath('reset-popup.png'),
+        animations: 'disabled',
+      });
       await page.evaluate(() => {
         // Mirror VS Code's window-level link opener, which ignores defaultPrevented.
         window.addEventListener('click', (event) => {
@@ -95,7 +114,7 @@ for (const theme of ['dark', 'light']) {
         });
       });
       await usage.click();
-      await expect(warning.locator('.provider-limit-popup')).toHaveCount(0);
+      await expect(popup).toBeVisible();
       expect(
         await page.evaluate(() => {
           // SAFETY: The controlled E2E harness records external navigation requests on this global.
@@ -112,6 +131,9 @@ for (const theme of ['dark', 'light']) {
           return harness.__varroE2E?.externalUrls;
         })
       ).toEqual(['https://github.com/settings/billing', 'https://github.com/settings/billing']);
+      await page.keyboard.press('Escape');
+      await expect(popup).toHaveCount(0);
+      await expect(resets).toBeFocused();
       await warning.getByRole('button', { name: /Dismiss .* quota warning/ }).click();
       await expect(warning).toHaveCount(0);
 

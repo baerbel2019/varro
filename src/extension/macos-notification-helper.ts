@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { asRecord } from '../shared/type-utils';
 import { readEditorVisibility } from './editor-window-visibility';
 
-type RunCommand = (file: string, args: string[]) => Promise<string | void>;
+type RunCommand = (file: string, args: string[], timeout?: number) => Promise<string | void>;
 
 /** Installs the repository-built app in durable extension storage for Launch Services. */
 export class MacOSNotificationHelper {
@@ -83,9 +83,12 @@ export class MacOSNotificationHelper {
       }
     }
     await this.run('/usr/bin/codesign', ['--verify', '--deep', '--strict', app]);
+    // Checksum-versioned apps never change in place, so forced registration is unnecessary.
+    // Launch Services can take longer than the default command timeout even for a valid app.
     await this.run(
       '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
-      ['-f', app]
+      [app],
+      30_000
     );
     return executable;
   }

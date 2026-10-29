@@ -65,6 +65,7 @@ test('runs native Windows inspection after all other projects without relaxing c
   assert.equal(native.test.setupFiles, undefined);
   assert.equal(native.test.fileParallelism, false);
   assert.deepEqual((await projectFiles(native)).toSorted(), [
+    'src/extension/followup-cache.test.ts',
     'src/extension/isolated-process.test.ts',
     'src/extension/windows-process-inspector.integration.test.ts',
   ]);

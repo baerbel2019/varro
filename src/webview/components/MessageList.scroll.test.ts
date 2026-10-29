@@ -24,6 +24,7 @@ import {
   hasAssistantModelChangeBetween,
   installMessageListTestEnvironment,
   installQueuedAnimationFrameMocks,
+  measureTranscriptRows,
   settleBottomFollow,
   reasoningPart,
   testDiffOverlayOwner,
@@ -586,6 +587,7 @@ describe('MessageList auto-scroll', () => {
         await Promise.resolve();
         animationFrames.flush();
       }
+      if (messageCount >= 50) await measureTranscriptRows(list, animationFrames);
       const previousBottom = initialHeight - 400;
       expect(list.scrollTop).toBe(previousBottom);
 
@@ -1304,6 +1306,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 2000;
     list.dispatchEvent(new Event('scroll'));
@@ -1804,6 +1807,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 20 * rowHeight;
     list.dispatchEvent(new Event('scroll'));
@@ -1903,6 +1907,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 20 * 300;
     list.dispatchEvent(new Event('scroll'));
@@ -1992,6 +1997,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -720 }));
     top = 6000;
     list.dispatchEvent(new Event('scroll'));
@@ -2124,6 +2130,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     const userIndex = 20;
     const assistantIndex = 21;
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
@@ -2288,6 +2295,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 1976;
     list.dispatchEvent(new Event('scroll'));
@@ -2831,95 +2839,104 @@ describe('MessageList auto-scroll', () => {
     animationFrames.restore();
   });
 
-  it('invalidates an offscreen active edit height when inline previews are disabled', async () => {
-    const animationFrames = installQueuedAnimationFrameMocks();
-    let list: HTMLDivElement | null = null;
-    let scrollTopValue = 0;
+  it.each([false, true])(
+    'invalidates an offscreen active edit height when inline previews are disabled (reopened: %s)',
+    async (reopened) => {
+      const animationFrames = installQueuedAnimationFrameMocks();
+      let list: HTMLDivElement | null = null;
+      let scrollTopValue = 0;
 
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this === list || this.classList.contains('interactive-list')) {
-        return new DOMRect(0, 0, 500, 400);
-      }
-      if (this.classList.contains('interactive-list-track')) {
-        return new DOMRect(0, 0, 500, 5000);
-      }
-      if (this.dataset.msgId?.startsWith('assistant-')) {
-        const index = Number(this.dataset.msgId.replace('assistant-', ''));
-        return new DOMRect(0, index * 100 - scrollTopValue, 500, 100);
-      }
-      return new DOMRect(0, 0, 500, 40);
-    });
+      vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+        this: HTMLElement
+      ) {
+        if (this === list || this.classList.contains('interactive-list')) {
+          return new DOMRect(0, 0, 500, 400);
+        }
+        if (this.classList.contains('interactive-list-track')) {
+          return new DOMRect(0, 0, 500, 5000);
+        }
+        if (this.dataset.msgId?.startsWith('assistant-')) {
+          const index = Number(this.dataset.msgId.replace('assistant-', ''));
+          return new DOMRect(0, index * 100 - scrollTopValue, 500, 100);
+        }
+        return new DOMRect(0, 0, 500, 40);
+      });
 
-    const editMessageId = 'assistant-0';
-    const edit = toolPart('edit-0', editMessageId, 'call-edit-0');
-    edit.tool = 'apply_patch';
-    edit.state = {
-      status: 'completed',
-      input: {
-        patchText:
-          '*** Begin Patch\n*** Update File: src/app.ts\n@@\n-const value = 1;\n+const value = 2;\n*** End Patch',
-      },
-      output: 'Done',
-      title: 'apply_patch',
-      metadata: {},
-      time: { start: 1, end: 2 },
-    };
-    setShowFileDiffs(true);
-    setState('activeSessionId', 'session-1');
-    setState('sessionStatus', reconcile({ 'session-1': { type: 'busy' } }));
-    replaceMessages(
-      Array.from({ length: 50 }, (_, index) => {
-        const messageId = `assistant-${index}`;
-        return {
-          info: assistantMessage(messageId, { parentID: 'user-1' }),
-          parts:
-            index === 0
-              ? [edit]
-              : [{ ...textPart(`text-${index}`, `Response ${index}`), messageID: messageId }],
-        };
-      })
-    );
+      const editMessageId = 'assistant-20';
+      const edit = toolPart('edit-0', editMessageId, 'call-edit-0');
+      edit.tool = 'apply_patch';
+      edit.state = {
+        status: 'completed',
+        input: {
+          patchText:
+            '*** Begin Patch\n*** Update File: src/app.ts\n@@\n-const value = 1;\n+const value = 2;\n*** End Patch',
+        },
+        output: 'Done',
+        title: 'apply_patch',
+        metadata: {},
+        time: { start: 1, end: 2 },
+      };
+      setShowFileDiffs(true);
+      setState('activeSessionId', 'session-1');
+      setState('sessionStatus', reconcile({ 'session-1': { type: 'busy' } }));
+      replaceMessages(
+        Array.from({ length: 50 }, (_, index) => {
+          const messageId = `assistant-${index}`;
+          return {
+            info: assistantMessage(messageId, { parentID: 'user-1' }),
+            parts:
+              index === 20
+                ? [edit]
+                : [{ ...textPart(`text-${index}`, `Response ${index}`), messageID: messageId }],
+          };
+        })
+      );
 
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
-    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 5000 });
-    Object.defineProperty(list, 'scrollTop', {
-      configurable: true,
-      get: () => scrollTopValue,
-      set: (value: number) => {
-        scrollTopValue = value;
-      },
-    });
-    for (let frame = 0; frame < 4; frame += 1) {
+      for (let mount = 0; mount < (reopened ? 2 : 1); mount += 1) {
+        if (mount > 0) cleanup?.();
+        cleanup = render(() => MessageList(), container!);
+        list = container!.querySelector<HTMLDivElement>('.interactive-list')!;
+        Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
+        Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 5000 });
+        Object.defineProperty(list, 'scrollTop', {
+          configurable: true,
+          get: () => scrollTopValue,
+          set: (value: number) => {
+            scrollTopValue = value;
+          },
+        });
+        for (let frame = 0; frame < 4; frame += 1) {
+          await Promise.resolve();
+          animationFrames.flush();
+        }
+        if (mount === 0) await measureTranscriptRows(list, animationFrames);
+      }
+      list!.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
+      scrollTopValue = 4000;
+      list!.dispatchEvent(new Event('scroll'));
       await Promise.resolve();
       animationFrames.flush();
+      await Promise.resolve();
+
+      expect(container?.querySelector(`[data-msg-id="${editMessageId}"]`)).toBeNull();
+      const topSpacer = () =>
+        Number.parseFloat(
+          container?.querySelector<HTMLElement>('.virtual-spacer-top')?.style.height || '0'
+        );
+      const topPadBefore = topSpacer();
+
+      setShowFileDiffs(false);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(container?.querySelector(`[data-msg-id="${editMessageId}"]`)).toBeNull();
+      // A reopen's initial preview projection already invalidates the old estimate.
+      // Hiding that still-unmounted preview must not restore its old measured height.
+      expect(topSpacer() - topPadBefore).toBe(reopened ? 0 : 60);
+      expect(topPadBefore % 100).toBe(reopened ? 60 : 0);
+      animationFrames.restore();
     }
-    list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
-    scrollTopValue = 2000;
-    list.dispatchEvent(new Event('scroll'));
-    await Promise.resolve();
-    animationFrames.flush();
-    await Promise.resolve();
-
-    expect(container?.querySelector(`[data-msg-id="${editMessageId}"]`)).toBeNull();
-    const topSpacer = () =>
-      Number.parseFloat(
-        container?.querySelector<HTMLElement>('.virtual-spacer-top')?.style.height || '0'
-      );
-    const topPadBefore = topSpacer();
-
-    setShowFileDiffs(false);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(container?.querySelector(`[data-msg-id="${editMessageId}"]`)).toBeNull();
-    expect(topSpacer() - topPadBefore).toBe(60);
-    animationFrames.restore();
-  });
+  );
 
   it('preserves the visible row while invalidating offscreen thinking heights above it', async () => {
     const animationFrames = installQueuedAnimationFrameMocks();
@@ -3002,6 +3019,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 2000;
     list.dispatchEvent(new Event('scroll'));
@@ -3150,6 +3168,7 @@ describe('MessageList auto-scroll', () => {
       animationFrames.flush();
     }
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 1998;
     list.dispatchEvent(new Event('scroll'));
@@ -3246,6 +3265,7 @@ describe('MessageList auto-scroll', () => {
       container?.querySelector('.interactive-list-track')?.classList.contains('virtualized')
     ).toBe(true);
 
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
     scrollTopValue = 3000;
     list.dispatchEvent(new Event('scroll'));
@@ -3322,6 +3342,12 @@ describe('MessageList auto-scroll', () => {
         scrollTopValue = value;
       },
     });
+    await measureTranscriptRows(list, animationFrames);
+    list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
+    list.scrollTop = 0;
+    list.dispatchEvent(new Event('scroll'));
+    await Promise.resolve();
+    animationFrames.flush();
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     const firstRow = container?.querySelector('[data-msg-id="assistant-0"]') as HTMLDivElement;
     const rowObserver = observers.find((observer) => observer.targets.has(firstRow));
@@ -3417,6 +3443,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -3522,6 +3549,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -3620,6 +3648,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -3713,6 +3742,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -50 }));
     scrollTopValue = 4450;
     list.dispatchEvent(new Event('scroll'));
@@ -5697,6 +5727,7 @@ describe('MessageList auto-scroll', () => {
       await Promise.resolve();
       animationFrames.flush();
     }
+    await measureTranscriptRows(list, animationFrames);
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
     scrollTopValue = messageTrackHeight - list.clientHeight - 220;
     list.dispatchEvent(new Event('scroll'));

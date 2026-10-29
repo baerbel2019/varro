@@ -564,8 +564,21 @@ describe.skipIf(!process.env.VARRO_OPENCODE_TEST_BINARY)('released managed start
           );
           expect(prompts.warning).not.toHaveBeenCalled();
           if (credentialLaunch) {
+            phase = 'recovered replacement stream admission';
+            const streamDeadline = Date.now() + 5000;
+            while (
+              attached.status.state === 'running' &&
+              attached.status.eventStream !== 'healthy' &&
+              Date.now() < streamDeadline
+            )
+              await new Promise<void>((done) => setTimeout(done, 50));
+            expect(attached.status).toMatchObject({ state: 'running', eventStream: 'healthy' });
+            expect(attached.isAttachOnly).toBe(true);
+            const listeners = await findListeningPids(replacementPort);
+            expect(listeners).toHaveLength(1);
+            phase = 'recovered replacement restart rejection';
             await expect(attached.restart()).rejects.toThrow('attach-only');
-            expect(await findListeningPids(replacementPort)).toHaveLength(1);
+            expect(await findListeningPids(replacementPort)).toEqual(listeners);
           }
           return;
         }

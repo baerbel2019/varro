@@ -10,14 +10,49 @@ const input = () => ({
 });
 
 describe('one-shot generation dispatch', () => {
-  it('falls back only for the exact selected model admission error', async () => {
+  it.each([false, true])(
+    'prefers the text route when the legacy alias exists: %s',
+    async (legacy) => {
+      const paths = {
+        '/api/experimental/generate/text': { post: {} },
+      };
+      if (legacy) Object.assign(paths, specification.paths);
+      const request = vi
+        .fn()
+        .mockResolvedValueOnce({
+          paths,
+        })
+        .mockResolvedValueOnce({ data: { text: 'Done' } });
+      expect(await tryGenerateOneShot({ apiVersion: 2, request }, input())).toEqual({
+        text: 'Done',
+      });
+      expect(request.mock.calls[1]?.[1]).toBe('/api/experimental/generate/text');
+    }
+  );
+  it('does not retry through the legacy alias after a canonical-route failure', async () => {
     const request = vi
       .fn()
-      .mockResolvedValueOnce(specification)
-      .mockRejectedValueOnce(new Error('400 Model unavailable: test/small'));
-    expect(await tryGenerateOneShot({ apiVersion: 2, request }, input())).toBeNull();
+      .mockResolvedValueOnce({
+        paths: {
+          ...specification.paths,
+          '/api/experimental/generate/text': { post: {} },
+        },
+      })
+      .mockRejectedValueOnce(new Error('503 Provider failed'));
+    await expect(tryGenerateOneShot({ apiVersion: 2, request }, input())).rejects.toThrow('503');
     expect(request).toHaveBeenCalledTimes(2);
   });
+  it.each(['400 Model unavailable: test/small', '404 Model not found: test/small'])(
+    'falls back only for the exact selected model admission error %s',
+    async (message) => {
+      const request = vi
+        .fn()
+        .mockResolvedValueOnce(specification)
+        .mockRejectedValueOnce(new Error(message));
+      expect(await tryGenerateOneShot({ apiVersion: 2, request }, input())).toBeNull();
+      expect(request).toHaveBeenCalledTimes(2);
+    }
+  );
   it('rejects malformed output without offering another generation', async () => {
     const request = vi
       .fn()
@@ -52,16 +87,31 @@ describe('one-shot generation dispatch', () => {
     );
     expect(request).toHaveBeenCalledTimes(2);
   });
-  it.each(['401 Unauthorized', '503 Unavailable', 'Request timed out', '404 Model not found'])(
-    'does not offer a fallback after generation rejects with %s',
+  it.each([
+    '401 Unauthorized',
+    '503 Unavailable',
+    'Request timed out',
+    '404 Model not found',
+    '404 Model not found: test/other',
+    '502 Model not found: test/small',
+  ])('does not offer a fallback after generation rejects with %s', async (message) => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(specification)
+      .mockRejectedValueOnce(new Error(message));
+    await expect(tryGenerateOneShot({ apiVersion: 2, request }, input())).rejects.toThrow(message);
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+  it.each(['400 Model unavailable: test/small', '404 Model not found: test/small'])(
+    'does not fall back for a model admission error without an explicit model: %s',
     async (message) => {
       const request = vi
         .fn()
         .mockResolvedValueOnce(specification)
         .mockRejectedValueOnce(new Error(message));
-      await expect(tryGenerateOneShot({ apiVersion: 2, request }, input())).rejects.toThrow(
-        message
-      );
+      await expect(
+        tryGenerateOneShot({ apiVersion: 2, request }, { ...input(), model: null })
+      ).rejects.toThrow(message);
       expect(request).toHaveBeenCalledTimes(2);
     }
   );

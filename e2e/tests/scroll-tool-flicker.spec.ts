@@ -189,30 +189,7 @@ test('mocked session playback has no frame-level flicker', async ({ page }) => {
   });
 });
 
-test('running tool updates preserve the node and its current entrance animation', async ({
-  page,
-}) => {
-  await page.addInitScript(() => {
-    document.addEventListener('animationstart', (event) => {
-      if (
-        !(event.target instanceof HTMLElement) ||
-        event.target.dataset.activityPartId !== 'tool-active-0'
-      )
-        return;
-      if (event.animationName !== 'assistant-active-activity-in') return;
-      const animation = event.target
-        .getAnimations()
-        .find(
-          (candidate) =>
-            candidate instanceof CSSAnimation && candidate.animationName === event.animationName
-        );
-      if (animation) {
-        animation.pause();
-        animation.currentTime = 70;
-      }
-    });
-  });
-  // Only the initial tray admission animates; queued tools reuse it without an entrance.
+test('running tool updates preserve the node without an entrance animation', async ({ page }) => {
   await page.goto('/e2e/harness/index.html?scenario=tool-cards&activeTray=1&activeTrayCount=1');
   const item = page.locator(
     '.assistant-active-activity-item[data-activity-part-id="tool-active-0"]'
@@ -221,16 +198,7 @@ test('running tool updates preserve the node and its current entrance animation'
   const result = await item.evaluate(async (original) => {
     const control = original.querySelector<HTMLButtonElement>('button')!;
     control.focus();
-    const entrance = original
-      .getAnimations()
-      .find(
-        (animation) =>
-          animation instanceof CSSAnimation &&
-          animation.animationName === 'assistant-active-activity-in'
-      );
-    if (!entrance) throw new Error('Expected the real CSS entrance animation');
-    entrance.pause();
-    entrance.currentTime = 70;
+    const initialAnimation = getComputedStyle(original).animationName;
     // SAFETY: The controlled tool-cards harness exposes this typed test API.
     const harness = (window as HarnessWindow).__varroE2E;
     const part = harness
@@ -264,12 +232,10 @@ test('running tool updates preserve the node and its current entrance animation'
     );
     const snapshot = {
       sameNode: current === original,
-      sameAnimation: current?.getAnimations().includes(entrance) ?? false,
-      currentTime: entrance.currentTime,
-      playState: entrance.playState,
+      initialAnimation,
+      updatedAnimation: current ? getComputedStyle(current).animationName : null,
       controlPreserved: control.isConnected && document.activeElement === control,
     };
-    entrance.play();
     return snapshot;
   });
   await expect(item.locator('.tool-invocation-title')).toHaveText('Search: updated-sources');
@@ -279,11 +245,8 @@ test('running tool updates preserve the node and its current entrance animation'
   expect
     .soft(result.sameNode, 'A running object update must not remount the activity item')
     .toBe(true);
-  expect
-    .soft(result.sameAnimation, 'The existing CSS animation must survive the update')
-    .toBe(true);
-  expect.soft(result.currentTime).toBe(70);
-  expect.soft(result.playState).toBe('paused');
+  expect.soft(result.initialAnimation).toBe('none');
+  expect.soft(result.updatedAnimation).toBe('none');
   expect(result.controlPreserved, 'The visible tool must keep its controls and focus').toBe(true);
 });
 
@@ -309,8 +272,13 @@ test('tool completion preserves the running outer node until direct grouping', a
     await Promise.all(
       originals.flatMap((node) => node!.getAnimations().map((animation) => animation.finished))
     );
-    const samples: Array<{ sameNodes: boolean; retained: number; exiting: number; count: number }> =
-      [];
+    const samples: Array<{
+      sameNodes: boolean;
+      retained: number;
+      exiting: number;
+      count: number;
+      animating: boolean;
+    }> = [];
     for (const part of running.toReversed()) {
       if (part.state.status !== 'running') throw new Error('Expected a running tool');
       harness.replayServerEvent({
@@ -344,6 +312,9 @@ test('tool completion preserves the running outer node until direct grouping', a
         retained: current.filter((node) => node.classList.contains('is-completed')).length,
         exiting: current.filter((node) => node.classList.contains('is-exiting')).length,
         count: current.length,
+        animating: [...document.querySelectorAll('.assistant-active-activity-item')].some(
+          (node) => getComputedStyle(node).animationName !== 'none'
+        ),
       });
     } while (performance.now() - start < 3_500);
     return { samples, originalsDisconnected: originals.every((node) => !node!.isConnected) };
@@ -361,6 +332,7 @@ test('tool completion preserves the running outer node until direct grouping', a
     'Completion must not replace a running outer node'
   ).toBe(true);
   expect(result.samples.at(-1)?.count).toBe(0);
+  expect(result.samples.every((sample) => !sample.animating)).toBe(true);
   expect(result.originalsDisconnected).toBe(true);
   await expect(items).toHaveCount(1);
   await expect(items).toHaveAttribute('data-activity-part-id', 'tool-active-1');

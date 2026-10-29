@@ -210,6 +210,26 @@ describe('VS Code drop payload parsers', () => {
     await expect(collectDroppedPaths(dataTransfer)).resolves.toEqual(['/repo/src/a.ts']);
   });
 
+  it.each(['text/uri-list', 'application/vnd.code.uri-list', 'ResourceURLs', 'CodeFiles'])(
+    'does not extract local paths from external URLs in %s',
+    async (type) => {
+      const url = 'https://example.com/repo/private.txt';
+      const value = ['ResourceURLs', 'CodeFiles'].includes(type) ? JSON.stringify([url]) : url;
+      await expect(collectDroppedPaths(makeDataTransfer({ [type]: value }))).resolves.toEqual([]);
+    }
+  );
+
+  it('keeps file-backed resources but ignores web resources in mixed editor drops', async () => {
+    const dataTransfer = makeDataTransfer({
+      CodeEditors: JSON.stringify([
+        { resource: 'https://example.com/repo/private.txt' },
+        { resource: 'file:///repo/src/a.ts' },
+      ]),
+    });
+
+    await expect(collectDroppedPaths(dataTransfer)).resolves.toEqual(['/repo/src/a.ts']);
+  });
+
   it('tolerates a getData implementation that throws for a type', async () => {
     // SAFETY: The fixture provides the unknown fields read by this statement.
     const dataTransfer = fixture<DataTransfer>({
@@ -274,6 +294,8 @@ describe('dropped path decoding', () => {
     ['vscode-file://vscode-app/repo/a.ts', '/repo/a.ts'],
     ['file://server/share/a.ts', '//server/share/a.ts'],
     ['file:///repo/with%20space.ts', '/repo/with space.ts'],
+    ['vscode-resource://file///repo/a.ts', '/repo/a.ts'],
+    ['vscode-remote://ssh-remote+host/repo/a.ts', '/repo/a.ts'],
   ])('decodes %s', (input, expected) => {
     expect(parseDroppedText(input)).toEqual([expected]);
   });
@@ -309,6 +331,18 @@ describe('dropped path decoding', () => {
 
   it('ignores an unparseable url scheme', () => {
     expect(parseDroppedText('http://')).toEqual([]);
+  });
+
+  it.each([
+    'https://example.com/repo/private.txt',
+    'http://example.com/repo/private.txt',
+    'ftp://example.com/repo/private.txt',
+    'custom:///repo/private.txt',
+    'untitled:/repo/private.txt',
+    'git:/repo/private.txt?ref=HEAD',
+  ])('does not turn the non-filesystem URL %s into a local path', (url) => {
+    expect(parseDroppedText(url)).toEqual([]);
+    expect(parseDroppedText(JSON.stringify({ resource: url }))).toEqual([]);
   });
 });
 

@@ -50,6 +50,7 @@ describe('ServerStatus', () => {
     expect(container?.textContent).toContain('Connecting to OpenCode...');
     expect(container?.textContent).not.toContain('Starting OpenCode...');
     expect(container?.textContent).not.toContain('Spawning the local server');
+    expect(container?.querySelectorAll('.loading-dot')).toHaveLength(3);
   });
 
   it('shows a pulsing Varro logo while server detection is pending', () => {

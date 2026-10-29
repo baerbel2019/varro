@@ -667,6 +667,27 @@ describe('ModelsPanel', () => {
     expect(findButton(dialog, 'Save changes')?.disabled).toBe(true);
   });
 
+  it.each([undefined, false, true])(
+    'gates the native decision section on debug visibility %s',
+    async (visible) => {
+      clientMocks.decisionProviderStatus.mockResolvedValue({
+        jev: { connected: false, credentialSource: null, model: 'jev-latest', autoApprove: false },
+        native: {
+          visible,
+          supported: true,
+          model: null,
+          models: [{ providerID: 'fixture', modelID: 'reviewer', name: 'Reviewer' }],
+        },
+      });
+      cleanup = render(() => ModelsPanel(), container!);
+      await vi.waitFor(() => expect(clientMocks.decisionProviderStatus).toHaveBeenCalled());
+      await Promise.resolve();
+      expect(!!container?.querySelector('select[aria-label="Native permission reviewer"]')).toBe(
+        visible === true
+      );
+    }
+  );
+
   it('adds Jev from the provider actions menu and shows it above providers', async () => {
     const disconnected = {
       jev: {
@@ -719,26 +740,34 @@ describe('ModelsPanel', () => {
     await vi.waitFor(() => expect(container?.querySelector('.decision-provider')).toBeNull());
   });
 
-  it('strikes through the auto-approve model tag while Jev handles auto-approve', async () => {
-    clientMocks.decisionProviderStatus.mockResolvedValue({
-      jev: {
-        connected: true,
-        credentialSource: 'secret',
-        model: 'jev-latest',
-        autoApprove: true,
-      },
-    });
-    cleanup = render(() => ModelsPanel(), container!);
+  it.each(['Jev', 'native'])(
+    'marks the chat judge as fallback while %s handles auto-approve',
+    async (reviewer) => {
+      clientMocks.decisionProviderStatus.mockResolvedValue({
+        native: {
+          supported: true,
+          model: reviewer === 'native' ? { providerID: 'typesafe-ai', modelID: 'jev' } : null,
+          models: [],
+        },
+        jev: {
+          connected: true,
+          credentialSource: 'secret',
+          model: 'jev-latest',
+          autoApprove: reviewer === 'Jev',
+        },
+      });
+      cleanup = render(() => ModelsPanel(), container!);
 
-    await vi.waitFor(() =>
-      expect(container?.querySelector('.models-route-tag-approve')?.classList).toContain(
-        'models-route-tag-overridden'
-      )
-    );
-    expect(container?.querySelector('.models-route-tag-approve')?.getAttribute('aria-label')).toBe(
-      'Auto-approve model (TypeSafe Jev decides first; used only if Jev fails)'
-    );
-  });
+      await vi.waitFor(() =>
+        expect(container?.querySelector('.models-route-tag-approve')?.classList).toContain(
+          'models-route-tag-overridden'
+        )
+      );
+      expect(
+        container?.querySelector('.models-route-tag-approve')?.getAttribute('aria-label')
+      ).toBe('Auto-approve chat fallback (a decision model reviews first)');
+    }
+  );
 
   it.each(['Fast', 'Ultrafast'])('shows a dimmed %s label after the flash icons', async (speed) => {
     setState('providers', 0, 'models', 'gpt-5', 'name', `Claude Opus 5 ${speed}`);

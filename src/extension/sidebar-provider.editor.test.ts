@@ -2256,7 +2256,7 @@ describe('SidebarProvider editor panels', () => {
     await provider.openSessionInEditor('session-1');
     await provider.openSessionInSidebar('session-1');
 
-    expect(getVscodeMock().commands.executeCommand).toHaveBeenCalledWith('varro.chat.focus');
+    expect(getVscodeMock().commands.executeCommand).toHaveBeenCalledWith('varro.chat.focusInput');
     expect(editor.panel.dispose).toHaveBeenCalledOnce();
     await provider.handleMessage({ type: 'ready' });
     await provider.handleMessage({

@@ -19,7 +19,7 @@ OpenCode remains responsible for agents, providers, models, commands, skills, MC
 1. [Install Varro](https://marketplace.visualstudio.com/items?itemName=koltyakov.varro).
 2. Install [OpenCode v2](https://opencode.ai/v2/docs/). On macOS, Linux, or WSL, run `npm install -g @opencode/cli`. On native Windows, download the standalone CLI.
 3. Connect a provider with `opencode auth login` or `/connect` in Varro.
-4. Open a folder, select `Varro` in the Activity Bar, and start a session. Varro handles the server connection.
+4. Open a folder, select `Varro` in the Secondary Side Bar, and start a session. You can also run `Varro: Focus Chat` from the Command Palette. Varro handles the server connection.
 
 Install OpenCode where Varro runs: the Windows CLI for native Windows, or inside WSL for a WSL window. Add it to `PATH` or set `varro.server.command` to its executable path.
 
@@ -137,7 +137,7 @@ Global configuration reloads when OpenCode is idle. Project changes may need `Va
 
 - [VS Code](https://code.visualstudio.com/) or [VSCodium](https://vscodium.com/) 1.107 or newer
 - [Node.js](https://nodejs.org/) 22.22.2+ on Node 22, or Node 24.15.0+
-- [OpenCode v2 CLI](https://opencode.ai/v2/docs/) 2.0.5+ recommended, or [v1 CLI](https://opencode.ai/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.1.4 and v1 1.19.4
+- [OpenCode v2 CLI](https://opencode.ai/v2/docs/) 2.0.5+ recommended, or [v1 CLI](https://opencode.ai/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.2.1 and v1 1.19.5
 - A trusted, non-virtual workspace. Remote workspaces run Varro and OpenCode on the remote extension host
 
 ## Documentation
