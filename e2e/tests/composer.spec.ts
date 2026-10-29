@@ -68,6 +68,40 @@ test('creates a session and sends a prompt through the mocked bridge', async ({ 
   );
 });
 
+test('preserves multiline native text insertion through send', async ({ page }) => {
+  await page.goto('/e2e/harness/index.html?scenario=blank');
+  await waitForHarnessStartup(page);
+  const composer = page.getByRole('textbox', { name: 'Message composer' }).first();
+  await composer.click();
+  const prompt = 'first line\nsecond line\n\nlast line';
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send('Input.insertText', { text: prompt });
+    await composer.press('Enter');
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const harness = window as Window & {
+            __varroE2E?: {
+              requests: Array<{
+                path: string;
+                body?: { parts?: Array<{ type: string; text?: string }> };
+              }>;
+            };
+          };
+          return harness.__varroE2E?.requests
+            .findLast((request) =>
+              new URL(request.path, 'http://varro.test').pathname.endsWith('/prompt_async')
+            )
+            ?.body?.parts?.find((part) => part.type === 'text')?.text;
+        })
+      )
+      .toBe(prompt);
+  } finally {
+    await cdp.detach();
+  }
+});
+
 test('pastes an absolute path as immediately editable text without command suggestions', async ({
   page,
 }) => {

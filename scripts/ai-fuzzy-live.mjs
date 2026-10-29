@@ -1221,7 +1221,21 @@ export class CdpController {
 
   readComposerText() {
     return this.evaluate(
-      `document.querySelector('[aria-label="Message composer"]')?.textContent ?? ''`
+      `(() => {
+        const editor = document.querySelector('[aria-label="Message composer"]');
+        if (!editor) return '';
+        // Match RichComposerArea's logical text, not textContent, which drops BRs.
+        const read = (parent) => {
+          const nodes = [...parent.childNodes];
+          return nodes.map((node) => {
+            if (node.nodeType === Node.TEXT_NODE) return (node.textContent ?? '').replaceAll('\u200B', '');
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+            if (node.tagName === 'BR') return nodes.length === 1 ? '' : '\\n';
+            return node.dataset.chipMarker || read(node);
+          }).join('');
+        };
+        return read(editor);
+      })()`
     );
   }
 

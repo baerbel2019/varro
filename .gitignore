@@ -11,3 +11,4 @@ varro-playback.db*
 research_notes/
 reports/
 logs/
+.vitest/
