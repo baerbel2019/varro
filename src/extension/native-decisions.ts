@@ -1,4 +1,4 @@
-import type { GenerateDecisionsInput } from '@opencode/client';
+import type { ExperimentalGenerateDecisionsInput } from '@opencode/client';
 import type {
   AutoApproveJudgeReference,
   AutoApproveJudgeResponse,
@@ -66,7 +66,7 @@ export class NativeDecisions {
     const signal = AbortSignal.timeout(5000);
     if (!(await this.supported(signal)))
       throw new Error('Native decision generation is unavailable');
-    const questions: GenerateDecisionsInput['questions'] = Object.entries(
+    const questions: ExperimentalGenerateDecisionsInput['questions'] = Object.entries(
       permissionDecisionQuestions()
     ).map(([name, question]) =>
       question.type === 'choice'
@@ -81,7 +81,7 @@ export class NativeDecisions {
           }
         : { type: 'predicate', name, instructions: question.instructions }
     );
-    const body: GenerateDecisionsInput = {
+    const body: ExperimentalGenerateDecisionsInput = {
       model: { providerID: model.providerID, id: model.modelID },
       input: [{ type: 'text', text: JSON.stringify({ permission, priorUserDecisions }) }],
       questions,

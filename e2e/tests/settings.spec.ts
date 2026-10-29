@@ -305,28 +305,31 @@ test('chat font changes preserve main typography proportions and a detached anch
   );
   const anchor = await list.evaluate((element) => {
     const bounds = element.getBoundingClientRect();
-    const row = [...element.querySelectorAll<HTMLElement>('[data-msg-id]')].find((candidate) => {
-      const rect = candidate.getBoundingClientRect();
-      return rect.bottom > bounds.top && rect.top < bounds.bottom;
-    });
-    if (!row?.dataset.msgId) throw new Error('Visible message anchor is not mounted');
-
+    // Match the reflow owner's fully painted anchor, not a clipped paragraph in the
+    // first intersecting row whose wrapping can change above the actual destination.
     const blocks = [
-      ...row.querySelectorAll<HTMLElement>(
-        '.rendered-markdown :is(p, li, pre, table, blockquote, h1, h2, h3, h4, h5, h6)'
+      ...element.querySelectorAll<HTMLElement>(
+        '[data-assistant-render-key] :is(p, li, pre, table, h1, h2, h3, h4, h5, h6)'
       ),
+      ...element.querySelectorAll<HTMLElement>('.user-message-card'),
     ];
-    let block = blocks.find((candidate) => candidate.getBoundingClientRect().bottom > bounds.top);
-    while (block && block.getBoundingClientRect().top < bounds.top) {
-      const next = blocks[blocks.indexOf(block) + 1];
-      if (!next || next.getBoundingClientRect().top >= bounds.bottom) break;
-      block = next;
-    }
-    if (!block) throw new Error('Visible Markdown anchor is not mounted');
+    const block = blocks
+      .map((candidate) => ({ candidate, rect: candidate.getBoundingClientRect() }))
+      .filter(
+        ({ rect }) =>
+          rect.top >= bounds.top + 8 && rect.bottom <= bounds.bottom - 8 && rect.height > 8
+      )
+      .toSorted((left, right) => left.rect.top - right.rect.top)[0]?.candidate;
+    const row = block?.closest<HTMLElement>('[data-msg-id]');
+    if (!block || !row?.dataset.msgId)
+      throw new Error('Fully visible reflow anchor is not mounted');
 
     return {
       messageId: row.dataset.msgId,
       text: block.innerText,
+      selector: block.classList.contains('user-message-card')
+        ? '.user-message-card'
+        : `.rendered-markdown ${block.tagName}`,
       top: block.getBoundingClientRect().top - bounds.top,
     };
   });
@@ -383,11 +386,9 @@ test('chat font changes preserve main typography proportions and a detached anch
       const row = [...element.querySelectorAll<HTMLElement>('[data-msg-id]')].find(
         (candidate) => candidate.dataset.msgId === target.messageId
       );
-      const block = [
-        ...(row?.querySelectorAll<HTMLElement>(
-          '.rendered-markdown :is(p, li, pre, table, blockquote, h1, h2, h3, h4, h5, h6)'
-        ) ?? []),
-      ].find((candidate) => candidate.innerText === target.text);
+      const block = [...(row?.querySelectorAll<HTMLElement>(target.selector) ?? [])].find(
+        (candidate) => candidate.innerText === target.text
+      );
       return block?.isConnected
         ? block.getBoundingClientRect().top - element.getBoundingClientRect().top
         : null;

@@ -89,7 +89,7 @@
   "dependencies": {
     "@imagemagick/magick-wasm": "0.0.45",
     "@opencode-ai/sdk": "^1.19.5",
-    "@opencode/client": "^2.2.0",
+    "@opencode/client": "^2.2.1",
     "cross-spawn": "7.0.6",
     "dompurify": "3.4.17",
     "highlight.js": "11.12.0",
@@ -744,7 +744,7 @@
     "vscode": "^1.107.0"
   },
   "volta": {
-    "node": "24.22.1",
+    "node": "24.22.2",
     "npm": "12.2.1"
   },
   "allowScripts": {

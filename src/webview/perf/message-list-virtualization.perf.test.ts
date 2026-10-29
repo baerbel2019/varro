@@ -11,12 +11,14 @@ const {
   messageRowMounts,
   stickyPreviewMessageReads,
   stickyPreviewSelectionPasses,
+  selectedStickyPrompt,
 } = vi.hoisted(() => ({
   activityGroupingPasses: { value: 0 },
   assistantDialogSummaryPasses: { value: 0 },
   messageRowMounts: { current: 0, peak: 0 },
   stickyPreviewMessageReads: { value: 0 },
   stickyPreviewSelectionPasses: { value: 0 },
+  selectedStickyPrompt: { id: '' },
 }));
 
 /* oxlint-disable anti-slop/no-module-mocking -- This benchmark isolates MessageList module integration from unrelated render work. */
@@ -81,7 +83,14 @@ vi.mock('../components/message-list/sticky-preview', async (importOriginal) => {
           return target[property as keyof typeof target];
         },
       });
-      return actual.getStickyUserMessagePreview(countedMessages, args[1], args[2], args[3]);
+      const preview = actual.getStickyUserMessagePreview(
+        countedMessages,
+        args[1],
+        args[2],
+        args[3]
+      );
+      selectedStickyPrompt.id = preview?.id ?? '';
+      return preview;
     },
   };
 });
@@ -219,8 +228,8 @@ function resizeObserverEntry(
   };
 }
 
-// Exact-height bootstrap mounts the full fixture before bounding the window. Allow for DOM
-// setup under parallel suite load; the assertions below enforce row and work-count budgets.
+// Initial and subsequent mounts must stay bounded. Allow for DOM setup under parallel suite
+// load; the assertions below enforce row and work-count budgets rather than elapsed time.
 describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
   beforeEach(() => {
     resetDefaultAppState();
@@ -230,6 +239,7 @@ describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
     messageRowMounts.peak = 0;
     stickyPreviewMessageReads.value = 0;
     stickyPreviewSelectionPasses.value = 0;
+    selectedStickyPrompt.id = '';
     container = document.createElement('div');
     document.body.appendChild(container);
 
@@ -333,8 +343,8 @@ describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
   });
 
   it('renders only a bounded row window for large transcripts', async () => {
-    // Principle: once the exact-height bootstrap completes, large transcripts must return to a
-    // bounded DOM window with virtual spacers. Rendering the whole transcript is a regression.
+    // Principle: large transcripts must use a bounded DOM window from the initial render,
+    // not mount the whole transcript to measure offscreen rows.
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
       this: HTMLElement
     ) {
@@ -359,11 +369,13 @@ describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
     cleanup = render(() => MessageList(), container!);
     await settlePerfEffects();
 
-    expect(messageRowMounts.peak).toBe(200);
+    expect(messageRowMounts.peak).toBeGreaterThan(0);
+    expect(messageRowMounts.peak).toBeLessThan(80);
     expect(messageRowMounts.current).toBe(container?.querySelectorAll('[data-msg-id]').length);
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(80);
     expect(container?.querySelector('.interactive-item-off-core')).toBeTruthy();
-    expect(container?.querySelector('.virtual-spacer-bottom')).toBeTruthy();
+    expect(container?.querySelector('[data-msg-id="message-0"]')).toBeNull();
+    expect(container?.querySelector('.virtual-spacer-top')).toBeTruthy();
   });
 
   it('bootstraps batched measurements when collapsed activity has exact zero-height rows', async () => {
@@ -666,12 +678,18 @@ describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
       this: HTMLElement
     ) {
-      const index = Number(this.dataset.msgId?.replace('message-', ''));
-      if (this.hasAttribute('data-msg-id')) {
-        return new DOMRect(0, index * 120 - (list?.scrollTop ?? 0), 500, 120);
+      const row = this.closest<HTMLElement>('[data-msg-id]');
+      if (row) {
+        const index = Number(row.dataset.msgId?.replace('message-', ''));
+        return new DOMRect(
+          0,
+          index * 160 - (list?.scrollTop ?? 0),
+          500,
+          this.classList.contains('user-message-card') ? 40 : 160
+        );
       }
       if (this.classList.contains('interactive-list-track')) {
-        return new DOMRect(0, -(list?.scrollTop ?? 0), 500, 24_000);
+        return new DOMRect(0, -(list?.scrollTop ?? 0), 500, 32_000);
       }
       return new DOMRect(0, 0, 500, 500);
     });
@@ -688,13 +706,16 @@ describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
     await settlePerfEffects();
     list = container!.querySelector<HTMLElement>('.interactive-list')!;
     Object.defineProperty(list, 'clientHeight', { configurable: true, value: 500 });
-    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 24_000 });
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 32_000 });
     list.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, bubbles: true }));
-    list.scrollTop = 7_330;
+    list.scrollTop = 7_240;
     list.dispatchEvent(new Event('scroll'));
     await settlePerfEffects();
     await settlePerfEffects();
 
+    const stickyMessageId = selectedStickyPrompt.id;
+    expect(stickyMessageId).toBeTruthy();
+    const stickyMessageIndex = Number(stickyMessageId!.replace('message-', ''));
     stickyPreviewSelectionPasses.value = 0;
     for (let step = 0; step < 20; step += 1) {
       list.scrollTop += 1;
@@ -703,7 +724,7 @@ describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
     }
     expect(stickyPreviewSelectionPasses.value).toBe(0);
 
-    setState('messages', 60, 'parts', 0, (part) =>
+    setState('messages', stickyMessageIndex, 'parts', 0, (part) =>
       part.type === 'text' ? { ...part, text: 'Updated prompt' } : part
     );
     await settlePerfEffects();
@@ -778,10 +799,15 @@ describe('MessageList virtualization perf guards', { timeout: 60_000 }, () => {
     setState('activeSessionId', 'session-1');
 
     cleanup = render(() => MessageList(), container!);
-    await settlePerfEffects();
+    // Let cold tail measurements and initial range selection settle before observing reflow.
+    for (let frame = 0; frame < 8; frame += 1) await settlePerfEffects();
 
     const list = container!.querySelector<HTMLElement>('.interactive-list')!;
     const track = container!.querySelector<HTMLElement>('.interactive-list-track')!;
+    list.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, bubbles: true }));
+    list.scrollTop = 0;
+    list.dispatchEvent(new Event('scroll'));
+    for (let frame = 0; frame < 8; frame += 1) await settlePerfEffects();
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(80);
 
     const initialBottomSpacerHeight = container
