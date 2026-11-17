@@ -1,8 +1,14 @@
 import { produce, reconcile } from 'solid-js/store';
 import type { Command, Provider } from '../types';
 import type { SelectedModel } from './app-state-types';
-import type { McpStatus, ModelPreferences, ProviderLimitStatus } from '../../shared/protocol';
+import type {
+  McpDefaults,
+  McpStatus,
+  ModelPreferences,
+  ProviderLimitStatus,
+} from '../../shared/protocol';
 import { JEV_DECISION_PROVIDER_ID } from '../../shared/protocol';
+import { LARGE_MODEL_CATALOG_THRESHOLD } from '../../shared/provider-order';
 import type { ProviderAuthMethodsByProvider } from '../../shared/opencode-types';
 import { setState, showSessionPicker, state } from './app-state';
 import { postMessage } from './bridge';
@@ -11,7 +17,7 @@ import { STORAGE_KEYS, writeStored } from './state-storage';
 import { writeStoredSelectedModelForWorkspace } from './state-stored-values';
 import { isActiveSessionWorking, isSessionTreeStatusWorking } from './state-session-lifecycle';
 
-export const LARGE_MODEL_CATALOG_THRESHOLD = 50;
+export { LARGE_MODEL_CATALOG_THRESHOLD } from '../../shared/provider-order';
 const MANAGED_MODEL_CATALOG_MARKER = '*';
 const pendingAgentSelections = new Map<string, string>();
 const pendingModelSelections = new Map<string, string>();
@@ -65,16 +71,13 @@ export function getSelectedAgentForSession(sessionId: string | null | undefined)
 }
 
 export function getSelectedMcpsForSession(sessionId: string | null | undefined): string[] | null {
-  if (!sessionId) {
-    return (
-      state.draftSelectedMcps ??
-      Object.entries(state.mcpStatus)
-        .filter(([, value]) => value?.status === 'connected')
-        .map(([name]) => name)
-        .toSorted((a, b) => a.localeCompare(b))
-    );
-  }
-  return state.sessionSelectedMcps[sessionId] || null;
+  const selected = sessionId ? state.sessionSelectedMcps[sessionId] : state.draftSelectedMcps;
+  if (selected) return selected;
+  if (!state.mcpDefaults) return null;
+  return Object.entries(state.mcpDefaults.effective)
+    .filter(([, enabled]) => enabled)
+    .map(([name]) => name)
+    .toSorted((a, b) => a.localeCompare(b));
 }
 
 export function setSelectedModel(
@@ -206,8 +209,17 @@ export function setMcpStatus(status: Record<string, McpStatus>) {
   setState('mcpStatus', status);
 }
 
+export function setMcpDefaults(defaults: McpDefaults) {
+  setState('mcpDefaults', reconcile(defaults));
+}
+
 export function getAvailableMcpNames() {
-  return Object.keys(state.mcpStatus).toSorted((a, b) => a.localeCompare(b));
+  return [
+    ...new Set([
+      ...Object.keys(state.mcpStatus),
+      ...Object.keys(state.mcpDefaults?.effective ?? {}),
+    ]),
+  ].toSorted((a, b) => a.localeCompare(b));
 }
 
 export function setSelectedMcpsForSession(sessionId: string, names: string[]) {
@@ -449,6 +461,31 @@ export function setProviderOrder(providerIDs: readonly string[]) {
   publishModelPreferences(base);
 }
 
+export function isProviderLimitPinned(providerID: string) {
+  return state.providerLimitPins[providerID] !== undefined;
+}
+
+export function canPinProviderLimits(providerID: string) {
+  const limit = getProviderLimit(providerID, null);
+  return limit?.status === 'available' && limit.windows.length > 0;
+}
+
+export function setProviderLimitPin(providerID: string, displayName: string | null) {
+  if (
+    displayName !== null &&
+    !isProviderLimitPinned(providerID) &&
+    !canPinProviderLimits(providerID)
+  )
+    return;
+  const base = getModelPreferencesSnapshot();
+  const next = { ...state.providerLimitPins };
+  if (displayName === null) delete next[providerID];
+  else next[providerID] = displayName.trim();
+  setState('providerLimitPins', reconcile(next));
+  writeStored(STORAGE_KEYS.providerLimitPins, next);
+  publishModelPreferences(base);
+}
+
 export function setModelOrder(providerID: string, modelIDs: readonly string[]) {
   const base = getModelPreferencesSnapshot();
   const prefix = `${providerID}:`;
@@ -659,6 +696,7 @@ export function getModelPreferencesSnapshot(): ModelPreferences {
   const preferences: ModelPreferences = {
     modelVariantSelections: { ...state.modelVariantSelections },
     providerOrder: [...state.providerOrder],
+    providerLimitPins: { ...state.providerLimitPins },
     modelOrder: [...state.modelOrder],
     hiddenProviders: [...state.hiddenProviders],
     hiddenModels: [...state.hiddenModels],
@@ -679,6 +717,7 @@ export function applyModelPreferencesSnapshot(preferences: ModelPreferences) {
   writeStored(STORAGE_KEYS.lastSelectedModel, preferences.lastSelectedModel ?? null);
   setState('modelVariantSelections', reconcile(preferences.modelVariantSelections));
   setState('providerOrder', reconcile(preferences.providerOrder));
+  setState('providerLimitPins', reconcile(preferences.providerLimitPins ?? {}));
   setState('modelOrder', reconcile(preferences.modelOrder));
   setState('hiddenProviders', reconcile(preferences.hiddenProviders));
   setState('hiddenModels', reconcile(preferences.hiddenModels));
@@ -688,6 +727,7 @@ export function applyModelPreferencesSnapshot(preferences: ModelPreferences) {
   setState('modelDisplayNames', reconcile(preferences.modelDisplayNames));
   writeStored(STORAGE_KEYS.modelVariantSelections, preferences.modelVariantSelections);
   writeStored(STORAGE_KEYS.providerOrder, preferences.providerOrder);
+  writeStored(STORAGE_KEYS.providerLimitPins, preferences.providerLimitPins ?? {});
   writeStored(STORAGE_KEYS.modelOrder, preferences.modelOrder);
   writeStored(STORAGE_KEYS.hiddenProviders, preferences.hiddenProviders);
   writeStored(STORAGE_KEYS.hiddenModels, preferences.hiddenModels);

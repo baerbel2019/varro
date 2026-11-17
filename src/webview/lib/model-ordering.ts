@@ -4,24 +4,7 @@ type ProviderModel = Provider['models'][string];
 
 const GPT_MODEL_TIER_ORDER = ['astra', 'sol', 'terra', 'luna'] as const;
 const CLAUDE_MODEL_TIER_ORDER = ['fable', 'opus', 'sonnet', 'haiku'] as const;
-const PROVIDER_PRIORITY = ['openai', 'anthropic', 'github-copilot', 'groq', 'google'] as const;
-
-export function compareProviders(
-  a: Pick<Provider, 'id' | 'name'>,
-  b: Pick<Provider, 'id' | 'name'>
-) {
-  // SAFETY: The surrounding shape or discriminator check establishes the owner type contract used below.
-  const aPriority = PROVIDER_PRIORITY.indexOf(a.id as (typeof PROVIDER_PRIORITY)[number]);
-  // SAFETY: The surrounding shape or discriminator check establishes the owner type contract used below.
-  const bPriority = PROVIDER_PRIORITY.indexOf(b.id as (typeof PROVIDER_PRIORITY)[number]);
-  const priorityOrder =
-    (aPriority < 0 ? PROVIDER_PRIORITY.length : aPriority) -
-    (bPriority < 0 ? PROVIDER_PRIORITY.length : bPriority);
-  if (priorityOrder !== 0) return priorityOrder;
-
-  const nameOrder = a.name.localeCompare(b.name);
-  return nameOrder !== 0 ? nameOrder : a.id.localeCompare(b.id);
-}
+export { compareProviders } from '../../shared/provider-order';
 
 function releaseTime(model: ProviderModel) {
   return modelReleaseTime(model) ?? 0;
@@ -41,6 +24,16 @@ function claudeModelTier(model: ProviderModel) {
     new RegExp(`\\b${name}\\b`).test(identity)
   );
   return tier >= 0 ? tier : CLAUDE_MODEL_TIER_ORDER.length;
+}
+
+function claudeModelVersion(model: ProviderModel): number[] {
+  for (const identity of [model.name, model.id]) {
+    const version = identity.match(
+      /\b(?:claude|fable|opus|sonnet|haiku)[-\s]+v?(\d+(?:[.-]\d{1,3}\b)*)\b/i
+    )?.[1];
+    if (version) return version.split(/[.-]/).map(Number);
+  }
+  return [];
 }
 
 function modelReleaseTime(model: ProviderModel) {
@@ -121,9 +114,16 @@ export function sortProviderModels(
     const deprecatedOrder = Number(a.status === 'deprecated') - Number(b.status === 'deprecated');
     if (deprecatedOrder !== 0) return deprecatedOrder;
 
-    if (providerID === 'varro-claude') {
+    if (providerID === 'varro-claude' || providerID === 'claude-agent') {
       const claudeTierOrder = claudeModelTier(a) - claudeModelTier(b);
       if (claudeTierOrder !== 0) return claudeTierOrder;
+
+      const aVersion = claudeModelVersion(a);
+      const bVersion = claudeModelVersion(b);
+      for (let index = 0; index < Math.max(aVersion.length, bVersion.length); index++) {
+        const versionOrder = (bVersion[index] ?? 0) - (aVersion[index] ?? 0);
+        if (versionOrder !== 0) return versionOrder;
+      }
     }
 
     const aGptTier = gptModelTier(a);

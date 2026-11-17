@@ -31,6 +31,8 @@ import {
   setShowTurnTimer,
   showModelPicker,
   setShowModelPicker,
+  showMcpSettings,
+  setShowMcpSettings,
   setState,
   setSelectedModel,
   applySessionSelectedModelsSnapshot,
@@ -78,18 +80,24 @@ import { closeSideQuestion, sideQuestionView } from '../lib/side-question';
 import { upsertMessageInfo } from '../lib/state-messages';
 import * as imageCompression from '../lib/image-compression';
 import * as imageLoading from '../lib/image-loading';
+import {
+  createChatAnnotation,
+  getChatAnnotationLabel,
+  readChatAnnotation,
+} from '../../shared/chat-annotation';
+import { pastedTextDataUrl } from '../../shared/pasted-text';
 
 describe('composer dictation integration', () => {
   it('places the mic immediately before Attach and focuses the composer on activation', async () => {
     const sent: WebviewMessage[] = [];
     defaultBridgeSend = (message) => {
       sent.push(message);
-      if (message.type !== 'handy/request') return;
+      if (message.type !== 'dictation/request') return;
       queueMicrotask(() =>
         window.dispatchEvent(
           new MessageEvent('message', {
             data: {
-              type: 'handy/result',
+              type: 'dictation/result',
               payload: {
                 requestId: message.payload.requestId,
                 available: true,
@@ -126,7 +134,7 @@ describe('composer dictation integration', () => {
     window.getSelection()?.addRange(range);
     mic?.click();
     expect(document.activeElement).toBe(editor);
-    expect(sent.at(-1)).toMatchObject({ type: 'handy/request', payload: { action: 'start' } });
+    expect(sent.at(-1)).toMatchObject({ type: 'dictation/request', payload: { action: 'start' } });
     await Promise.resolve();
     expect(
       container?.querySelector('.chat-input-container[data-dictation-requested="true"]')
@@ -2096,6 +2104,102 @@ describe('ChatInput', () => {
     }
   });
 
+  it.each([false, true])(
+    'attaches pathless external folders after the drop data expires, remote=%s',
+    async (remoteExtensionHost) => {
+      const bridgeWindow = fixture<{
+        __sendToExtension?: (message: WebviewMessage) => void;
+        __initialWebviewState?: { remoteExtensionHost: boolean };
+      }>(window);
+      const originalSend = bridgeWindow.__sendToExtension;
+      const originalState = bridgeWindow.__initialWebviewState;
+      const sent: WebviewMessage[] = [];
+      bridgeWindow.__sendToExtension = (message) => sent.push(message);
+      bridgeWindow.__initialWebviewState = { remoteExtensionHost };
+      const file = new File(['hello'], 'note.txt');
+      const child = fixture<FileSystemFileEntry>({
+        name: 'note.txt',
+        isFile: true,
+        isDirectory: false,
+        file: (resolve: (value: File) => void) => resolve(file),
+      });
+      const root = fixture<FileSystemDirectoryEntry>({
+        name: 'external',
+        isDirectory: true,
+        createReader: () => {
+          let read = false;
+          return {
+            readEntries: (resolve: (entries: FileSystemEntry[]) => void) => {
+              resolve(read ? [] : [child]);
+              read = true;
+            },
+          };
+        },
+      });
+      const folderFile = new File([], 'external');
+      const transfer = fixture<DataTransfer>({
+        types: ['Files'],
+        files: [folderFile],
+        items: [{ kind: 'file', webkitGetAsEntry: () => root, getAsFile: () => folderFile }],
+        getData: () => '',
+      });
+      try {
+        cleanup = render(() => ChatInput(), container!);
+        dispatchDragEvent(container!.querySelector('.chat-input-container')!, 'drop', transfer);
+        Object.defineProperties(transfer, {
+          files: { value: [] },
+          items: { value: [] },
+        });
+        await vi.waitFor(() =>
+          expect(sent).toContainEqual({
+            type: 'files/drop-content',
+            payload: {
+              directory: { name: 'external', directories: [] },
+              files: [{ name: 'note.txt', content: btoa('hello'), size: 5 }],
+            },
+          })
+        );
+        expect(sent.filter((message) => message.type === 'files/drop-content')).toHaveLength(1);
+      } finally {
+        bridgeWindow.__sendToExtension = originalSend;
+        bridgeWindow.__initialWebviewState = originalState;
+      }
+    }
+  );
+
+  it('keeps external folder drops path-based when the host exposes their path', async () => {
+    const bridgeWindow = fixture<{ __sendToExtension?: (message: WebviewMessage) => void }>(window);
+    const originalSend = bridgeWindow.__sendToExtension;
+    const sent: WebviewMessage[] = [];
+    bridgeWindow.__sendToExtension = (message) => sent.push(message);
+    const createReader = vi.fn();
+    const root = fixture<FileSystemDirectoryEntry>({
+      name: 'external',
+      isDirectory: true,
+      createReader,
+    });
+    const file = fixture<File>({ name: 'external', path: '/outside/external' });
+    const transfer = fixture<DataTransfer>({
+      types: ['Files'],
+      files: [file],
+      items: [{ kind: 'file', getAsFile: () => file, webkitGetAsEntry: () => root }],
+      getData: () => '',
+    });
+    try {
+      cleanup = render(() => ChatInput(), container!);
+      dispatchDragEvent(container!.querySelector('.chat-input-container')!, 'drop', transfer);
+      await vi.waitFor(() =>
+        expect(sent).toContainEqual({
+          type: 'files/drop',
+          payload: { paths: ['/outside/external'] },
+        })
+      );
+      expect(createReader).not.toHaveBeenCalled();
+    } finally {
+      bridgeWindow.__sendToExtension = originalSend;
+    }
+  });
+
   it('rejects per-file and aggregate dropped content limits before FileReader work', async () => {
     const originalFileReader = globalThis.FileReader;
     // SAFETY: The fixture provides the unknown fields read by this statement.
@@ -2310,7 +2414,7 @@ describe('ChatInput', () => {
     );
   });
 
-  it('shows configured MCPs and toggles the picker', async () => {
+  it('shows configured MCP selections independently of connection status and toggles the picker', async () => {
     cleanup = render(() => ChatInput(), container!);
 
     expect(container?.querySelector('.toolbar-mcp-count')).toBeNull();
@@ -2320,6 +2424,12 @@ describe('ChatInput', () => {
       beta: { status: 'disabled' },
       gamma: { status: 'connected' },
       delta: { status: 'failed' },
+    });
+    setState('mcpDefaults', {
+      global: { alpha: true, beta: false, gamma: true, delta: false },
+      project: {},
+      effective: { alpha: true, beta: false, gamma: true, delta: false },
+      editable: true,
     });
 
     const mcpCount = container?.querySelector<HTMLButtonElement>('.toolbar-mcp-count');
@@ -2349,7 +2459,7 @@ describe('ChatInput', () => {
       gamma: { status: 'failed' },
       delta: { status: 'disabled' },
     });
-    expect(container?.querySelector('.toolbar-mcp-count')?.textContent).toContain('0/4');
+    expect(container?.querySelector('.toolbar-mcp-count')?.textContent).toContain('2/4');
 
     setState('mcpStatus', {
       alpha: { status: 'disabled' },
@@ -2357,9 +2467,33 @@ describe('ChatInput', () => {
       gamma: { status: 'disabled' },
       delta: { status: 'disabled' },
     });
+    setState('mcpDefaults', 'effective', { alpha: false, beta: false, gamma: false, delta: false });
     const disconnectedCount = container?.querySelector<HTMLButtonElement>('.toolbar-mcp-count');
     expect(disconnectedCount?.textContent).toContain('0/4');
   });
+
+  it.each(['/mcp', '/mcps'])(
+    'opens Manage MCPs for %s when no servers are configured',
+    async (command) => {
+      setShowMcpSettings(false);
+      setState('mcpStatus', reconcile({}));
+      setState(
+        'mcpDefaults',
+        reconcile({ global: {}, project: {}, effective: {}, editable: true })
+      );
+      setInputText(command);
+      cleanup = render(() => ChatInput(), container!);
+      container
+        ?.querySelector('.rich-composer')
+        ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await flushAsyncWork();
+      expect(showMcpSettings()).toBe(true);
+      expect(container?.querySelector('.dropdown-menu')).toBeNull();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(inputText()).toBe('');
+      setShowMcpSettings(false);
+    }
+  );
 
   it('shows cumulative active-turn duration only while the turn is working', async () => {
     vi.useFakeTimers();
@@ -4665,7 +4799,7 @@ describe('ChatInput', () => {
     expect(sendMessageMock).not.toHaveBeenCalled();
   });
 
-  it.each(['/docs test', '/docs', '  /DOCS test'])(
+  it.each(['/docs test', '/docs', '  /DOCS test', '/docs\ntest\ntest', '/docs\n\ntest'])(
     'renders the leading skill command %s as a chip without changing its send path',
     async (draft) => {
       setState('commands', [
@@ -4690,7 +4824,7 @@ describe('ChatInput', () => {
       await flushAsyncWork();
       expect(runSlashCommandByNameMock).toHaveBeenCalledWith(
         'docs',
-        draft.includes('test') ? 'test' : ''
+        draft.trim().replace(/^\/docs\s*/i, '')
       );
       expect(sendMessageMock).not.toHaveBeenCalled();
     }
@@ -4900,6 +5034,111 @@ describe('ChatInput', () => {
     expect(titles).not.toContain('/skill:browser-bridge');
   });
 
+  it.each(
+    ['bro', 'browser-bridge', 'BROWSER-BRIDGE', 'web'].flatMap((query) =>
+      ['Enter', 'Tab', 'click'].flatMap((selection) =>
+        [' for this', '', '\nKeep this line'].map((suffix) => ({ query, selection, suffix }))
+      )
+    )
+  )(
+    'preserves surrounding draft text when selecting /$query with $selection before "$suffix"',
+    async ({ query, selection, suffix }) => {
+      setState('commands', [
+        {
+          name: 'browser-bridge',
+          description: 'Control a browser',
+          template: 'Control a browser',
+          source: 'skill',
+          hints: ['web'],
+        },
+      ]);
+      const prefix = 'Please use ';
+      setInputText(`${prefix}/${query}${suffix}`);
+      cleanup = render(() => ChatInput(), container!);
+      const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+      if (!editor?.firstChild) throw new Error('Expected populated composer editor');
+      editor.focus();
+      setCollapsedSelection(editor.firstChild, prefix.length + query.length + 1);
+      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'o', bubbles: true }));
+      await flushAsyncWork();
+
+      const items = [...container!.querySelectorAll<HTMLButtonElement>('.completion-slash')];
+      const index = items.findIndex(
+        (item) =>
+          item.querySelector('.composer-completion-title')?.textContent === '/skill:browser-bridge'
+      );
+      expect(index).toBeGreaterThanOrEqual(0);
+      if (selection === 'click') {
+        items[index]!.click();
+      } else {
+        for (let i = 0; i < index; i++) {
+          editor.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+          );
+        }
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: selection, bubbles: true, cancelable: true })
+        );
+      }
+      await flushAsyncWork();
+
+      const expected = `Please use $[browser-bridge]${suffix || ' '}`;
+      expect(inputText()).toBe(expected);
+      expect(editor.querySelector('[data-chip-type="mention-skill"]')?.textContent).toBe(
+        'browser-bridge'
+      );
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      );
+      await flushAsyncWork();
+      expect(sendMessageMock.mock.calls[0]?.[0]).toBe(expected);
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    '/docs/README.md',
+    'Inspect /docs/README.md',
+    'Inspect /docs\\README.md',
+    '//docs/share',
+    'C:\\docs\\README.md',
+    'https://example.com/docs',
+    'prefix/docs',
+    'cost$5',
+    '$5',
+    '$HOME',
+    '$docs-other',
+    'Use /docs-other',
+    'Use $[%ZZ]',
+    'Use $[]',
+  ])('keeps skill-like input %s as ordinary draft text', async (draft) => {
+    setState('commands', [
+      {
+        name: 'docs',
+        description: 'Write a document',
+        template: 'Write a document',
+        source: 'skill',
+      },
+    ]);
+    setInputText(draft);
+    cleanup = render(() => ChatInput(), container!);
+    const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+    if (!editor) throw new Error('Expected composer editor');
+    editor.focus();
+    setCollapsedSelection(editor, editor.childNodes.length);
+    editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'e', bubbles: true }));
+    await flushAsyncWork();
+
+    expect(inputText()).toBe(draft);
+    expect(editor.querySelector('[data-chip-type="mention-skill"]')).toBeNull();
+    expect(container?.querySelector('.composer-completion-menu')).toBeNull();
+    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+
   it.each(['Enter', 'Tab', 'click'])(
     'selects a dollar skill inline with %s and sends it with the prompt',
     async (selection) => {
@@ -4962,35 +5201,38 @@ describe('ChatInput', () => {
     }
   );
 
-  it('adds another skill at the end without replacing the first and restores chips from draft text', async () => {
-    setState('commands', [
-      { name: 'unslop', description: 'Edit writing', template: 'Edit writing', source: 'skill' },
-    ]);
-    setInputText('Use $[browser-bridge] then $un');
-    cleanup = render(() => ChatInput(), container!);
-    const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
-    if (!editor?.lastChild) throw new Error('Expected populated composer editor');
-    editor.focus();
-    setCollapsedSelection(editor.lastChild, editor.lastChild.textContent?.length ?? 0);
-    editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'n', bubbles: true }));
-    await flushAsyncWork();
-    editor.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
-    );
-    await flushAsyncWork();
-    expect(inputText()).toBe('Use $[browser-bridge] then $[unslop] ');
-    expect(
-      Array.from(editor.querySelectorAll('[data-chip-type="mention-skill"]')).map(
-        (chip) => chip.textContent
-      )
-    ).toEqual(['browser-bridge', 'unslop']);
-    editor.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
-    );
-    await flushAsyncWork();
-    expect(sendMessageMock.mock.calls[0]?.[0]).toBe('Use $[browser-bridge] then $[unslop] ');
-    expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
-  });
+  it.each(['$', '/'])(
+    'adds another %s skill without replacing an existing skill chip',
+    async (trigger) => {
+      setState('commands', [
+        { name: 'unslop', description: 'Edit writing', template: 'Edit writing', source: 'skill' },
+      ]);
+      setInputText(`Use $[browser-bridge] then ${trigger}un`);
+      cleanup = render(() => ChatInput(), container!);
+      const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+      if (!editor?.lastChild) throw new Error('Expected populated composer editor');
+      editor.focus();
+      setCollapsedSelection(editor.lastChild, editor.lastChild.textContent?.length ?? 0);
+      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'n', bubbles: true }));
+      await flushAsyncWork();
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+      );
+      await flushAsyncWork();
+      expect(inputText()).toBe('Use $[browser-bridge] then $[unslop] ');
+      expect(
+        Array.from(editor.querySelectorAll('[data-chip-type="mention-skill"]')).map(
+          (chip) => chip.textContent
+        )
+      ).toEqual(['browser-bridge', 'unslop']);
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      );
+      await flushAsyncWork();
+      expect(sendMessageMock.mock.calls[0]?.[0]).toBe('Use $[browser-bridge] then $[unslop] ');
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    }
+  );
 
   it('shows only skills for a bare dollar and dismisses without clearing the draft', async () => {
     setState('commands', [
@@ -5266,6 +5508,238 @@ describe('ChatInput', () => {
     });
   });
 
+  describe('save draft shortcut', () => {
+    function pressSave(options: KeyboardEventInit = {}) {
+      const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
+      editor.focus();
+      const event = new KeyboardEvent('keydown', {
+        key: 's',
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+        ...options,
+      });
+      editor.dispatchEvent(event);
+      return event;
+    }
+
+    it.each([
+      ['Cmd+S', false, true],
+      ['Cmd+S', true, true],
+      ['Ctrl+S', false, false],
+      ['Ctrl+S', true, false],
+    ] as const)('saves with %s when busy is %s', async (_shortcut, busy, metaKey) => {
+      vi.useFakeTimers();
+      setupModelState();
+      setState('activeSessionId', 'session-1');
+      setIsLoading(busy);
+      setState('sessionStatus', 'session-1', { type: busy ? 'busy' : 'idle' });
+      setInputText('Keep this draft');
+      setState('droppedFiles', [
+        { path: '/repo/src/a.ts', relativePath: 'src/a.ts', type: 'file' },
+      ]);
+      setState('terminalSelection', { text: 'npm test', terminalName: 'zsh' });
+      const sendToExtension = vi.fn(defaultBridgeSend);
+      fixture<{ __sendToExtension?: (message: WebviewMessage) => void }>(window).__sendToExtension =
+        sendToExtension;
+      cleanup = render(() => ChatInput(), container!);
+
+      expect(pressSave({ metaKey, ctrlKey: !metaKey }).defaultPrevented).toBe(true);
+
+      expect(inputText()).toBe('');
+      expect(state.droppedFiles).toEqual([]);
+      expect(state.terminalSelection).toBeNull();
+      expect(state.queuedMessages).toHaveLength(1);
+      expect(state.queuedMessages[0]).toMatchObject({
+        sessionId: 'session-1',
+        text: 'Keep this draft',
+        paused: true,
+        droppedFiles: [{ path: '/repo/src/a.ts' }],
+        terminalSelection: { text: 'npm test', terminalName: 'zsh' },
+        queuedContext: {
+          editorContext: {
+            queuedModel: { selection: { providerID: 'openai', modelID: 'gpt-4o' } },
+          },
+        },
+      });
+      expect(sendToExtension).toHaveBeenCalledWith({
+        type: 'queued-messages/update',
+        payload: {
+          messages: [expect.objectContaining({ sessionId: 'session-1', paused: true })],
+          mutationId: expect.any(String),
+        },
+      });
+      expect(container?.querySelector('.chat-queue-item.is-paused')).not.toBeNull();
+      expect(
+        container?.querySelector<HTMLButtonElement>('[aria-label="Edit queued message"]')?.disabled
+      ).toBe(false);
+
+      setIsLoading(false);
+      setState('sessionStatus', 'session-1', { type: 'idle' });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(state.queuedMessages[0]?.paused).toBe(true);
+    });
+
+    it('keeps a saved draft paused through edits and session switches until explicitly played', async () => {
+      vi.useFakeTimers();
+      setState('activeSessionId', 'session-1');
+      setInputText('Draft for later');
+      sendMessageMock.mockResolvedValue(true);
+      cleanup = render(() => ChatInput(), container!);
+      pressSave();
+
+      container!.querySelector<HTMLButtonElement>('[aria-label="Edit queued message"]')!.click();
+      expect(inputText()).toBe('Draft for later');
+      setInputText('Revised draft');
+      container!
+        .querySelector<HTMLDivElement>('.rich-composer')!
+        .dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await flushAsyncWork();
+      expect(inputText()).toBe('');
+      expect(state.queuedMessages).toHaveLength(1);
+      expect(state.queuedMessages[0]).toMatchObject({ text: 'Revised draft', paused: true });
+
+      setState('activeSessionId', 'session-2');
+      await vi.advanceTimersByTimeAsync(1_000);
+      setState('activeSessionId', 'session-1');
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+
+      container!.querySelector<HTMLButtonElement>('[aria-label="Play queued message"]')!.click();
+      await vi.advanceTimersByTimeAsync(300);
+      await flushAsyncWork();
+      expect(sendMessageMock).toHaveBeenCalledExactlyOnceWith(
+        'Revised draft',
+        expect.objectContaining({ targetSessionId: 'session-1' })
+      );
+      expect(state.queuedMessages).toEqual([]);
+    });
+
+    it('pauses an existing queue row when saving its edit without duplicating it', async () => {
+      vi.useFakeTimers();
+      setState('activeSessionId', 'session-1');
+      setIsLoading(true);
+      setState('queuedMessages', [{ id: 'q1', sessionId: 'session-1', text: 'Original' }]);
+      cleanup = render(() => ChatInput(), container!);
+      container!.querySelector<HTMLButtonElement>('[aria-label="Edit queued message"]')!.click();
+      setInputText('Saved revision');
+      pressSave();
+      setIsLoading(false);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(inputText()).toBe('');
+      expect(state.queuedMessages).toHaveLength(1);
+      expect(state.queuedMessages[0]).toMatchObject({ text: 'Saved revision', paused: true });
+      expect(sendMessageMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['/pause', '/stop', '/mcp', '/btw later', '/compact', '/problems'])(
+      'saves %s as draft text without executing it',
+      async (text) => {
+        vi.useFakeTimers();
+        setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+        setState('activeSessionId', 'session-1');
+        setInputText(text);
+        cleanup = render(() => ChatInput(), container!);
+        pressSave();
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        expect(inputText()).toBe('');
+        expect(state.queuedMessages).toHaveLength(1);
+        expect(state.queuedMessages[0]).toMatchObject({ text, paused: true });
+        expect(sendMessageMock).not.toHaveBeenCalled();
+        expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+        expect(abortSessionMock).not.toHaveBeenCalled();
+        expect(sideQuestionView()).toBeNull();
+      }
+    );
+
+    it.each<KeyboardEventInit>([
+      { metaKey: false },
+      { shiftKey: true },
+      { altKey: true },
+      { isComposing: true },
+      { repeat: true },
+    ])('does not save with unsupported key state %j', (options) => {
+      setState('activeSessionId', 'session-1');
+      setInputText('Unfinished draft');
+      cleanup = render(() => ChatInput(), container!);
+      pressSave(options);
+
+      expect(inputText()).toBe('Unfinished draft');
+      expect(state.queuedMessages).toEqual([]);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+    });
+
+    it('does not save an empty draft or handle the shortcut outside the input', () => {
+      setState('activeSessionId', 'session-1');
+      setInputText('   ');
+      cleanup = render(() => ChatInput(), container!);
+      pressSave();
+      expect(state.queuedMessages).toEqual([]);
+
+      setInputText('Keep typing');
+      const event = new KeyboardEvent('keydown', {
+        key: 's',
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      container!.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+      expect(inputText()).toBe('Keep typing');
+      expect(state.queuedMessages).toEqual([]);
+    });
+
+    it.each([false, true])(
+      'preserves a draft without a current session, newSession=%s',
+      (newSession) => {
+        if (newSession) setState('activeSessionId', 'session-1');
+        setInputText('No session yet');
+        cleanup = render(() => ChatInput({ newSession }), container!);
+        pressSave();
+
+        expect(inputText()).toBe('No session yet');
+        expect(state.queuedMessages).toEqual([]);
+        expect(sendMessageMock).not.toHaveBeenCalled();
+        expect(showSessionActionFeedbackMock).toHaveBeenCalledWith(
+          'Open a conversation',
+          'warning'
+        );
+      }
+    );
+
+    it('preserves the draft while messages are still loading', () => {
+      setState('activeSessionId', 'session-1');
+      setState('messagesLoading', true);
+      setInputText('Wait for the session');
+      cleanup = render(() => ChatInput(), container!);
+      pressSave();
+
+      expect(inputText()).toBe('Wait for the session');
+      expect(state.queuedMessages).toEqual([]);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(showSessionActionFeedbackMock).toHaveBeenCalledWith(
+        'Messages are still loading',
+        'warning'
+      );
+    });
+
+    it('does not submit an inline message edit', () => {
+      setState('activeSessionId', 'session-1');
+      startEditingMessage('user-1', 'session-1', 'Original prompt');
+      cleanup = render(() => ChatInput(), container!);
+      setInputText('Edited prompt');
+      pressSave();
+
+      expect(inputText()).toBe('Edited prompt');
+      expect(state.queuedMessages).toEqual([]);
+      expect(editMessageMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+    });
+  });
+
   it('queues busy composer attachments and clears them from the input', async () => {
     setupModelState();
     setInputText('Follow up with context');
@@ -5423,55 +5897,61 @@ describe('ChatInput', () => {
     ]);
   });
 
-  it('dispatches a queued message on authoritative idle without waiting for a timer', async () => {
-    vi.useFakeTimers();
-    setIsLoading(true);
-    setState('activeSessionId', 'session-1');
-    setState('sessionStatus', 'session-1', { type: 'busy' });
-    setState('selectedAgent', 'plan');
-    setState('queuedMessages', [
-      {
-        id: 'q1',
-        sessionId: 'session-1',
-        text: 'Implement the plan',
+  it.each([undefined, 'Implement plan'])(
+    'dispatches a queued message on authoritative idle, followupTitle=%s',
+    async (followupTitle) => {
+      vi.useFakeTimers();
+      setIsLoading(true);
+      setState('activeSessionId', 'session-1');
+      setState('sessionStatus', 'session-1', { type: 'busy' });
+      setState('selectedAgent', 'plan');
+      setState('queuedMessages', [
+        {
+          id: 'q1',
+          sessionId: 'session-1',
+          text: 'Implement the plan',
+          followupTitle,
+          agent: 'build',
+        },
+      ]);
+
+      cleanup = render(() => ChatInput(), container!);
+      await flushAsyncWork();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+
+      setIsLoading(false);
+      await flushAsyncWork();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+
+      for (const handler of serverEventHandlers.get('session.status') ?? []) {
+        handler({
+          type: 'session.status',
+          properties: { sessionID: 'session-1', status: { type: 'idle' } },
+        });
+      }
+      setState('sessionStatus', 'session-1', { type: 'idle' });
+      await flushAsyncWork();
+
+      const expectedOptions = {
+        messageId: expect.stringMatching(/^msg_/),
         agent: 'build',
-      },
-    ]);
-
-    cleanup = render(() => ChatInput(), container!);
-    await flushAsyncWork();
-    expect(sendMessageMock).not.toHaveBeenCalled();
-
-    setIsLoading(false);
-    await flushAsyncWork();
-    expect(sendMessageMock).not.toHaveBeenCalled();
-
-    for (const handler of serverEventHandlers.get('session.status') ?? []) {
-      handler({
-        type: 'session.status',
-        properties: { sessionID: 'session-1', status: { type: 'idle' } },
-      });
+        queuedAttachments: {
+          droppedFiles: undefined,
+          clipboardImages: undefined,
+          nativePdfs: undefined,
+          terminalSelection: undefined,
+          attachedDiagnostics: undefined,
+        },
+        queuedContext: expect.any(Object),
+        preserveComposer: true,
+        targetSessionId: 'session-1',
+        queuedMessageDispatch: { itemId: 'q1', lease: expect.any(Number) },
+      };
+      if (followupTitle) Object.assign(expectedOptions, { followupTitle, omitContext: true });
+      expect(sendMessageMock).toHaveBeenCalledWith('Implement the plan', expectedOptions);
+      expect(client.session.messages).not.toHaveBeenCalled();
     }
-    setState('sessionStatus', 'session-1', { type: 'idle' });
-    await flushAsyncWork();
-
-    expect(sendMessageMock).toHaveBeenCalledWith('Implement the plan', {
-      messageId: expect.stringMatching(/^msg_/),
-      agent: 'build',
-      queuedAttachments: {
-        droppedFiles: undefined,
-        clipboardImages: undefined,
-        nativePdfs: undefined,
-        terminalSelection: undefined,
-        attachedDiagnostics: undefined,
-      },
-      queuedContext: expect.any(Object),
-      preserveComposer: true,
-      targetSessionId: 'session-1',
-      queuedMessageDispatch: { itemId: 'q1', lease: expect.any(Number) },
-    });
-    expect(client.session.messages).not.toHaveBeenCalled();
-  });
+  );
 
   it('does not dispatch queued messages after an API failure', async () => {
     vi.useFakeTimers();
@@ -6301,6 +6781,151 @@ describe('ChatInput', () => {
         expect(dataTransfer.dropEffect).toBe(expected);
       }
     }
+  });
+
+  it.each(['text/plain', 'text/uri-list', 'text/html', 'Files'])(
+    'ignores %s drags started in the chat even after leaving and re-entering',
+    (dragType) => {
+      cleanup = render(() => ChatInput(), container!);
+      const source = document.createElement('div');
+      container!.append(source);
+      const composer = container!.querySelector('.chat-input-container')!;
+      const dataTransfer = createDragDataTransfer();
+      dataTransfer.setData(dragType, '/repo/src/a.ts');
+
+      const start = dispatchDragEvent(source, 'dragstart', dataTransfer);
+      expect(start.defaultPrevented).toBe(false);
+
+      for (const target of [source, composer]) {
+        for (const type of ['dragenter', 'dragover', 'dragleave', 'dragenter', 'dragover']) {
+          const event = dispatchDragEvent(target, type, dataTransfer);
+          expect(event.defaultPrevented).toBe(false);
+          expect(dataTransfer.dropEffect).toBe('none');
+          expect(document.querySelector('.chat-drop-overlay')).toBeNull();
+        }
+      }
+
+      const drop = dispatchDragEvent(composer, 'drop', dataTransfer);
+      expect(drop.defaultPrevented).toBe(false);
+      expect(state.droppedFiles).toEqual([]);
+      expect(document.querySelector('.chat-drop-overlay')).toBeNull();
+      dispatchDragEvent(source, 'dragend', dataTransfer);
+
+      const externalDrag = dispatchDragEvent(composer, 'dragenter', createDragDataTransfer());
+      expect(externalDrag.defaultPrevented).toBe(true);
+      expect(document.querySelector('.chat-drop-overlay')).not.toBeNull();
+    }
+  );
+
+  it.each([
+    { cancelled: false, shiftKey: false },
+    { cancelled: false, shiftKey: true },
+    { cancelled: true, shiftKey: false },
+    { cancelled: true, shiftKey: true },
+  ])(
+    'accepts external file drops after an unfinished chat drag, cancelled=$cancelled, Shift=$shiftKey',
+    async ({ cancelled, shiftKey }) => {
+      const bridgeWindow = fixture<{ __sendToExtension?: (message: WebviewMessage) => void }>(
+        window
+      );
+      const originalSend = bridgeWindow.__sendToExtension;
+      const sent: WebviewMessage[] = [];
+      bridgeWindow.__sendToExtension = (message) => sent.push(message);
+      try {
+        cleanup = render(() => ChatInput(), container!);
+        const source = document.createElement('a');
+        container!.append(source);
+        if (cancelled) source.addEventListener('dragstart', (event) => event.preventDefault());
+        const outgoing = createDragDataTransfer();
+        outgoing.setData('text/uri-list', 'https://example.com/chat-link');
+        dispatchDragEvent(source, 'dragstart', outgoing);
+        // Cancelled drags have no dragend; the host can also lose it after an outgoing drop.
+        const incoming = Object.assign(createDragDataTransfer(), { files: [], items: [] });
+        incoming.setData('CodeFiles', JSON.stringify(['/repo/src/incoming.ts']));
+        const composer = container!.querySelector('.chat-input-container')!;
+        for (const type of ['dragenter', 'dragover', 'drop']) {
+          const event = new MouseEvent(type, { bubbles: true, cancelable: true, shiftKey });
+          Object.defineProperty(event, 'dataTransfer', { value: incoming });
+          composer.dispatchEvent(event);
+          expect(event.defaultPrevented).toBe(true);
+        }
+        await flushAsyncWork();
+        expect(sent.filter((message) => message.type === 'files/drop')).toEqual([
+          { type: 'files/drop', payload: { paths: ['/repo/src/incoming.ts'] } },
+        ]);
+        expect(document.querySelector('.chat-drop-overlay')).toBeNull();
+      } finally {
+        bridgeWindow.__sendToExtension = originalSend;
+      }
+    }
+  );
+
+  it.each([false, true])(
+    'keeps accepted external drags out of VS Code window handlers, Shift=%s',
+    (shiftKey) => {
+      // VS Code installs these bubbling window handlers before loading the extension.
+      // dragenter respects defaultPrevented, but dragover forwards even accepted drags.
+      const forwarded = vi.fn();
+      const hostDragEnter = (event: Event) => {
+        if (!event.defaultPrevented) forwarded(event.type);
+      };
+      const hostDragOver = (event: Event) => forwarded(event.type);
+      window.addEventListener('dragenter', hostDragEnter);
+      window.addEventListener('dragover', hostDragOver);
+      try {
+        cleanup = render(() => ChatInput(), container!);
+        const composer = container!.querySelector('.chat-input-container')!;
+        for (const target of [document, container!, composer]) {
+          for (const type of ['dragenter', 'dragover', 'dragover']) {
+            const event = new Event(type, { bubbles: true, cancelable: true });
+            Object.defineProperties(event, {
+              dataTransfer: { value: createDragDataTransfer() },
+              shiftKey: { value: shiftKey },
+            });
+            target.dispatchEvent(event);
+            expect(event.defaultPrevented).toBe(true);
+          }
+        }
+        expect(forwarded).not.toHaveBeenCalled();
+        expect(document.querySelector('.chat-drop-overlay')).not.toBeNull();
+      } finally {
+        window.removeEventListener('dragenter', hostDragEnter);
+        window.removeEventListener('dragover', hostDragOver);
+      }
+    }
+  );
+
+  it.each(['dragend', 'blur', 'hidden'])('clears an incoming drop overlay on %s', (type) => {
+    cleanup = render(() => ChatInput(), container!);
+    dispatchDragEvent(container!, 'dragenter', createDragDataTransfer());
+    expect(document.querySelector('.chat-drop-overlay')).not.toBeNull();
+
+    if (type === 'hidden') {
+      const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+      try {
+        document.dispatchEvent(new Event('visibilitychange'));
+      } finally {
+        visibility.mockRestore();
+      }
+    } else if (type === 'blur') {
+      window.dispatchEvent(new Event('blur'));
+    } else {
+      dispatchDragEvent(container!, 'dragend', createDragDataTransfer());
+    }
+
+    expect(document.querySelector('.chat-drop-overlay')).toBeNull();
+  });
+
+  it('keeps an outgoing drag internal after the window loses focus', () => {
+    cleanup = render(() => ChatInput(), container!);
+    const dataTransfer = createDragDataTransfer();
+    dispatchDragEvent(container!, 'dragstart', dataTransfer);
+    window.dispatchEvent(new Event('blur'));
+
+    const event = dispatchDragEvent(container!, 'dragenter', dataTransfer);
+    expect(event.defaultPrevented).toBe(false);
+    expect(document.querySelector('.chat-drop-overlay')).toBeNull();
+    dispatchDragEvent(container!, 'dragend', dataTransfer);
   });
 
   it('reorders queued rows by dragging the left handle without showing the file-drop overlay', () => {
@@ -7150,50 +7775,56 @@ describe('ChatInput', () => {
     expect(inputText()).toBe('');
   });
 
-  it('sends queued rows as steers and removes them on success', async () => {
-    setupMatchingActiveTurn();
-    setIsLoading(true);
-    setState('activeSessionId', 'session-1');
-    setState('queuedMessages', [
-      {
-        id: 'q1',
-        sessionId: 'session-1',
-        text: 'test 2',
-        droppedFiles: [{ path: '/repo/src/a.ts', relativePath: 'src/a.ts', type: 'file' }],
-        clipboardImages: [
-          { id: 'img-1', url: 'blob:1', mime: 'image/png', filename: 'img-1.png', size: 10 },
-        ],
-        terminalSelection: { text: 'npm test', terminalName: 'zsh' },
-      },
-      { id: 'q2', sessionId: 'session-1', text: 'test 3' },
-    ]);
+  it.each([undefined, 'Inspect failures'])(
+    'sends queued rows as steers and removes them on success, followupTitle=%s',
+    async (followupTitle) => {
+      setupMatchingActiveTurn();
+      setIsLoading(true);
+      setState('activeSessionId', 'session-1');
+      setState('queuedMessages', [
+        {
+          id: 'q1',
+          sessionId: 'session-1',
+          text: 'test 2',
+          followupTitle,
+          droppedFiles: [{ path: '/repo/src/a.ts', relativePath: 'src/a.ts', type: 'file' }],
+          clipboardImages: [
+            { id: 'img-1', url: 'blob:1', mime: 'image/png', filename: 'img-1.png', size: 10 },
+          ],
+          terminalSelection: { text: 'npm test', terminalName: 'zsh' },
+        },
+        { id: 'q2', sessionId: 'session-1', text: 'test 3' },
+      ]);
 
-    cleanup = render(() => ChatInput(), container!);
+      cleanup = render(() => ChatInput(), container!);
 
-    container
-      ?.querySelector<HTMLButtonElement>('[aria-label="Send as Steer"]')
-      ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    await flushAsyncWork();
+      container
+        ?.querySelector<HTMLButtonElement>('[aria-label="Send as Steer"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await flushAsyncWork();
 
-    expect(sendMessageMock).toHaveBeenCalledWith('test 2', {
-      agent: undefined,
-      delivery: 'steer',
-      messageId: expect.stringMatching(/^msg_/),
-      queuedAttachments: {
-        droppedFiles: [{ path: '/repo/src/a.ts', relativePath: 'src/a.ts', type: 'file' }],
-        clipboardImages: [
-          { id: 'img-1', url: 'blob:1', mime: 'image/png', filename: 'img-1.png', size: 10 },
-        ],
-        nativePdfs: undefined,
-        terminalSelection: { text: 'npm test', terminalName: 'zsh' },
-        attachedDiagnostics: undefined,
-      },
-      preserveComposer: true,
-      targetSessionId: 'session-1',
-      queuedMessageDispatch: { itemId: 'q1', lease: expect.any(Number) },
-    });
-    expect(state.queuedMessages.map((item) => item.id)).toEqual(['q2']);
-  });
+      const expectedOptions = {
+        agent: undefined,
+        delivery: 'steer',
+        messageId: expect.stringMatching(/^msg_/),
+        queuedAttachments: {
+          droppedFiles: [{ path: '/repo/src/a.ts', relativePath: 'src/a.ts', type: 'file' }],
+          clipboardImages: [
+            { id: 'img-1', url: 'blob:1', mime: 'image/png', filename: 'img-1.png', size: 10 },
+          ],
+          nativePdfs: undefined,
+          terminalSelection: { text: 'npm test', terminalName: 'zsh' },
+          attachedDiagnostics: undefined,
+        },
+        preserveComposer: true,
+        targetSessionId: 'session-1',
+        queuedMessageDispatch: { itemId: 'q1', lease: expect.any(Number) },
+      };
+      if (followupTitle) Object.assign(expectedOptions, { followupTitle, omitContext: true });
+      expect(sendMessageMock).toHaveBeenCalledWith('test 2', expectedOptions);
+      expect(state.queuedMessages.map((item) => item.id)).toEqual(['q2']);
+    }
+  );
 
   it('shows inbox steers above the queue until the same message lands in the transcript', async () => {
     setIsLoading(true);
@@ -7269,6 +7900,70 @@ describe('ChatInput', () => {
       'Later follow-up'
     );
   });
+
+  it.each([false, true])(
+    'matches queue annotation previews for canonical pending steers with deferred content: %s',
+    (deferred) => {
+      setIsLoading(true);
+      setState('activeSessionId', 'session-1');
+      const file = createChatAnnotation(
+        'Original passage',
+        'Test annotation. '.repeat(5),
+        'session-source'
+      );
+      const text = `Steer @${file.relativePath}`;
+      const info: UserMessage = {
+        id: 'pending-annotation',
+        sessionID: 'session-1',
+        role: 'user',
+        pendingDelivery: 'steer',
+        time: { created: 1 },
+        agent: 'build',
+        model: { providerID: 'openai', modelID: 'test-model' },
+      };
+      setState('queuedMessages', [
+        { id: 'queue-annotation', sessionId: 'session-1', text, droppedFiles: [file] },
+      ]);
+      setState('messages', [
+        {
+          info,
+          parts: [
+            {
+              id: 'pending-text',
+              messageID: info.id,
+              sessionID: info.sessionID,
+              type: 'text',
+              text,
+            },
+            {
+              id: 'pending-file',
+              messageID: info.id,
+              sessionID: info.sessionID,
+              type: 'file',
+              mime: 'text/plain',
+              filename: file.relativePath,
+              url: deferred
+                ? 'varro-content:/part/pending-file'
+                : pastedTextDataUrl(file.pastedText!),
+              annotation: deferred ? readChatAnnotation(file)! : undefined,
+            },
+          ],
+        },
+      ]);
+      cleanup = render(() => ChatInput(), container!);
+      const labels = [...container!.querySelectorAll('.chat-queue-label')];
+      expect(labels.map((label) => label.textContent)).toEqual(
+        Array(2).fill(`Steer [${getChatAnnotationLabel('Test annotation. '.repeat(5))}]`)
+      );
+      expect(
+        container!.querySelector('.chat-steer-container .chat-queue-label .ui-icon')
+      ).toBeNull();
+      expect(
+        container!.querySelector('.chat-steer-container [aria-label="1 attachment"]')
+      ).not.toBeNull();
+      expect(state.messages[0]!.parts[0]).toMatchObject({ text });
+    }
+  );
 
   it('does not resend a restored queued steer that OpenCode already admitted', async () => {
     setupMatchingActiveTurn();
@@ -9991,6 +10686,13 @@ describe('ChatInput', () => {
     setState('sessionStatus', 'session-1', { type: 'busy' });
     setIsLoading(true);
     setState('droppedFiles', [{ path: '/repo/keep.ts', relativePath: 'keep.ts', type: 'file' }]);
+    addClipboardImage({
+      id: 'busy-side-image',
+      filename: 'Image 1',
+      mime: 'image/png',
+      url: 'data:image/png;base64,aW1hZ2U=',
+      size: 5,
+    });
     setInputText('Why did that fail?\nKeep it short.');
     cleanup = render(() => ChatInput(), container!);
     container?.querySelector<HTMLButtonElement>('[aria-label="More send options"]')!.click();
@@ -10010,6 +10712,8 @@ describe('ChatInput', () => {
     expect(inputText()).toBe('');
     expect(container?.querySelector('.busy-menu')).toBeNull();
     expect(state.droppedFiles).toHaveLength(1);
+    expect(state.clipboardImages).toHaveLength(1);
+    expect(sideQuestionView()?.context).not.toContain('data:image');
     expect(state.sessionStatus['session-1']).toEqual({ type: 'busy' });
     expect(state.queuedMessages).toEqual([]);
     expect(sendMessageMock).not.toHaveBeenCalled();
@@ -10033,6 +10737,84 @@ describe('ChatInput', () => {
     expect(inputText()).toBe('Ordinary follow-up');
     expect(sideQuestionView()).toBeNull();
   });
+
+  it.each(
+    ['strip', 'inline'].flatMap((placement) =>
+      ['send', 'enter'].map((action) => ({ placement, action }))
+    )
+  )(
+    'excludes a $placement image from /btw using $action and keeps it for the next regular send',
+    async ({ placement, action }) => {
+      setupModelState();
+      setState('providers', 0, 'models', 'gpt-4o', 'capabilities', 'vision', true);
+      setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion: 2 });
+      setState('activeSessionId', 'session-1');
+      setState('sessions', [session('session-1', 1, { directory: '/repo' })]);
+      const image = {
+        id: 'side-image',
+        filename: 'Image 1',
+        mime: 'image/png',
+        url: 'data:image/png;base64,aW1hZ2U=',
+        size: 5,
+      };
+      addClipboardImage(image);
+      const attachedImage = { ...state.clipboardImages[0]! };
+      const prompt = placement === 'inline' ? '[Image 1] Why?' : 'Why?';
+      setInputText(prompt);
+      cleanup = render(() => ChatInput(), container!);
+      await flushAsyncWork();
+      const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
+      const imageChip = () =>
+        container!.querySelector<HTMLElement>(
+          placement === 'inline' ? '[data-chip-type="image"]' : '.chat-attachment-chip'
+        )!;
+      expect(imageChip().classList.contains('disabled')).toBe(false);
+      enterComposerText(editor, `/btw ${prompt}`);
+      await flushAsyncWork();
+      expect(imageChip().classList.contains('disabled')).toBe(true);
+      expect(imageChip().title).toBe(
+        'Images are not included in side questions. Kept attached for your next regular message.'
+      );
+      enterComposerText(editor, prompt);
+      await flushAsyncWork();
+      expect(imageChip().classList.contains('disabled')).toBe(false);
+      enterComposerText(editor, `/btw ${prompt}`);
+      await flushAsyncWork();
+      const send = container!.querySelector<HTMLButtonElement>('[aria-label="Send (Enter)"]')!;
+      expect(send.disabled).toBe(false);
+      if (action === 'send') send.click();
+      else
+        container!
+          .querySelector('.rich-composer')!
+          .dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+          );
+      await flushAsyncWork();
+
+      expect(sideQuestionView()).toMatchObject({ sessionID: 'session-1', question: 'Why?' });
+      expect(sideQuestionView()?.context ?? '').toBe('');
+      expect(state.clipboardImages).toEqual([attachedImage]);
+      expect(inputText()).toBe('');
+      expect(container!.querySelector('.chat-attachment-chip.disabled')).toBeNull();
+      expect(container!.querySelector('.chat-attachment-chip')?.textContent).toContain('Image 1');
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+      expect(state.queuedMessages).toEqual([]);
+
+      closeSideQuestion();
+      setInputText('Now inspect the image');
+      const sentImages: (typeof image)[] = [];
+      sendMessageMock.mockImplementationOnce(async () => {
+        sentImages.push(...state.clipboardImages);
+        return true;
+      });
+      container!.querySelector<HTMLButtonElement>('[aria-label="Send (Enter)"]')!.click();
+      await flushAsyncWork();
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      expect(sendMessageMock.mock.calls[0]?.[0]).toBe('Now inspect the image');
+      expect(sentImages).toEqual([attachedImage]);
+    }
+  );
 
   it.each(['/b', '/bt'])(
     'opens the /btw suggestion from %s without treating the draft as a command',
@@ -10215,6 +10997,55 @@ describe('ChatInput', () => {
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(inputText()).toBe('');
   });
+
+  it.each([
+    ['/mcp', 'enter', false],
+    ['/mcps', 'send', false],
+    ['/mcps at', 'enter', true],
+    ['/mcp at', 'send', true],
+  ] as const)(
+    'opens %s with %s while busy=%s without sending attachments',
+    async (draft, action, busy) => {
+      setState('activeSessionId', 'session-1');
+      setState('sessions', [session('session-1', 1)]);
+      setState('sessionStatus', 'session-1', { type: busy ? 'busy' : 'idle' });
+      setIsLoading(busy);
+      setState('mcpStatus', {
+        atlassian: { status: 'needs_auth', error: 'Login required' },
+        'browser-bridge': { status: 'disabled' },
+      });
+      setState('droppedFiles', [{ path: '/repo/keep.ts', relativePath: 'keep.ts', type: 'file' }]);
+      setInputText(draft);
+      cleanup = render(() => ChatInput(), container!);
+      if (action === 'enter') {
+        container
+          ?.querySelector('.rich-composer')
+          ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      } else {
+        const send = container!.querySelector<HTMLButtonElement>(
+          '[aria-label="Send (Enter)"], [aria-label="Add to queue (Enter)"]'
+        );
+        expect(send).not.toBeNull();
+        send!.click();
+      }
+      await flushAsyncWork();
+      expect(container?.querySelector('.dropdown-header')?.textContent).toBe('MCPs');
+      expect(container?.querySelector('.dropdown-menu')?.textContent).toContain('atlassian');
+      if (draft.endsWith(' at')) {
+        expect(
+          container?.querySelector<HTMLInputElement>('[aria-label="Search MCPs"]')?.value
+        ).toBe('at');
+        expect(container?.querySelector('.dropdown-menu')?.textContent).not.toContain(
+          'browser-bridge'
+        );
+      }
+      expect(inputText()).toBe('');
+      expect(state.droppedFiles).toHaveLength(1);
+      expect(state.queuedMessages).toEqual([]);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(runSlashCommandByNameMock).not.toHaveBeenCalled();
+    }
+  );
 
   it('runs a typed slash command with args from the send button', async () => {
     setState('commands', [
@@ -11773,35 +12604,94 @@ describe('ChatInput', () => {
     }
   });
 
-  it('pastes images as attachments after the attachment row takes focus', async () => {
-    const fileReader = installControllableFileReader();
-    try {
-      cleanup = render(() => ChatInput(), container!);
-      await flushAsyncWork();
+  it.each(
+    [false, true].flatMap((editorWasFocused) =>
+      ['row', 'body', 'editor'].map((pasteTarget) => ({ editorWasFocused, pasteTarget }))
+    )
+  )(
+    'pastes outside the draft with editor focus=$editorWasFocused and paste target=$pasteTarget',
+    async ({ editorWasFocused, pasteTarget }) => {
+      const fileReader = installControllableFileReader();
+      try {
+        cleanup = render(() => ChatInput(), container!);
+        await flushAsyncWork();
 
-      const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
-      if (!editor) throw new Error('Expected composer editor');
-      editor.focus();
-      dispatchImagePaste(editor, [new File(['first'], 'first.png', { type: 'image/png' })]);
-      fileReader.resolve('first.png');
-      await flushAsyncWork();
+        const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
+        if (!editor) throw new Error('Expected composer editor');
+        editor.focus();
+        dispatchImagePaste(editor, [new File(['first'], 'first.png', { type: 'image/png' })]);
+        fileReader.resolve('first.png');
+        await flushAsyncWork();
 
-      const attachmentRow = container?.querySelector<HTMLElement>('.chat-attachments-container');
-      if (!attachmentRow) throw new Error('Expected attachment row');
-      editor.blur();
-      attachmentRow.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        const attachmentRow = container?.querySelector<HTMLElement>('.chat-attachments-container');
+        if (!attachmentRow) throw new Error('Expected attachment row');
+        setInputText('Existing draft');
+        editor.focus();
+        if (editor.firstChild) setCollapsedSelection(editor.firstChild, 8);
+        if (!editorWasFocused) editor.blur();
+        attachmentRow.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        expect(document.activeElement).toBe(attachmentRow);
 
-      dispatchImagePaste(document.body, [
-        new File(['second'], 'second.png', { type: 'image/png' }),
-      ]);
-      fileReader.resolve('second.png');
-      await flushAsyncWork();
+        const target =
+          pasteTarget === 'row' ? attachmentRow : pasteTarget === 'editor' ? editor : document.body;
+        const paste = dispatchImagePaste(
+          target,
+          [new File(['second'], 'second.png', { type: 'image/png' })],
+          'Clipboard image label'
+        );
+        expect(paste.defaultPrevented).toBe(true);
+        fileReader.resolve('second.png');
+        await flushAsyncWork();
 
-      expect(inputText()).toBe('');
-      expect(state.clipboardImages.map((image) => image.filename)).toEqual(['Image 1', 'Image 2']);
-    } finally {
-      fileReader.restore();
+        expect(inputText()).toBe('Existing draft');
+        expect(state.clipboardImages.map((image) => image.filename)).toEqual([
+          'Image 1',
+          'Image 2',
+        ]);
+        expect(attachmentRow.querySelectorAll('.chat-attachment-chip')).toHaveLength(2);
+        expect(document.activeElement).toBe(attachmentRow);
+
+        editor.focus();
+        if (editor.firstChild) setCollapsedSelection(editor.firstChild, 8);
+        dispatchImagePaste(editor, [new File(['third'], 'third.png', { type: 'image/png' })]);
+        fileReader.resolve('third.png');
+        await flushAsyncWork();
+
+        expect(inputText()).toBe('Existing [Image 3] draft');
+        expect(attachmentRow.querySelectorAll('.chat-attachment-chip')).toHaveLength(2);
+      } finally {
+        fileReader.restore();
+      }
     }
+  );
+
+  it('does not claim pastes after focus leaves the attachment row', async () => {
+    addClipboardImage({
+      id: 'existing-image',
+      url: 'data:image/png;base64,aW1hZ2U=',
+      mime: 'image/png',
+      filename: 'Image 1',
+      size: 5,
+    });
+    cleanup = render(() => ChatInput(), container!);
+    await flushAsyncWork();
+
+    const row = container?.querySelector<HTMLElement>('.chat-attachments-container');
+    if (!row) throw new Error('Expected attachment row');
+    row.click();
+    expect(document.activeElement).toBe(row);
+    const textPaste = dispatchImagePaste(row, [], 'Plain text');
+    expect(textPaste.defaultPrevented).toBe(false);
+
+    const otherInput = document.createElement('textarea');
+    container?.append(otherInput);
+    otherInput.focus();
+    const imagePaste = dispatchImagePaste(otherInput, [
+      new File(['other'], 'other.png', { type: 'image/png' }),
+    ]);
+    expect(imagePaste.defaultPrevented).toBe(false);
+    expect(inputText()).toBe('');
+    expect(state.clipboardImages).toHaveLength(1);
   });
 
   it.each([20, 10_000])('does not reread %i loaded messages on keystrokes', async (count) => {

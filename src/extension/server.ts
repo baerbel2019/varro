@@ -413,6 +413,7 @@ export class OpenCodeServer extends EventEmitter {
       },
       getUrl: () => this.url,
       getWorkspaceCwd: () => this.processManager.getWorkspaceCwd(),
+      canAliasWorkspacePaths: () => !this.isAttachOnly,
       getStatus: () => this._status,
       isDisposing: () => this.isDisposing,
       updateEventStreamState: (eventStream) => this.updateEventStreamState(eventStream),
@@ -1875,6 +1876,11 @@ export class OpenCodeServer extends EventEmitter {
       )
         throw new Error('OpenCode server is not accepting requests while stopping');
     }
+    if (method === 'POST' && new URL(path, 'http://localhost').pathname === '/global/dispose') {
+      options?.signal?.throwIfAborted();
+      await this.processManager.reconcileInjectedWebSearch();
+      options?.signal?.throwIfAborted();
+    }
     return this.transport.request(method, path, body, options);
   }
 
@@ -1883,7 +1889,9 @@ export class OpenCodeServer extends EventEmitter {
     return this._status.state === 'running' ? result : { state: 'inactive', directory };
   }
 
-  async readServerInfo(): Promise<OpenCodeServerInfo> {
+  async readServerInfo(options?: {
+    includeActiveAgentCount?: boolean;
+  }): Promise<OpenCodeServerInfo> {
     // About/diagnostics must not report a verified lease as unmanaged while its
     // asynchronous ownership observation or handoff is still being prepared.
     if (this.existingServerPreparationOperation) await this.existingServerPreparationOperation;
@@ -1898,7 +1906,9 @@ export class OpenCodeServer extends EventEmitter {
     } catch (err) {
       cliVersionError = err instanceof Error ? err.message : String(err);
     }
-    if (this._status.state === 'running') {
+    // Status-bar and ownership reads do not need activity. Enumerating historical
+    // directories for it can boot unrelated V2 locations while chat is starting.
+    if (this._status.state === 'running' && options?.includeActiveAgentCount !== false) {
       try {
         activeAgentCount = await this.readActiveAgentCount();
       } catch (err) {
@@ -2978,6 +2988,31 @@ export class OpenCodeServer extends EventEmitter {
       return this.recoverOwnershipAndRestart(options);
     }
     return this.startRestart(options);
+  }
+
+  /** Keep ownership and restart admission reserved until offline database work settles. */
+  async withStoppedServer<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.isAttachOnly)
+      throw new Error('Offline database maintenance requires a verified local managed server.');
+    if (this.lifecycle.getRestartPromise<string>() || this.pendingTerminalCliUpgrades > 0)
+      throw new Error('OpenCode is already restarting or updating. Retry after it finishes.');
+    if (this._status.state !== 'running')
+      throw new Error('Connect to the local OpenCode server before offline database maintenance.');
+    const outcome: { result?: { ok: true; value: T } | { ok: false; error: unknown } } = {};
+    await this.runRestart(async () => {
+      await this.processManager.stopServerForRestart();
+      try {
+        outcome.result = { ok: true, value: await operation() };
+      } catch (error) {
+        outcome.result = { ok: false, error };
+      }
+      // A failed/cancelled VACUUM must still restore the server before surfacing its error.
+    });
+    const result = outcome.result;
+    if (!result)
+      throw new Error('Database maintenance did not run. Retry after the current restart.');
+    if (!result.ok) throw result.error;
+    return result.value;
   }
 
   private async recoverOwnershipAndRestart(options: { force?: boolean }): Promise<string> {

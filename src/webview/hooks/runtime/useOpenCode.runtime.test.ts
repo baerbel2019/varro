@@ -13,6 +13,7 @@ function createRuntimeMock(label: string) {
     continueInterruptedSession: vi.fn().mockResolvedValue(undefined),
     resumeSteering: vi.fn().mockResolvedValue(true),
     applySessionMcps: vi.fn().mockResolvedValue(undefined),
+    refreshSessionMcps: vi.fn().mockResolvedValue(undefined),
     selectSession: vi.fn().mockResolvedValue(undefined),
     loadFullSessionHistory: vi.fn().mockResolvedValue(undefined),
     loadOlderSessionHistoryPage: vi.fn().mockResolvedValue(true),
@@ -43,6 +44,7 @@ function createRuntimeMock(label: string) {
     respondPermission: vi.fn().mockResolvedValue(undefined),
     alwaysAllowPermissionForProject: vi.fn().mockResolvedValue(undefined),
     alwaysAllowPermissionForSession: vi.fn().mockResolvedValue(undefined),
+    alwaysAllowPermissionForGlobal: vi.fn().mockResolvedValue(undefined),
     respondQuestion: vi.fn().mockResolvedValue(undefined),
     updatePermissionModeForSession: vi.fn().mockResolvedValue(undefined),
     rejectQuestion: vi.fn().mockResolvedValue(undefined),
@@ -123,8 +125,22 @@ describe('useOpenCode.runtime', () => {
     ).resolves.toBeUndefined();
     expect(installed.runtime.alwaysAllowPermissionForSession).toHaveBeenCalledWith(
       'session-1',
-      'permission-1'
+      'permission-1',
+      undefined
     );
+  });
+
+  it('forwards the background fork option to the installed runtime', async () => {
+    const installed = createRuntimeMock('installed');
+    const { module } = await loadModule();
+    module.installOpenCodeRuntime(installed.runtime);
+    await expect(module.forkSession('session-1', undefined, { select: false })).resolves.toBe(
+      'installed-fork'
+    );
+    expect(installed.runtime.forkSession).toHaveBeenCalledExactlyOnceWith('session-1', undefined, {
+      select: false,
+    });
+    expect(installed.runtime.selectSession).not.toHaveBeenCalled();
   });
 
   it('forwards session pagination to the installed runtime', async () => {

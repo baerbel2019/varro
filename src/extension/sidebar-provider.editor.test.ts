@@ -93,6 +93,71 @@ function createPanel() {
 }
 
 describe('SidebarProvider editor panels', () => {
+  it('excludes selected providers only from visible chats in this window', async () => {
+    const { provider } = await createSidebarProviderInstance();
+    const { ProviderLimitStatusBar } = await import('./provider-limit-status-bar');
+    const excluded = vi.spyOn(ProviderLimitStatusBar.prototype, 'setVisibleChatProviders');
+    const sidebar = createPanel();
+    const editor = createPanel();
+    try {
+      await provider.resolveWebviewView(sidebar.panel as never, {} as never, {} as never);
+      await vi.waitFor(() => expect(sidebar.panel.webview.html).toContain('documentId'));
+      sidebar.ready();
+      sidebar.receive({
+        type: 'commands/state',
+        payload: {
+          canAbort: false,
+          canSwitchSessions: false,
+          model: { providerID: 'openai', modelID: 'gpt' },
+        },
+      });
+      await vi.waitFor(() => expect(excluded).toHaveBeenLastCalledWith(['openai']));
+
+      getVscodeMock().window.createWebviewPanel.mockReturnValue(editor.panel);
+      await provider.openNewEditor();
+      await vi.waitFor(() => expect(editor.panel.webview.html).toContain('documentId'));
+      editor.ready();
+      editor.receive({
+        type: 'commands/state',
+        payload: {
+          canAbort: false,
+          canSwitchSessions: false,
+          model: { providerID: 'anthropic', modelID: 'claude' },
+        },
+      });
+      await vi.waitFor(() => expect(excluded).toHaveBeenLastCalledWith(['openai', 'anthropic']));
+      editor.setVisible(false);
+      expect(excluded).toHaveBeenLastCalledWith(['openai']);
+      editor.setVisible(true);
+      expect(excluded).toHaveBeenLastCalledWith(['openai', 'anthropic']);
+      sidebar.setVisible(false);
+      expect(excluded).toHaveBeenLastCalledWith(['anthropic']);
+      sidebar.setVisible(true);
+      expect(excluded).toHaveBeenLastCalledWith(['openai', 'anthropic']);
+
+      await provider.handleMessage({
+        type: 'commands/state',
+        payload: {
+          canAbort: false,
+          canSwitchSessions: false,
+          model: { providerID: 'openai', modelID: 'gpt' },
+          modelVisible: false,
+        },
+      });
+      expect(excluded).toHaveBeenLastCalledWith(['anthropic']);
+      await provider.handleMessage({
+        type: 'commands/state',
+        payload: { canAbort: false, canSwitchSessions: false, model: null },
+      });
+      expect(excluded).toHaveBeenLastCalledWith(['anthropic']);
+      editor.panel.dispose();
+      expect(excluded).toHaveBeenLastCalledWith([]);
+    } finally {
+      excluded.mockRestore();
+      await provider.dispose();
+    }
+  });
+
   it('persists hiding a moved link and invalidates lists without changing the conversation', async () => {
     const workspaceState = createWorkspaceState();
     const moved = {
@@ -224,6 +289,7 @@ describe('SidebarProvider editor panels', () => {
   it.each([
     ['/other', true],
     ['/outside', false],
+    ['/worktrees/feature', true],
   ] as const)(
     'handles an active conversation moving to %s without treating it as deleted',
     async (directory, available) => {
@@ -232,14 +298,20 @@ describe('SidebarProvider editor panels', () => {
         path === '/repo' || path === '/other' ? path : null
       );
       const server = createServer({
-        request: vi.fn(async () => ({
-          id: 'session-1',
-          directory,
-          projectID: 'project-1',
-          title: 'Transferred chat',
-          version: '2',
-          time: { created: 1, updated: 2 },
-        })),
+        request: vi.fn(async (_method, path) => {
+          if (path === '/project/current') return { id: 'project-1', worktree: '/repo' };
+          if (path === '/project') return [{ id: 'project-1', vcs: 'git' }];
+          if (path.startsWith('/experimental/worktree'))
+            return [{ directory: '/worktrees/feature', strategy: 'git' }];
+          return {
+            id: 'session-1',
+            directory,
+            projectID: 'project-1',
+            title: 'Transferred chat',
+            version: '2',
+            time: { created: 1, updated: 2 },
+          };
+        }),
       });
       const { provider } = await createSidebarProviderInstance({ contextProvider, server });
       const editor = createPanel();

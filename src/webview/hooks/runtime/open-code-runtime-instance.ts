@@ -1,4 +1,4 @@
-import { batch, createSignal, onCleanup, onMount } from 'solid-js';
+import { batch, createEffect, createSignal, on, onCleanup, onMount } from 'solid-js';
 import type {
   QuestionAnswer,
   AutoApproveJudgeReference,
@@ -10,11 +10,13 @@ import type {
 } from '../../../shared/protocol';
 import { syncWindowChatTheme } from '../../lib/window-chat-theme';
 import { reconcile } from 'solid-js/store';
+import type { PermissionApprovalOptions } from '../../../shared/opencode-types';
 import {
   AUTO_APPROVE_JUDGE_TIMEOUT_MS,
   createSessionWorkspaceMetadata,
 } from '../../../shared/protocol';
 import { DEFAULT_PROVIDER_LIMIT_POLL_INTERVAL_SECONDS } from '../../../shared/provider-limit-config';
+import { normalizeModelVariant } from '../../../shared/model-variant';
 import { getFollowupActionTitle } from '../../../shared/followups';
 import { getResolvedAgentPermissionRules } from '../../../shared/permission-rules';
 import { isPlaceholderSessionTitle } from '../../../shared/session-title';
@@ -83,6 +85,7 @@ import {
   takeCachedSessionHistoryPage,
 } from '../../lib/message-window';
 import { getNewChatDraftGeneration, startNewChatDraft } from '../../lib/new-chat-draft';
+import { getEffectiveComposerSessionId } from '../../lib/state-view-persistence';
 import { readInitialWebviewState, readWebviewInstanceContext } from '../../lib/state-stored-values';
 import { STORAGE_KEYS, writeStored } from '../../lib/state-storage';
 import {
@@ -167,6 +170,7 @@ export interface OpenCodeRuntime {
   continueInterruptedSession(sessionId: string): Promise<void>;
   resumeSteering(sessionId: string): Promise<boolean>;
   applySessionMcps(names: string[], sessionId?: string | null): Promise<void>;
+  refreshSessionMcps(sessionId?: string | null): Promise<void>;
   selectSession(id: string, options?: SessionSelectionOptions): Promise<boolean>;
   loadFullSessionHistory(sessionId: string): Promise<void>;
   loadOlderSessionHistoryPage(
@@ -176,7 +180,11 @@ export interface OpenCodeRuntime {
   loadOlderSessionPrompts(sessionId: string, isOwnerCurrent?: () => boolean): Promise<boolean>;
   createSession(title?: string, initialPermissionMode?: PermissionMode): Promise<string | null>;
   renameSession(id: string, title: string): Promise<boolean>;
-  forkSession(id: string, messageID?: string): Promise<string | null>;
+  forkSession(
+    id: string,
+    messageID?: string,
+    options?: { select?: boolean }
+  ): Promise<string | null>;
   deleteSession(id: string): Promise<void>;
   deleteSessionImmediately(id: string, options?: { directory?: string }): Promise<void>;
   restoreSession(rootID: string): Promise<void>;
@@ -234,8 +242,21 @@ export interface OpenCodeRuntime {
     response: 'once' | 'always' | 'reject',
     options?: { rethrow?: boolean }
   ): Promise<void>;
-  alwaysAllowPermissionForProject(sessionId: string, permissionId: string): Promise<void>;
-  alwaysAllowPermissionForSession(sessionId: string, permissionId: string): Promise<void>;
+  alwaysAllowPermissionForProject(
+    sessionId: string,
+    permissionId: string,
+    patterns?: string[]
+  ): Promise<void>;
+  alwaysAllowPermissionForSession(
+    sessionId: string,
+    permissionId: string,
+    patterns?: string[]
+  ): Promise<void>;
+  alwaysAllowPermissionForGlobal(
+    sessionId: string,
+    permissionId: string,
+    patterns: string[]
+  ): Promise<void>;
   respondQuestion(
     requestID: string,
     answers: QuestionAnswer,
@@ -289,9 +310,15 @@ export type SessionStatusSnapshot = {
 type PermissionJudgeAttempt = {
   permission: Permission;
   automationLease?: number;
+  decisionTurnMessageId?: string;
   status: 'judging' | 'visible' | 'responded';
   countedInFlight: boolean;
   promise: Promise<void>;
+};
+
+type PermissionDecisionReference = {
+  reference: AutoApproveJudgeReference;
+  turnMessageId: string | undefined;
 };
 
 type PermissionJudgeOutcome =
@@ -1092,6 +1119,8 @@ export function resetWorkspaceDerivedState(options?: {
     appStore.setState('commandsLoaded', false);
     appStore.setState('commands', []);
     appStore.setState('lspStatus', []);
+    appStore.setState('mcpDefaults', null);
+    routingStore.resetDraftSelectedMcps();
     appStore.setState('sessionAutoPermissionCounts', reconcile({}));
     appStore.setState('sessionAutoPermissionActivity', reconcile({}));
     appStore.setState('autoPermissionCountsSince', Date.now());
@@ -1149,7 +1178,33 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
   let sessionActivationPreserveTranscript = false;
   let initialRouteConsumed = false;
   let restoredPermissionsClassified = false;
-  const permissionDecisionReferencesByTree = new Map<string, AutoApproveJudgeReference[]>();
+  const permissionDecisionReferencesByTree = new Map<string, PermissionDecisionReference[]>();
+  const permissionDecisionTurnsBySession = new Map<string, { id: string; created: number }>();
+
+  function getPermissionDecisionTurnMessageId(sessionId: string): string | undefined {
+    const rootId = getPermissionDecisionScopeId(sessionId);
+    const isRootUserMessage = (entry: MessageEntry) =>
+      entry.info.sessionID === rootId && entry.info.role === 'user';
+    const message =
+      appStore.state.messages.findLast(isRootUserMessage)?.info ??
+      getCachedSessionMessages(rootId).findLast(isRootUserMessage)?.info;
+    if (message) recordPermissionDecisionTurn(message);
+    return permissionDecisionTurnsBySession.get(rootId)?.id;
+  }
+
+  function recordPermissionDecisionTurn(message: MessageEntry['info']) {
+    const previous = permissionDecisionTurnsBySession.get(message.sessionID);
+    if (
+      !previous ||
+      message.time.created > previous.created ||
+      (message.time.created === previous.created && message.id > previous.id)
+    ) {
+      permissionDecisionTurnsBySession.set(message.sessionID, {
+        id: message.id,
+        created: message.time.created,
+      });
+    }
+  }
   const permissionJudgeAttempts = new Map<string, PermissionJudgeAttempt>();
   const pendingPermissionSnapshot = new Map<string, Permission>();
   let permissionSynchronization: { ready: Promise<void>; complete: Promise<void> } | null = null;
@@ -1215,7 +1270,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     isActiveSession: (sessionId) => appStore.state.activeSessionId === sessionId,
     getMessages: () => appStore.state.messages,
     onSessionSettled: () => {
-      void syncSessionMcps(appStore.state.activeSessionId).catch((err) =>
+      void syncSessionMcps(getEffectiveComposerSessionId()).catch((err) =>
         logError('syncSessionMcpsAfterSessionSettled', err)
       );
     },
@@ -1305,6 +1360,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
         syncSessionMessages,
       },
       repairSessionTitle,
+      userMessageUpdated: recordPermissionDecisionTurn,
       sessionApprovalOperations: {
         respondPermission: sessionApprovalOperations.respondPermission,
         respondAutomaticPermission: (sessionId, permissionId, response, options) =>
@@ -1336,6 +1392,17 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
 
   function useOpenCode() {
     hideAutomaticallyHandledRestoredPermissions();
+    createEffect(
+      on(
+        getEffectiveComposerSessionId,
+        (sessionId) => {
+          if (initialized && sessionId === null) {
+            void syncSessionMcps(null).catch((error) => logError('syncDraftMcps', error));
+          }
+        },
+        { defer: true }
+      )
+    );
 
     onMount(() => {
       const initialTheme = syncWindowChatTheme({
@@ -1966,13 +2033,19 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
       );
       return;
     }
-    if (outcome.response.decision === 'ask') {
-      showPermissionAfterJudge(attempt, outcome.response.reason, outcome.response.actionSummary);
+    const staleRejection =
+      outcome.response.decision === 'reject' &&
+      attempt.decisionTurnMessageId !== getPermissionDecisionTurnMessageId(permission.sessionID);
+    if (outcome.response.decision === 'ask' || staleRejection) {
+      const reason = staleRejection
+        ? 'A new user message arrived after this review. Please confirm this request.'
+        : outcome.response.reason;
+      showPermissionAfterJudge(attempt, reason, outcome.response.actionSummary);
       finishPermissionJudgeAttempt(attempt);
       finishAutoApproveActivity(
         permission,
         'approval-required',
-        outcome.response.reason || 'Automatic review requested manual approval.',
+        reason || 'Automatic review requested manual approval.',
         outcome.response.reviewerModel
       );
       return;
@@ -2055,12 +2128,21 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     const judgeRequest = Promise.resolve()
       .then(async (): Promise<PermissionJudgeOutcome> => {
         const model = resolvePermissionJudgeModel(permission.sessionID);
+        const turnMessageId = getPermissionDecisionTurnMessageId(permission.sessionID);
+        attempt.decisionTurnMessageId = turnMessageId;
+        const references =
+          permissionDecisionReferencesByTree.get(
+            getPermissionDecisionScopeId(permission.sessionID)
+          ) || [];
         const request = {
           permission,
-          approvedReferences:
-            permissionDecisionReferencesByTree.get(
-              getPermissionDecisionScopeId(permission.sessionID)
-            ) || [],
+          // A rejection blocks retries within this turn, not a later user request.
+          approvedReferences: references
+            .filter(
+              ({ reference, turnMessageId: referenceTurn }) =>
+                reference.response !== 'reject' || referenceTurn === turnMessageId
+            )
+            .map(({ reference }) => reference),
           model: model || undefined,
         };
         if (attempt.automationLease === undefined) {
@@ -2231,15 +2313,40 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     for (const result of results) {
       if (result.status === 'rejected') logError('reconcileServerState', result.reason);
     }
+    if (
+      connection === connectionGeneration &&
+      workspace === workspaceGeneration &&
+      appStore.state.mcpDefaults
+    ) {
+      await syncSessionMcps(getEffectiveComposerSessionId());
+    }
   }
 
   const sessionMcpOperations = new SessionMcpOperations({
     getSelectedMcpsForSession: routingStore.getSelectedMcpsForSession,
+    getSharedMcpNames: () => {
+      // A different project/view can be using this server without sharing its
+      // selections with us. Never disconnect its live connections speculatively.
+      const unknownRunningSession = Object.entries(appStore.state.sessionStatus).some(
+        ([id, status]) => {
+          if (status?.type !== 'busy' && status?.type !== 'retry') return false;
+          const root = getSessionTreeRootId(id) || id;
+          if (appStore.state.sessionSelectedMcps[id] || appStore.state.sessionSelectedMcps[root])
+            return false;
+          const session = appStore.state.sessions.find((candidate) => candidate.id === root);
+          return (
+            !session ||
+            !isSameWorkspacePath(session.directory, appStore.state.editorContext.workspacePath)
+          );
+        }
+      );
+      return unknownRunningSession ? routingStore.getConnectedMcpNames() : [];
+    },
     getRequiredMcpSessionIds: (targetSessionId) => [
       ...(targetSessionId ? [targetSessionId] : []),
       ...Object.entries(appStore.state.sessionStatus)
         .filter(([, status]) => status?.type === 'busy' || status?.type === 'retry')
-        .map(([sessionId]) => sessionId),
+        .flatMap(([sessionId]) => [sessionId, getSessionTreeRootId(sessionId) || sessionId]),
     ],
     getMcpStatus: () => appStore.state.mcpStatus,
     loadMcps,
@@ -2259,6 +2366,8 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     activeInitializationAttempt = null;
     initializationOperation = null;
     startupStatusSnapshot = null;
+    uiStore.setStartupWaitingForPlugins(false);
+    uiStore.setStartupAddonWarning(null);
   }
 
   function invalidateWorkspaceAsyncWork(
@@ -2290,6 +2399,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     promptHistoryLoads.clear();
     promptHistoryPageLoads.clear();
     permissionDecisionReferencesByTree.clear();
+    permissionDecisionTurnsBySession.clear();
     for (const attempt of permissionJudgeAttempts.values()) {
       finishPermissionJudgeAttempt(attempt);
       clearReviewingAutoApproveActivity(attempt.permission);
@@ -2352,12 +2462,27 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     await sessionMcpOperations.applySessionMcps(names, sessionId);
   }
 
+  async function refreshSessionMcps(sessionId = appStore.state.activeSessionId) {
+    if ((await loadMcps({ fresh: true })) === false)
+      throw new Error('Could not refresh MCP configuration');
+    await syncSessionMcps(sessionId);
+  }
+
   const connectionBootstrapOperations = createConnectionBootstrapOperations({
     health: client.health,
     loadInitialData: async () => {
       const workspace = workspaceGeneration;
       const [snapshots, , statuses] = await Promise.all([
-        dataLoaders.loadEssentialSnapshots(),
+        dataLoaders.loadEssentialSnapshots({
+          onWaitingForPlugins: (waiting) => {
+            if (workspace !== workspaceGeneration) return;
+            uiStore.setStartupWaitingForPlugins(waiting);
+            if (!waiting) uiStore.setStartupAddonWarning(null);
+          },
+          onAddonWarning: (warning) => {
+            if (workspace === workspaceGeneration) uiStore.setStartupAddonWarning(warning);
+          },
+        }),
         syncPendingPermissions({ waitForAutomation: false }),
         loadCurrentSessionStatusSnapshot(),
       ]);
@@ -2365,13 +2490,16 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
         throw new Error(
           snapshots.state === 'superseded'
             ? 'Startup snapshots were superseded by a workspace change'
-            : `Could not load ${snapshots.failed.join(', ')}`
+            : `Could not load ${snapshots.failed.join(', ')}${snapshots.error ? `: ${snapshots.error}` : ''}`
         );
       if (workspace === workspaceGeneration)
         startupStatusSnapshot = { workspace, snapshot: statuses };
     },
     loadBackgroundData: async () => {
+      const workspace = workspaceGeneration;
       await Promise.all([loadCompatibilityState(), loadMcps(), loadLsps(), loadRecycleBin()]);
+      if (workspace === workspaceGeneration && appStore.state.mcpDefaults)
+        await syncSessionMcps(getEffectiveComposerSessionId());
     },
     hydrateSessionStatuses,
     getActiveSessionId: () => appStore.state.activeSessionId,
@@ -2776,10 +2904,12 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     getCommandRouting: (sessionId = appStore.state.activeSessionId) => {
       const model =
         routingStore.getSelectedModelForSession(sessionId) ?? appStore.state.selectedModel;
-      return {
+      const variant = normalizeModelVariant(model?.modelID, model?.variant);
+      const routing = {
         agent: appStore.state.selectedAgent ?? undefined,
         model: model ? `${model.providerID}/${model.modelID}` : undefined,
       };
+      return variant ? { ...routing, variant } : routing;
     },
     startLoading: uiStore.startLoading,
     runSessionCommand: (sessionId, input) =>
@@ -2893,7 +3023,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     resolveDefaultAgent: () =>
       getDefaultPrimaryAgentName(appStore.state.agents, routingStore.getPersistedSelectedAgent()),
     setSelectedAgent: routingStore.setSelectedAgent,
-    getInitialMcpNames: () => routingStore.getSelectedMcpsForSession(null) || [],
+    getInitialMcpNames: () => appStore.state.draftSelectedMcps,
     setSelectedMcpsForSession: routingStore.setSelectedMcpsForSession,
     resetDraftSelectedMcps: routingStore.resetDraftSelectedMcps,
     setPermissionModeForSession: permissionsStore.setPermissionModeForSession,
@@ -3175,8 +3305,12 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     return load;
   }
 
-  async function forkSession(id: string, messageID?: string): Promise<string | null> {
-    return sessionManagementOperations.forkSession(id, messageID);
+  async function forkSession(
+    id: string,
+    messageID?: string,
+    options?: { select?: boolean }
+  ): Promise<string | null> {
+    return sessionManagementOperations.forkSession(id, messageID, options);
   }
 
   async function renameSession(id: string, title: string): Promise<boolean> {
@@ -3375,6 +3509,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     const decisionReference = permission
       ? toApprovedPermissionReference(permission, response)
       : null;
+    const decisionTurnMessageId = getPermissionDecisionTurnMessageId(sessionId);
     const releaseRemovalIntent = registerPermissionRemovalIntent(
       groupMembers.length > 0 ? groupMembers.map((member) => member.id) : [permissionId],
       response === 'always'
@@ -3408,7 +3543,11 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
       releaseRemovalIntent();
     }
     if (permission && decisionReference) {
-      recordPermissionDecisionReference(permission.sessionID, decisionReference);
+      recordPermissionDecisionReference(
+        permission.sessionID,
+        decisionReference,
+        decisionTurnMessageId
+      );
       for (const member of groupMembers.length > 0 ? groupMembers : [permission]) {
         finishAutoApproveActivity(
           member,
@@ -3424,27 +3563,58 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     }
   }
 
-  async function alwaysAllowPermissionForProject(sessionId: string, permissionId: string) {
-    await client.session.persistProjectPermissionAllow(sessionId, permissionId, {
+  async function alwaysAllowPermissionForProject(
+    sessionId: string,
+    permissionId: string,
+    patterns?: string[]
+  ) {
+    const status = appStore.state.serverStatus;
+    // V2's always reply saves a second, durable database grant outside the config.
+    const response = status.state === 'running' && status.apiVersion === 1 ? 'always' : 'once';
+    const options: PermissionApprovalOptions = {
       directory: getSessionDirectory(sessionId),
-    });
-    await respondPermission(sessionId, permissionId, 'always', { rethrow: true });
+    };
+    if (patterns) options.patterns = patterns;
+    await client.session.persistProjectPermissionAllow(sessionId, permissionId, options);
+    await respondPermission(sessionId, permissionId, response, { rethrow: true });
   }
 
-  async function alwaysAllowPermissionForSession(sessionId: string, permissionId: string) {
-    await client.session.allowPermissionForSession(sessionId, permissionId, {
+  async function alwaysAllowPermissionForSession(
+    sessionId: string,
+    permissionId: string,
+    patterns?: string[]
+  ) {
+    const options: PermissionApprovalOptions = {
       directory: getSessionDirectory(sessionId),
+    };
+    if (patterns) options.patterns = patterns;
+    await client.session.allowPermissionForSession(sessionId, permissionId, options);
+    await respondPermission(sessionId, permissionId, 'once', { rethrow: true });
+  }
+
+  async function alwaysAllowPermissionForGlobal(
+    sessionId: string,
+    permissionId: string,
+    patterns: string[]
+  ) {
+    await client.session.persistGlobalPermissionAllow(sessionId, permissionId, {
+      directory: getSessionDirectory(sessionId),
+      patterns,
     });
     await respondPermission(sessionId, permissionId, 'once', { rethrow: true });
   }
 
   function recordPermissionDecisionReference(
     sessionId: string,
-    reference: AutoApproveJudgeReference
+    reference: AutoApproveJudgeReference,
+    turnMessageId: string | undefined
   ) {
     const scopeId = getPermissionDecisionScopeId(sessionId);
     const references = permissionDecisionReferencesByTree.get(scopeId) || [];
-    permissionDecisionReferencesByTree.set(scopeId, [...references, reference].slice(-20));
+    permissionDecisionReferencesByTree.set(
+      scopeId,
+      [...references, { reference, turnMessageId }].slice(-20)
+    );
   }
 
   async function respondQuestion(
@@ -3485,6 +3655,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     refreshProviderLimit,
     continueInterruptedSession,
     applySessionMcps,
+    refreshSessionMcps,
     resumeSteering,
     selectSession,
     loadFullSessionHistory,
@@ -3516,6 +3687,7 @@ export function createOpenCodeRuntime(): OpenCodeRuntime {
     respondPermission,
     alwaysAllowPermissionForProject,
     alwaysAllowPermissionForSession,
+    alwaysAllowPermissionForGlobal,
     respondQuestion,
     updatePermissionModeForSession,
     rejectQuestion,

@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installHighlightWorker } from '../../lib/highlight-worker.test-support';
 import { render } from 'solid-js/web';
-import { navArrowLeftIcon, navArrowRightIcon } from '../../lib/ui-icons';
+import { messageTextIcon, navArrowLeftIcon, navArrowRightIcon } from '../../lib/ui-icons';
 import { toCssUrl } from '../UiIcon';
 import { StickyUserMessagePreviewCard } from '../message-list/MessageListChrome';
 import type { AgentPart, FilePart, Part, TextPart } from '../../types';
@@ -24,6 +24,9 @@ import { formatSkillAttachment } from '../../lib/skill-reference';
 import { formatDatabaseAttachmentReference } from '../../../shared/database-context';
 import { formatInlineProblem, problemReferenceMarker } from '../../lib/editor-problems';
 import { pastedTextDataUrl } from '../../../shared/pasted-text';
+import { createChatAnnotation } from '../../../shared/chat-annotation';
+import { citationPathChecks } from '../../lib/citation-path-checks';
+import { isAssistantActivityPart } from '../../lib/assistant-activity';
 
 const selectSessionMock = vi.hoisted(() => vi.fn());
 const retryMessageMock = vi.hoisted(() => vi.fn());
@@ -114,13 +117,14 @@ describe('native subagent results', () => {
         id: part.id,
         messageID: part.messageID,
         sessionID: part.sessionID,
-        tool: 'task',
+        tool: 'automatic_action',
         state: {
           status: resultState === 'completed' ? 'completed' : 'error',
           metadata: { sessionID: 'native-child' },
         },
       });
       const action = parsed.automaticParts[0]!;
+      expect(isAssistantActivityPart(action)).toBe(true);
       if (action.state.status === 'completed') expect(action.state.output).toBe('Audit result');
       expect(getUserMessagePreviewText([part])).toBe('(no content)');
       expect(hasUserMessageEditableContent([part])).toBe(false);
@@ -360,6 +364,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup?.();
+  vi.restoreAllMocks();
   cleanup = undefined;
   container?.remove();
   container = null;
@@ -376,6 +381,55 @@ afterEach(() => {
 });
 
 describe('UserMessageContent', () => {
+  it.each([false, true])(
+    'renders annotation comments and the message-text icon with deferred content: %s',
+    async (deferred) => {
+      vi.useFakeTimers();
+      try {
+        const send = installSendToExtension();
+        const file = createChatAnnotation('Selected passage', 'Please check this assumption');
+        const part: FilePart = {
+          id: 'annotation-1',
+          sessionID: 'session-1',
+          messageID: 'message-1',
+          type: 'file',
+          mime: 'text/plain',
+          filename: file.relativePath,
+          url: deferred
+            ? 'varro-content:/session/session-1/message/message-1/part/annotation-1'
+            : pastedTextDataUrl(file.pastedText!),
+          annotation: deferred
+            ? { selectedText: 'Selected passage', note: 'Please check this assumption' }
+            : undefined,
+        };
+        renderUserContent([
+          textPart('prompt', `Review @${file.relativePath}`),
+          part,
+          { ...part, id: 'duplicate' },
+        ]);
+        const chips = container!.querySelectorAll<HTMLElement>('.inline-chip');
+        expect(chips).toHaveLength(1);
+        const chip = chips[0]!;
+        expect(chip.textContent).toBe('Please check this assumption');
+        expect(chip.hasAttribute('title')).toBe(false);
+        expect(
+          chip.querySelector<HTMLElement>('.ui-icon')?.style.getPropertyValue('--ui-icon-mask')
+        ).toBe(toCssUrl(messageTextIcon));
+        chip.dispatchEvent(new MouseEvent('mouseenter'));
+        await vi.advanceTimersByTimeAsync(400);
+        expect(document.querySelector('.chat-annotation-tooltip-note')?.textContent).toBe(
+          'Please check this assumption'
+        );
+        expect(document.querySelector('.chat-annotation-tooltip-quote')?.textContent).toBe(
+          'Selected passage'
+        );
+        expect(send).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
+
   it.each(['In CI', '**In CI**'])(
     'renders pasted text once inline after %s and opens its content',
     (prefix) => {
@@ -1385,6 +1439,7 @@ describe('UserMessageContent', () => {
   it.each(['src/', 'file:///repo/src/'])(
     'offers complete label Copy and Copy path for a user-message folder link to %s',
     (href) => {
+      vi.spyOn(citationPathChecks, 'peek').mockReturnValue('/repo/src');
       setAppState('editorContext', {
         workspacePath: '/repo',
         activeFile: null,

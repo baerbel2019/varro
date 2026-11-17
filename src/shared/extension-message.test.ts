@@ -2,12 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { isEditorContext, parseExtensionMessage } from './extension-message';
 
 describe('parseExtensionMessage', () => {
-  it('validates Handy results', () => {
+  it('validates dictation results and provider names', () => {
     const message = {
-      type: 'handy/result',
+      type: 'dictation/result',
       payload: { requestId: '1', available: true, running: true, state: 'idle' },
     };
     expect(parseExtensionMessage(message)).toEqual(message);
+    for (const provider of ['handy', 'hex']) {
+      const withProvider = { ...message, payload: { ...message.payload, provider } };
+      expect(parseExtensionMessage(withProvider)).toEqual(withProvider);
+    }
     expect(
       parseExtensionMessage({ ...message, payload: { ...message.payload, error: 'Start Handy' } })
     ).toEqual({ ...message, payload: { ...message.payload, error: 'Start Handy' } });
@@ -21,6 +25,7 @@ describe('parseExtensionMessage', () => {
       { ...message.payload, revision: Infinity },
       { ...message.payload, revision: 1.5 },
       { ...message.payload, error: 1 },
+      { ...message.payload, provider: 'other' },
       { ...message.payload, requestId: '' },
     ]) {
       expect(parseExtensionMessage({ ...message, payload })).toBeNull();
@@ -165,6 +170,41 @@ describe('parseExtensionMessage', () => {
       { creditBalance: Infinity },
       { creditBalance: -1 },
       { usageLimitResets: { credits: [null] } },
+    ]) {
+      expect(
+        parseExtensionMessage({
+          ...message,
+          payload: { ...message.payload, status: { ...message.payload.status, ...invalid } },
+        })
+      ).toBeNull();
+    }
+  });
+
+  it('validates the explicit Codex-login warning without accepting it on unrelated statuses', () => {
+    const message = {
+      type: 'provider-limit/updated',
+      payload: {
+        directory: '/repo',
+        status: {
+          providerID: 'openai',
+          status: 'unsupported',
+          source: 'provider',
+          checkedAt: 1,
+          note: 'Token sharing cannot read quotas',
+          codexLoginRequired: { connectionID: 'connection' },
+        },
+      },
+    };
+    expect(parseExtensionMessage(message)).toEqual(message);
+    for (const invalid of [
+      { codexLoginRequired: null },
+      { codexLoginRequired: {} },
+      { codexLoginRequired: { connectionID: 42 } },
+      { codexLoginRequired: { connectionID: ' ' } },
+      { status: 'error' },
+      { status: 'available', windows: [] },
+      { providerID: 'anthropic' },
+      { source: 'opencode' },
     ]) {
       expect(
         parseExtensionMessage({

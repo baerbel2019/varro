@@ -1,5 +1,6 @@
 export {
   alwaysAllowPermissionForProject,
+  alwaysAllowPermissionForGlobal,
   alwaysAllowPermissionForSession,
   abortSession,
   manageChildTask,
@@ -26,6 +27,7 @@ export {
   renameSession,
   refreshProviderLimit,
   refreshRoutingState,
+  refreshSessionMcps,
   rejectQuestion,
   reloadSessions,
   respondPermission,

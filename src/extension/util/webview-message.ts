@@ -5,8 +5,12 @@ import {
   MAX_DROPPED_CONTENT_FILES,
   MAX_DROPPED_CONTENT_FILE_BYTES,
   MAX_DROPPED_CONTENT_TOTAL_BYTES,
+  MAX_DROPPED_DIRECTORY_ENTRIES,
+  isSafeDroppedRelativePath,
 } from '../../shared/dropped-content-policy';
+import type { DroppedContentDirectory } from '../../shared/dropped-content-policy';
 import { OPENCODE_TERMINAL_COMMANDS } from '../../shared/opencode-install';
+import { parseFollowupTitle } from '../../shared/followups';
 import { isInlineProblemAttachment } from '../../shared/extension-message';
 import {
   isPermissionMode,
@@ -50,6 +54,7 @@ import {
 // shell text in the user's terminal.
 const ALLOWED_TERMINAL_COMMANDS = new Set<string>([
   'opencode auth login',
+  'claude auth login',
   'opencode auth',
   'opencode auth logout',
   ...OPENCODE_TERMINAL_COMMANDS,
@@ -114,7 +119,7 @@ interface RalphContentBudget {
  * tests can assert their own tables stay exhaustive as the protocol grows.
  */
 export const WEBVIEW_MESSAGE_TYPES = {
-  'handy/request': true,
+  'dictation/request': true,
   'context/request': true,
   'workspace/select': true,
   'commands/state': true,
@@ -191,17 +196,24 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
   if (!type || !hasOwn(WEBVIEW_MESSAGE_TYPES, type)) return null;
 
   switch (type) {
-    case 'handy/request': {
+    case 'dictation/request': {
       const payload = asRecord(message?.payload);
       const requestId = getString(payload?.requestId);
       const action = payload?.action;
+      const provider = payload?.provider;
       if (
         !requestId ||
         requestId.length > 128 ||
+        (provider !== undefined && provider !== 'handy' && provider !== 'hex') ||
         (action !== 'status' && action !== 'start' && action !== 'stop' && action !== 'cancel')
       )
         return null;
-      return { type, payload: { requestId, action } };
+      const result: Extract<WebviewMessage, { type: 'dictation/request' }> = {
+        type,
+        payload: { requestId, action },
+      };
+      if (provider) result.payload.provider = provider;
+      return result;
     }
     case 'context/request':
     case 'providers/refresh':
@@ -209,11 +221,20 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
     case 'terminal-selection/clear':
     case 'files/pick':
     case 'webview/reload':
-    case 'vscode/open-folder':
     case 'vscode/show-output':
     case 'chat/new-editor':
     case 'chat/new-window':
       return { type };
+
+    case 'vscode/open-folder': {
+      if (message?.payload === undefined) return { type };
+      const payload = asRecord(message.payload);
+      const sessionId = payload?.sessionId;
+      const directory = getBoundedString(payload?.directory, MAX_PATH_LENGTH);
+      return isSafePersistedSessionId(sessionId) && /^[A-Za-z0-9_-]+$/.test(sessionId) && directory
+        ? { type, payload: { sessionId, directory } }
+        : null;
+    }
 
     case 'ready': {
       if (message?.payload === undefined) return { type };
@@ -604,7 +625,8 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       const payload = asRecord(message?.payload);
       if (
         typeof payload?.canAbort !== 'boolean' ||
-        typeof payload.canSwitchSessions !== 'boolean'
+        typeof payload.canSwitchSessions !== 'boolean' ||
+        (payload.modelVisible !== undefined && typeof payload.modelVisible !== 'boolean')
       ) {
         return null;
       }
@@ -617,6 +639,7 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
           model: null,
         };
         if (sessionId.value !== undefined) commandState.sessionId = sessionId.value;
+        if (payload.modelVisible !== undefined) commandState.modelVisible = payload.modelVisible;
         return { type, payload: commandState };
       }
       const model = asRecord(payload.model);
@@ -640,6 +663,7 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
         model: selectedModel,
       };
       if (sessionId.value !== undefined) commandState.sessionId = sessionId.value;
+      if (payload.modelVisible !== undefined) commandState.modelVisible = payload.modelVisible;
       return { type, payload: commandState };
     }
 
@@ -688,17 +712,39 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
 
     case 'files/drop-content': {
       const payload = asRecord(message?.payload);
-      if (!Array.isArray(payload?.files) || payload.files.length === 0) return null;
+      if (!Array.isArray(payload?.files)) return null;
+      let directory: DroppedContentDirectory | undefined;
+      if (payload.directory !== undefined) {
+        const record = asRecord(payload.directory);
+        const name = getBoundedString(record?.name, 255);
+        if (
+          !name ||
+          name.includes('/') ||
+          !isSafeDroppedRelativePath(name) ||
+          !Array.isArray(record?.directories) ||
+          record.directories.length + payload.files.length > MAX_DROPPED_DIRECTORY_ENTRIES ||
+          !record.directories.every(
+            (path): path is string => isString(path) && isSafeDroppedRelativePath(path)
+          )
+        )
+          return null;
+        directory = { name, directories: record.directories };
+      }
+      if (!directory && payload.files.length === 0) return null;
       if (payload.files.length > MAX_DROPPED_CONTENT_FILES) return null;
       const files: Array<{ name: string; content: string; size: number }> = [];
       let totalSize = 0;
       for (const entry of payload.files) {
         const record = asRecord(entry);
-        const name = getBoundedString(record?.name, MAX_DROPPED_CONTENT_NAME_LENGTH);
+        const name = getBoundedString(
+          record?.name,
+          directory ? 1024 : MAX_DROPPED_CONTENT_NAME_LENGTH
+        );
         const content = getBoundedString(record?.content, MAX_DROPPED_CONTENT_BASE64_LENGTH, true);
         const size = getSafeInteger(record?.size);
         if (
           !name ||
+          (directory && !isSafeDroppedRelativePath(name)) ||
           content === null ||
           size === null ||
           size > MAX_DROPPED_CONTENT_FILE_BYTES ||
@@ -710,7 +756,7 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
         if (totalSize > MAX_DROPPED_CONTENT_TOTAL_BYTES) return null;
         files.push({ name, content, size });
       }
-      return { type, payload: { files } };
+      return { type, payload: directory ? { files, directory } : { files } };
     }
 
     case 'pdfs/store': {
@@ -825,6 +871,7 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       const payload = asRecord(message?.payload);
       const path = getBoundedString(payload?.path, MAX_PATH_LENGTH);
       const line = payload?.line === undefined ? undefined : getSafeInteger(payload.line);
+      const endLine = payload?.endLine === undefined ? undefined : getSafeInteger(payload.endLine);
       const kind = payload?.kind;
       const view = payload?.view;
       const sessionID = getOptionalBoundedString(payload?.sessionID, 512);
@@ -832,16 +879,24 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       const requestId =
         payload?.requestId === undefined ? undefined : getSafeInteger(payload.requestId);
       if (!path || (payload?.line !== undefined && line === null)) return null;
+      if (
+        payload?.endLine !== undefined &&
+        (endLine == null || line == null || line < 1 || endLine < line)
+      )
+        return null;
       if (payload?.requestId !== undefined && requestId === null) return null;
       if (payload?.sessionID !== undefined && !sessionID) return null;
       if (payload?.directory !== undefined && !directory) return null;
       if (kind !== undefined && kind !== 'auto' && kind !== 'file' && kind !== 'directory')
         return null;
       if (view !== undefined && view !== 'diff') return null;
+      if (payload?.exact !== undefined && typeof payload.exact !== 'boolean') return null;
       const openPayload: Extract<WebviewMessage, { type: 'vscode/open' }>['payload'] = { path };
       if (line !== undefined && line !== null) openPayload.line = line;
+      if (endLine !== undefined && endLine !== null) openPayload.endLine = endLine;
       if (kind) openPayload.kind = kind;
       if (view) openPayload.view = view;
+      if (payload?.exact !== undefined) openPayload.exact = payload.exact;
       if (sessionID) openPayload.sessionID = sessionID;
       if (directory) openPayload.directory = directory;
       if (requestId !== undefined && requestId !== null) openPayload.requestId = requestId;
@@ -1459,6 +1514,7 @@ function isValidQueuedMessageRouting(record: UnknownRecord) {
   if (record.agent !== undefined && !getBoundedString(record.agent, MAX_RALPH_ID_LENGTH))
     return false;
   if (record.paused !== undefined && typeof record.paused !== 'boolean') return false;
+  if (record.followupTitle !== undefined && !parseFollowupTitle(record.followupTitle)) return false;
   if (!Array.isArray(record.droppedFiles) || !Array.isArray(record.clipboardImages)) return false;
   if (record.attachedDiagnostics !== undefined && !asRecord(record.attachedDiagnostics))
     return false;
@@ -1821,11 +1877,15 @@ const API_ROUTES: ApiRoute[] = [
   route('/global/config', methodsNoQuery('GET')),
   route('/model/default', methodsNoQuery('GET')),
   route('/config/providers', methodsNoQuery('GET')),
+  route(VARRO_API_ENDPOINTS.startupDiagnostics, methodsNoQuery('GET')),
   route('/provider', methodsNoQuery('GET')),
   route('/provider/auth', methodsNoQuery('GET')),
   route('/auth/:id', methodsNoQuery('PUT', 'DELETE')),
   route('/command', methodsNoQuery('GET')),
   route('/mcp', methodsNoQuery('GET')),
+  route(VARRO_API_ENDPOINTS.mcpDefaults, methodsNoQuery('GET', 'POST')),
+  route(VARRO_API_ENDPOINTS.mcpConfig, methodsNoQuery('POST')),
+  route(VARRO_API_ENDPOINTS.mcpConfigOpen, methodsNoQuery('POST')),
   route('/lsp', methodsNoQuery('GET')),
   route('/vcs/status', methodsNoQuery('GET')),
   route('/agent', methodsNoQuery('GET')),
@@ -1869,6 +1929,8 @@ const API_ROUTES: ApiRoute[] = [
   route(VARRO_API_ENDPOINTS.workspaceFilePick, methodsNoQuery('GET')),
   route(VARRO_API_ENDPOINTS.copiedSelectionMatch, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.remoteImage, methodsNoQuery('POST')),
+  route(VARRO_API_ENDPOINTS.citationPaths, methodsNoQuery('POST')),
+  route(VARRO_API_ENDPOINTS.citationSymbols, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.workspaceProblems, methodsNoQuery('GET')),
   route(
     VARRO_API_ENDPOINTS.sessionTransferHide,
@@ -1891,6 +1953,7 @@ const API_ROUTES: ApiRoute[] = [
   route(VARRO_API_ENDPOINTS.promptCompletionTest, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.openCodeConfigDisableProvider, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.openCodeConfigPermissions, methodsNoQuery('GET', 'POST')),
+  route(VARRO_API_ENDPOINTS.openCodeGlobalPermissions, methodsNoQuery('GET', 'POST')),
   route(VARRO_API_ENDPOINTS.permissionJudge, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.decisionProviders, methodsNoQuery('GET', 'POST')),
   route(
@@ -1899,6 +1962,10 @@ const API_ROUTES: ApiRoute[] = [
   ),
   route(
     VARRO_API_ENDPOINTS.permissionSessionAllow,
+    ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
+  ),
+  route(
+    VARRO_API_ENDPOINTS.permissionGlobalAllow,
     ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
   ),
   route(VARRO_API_ENDPOINTS.permissionSessionRules, ({ method, url }) =>
@@ -1921,11 +1988,19 @@ const API_ROUTES: ApiRoute[] = [
   ),
   route(`${VARRO_API_ENDPOINTS.session}/:id/activate`, methodsNoQuery('POST')),
   route(
+    `${VARRO_API_ENDPOINTS.session}/:id/location`,
+    ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)
+  ),
+  route(
     `${VARRO_API_ENDPOINTS.session}/:id/followups`,
     ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
   ),
   route(
     `${VARRO_API_ENDPOINTS.session}/:id/followups/dismiss`,
+    ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
+  ),
+  route(
+    `${VARRO_API_ENDPOINTS.session}/:id/followups/session`,
     ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
   ),
   route(

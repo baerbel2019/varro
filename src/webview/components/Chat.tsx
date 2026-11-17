@@ -19,6 +19,9 @@ import {
   setShowModels,
   showPermissionSettings,
   setShowPermissionSettings,
+  showMcpSettings,
+  setShowMcpSettings,
+  requestComposerFocus,
 } from '../lib/state';
 import { Show, createSignal, onMount, onCleanup, createEffect, createMemo, on } from 'solid-js';
 import { selectSession, deleteSessionImmediately } from '../hooks/useOpenCode';
@@ -120,6 +123,7 @@ export function Chat() {
     error: string;
     loading: boolean;
     providerID: string | null;
+    methodID?: string;
   } | null>(null);
 
   createEffect(() => {
@@ -131,6 +135,7 @@ export function Chat() {
       error: '',
       loading: true,
       providerID: request.providerID,
+      methodID: request.methodID,
     };
     setProviderConnectionData(loadingState);
     void client.config.providerCatalog().then(
@@ -141,6 +146,7 @@ export function Chat() {
           error: '',
           loading: false,
           providerID: request.providerID,
+          methodID: request.methodID,
         });
       },
       (error) => {
@@ -150,6 +156,7 @@ export function Chat() {
           error: error instanceof Error ? error.message : String(error),
           loading: false,
           providerID: request.providerID,
+          methodID: request.methodID,
         });
       }
     );
@@ -340,6 +347,7 @@ export function Chat() {
       canAbort: Boolean(activeSessionId) && isActiveSessionWorking(),
       canSwitchSessions,
       model: modelPayload,
+      modelVisible: shouldRenderWorkspace() && !showModels(),
       sessionId: activeSessionId,
     };
     const key = JSON.stringify(payload);
@@ -728,6 +736,11 @@ export function Chat() {
         ) {
           return;
         }
+        if (showMcpSettings()) {
+          setShowMcpSettings(false);
+          requestComposerFocus();
+          return;
+        }
         if (showPermissionSettings()) {
           setShowPermissionSettings(false);
           return;
@@ -925,6 +938,7 @@ export function Chat() {
         showSessionPicker={isEditorSurface ? false : showSessionPicker()}
         showModels={showModels()}
         showPermissionSettings={showPermissionSettings()}
+        showMcpSettings={showMcpSettings()}
         showReconnectBanner={showReconnectBanner()}
         slowApiRequests={slowApiRequests()}
         sessionFilter={sessionFilter()}
@@ -1012,6 +1026,7 @@ export function Chat() {
             providerLoadError={data().error}
             isLoadingProviders={data().loading}
             initialProviderID={data().providerID}
+            initialMethodID={data().methodID}
             lockProvider={Boolean(data().providerID)}
             reauthentication={Boolean(data().providerID)}
             onClose={() => setProviderConnectionData(null)}

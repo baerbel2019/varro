@@ -32,6 +32,7 @@ import type {
   InlineProblemAttachment,
   DroppedFile,
   LspStatus,
+  McpDefaults,
   McpStatus,
   PermissionMode,
   ProviderLimitStatus,
@@ -171,6 +172,7 @@ export interface AppState {
   providers: Provider[];
   providerLimits: Record<string, ProviderLimitStatus | null>;
   mcpStatus: Record<string, McpStatus>;
+  mcpDefaults: McpDefaults | null;
   lspStatus: LspStatus[];
   providerDefaults: Record<string, string>;
   sessionPermissionModes: Record<string, PermissionMode>;
@@ -188,6 +190,7 @@ export interface AppState {
   sessionSelectedModels: SessionSelectedModels;
   modelVariantSelections: ModelVariantSelections;
   providerOrder: string[];
+  providerLimitPins: Record<string, string>;
   modelOrder: string[];
   sessionSelectedMcps: SessionSelectedMcps;
   draftSelectedMcps: string[] | null;
@@ -262,6 +265,10 @@ export interface AppStateInstance {
   setErrorRetry(action: (() => void) | null): void;
   connectionInitialized: Accessor<boolean>;
   setConnectionInitialized: Setter<boolean>;
+  startupWaitingForPlugins: Accessor<boolean>;
+  setStartupWaitingForPlugins: Setter<boolean>;
+  startupAddonWarning: Accessor<string | null>;
+  setStartupAddonWarning: Setter<string | null>;
   showSessionPicker: Accessor<boolean>;
   setShowSessionPicker: Setter<boolean>;
   manualWorkspaceSelection: Accessor<boolean>;
@@ -272,6 +279,8 @@ export interface AppStateInstance {
   setShowModels: Setter<boolean>;
   showPermissionSettings: Accessor<boolean>;
   setShowPermissionSettings: Setter<boolean>;
+  showMcpSettings: Accessor<boolean>;
+  setShowMcpSettings: Setter<boolean>;
   composerFocusKey: Accessor<number>;
   setComposerFocusKey: Setter<number>;
   openAttentionSessionsKey: Accessor<number>;
@@ -449,6 +458,7 @@ export function createAppState(): AppStateInstance {
     providers: [],
     providerLimits: {},
     mcpStatus: {},
+    mcpDefaults: null,
     lspStatus: [],
     providerDefaults: {},
     sessionPermissionModes: initialWebviewState.sessionPermissionModes ?? {},
@@ -476,6 +486,9 @@ export function createAppState(): AppStateInstance {
       readStoredNullableStringRecord(STORAGE_KEYS.modelVariantSelections),
     providerOrder:
       modelPreferences?.providerOrder ?? readStoredStringArray(STORAGE_KEYS.providerOrder),
+    providerLimitPins: modelPreferences
+      ? (modelPreferences.providerLimitPins ?? {})
+      : readStoredStringRecord(STORAGE_KEYS.providerLimitPins),
     modelOrder: modelPreferences?.modelOrder ?? readStoredStringArray(STORAGE_KEYS.modelOrder),
     sessionSelectedMcps: readStoredStringArrayRecord(STORAGE_KEYS.sessionSelectedMcps),
     draftSelectedMcps: null,
@@ -552,6 +565,8 @@ export function createAppState(): AppStateInstance {
     setErrorRetrySignal(() => action);
   };
   const [connectionInitialized, setConnectionInitialized] = createSignal(false);
+  const [startupWaitingForPlugins, setStartupWaitingForPlugins] = createSignal(false);
+  const [startupAddonWarning, setStartupAddonWarning] = createSignal<string | null>(null);
   const [showSessionPicker, setShowSessionPicker] = createSignal(false);
   const storedWorkspacePath = readStored<unknown>(STORAGE_KEYS.workspacePath);
   const initialManualWorkspaceSelection =
@@ -569,6 +584,7 @@ export function createAppState(): AppStateInstance {
   const [showModelPicker, setShowModelPicker] = createSignal(false);
   const [showModels, setShowModels] = createSignal(false);
   const [showPermissionSettings, setShowPermissionSettings] = createSignal(false);
+  const [showMcpSettings, setShowMcpSettings] = createSignal(false);
   const [composerFocusKey, setComposerFocusKey] = createSignal(0);
   const [openAttentionSessionsKey, setOpenAttentionSessionsKey] = createSignal(0);
   const [openCompletedSessionsKey, setOpenCompletedSessionsKey] = createSignal(0);
@@ -647,6 +663,10 @@ export function createAppState(): AppStateInstance {
     setErrorRetry,
     connectionInitialized,
     setConnectionInitialized,
+    startupWaitingForPlugins,
+    setStartupWaitingForPlugins,
+    startupAddonWarning,
+    setStartupAddonWarning,
     showSessionPicker,
     setShowSessionPicker,
     manualWorkspaceSelection,
@@ -657,6 +677,8 @@ export function createAppState(): AppStateInstance {
     setShowModels,
     showPermissionSettings,
     setShowPermissionSettings,
+    showMcpSettings,
+    setShowMcpSettings,
     composerFocusKey,
     setComposerFocusKey,
     openAttentionSessionsKey,
@@ -742,6 +764,10 @@ export const errorRetry = defaultAppState.errorRetry;
 export const setErrorRetry = defaultAppState.setErrorRetry;
 export const connectionInitialized = defaultAppState.connectionInitialized;
 export const setConnectionInitialized = defaultAppState.setConnectionInitialized;
+export const startupWaitingForPlugins = defaultAppState.startupWaitingForPlugins;
+export const setStartupWaitingForPlugins = defaultAppState.setStartupWaitingForPlugins;
+export const startupAddonWarning = defaultAppState.startupAddonWarning;
+export const setStartupAddonWarning = defaultAppState.setStartupAddonWarning;
 export const showSessionPicker = defaultAppState.showSessionPicker;
 export const setShowSessionPicker = defaultAppState.setShowSessionPicker;
 export const manualWorkspaceSelection = defaultAppState.manualWorkspaceSelection;
@@ -753,6 +779,8 @@ export const showModels = defaultAppState.showModels;
 export const setShowModels = defaultAppState.setShowModels;
 export const showPermissionSettings = defaultAppState.showPermissionSettings;
 export const setShowPermissionSettings = defaultAppState.setShowPermissionSettings;
+export const showMcpSettings = defaultAppState.showMcpSettings;
+export const setShowMcpSettings = defaultAppState.setShowMcpSettings;
 export const composerFocusKey = defaultAppState.composerFocusKey;
 export const setComposerFocusKey = defaultAppState.setComposerFocusKey;
 export const openAttentionSessionsKey = defaultAppState.openAttentionSessionsKey;
@@ -803,11 +831,14 @@ export function resetDefaultAppState() {
   setLoadingLastActivityAt(next.loadingLastActivityAt());
   setError(next.error());
   setConnectionInitialized(next.connectionInitialized());
+  setStartupWaitingForPlugins(next.startupWaitingForPlugins());
+  setStartupAddonWarning(next.startupAddonWarning());
   setShowSessionPicker(next.showSessionPicker());
   setManualWorkspaceSelection(next.manualWorkspaceSelection());
   setShowModelPicker(next.showModelPicker());
   setShowModels(next.showModels());
   setShowPermissionSettings(next.showPermissionSettings());
+  setShowMcpSettings(next.showMcpSettings());
   setComposerFocusKey(next.composerFocusKey());
   setOpenAttentionSessionsKey(next.openAttentionSessionsKey());
   setOpenCompletedSessionsKey(next.openCompletedSessionsKey());

@@ -80,6 +80,7 @@ import { buildServerEnv, getServerPathEntries } from './util/server-path';
 import { runWindowsCliUpdate } from './util/windows-cli-update';
 import { getVarroTestStateDirectory } from './varro-test-state';
 import { getVarroStateDirectory } from './varro-state-paths';
+import { hasStoredWebSearchPreference } from './websearch-preference';
 
 const CLI_OUTPUT_MAX_CHARS = 1024 * 1024;
 const CLI_OUTPUT_TRUNCATED_MARKER = '[earlier output truncated]\n';
@@ -202,6 +203,13 @@ function containsOpenAIStreamTimeout(raw: string): boolean {
       return !!settings && ('chunkTimeout' in settings || 'timeout' in settings);
     });
   });
+}
+
+function containsWebSearchPreference(raw: string): boolean {
+  const errors: ParseError[] = [];
+  const value = asRecord(parse(raw, errors, { allowTrailingComma: true }));
+  // Unknown configuration must not become consent to use external search providers.
+  return errors.length > 0 || !value || Object.hasOwn(value, 'websearch');
 }
 
 interface MaintenanceCallbacks {
@@ -548,7 +556,7 @@ export function sweepStaleInjectedConfigDirectories(now = Date.now()): Promise<v
 
 // Owns OpenCode spawn and termination mechanics; OpenCodeServer owns lifecycle and retry policy.
 export class OpenCodeProcess {
-  static readonly MISSING_CLI_MESSAGE = `OpenCode CLI not found. Install OpenCode v2 with: ${OPENCODE_INSTALL_COMMAND}. OpenCode v1 is also supported; see Varro's setup guide for installation options.`;
+  static readonly MISSING_CLI_MESSAGE = `OpenCode CLI not found. Install OpenCode v2 with: ${OPENCODE_INSTALL_COMMAND}.`;
 
   /** Unambiguous "the binary is not there": the spawn itself never got started. */
   static isMissingCliFailure(text: string): boolean {
@@ -1534,8 +1542,7 @@ export class OpenCodeProcess {
       return false;
     const retired = [];
     for (const [path, lease] of candidates) {
-      if (normalizeExecutableIdentity(lease.executable) !== normalizeExecutableIdentity(executable))
-        continue;
+      if (!(await this.matchesExecutableIdentity(lease.executable, executable))) continue;
       if (!(await this.isRegisteredProcessRetired(lease))) return false;
       retired.push({ path, lease });
     }
@@ -2620,6 +2627,8 @@ export class OpenCodeProcess {
       config.agent = { ask: ASK_AGENT };
     }
     const version = this.injectedConfigServerVersion ?? this.installedCliVersionCache?.value ?? '';
+    if (openCodeApiVersion(version) === 2 && (await this.shouldDefaultWebSearch()))
+      config.websearch = { provider: 'random' };
     if (
       openCodeApiVersion(version) === 2 &&
       compareVersions(version, '2.0.20') >= 0 &&
@@ -2645,11 +2654,83 @@ export class OpenCodeProcess {
     this.injectedConfigServerVersion = version;
   }
 
+  private async shouldDefaultWebSearch(): Promise<boolean> {
+    if (
+      await this.hasConfiguredValue(
+        containsWebSearchPreference,
+        'a web search preference',
+        'ancestors'
+      )
+    )
+      return false;
+    try {
+      // A config default outranks OpenCode's saved interactive choice, including false.
+      return !(await hasStoredWebSearchPreference());
+    } catch (error) {
+      logger.warn(
+        `Preserving OpenCode web search selection because its saved preference could not be inspected: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return false;
+    }
+  }
+
+  /** Recheck global preferences before reload, so an injected default cannot hide a new opt-out. */
+  async reconcileInjectedWebSearch(): Promise<void> {
+    const version = this.injectedConfigServerVersion ?? this.installedCliVersionCache?.value ?? '';
+    if (openCodeApiVersion(version) !== 2) return;
+    await this.updateOwnedInjectedConfig(async (config) => {
+      const existing = asRecord(config.websearch);
+      // Only remove our exact fallback, never an unrelated runtime setting.
+      if (
+        Object.hasOwn(config, 'websearch') &&
+        (!existing || existing.provider !== 'random' || Object.keys(existing).length !== 1)
+      )
+        return false;
+      const useDefault = await this.shouldDefaultWebSearch();
+      if (useDefault === Object.hasOwn(config, 'websearch')) return false;
+      if (useDefault) config.websearch = { provider: 'random' };
+      else delete config.websearch;
+      return true;
+    });
+  }
+
   async reconcileInjectedStreamTimeout(version: string): Promise<boolean> {
     if (openCodeApiVersion(version) !== 2 || compareVersions(version, '2.0.20') < 0) return false;
-    const lease = this.ownershipLease;
-    if (!this._managedProcess || !lease?.configPath || lease.host !== this.hostOwner) return false;
     let available = false;
+    await this.updateOwnedInjectedConfig(async (config, content) => {
+      this.injectedConfigServerVersion = version;
+      const providers = asRecord(config.providers) ?? {};
+      const openai = asRecord(providers.openai) ?? {};
+      const settings = asRecord(openai.settings) ?? {};
+      // An existing injected default may still need a reload after a failed
+      // attempt. All other explicit policies remain untouched.
+      if (containsOpenAIStreamTimeout(content)) {
+        available = settings.chunkTimeout === 300000;
+        return false;
+      }
+      if (
+        await this.hasConfiguredValue(
+          containsOpenAIStreamTimeout,
+          'an OpenAI stream timeout',
+          'ancestors'
+        )
+      )
+        return false;
+      config.providers = {
+        ...providers,
+        openai: { ...openai, settings: { ...settings, chunkTimeout: 300000 } },
+      };
+      available = true;
+      return true;
+    });
+    return available;
+  }
+
+  private async updateOwnedInjectedConfig(
+    update: (config: Record<string, unknown>, content: string) => Promise<boolean>
+  ): Promise<void> {
+    const lease = this.ownershipLease;
+    if (!this._managedProcess || !lease?.configPath || lease.host !== this.hostOwner) return;
     await this.runInjectedConfigOperation(async () => {
       const claim = await this.acquireOwnershipClaim({
         hostPid: lease.hostPid,
@@ -2672,32 +2753,11 @@ export class OpenCodeProcess {
           !(await this.matchesInjectedConfigOwner(lease))
         )
           return;
-        this.injectedConfigServerVersion = version;
         const content = await readFile(lease.configPath!, 'utf-8');
         const errors: ParseError[] = [];
         const config = asRecord(parse(content, errors, { allowTrailingComma: true }));
         if (!config || errors.length > 0) return;
-        const providers = asRecord(config.providers) ?? {};
-        const openai = asRecord(providers.openai) ?? {};
-        const settings = asRecord(openai.settings) ?? {};
-        // An existing injected default may still need a reload after a failed
-        // attempt. All other explicit policies remain untouched.
-        if (containsOpenAIStreamTimeout(content)) {
-          available = settings.chunkTimeout === 300000;
-          return;
-        }
-        if (
-          await this.hasConfiguredValue(
-            containsOpenAIStreamTimeout,
-            'an OpenAI stream timeout',
-            'ancestors'
-          )
-        )
-          return;
-        config.providers = {
-          ...providers,
-          openai: { ...openai, settings: { ...settings, chunkTimeout: 300000 } },
-        };
+        if (!(await update(config, content))) return;
         const temporaryPath = `${lease.configPath}.${randomBytes(8).toString('hex')}.tmp`;
         try {
           await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
@@ -2705,12 +2765,10 @@ export class OpenCodeProcess {
         } finally {
           await rm(temporaryPath, { force: true });
         }
-        available = true;
       } finally {
         await this.releaseOwnershipClaim(claim);
       }
     });
-    return available;
   }
 
   private async hasConfiguredValue(
@@ -3260,6 +3318,30 @@ export class OpenCodeProcess {
     return (await this.inspectOwnershipLease(lease)).matches;
   }
 
+  private async matchesExecutableIdentity(recorded: string, observed: string): Promise<boolean> {
+    const recordedPath = normalizeExecutableIdentity(recorded);
+    const observedPath = normalizeExecutableIdentity(observed);
+    if (recordedPath === observedPath) return true;
+    // macOS can report either hard-link path for the same running executable.
+    // Compare fresh file identities, not contents or basenames, without caching.
+    try {
+      const [recordedFile, observedFile] = await Promise.all([
+        readStat(recordedPath, { bigint: true }),
+        readStat(observedPath, { bigint: true }),
+      ]);
+      return (
+        recordedFile.isFile() &&
+        observedFile.isFile() &&
+        recordedFile.ino !== 0n &&
+        recordedFile.dev === observedFile.dev &&
+        recordedFile.ino === observedFile.ino
+      );
+    } catch {
+      // Missing or inaccessible file identity cannot establish path equivalence.
+      return false;
+    }
+  }
+
   private async inspectOwnershipLease(
     lease: ManagedServerOwnershipLease
   ): Promise<{ matches: true } | { matches: false; reason: string; inconclusive?: boolean }> {
@@ -3279,7 +3361,7 @@ export class OpenCodeProcess {
       : await readProcessExecutable(lease.pid, this.linuxProcRoot);
     if (!executable)
       throw new Error(`Cannot verify executable identity for managed OpenCode PID ${lease.pid}`);
-    if (normalizeExecutableIdentity(executable) !== normalizeExecutableIdentity(lease.executable)) {
+    if (!(await this.matchesExecutableIdentity(lease.executable, executable))) {
       return {
         matches: false,
         reason: `Executable identity differs for PID ${lease.pid} on port ${lease.port}: expected ${JSON.stringify(lease.executable)}, observed ${JSON.stringify(executable)}.`,
@@ -3391,8 +3473,7 @@ export class OpenCodeProcess {
       if (owner.port !== undefined) {
         if (
           owner.port === this._port &&
-          normalizeExecutableIdentity(owner.executable!) ===
-            normalizeExecutableIdentity(executable) &&
+          (await this.matchesExecutableIdentity(owner.executable!, executable)) &&
           matchesBirthIdentity(owner.birthIdentity!, birthIdentity, owner.createdAt)
         ) {
           return { ...owner, configPath };
@@ -3420,7 +3501,7 @@ export class OpenCodeProcess {
       !owner ||
       owner.pid !== pid ||
       owner.port !== this._port ||
-      normalizeExecutableIdentity(owner.executable!) !== normalizeExecutableIdentity(executable) ||
+      !(await this.matchesExecutableIdentity(owner.executable!, executable)) ||
       !matchesBirthIdentity(owner.birthIdentity!, birthIdentity, owner.createdAt)
     ) {
       return null;

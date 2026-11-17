@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'solid-js/web';
 import * as bridge from '../lib/bridge';
+import { citationPathChecks } from '../lib/citation-path-checks';
 import * as clipboard from '../lib/write-clipboard';
 import * as feedback from './chat/SessionActionFeedback';
 import {
@@ -125,6 +126,32 @@ afterEach(() => {
 });
 
 describe('SideQuestionDialog', () => {
+  it('opens answer citations in the modal session even when another session is active', async () => {
+    vi.mocked(bridge.apiCall).mockResolvedValue({ text: '`models/file.py:710-744`' });
+    const checks = vi.spyOn(citationPathChecks, 'peek').mockReturnValue('/repo/models/file.py');
+    const open = vi.spyOn(bridge, 'openPathWithResult').mockResolvedValue('opened');
+    mount('Where is the implementation?');
+    await settle();
+    button('Send (Enter)').click();
+    await settle();
+    setState('activeSessionId', 'another-session');
+    setState('editorContext', 'workspacePath', '/other');
+    dialog().querySelector<HTMLAnchorElement>('a.file-path-link')!.click();
+    expect(open).toHaveBeenCalledWith({
+      path: '/repo/models/file.py',
+      line: 710,
+      endLine: 744,
+      kind: 'file',
+      exact: true,
+      sessionID: 'ses_side',
+      directory: '/repo',
+    });
+    expect(checks).toHaveBeenCalledWith('models/file.py', {
+      directory: '/repo',
+      sessionID: 'ses_side',
+    });
+  });
+
   it('sends successive questions without creating unowned computations', async () => {
     const warn = vi.spyOn(console, 'warn');
     mount();

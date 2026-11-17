@@ -115,6 +115,7 @@ import {
 } from './provider-file-refresh-controller';
 import type { ProviderSignatureFileSystem } from './provider-file-refresh-controller';
 import { ProviderLimitService } from './provider-limit-service';
+import { ProviderLimitStatusBar } from './provider-limit-status-bar';
 import { PinnedSessionManager } from './pinned-session-manager';
 import { QueuedMessageStore } from './queued-message-store';
 import { RalphHost } from './ralph-host';
@@ -133,7 +134,7 @@ import { SessionHistoryScopeStore } from './session-history-scope-store';
 import { SessionTitleFallback } from './session-title-fallback';
 import { SessionTrashManager } from './session-trash-manager';
 import { createSidebarProviderActions } from './sidebar-provider-actions';
-import { HandyIntegration } from './handy-integration';
+import { DictationIntegration } from './dictation-integration';
 import { LegacySessionImport } from './legacy-session-import';
 import { SidebarProviderBridge } from './sidebar-provider-bridge';
 import { SidebarProviderContextFiles } from './sidebar-provider-context-files';
@@ -141,6 +142,7 @@ import { SidebarProviderRuntime } from './sidebar-provider-runtime';
 import { WebviewSession } from './webview-session';
 import { WorkspaceSessionStatusCoordinator } from './workspace-session-status-coordinator';
 import { UsageReportService } from './usage-report-service';
+import { SessionCleanupService } from './session-cleanup-service';
 import { getWorkspaceSessionIdsForEvent } from './sidebar-provider-utils';
 import { resolveServerLaunch } from './util/server-launch';
 
@@ -185,6 +187,7 @@ interface WebviewEndpoint {
   siblingAlertsKey: string;
   ready: boolean;
   focused: boolean;
+  selectedProviderID?: string;
 }
 
 interface EditorEndpoint extends WebviewEndpoint {
@@ -235,7 +238,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private openCodeServerProcessId: number | null = null;
   private openCodeUptimeTimer: ReturnType<typeof setInterval> | null = null;
   private readonly extensionVersion: string;
-  private readonly handyIntegration = new HandyIntegration();
+  private readonly dictationIntegration = new DictationIntegration();
   private activeChatModel: ChatModelSelection | null = null;
   private readonly fileSearch: FileSearchService;
   private readonly sessionState: SessionStateManager;
@@ -269,6 +272,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private readonly bridge: SidebarProviderBridge;
   private readonly runtime: SidebarProviderRuntime;
   private readonly providerLimitService: ProviderLimitService;
+  private readonly providerLimitStatusBar: ProviderLimitStatusBar;
   private readonly webviewSession: WebviewSession;
   private readonly serverEventBridge: ServerEventBridge;
   private readonly streamingText: StreamingTextCache;
@@ -376,8 +380,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const globalPersistence = new HostPersistence(globalState);
     this.droppedFilesService = new DroppedFilesService(contextProvider);
     this.fileSearch = new FileSearchService();
-    this.providerLimitService = new ProviderLimitService(server, undefined, undefined, (payload) =>
-      this.post({ type: 'provider-limit/updated', payload })
+    this.providerLimitService = new ProviderLimitService(
+      server,
+      undefined,
+      undefined,
+      (payload) => {
+        this.providerLimitStatusBar.acceptUpdate(payload);
+        this.post({ type: 'provider-limit/updated', payload });
+      }
     );
     const isOpenAIPro = async () => {
       const status = await this.providerLimitService.get('openai', null);
@@ -394,6 +404,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.sessionPlanState = new SessionPlanStateStore(persistence);
     this.sessionHistoryScopes = new SessionHistoryScopeStore(persistence);
     this.modelPreferences = new ModelPreferencesStore(globalPersistence, persistence);
+    this.providerLimitStatusBar = new ProviderLimitStatusBar(
+      server,
+      this.providerLimitService,
+      () => this.modelPreferences.get()
+    );
     this.sessionReadState = new SessionReadStateStore(globalPersistence);
     this.draftImages = new DraftImageStore(persistence);
     this.hiddenSessions = new HiddenSessionManager();
@@ -532,7 +547,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         undefined,
         undefined,
         globalStorageUri?.fsPath,
-        () => this.notificationWindowUrl()
+        (sessionID) => this.notificationWindowUrl(sessionID)
       )
     );
     this.notificationUriHandler = vscode.window.registerUriHandler({
@@ -615,12 +630,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         server,
         persistence,
         clearProviderLimitCache: () => this.providerLimitService.clearCache(),
-        postRefresh: (options) =>
+        postRefresh: (options) => {
+          void this.providerLimitStatusBar.refresh();
           this.post(
             options?.revalidateAuth
               ? { type: 'providers/refresh', payload: { revalidateAuth: true } }
               : { type: 'providers/refresh' }
-          ),
+          );
+        },
         postPendingStatus: (pending) =>
           this.post({ type: 'providers/status', payload: { pending } }),
         getWorkspaceDirectories: () => {
@@ -652,6 +669,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
     this.configDisposable = vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('varro.notifications')) this.attentionNotifications.update();
+      if (event.affectsConfiguration('varro.providerLimits.statusBarDisplay')) {
+        this.providerLimitStatusBar.configurationChanged();
+      }
       // VS Code can announce the theme kind before it updates the configured theme name.
       // Also refresh the per-view counterpart after the name changes, including same-kind switches.
       if (
@@ -789,10 +809,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         cancelApiRequestsBeforeGeneration: (generation) =>
           endpointRef.restProxy?.cancelRequestsBeforeGeneration(generation),
         handleDisposedSideEffects: () => {
-          if (endpointRef.endpoint) this.setEndpointReady(endpointRef.endpoint, false);
+          if (endpointRef.endpoint) {
+            endpointRef.endpoint.selectedProviderID = undefined;
+            this.setEndpointReady(endpointRef.endpoint, false);
+          }
+          this.updateProviderLimitExclusions();
         },
         handleUnavailableSideEffects: () => {
-          if (endpointRef.endpoint) this.setEndpointReady(endpointRef.endpoint, false);
+          if (endpointRef.endpoint) {
+            endpointRef.endpoint.selectedProviderID = undefined;
+            this.setEndpointReady(endpointRef.endpoint, false);
+          }
+          this.updateProviderLimitExclusions();
         },
         editorContext: getEndpointContext,
       },
@@ -1069,13 +1097,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     const messageRouter = new MessageRouter(
       createSidebarProviderActions({
-        handyIntegration: this.handyIntegration,
+        dictationIntegration: this.dictationIntegration,
         contextProvider: this.contextProvider,
         extensionId: this.extensionId,
         webviewSession,
         setProviderWatchActive: (active) => this.setProviderWatchActive(active),
-        setActiveChatModel: (model) => {
+        setActiveChatModel: (model, modelVisible) => {
           if (webviewContext.surface === 'sidebar') this.activeChatModel = model;
+          if (endpointRef.endpoint) {
+            endpointRef.endpoint.selectedProviderID = modelVisible ? model?.providerID : undefined;
+          }
+          this.updateProviderLimitExclusions();
         },
         acknowledgeSessionSeen: (sessionId) => {
           // Legacy seen events have no turn timestamp and may arrive after a newer completion.
@@ -1178,8 +1210,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         },
         handleDroppedPaths: (paths) =>
           contextFilesState.handleDroppedPaths(paths, (message) => post(message)),
-        handleDroppedContent: (files) =>
-          contextFilesState.handleDroppedContent(files, (message) => post(message)),
+        handleDroppedContent: (files, directory) =>
+          contextFilesState.handleDroppedContent(files, (message) => post(message), directory),
         storePdf: (payload) => {
           const generation = webviewSession.getRequestGeneration();
           return this.storePdf(payload, post, () =>
@@ -1375,10 +1407,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         },
         updateModelPreferences: async ({ base, preferences }) => {
           const updated = await this.modelPreferences.update(base, preferences);
+          this.providerLimitStatusBar.preferencesChanged();
           this.post({ type: 'model-preferences/sync', payload: updated });
         },
         migrateModelPreferences: async (preferences) => {
           const migrated = await this.modelPreferences.migrateLegacy(preferences);
+          this.providerLimitStatusBar.preferencesChanged();
           this.post({ type: 'model-preferences/sync', payload: migrated });
         },
         updateDraftImages: ({ images }) => this.draftImages.update(images, webviewContext.viewId),
@@ -1451,8 +1485,32 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async notificationWindowUrl(): Promise<string> {
-    return this.projectWindowUrl(this.contextProvider.context.workspacePath ?? undefined);
+  private async notificationWindowUrl(sessionID: string): Promise<string> {
+    const directory = this.contextProvider.context.workspacePath ?? undefined;
+    if (
+      vscode.workspace.workspaceFile?.scheme === 'file' ||
+      vscode.workspace.workspaceFolders?.length
+    ) {
+      const url = this.projectWindowUrl(directory);
+      // VS Code still focuses an existing project window. If it was closed, open a new
+      // window rather than replacing whichever unrelated workspace is currently active.
+      return url ? `${url}?windowId=_blank` : '';
+    }
+
+    // Scratch is an internal working directory, not a project to open in the active window.
+    // Resolve an extension callback so VS Code routes the click to this specific window.
+    const query = new URLSearchParams({
+      session: sessionID,
+      root: this.sessionState.rootSessionIdFor(sessionID),
+    });
+    if (directory) query.set('directory', directory);
+    const uri = vscode.Uri.from({
+      scheme: vscode.env.uriScheme,
+      authority: this.extensionId,
+      path: '/notification',
+      query: query.toString(),
+    });
+    return (await vscode.env.asExternalUri(uri)).toString();
   }
 
   private traySessions(): TraySession[] {
@@ -1762,6 +1820,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
       if (removed) this.postEditorTabsState();
       this.endpoints.delete(endpoint);
+      this.updateProviderLimitExclusions();
       this.setEndpointReady(endpoint, false);
       endpoint.contextFilesState.clearContextFiles();
       endpoint.fileSearch.dispose();
@@ -3408,6 +3467,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     await this.usageReportService.openReport(false);
   }
 
+  async exportUsageCsv() {
+    await this.usageReportService.exportCsv();
+  }
+
+  async deleteOldSessions() {
+    await new SessionCleanupService(this.server, () => this.runtime.ensureServerStarted()).run();
+  }
+
   async openMarkdownDocument(content: string, title: string, show = true) {
     return this.toolOutputProvider.open({
       content,
@@ -3445,11 +3512,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   async dispose() {
-    this.handyIntegration.dispose();
+    this.dictationIntegration.dispose();
     await this.commitMessageService.cancel();
     this.macOSTray?.dispose();
     this.notificationUriHandler.dispose();
     this.attentionNotifications.dispose();
+    this.providerLimitStatusBar.dispose();
     this.providerLimitService.dispose();
     this.disposing = true;
     if (this.openCodeUptimeTimer) {
@@ -3694,7 +3762,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
       return;
     }
-    const serverInfo = await this.server.readServerInfo().catch(() => null);
+    const serverInfo = await this.server
+      .readServerInfo({ includeActiveAgentCount: false })
+      .catch(() => null);
     const version = serverInfo?.health?.version ?? serverInfo?.cliVersion ?? '';
     if (openCodeApiVersion(version) === 2) {
       this.providerLimitService.clearCache();
@@ -3884,7 +3954,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return readExtensionConfigState();
   }
 
+  private updateProviderLimitExclusions() {
+    this.providerLimitStatusBar.setVisibleChatProviders(
+      [...this.endpoints].flatMap((endpoint) =>
+        endpoint.bridge.getView()?.visible && endpoint.selectedProviderID
+          ? [endpoint.selectedProviderID]
+          : []
+      )
+    );
+  }
+
   private updateStatusBarItem() {
+    this.updateProviderLimitExclusions();
+    this.providerLimitStatusBar.updateConnection(
+      this.contextProvider.context.workspacePath || undefined
+    );
     this.macOSTray?.update();
     this.postSiblingWorkspaceAlerts();
     this.updateSessionReconcileTimer();
@@ -3928,7 +4012,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.openCodeVersionCheck = 'checking';
     const generation = this.openCodeVersionGeneration;
     void this.server
-      .readServerInfo()
+      .readServerInfo({ includeActiveAgentCount: false })
       .then((info) => {
         if (
           this.disposing ||

@@ -3,21 +3,26 @@
 import * as vscode from 'vscode';
 import { existsSync, realpathSync } from 'fs';
 import { posix, win32 } from 'path';
+import { isDeepStrictEqual } from 'util';
 import { applyEdits, modify, parse, printParseErrorCode, type ParseError } from 'jsonc-parser';
 import type {
   OpenCodePermissionConfig,
+  OpenCodeGlobalPermissionConfig,
   OpenCodePermissionConfigSource,
   OpenCodeServerMemoryPermission,
   OpenCodeServerMemoryPermissions,
   PermissionRule,
 } from '../shared/opencode-types';
 import { isScalarConfigPermission } from '../shared/permission-rules';
-import type { OpenCodeModelRouting } from '../shared/protocol';
+import type { McpDefaults, OpenCodeModelRouting } from '../shared/protocol';
+import { parseMcpConfigSnippet } from '../shared/mcp-config';
+import type { McpConfigScope } from '../shared/mcp-config';
 import { VARRO_VISION_AGENT_DESCRIPTION, VARRO_VISION_AGENT_PROMPT } from '../shared/vision-agent';
 import { isSameWorkspacePath, normalizeWorkspaceIdentity } from '../shared/workspace-path';
 import { logger } from './logger';
 import { readFollowupModel } from './extension-config';
 import { v1Action, v2Action } from './opencode-v2-projection';
+import { editNativePermissionConfig } from './opencode-permission-config';
 import { getOpenCodeApiCapabilities } from './opencode-api-capabilities';
 import type { OpenCodeServer } from './server';
 import { asRecord, parseModelRoute } from './sidebar-provider-utils';
@@ -158,6 +163,336 @@ export class OpenCodeConfigService {
     const followupModel = parseModelRoute(readFollowupModel(extensionConfig));
     if (followupModel) routing.followupModel = followupModel;
     return routing;
+  }
+
+  private mcpServers(config: Record<string, unknown>) {
+    const mcp = asRecord(config.mcp) ?? {};
+    if (this.callbacks.server.apiVersion === 1) return mcp;
+    return Object.fromEntries(
+      Object.entries(asRecord(mcp.servers) ?? mcp).filter(([, value]) => {
+        const server = asRecord(value);
+        return (
+          server?.type === 'local' ||
+          server?.type === 'remote' ||
+          typeof server?.enabled === 'boolean' ||
+          typeof server?.disabled === 'boolean'
+        );
+      })
+    );
+  }
+
+  private mcpDefaultsFromFiles(files: OpenCodeConfigFile[]): McpDefaults {
+    const globalPaths = getOpenCodeConfigPaths();
+    const global = new Map<string, boolean>();
+    const project = new Map<string, boolean>();
+    const effective = new Map<string, boolean>();
+    const inheritedServers = new Map<string, Record<string, unknown>>();
+    for (const file of files) {
+      const scope = globalPaths.includes(file.path) ? global : project;
+      for (const [name, value] of Object.entries(this.mcpServers(file.config))) {
+        let server = asRecord(value);
+        if (!server) continue;
+        if (this.callbacks.server.apiVersion === 1)
+          server = { ...inheritedServers.get(name), ...server };
+        inheritedServers.set(name, server);
+        const enabled = server.disabled !== true && server.enabled !== false;
+        scope.set(name, enabled);
+        effective.set(name, enabled);
+      }
+    }
+    const defaults: McpDefaults = {
+      global: Object.fromEntries(global),
+      project: Object.fromEntries(project),
+      effective: Object.fromEntries(effective),
+      editable: true,
+    };
+    const oauthServers = [...inheritedServers]
+      .filter(([, server]) => server.type === 'remote' && server.oauth !== false)
+      .map(([name]) => name);
+    if (oauthServers.length) defaults.oauthServers = oauthServers;
+    return defaults;
+  }
+
+  private mcpServer(config: Record<string, unknown>, name: string) {
+    const servers = this.mcpServers(config);
+    return Object.hasOwn(servers, name) ? asRecord(servers[name]) : null;
+  }
+
+  // A project entry can only be dropped when it adds nothing but the enabled flag.
+  private isInheritedMcpCopy(server: Record<string, unknown>, inherited: Record<string, unknown>) {
+    const { enabled: _enabled, disabled: _disabled, ...settings } = server;
+    const { enabled: _globalEnabled, disabled: _globalDisabled, ...globalSettings } = inherited;
+    return isDeepStrictEqual(
+      this.callbacks.server.apiVersion === 2 ? settings : { ...globalSettings, ...settings },
+      globalSettings
+    );
+  }
+
+  async readMcpDefaults(): Promise<McpDefaults> {
+    if (this.callbacks.server.isAttachOnly) {
+      const config = asRecord(await this.requestServer('GET', '/config'));
+      if (!config) throw new Error('OpenCode returned an invalid MCP configuration');
+      const defaults = this.mcpDefaultsFromFiles([
+        { path: '', uri: vscode.Uri.file('/'), raw: '', config },
+      ]);
+      return { ...defaults, global: {}, project: {}, editable: false };
+    }
+    return this.mcpDefaultsFromFiles((await this.readOpenCodeConfigObject(true)).files);
+  }
+
+  async openMcpConfig(scope: McpConfigScope): Promise<void> {
+    if (this.callbacks.server.isAttachOnly)
+      throw new Error(
+        'Open the OpenCode configuration on the server host. This connection is managed elsewhere.'
+      );
+    const workspacePath = scope === 'project' ? this.getOpenCodeWorkspacePath() : undefined;
+    const candidates = workspacePath
+      ? resolveOpenCodeProjectConfigPaths(
+          workspacePath,
+          (candidate) =>
+            getOpenCodePathApi(candidate).basename(candidate) === '.git'
+              ? existsSync(candidate)
+              : true,
+          this.callbacks.server.apiVersion
+        )
+      : getOpenCodeConfigPaths();
+    let path: string | undefined;
+    for (const candidate of candidates.toReversed()) {
+      if (await this.readConfigStat(vscode.Uri.file(candidate))) {
+        path = candidate;
+        break;
+      }
+    }
+    path ??= workspacePath
+      ? getOpenCodePathApi(workspacePath).join(workspacePath, 'opencode.json')
+      : getOpenCodeConfigPaths()[1]!;
+    const uri = vscode.Uri.file(path);
+    await withOpenCodeConfigUpdateLock(getCanonicalOpenCodeConfigPath(path), async () => {
+      if (await this.readConfigStat(uri)) return;
+      if (
+        vscode.workspace.textDocuments.some((document) =>
+          isSameWorkspacePath(document.uri.fsPath, path)
+        )
+      )
+        return;
+      await vscode.workspace.fs.createDirectory(
+        vscode.Uri.file(getOpenCodePathApi(path).dirname(path))
+      );
+      await vscode.workspace.fs.writeFile(
+        uri,
+        new TextEncoder().encode('{\n  "$schema": "https://opencode.ai/config.json"\n}\n')
+      );
+    });
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri), {
+      preview: false,
+    });
+  }
+
+  private mcpConfigTarget(
+    snapshot: OpenCodeConfigSnapshot,
+    scope: McpConfigScope
+  ): OpenCodeConfigFile {
+    if (scope === 'project') return snapshot.target;
+    const paths = getOpenCodeConfigPaths();
+    const existing = snapshot.files.filter((file) => paths.includes(file.path)).at(-1);
+    if (existing) return existing;
+    const path = paths[1]!;
+    return { path, uri: vscode.Uri.file(path), raw: '{}\n', config: {} };
+  }
+
+  async addMcpConfig(scope: McpConfigScope, json: string, name?: string): Promise<McpDefaults> {
+    const { servers, requiresName } = parseMcpConfigSnippet(json, name);
+    if (requiresName && !Object.keys(servers).length)
+      throw new Error('Enter a name for this MCP server.');
+    let snapshot = await this.readOpenCodeConfigObject(true);
+    while (true) {
+      const lockPath = getCanonicalOpenCodeConfigPath(this.mcpConfigTarget(snapshot, scope).path);
+      const retry = await withOpenCodeConfigUpdateLock(lockPath, async () => {
+        const current = await this.readOpenCodeConfigObject(true);
+        const target = this.mcpConfigTarget(current, scope);
+        if (getCanonicalOpenCodeConfigPath(target.path) !== lockPath) return current;
+        if (
+          vscode.workspace.textDocuments.some(
+            (document) => document.isDirty && isSameWorkspacePath(document.uri.fsPath, target.path)
+          )
+        )
+          throw new Error(`${target.path} has unsaved changes; save before adding MCP servers.`);
+        const globalPaths = getOpenCodeConfigPaths();
+        const scopeFiles = current.files.filter(
+          (file) => globalPaths.includes(file.path) === (scope === 'global')
+        );
+        const duplicate = Object.keys(servers).find((key) =>
+          scopeFiles.some((file) => this.mcpServer(file.config, key))
+        );
+        if (duplicate)
+          throw new Error(
+            `MCP server ${duplicate} is already configured in this scope. Open the config file to edit it.`
+          );
+        const initialStat = await this.readConfigStat(target.uri);
+        const mcp = asRecord(target.config.mcp);
+        if (
+          (target.config.mcp !== undefined && !mcp) ||
+          (mcp?.servers !== undefined && !asRecord(mcp.servers))
+        )
+          throw new Error(
+            'The existing MCP configuration is invalid. Open the config file to fix it before adding servers.'
+          );
+        const native =
+          this.callbacks.server.apiVersion === 2 &&
+          (!!asRecord(mcp?.servers) || !Object.keys(this.mcpServers(target.config)).length);
+        let raw = target.raw.trim() ? target.raw : '{}\n';
+        if (!target.config.$schema)
+          raw = applyJsoncChange(raw, ['$schema'], 'https://opencode.ai/config.json');
+        for (const [key, value] of Object.entries(servers)) {
+          const server = { ...value };
+          if (native) {
+            if (typeof server.enabled === 'boolean') server.disabled = !server.enabled;
+            delete server.enabled;
+          } else {
+            if (typeof server.disabled === 'boolean') server.enabled = !server.disabled;
+            delete server.disabled;
+          }
+          raw = applyJsoncChange(raw, native ? ['mcp', 'servers', key] : ['mcp', key], server);
+        }
+        if (!this.areConfigStatsEqual(initialStat, await this.readConfigStat(target.uri)))
+          throw new Error(`${target.path} changed while adding MCP servers; please retry.`);
+        if (initialStat) {
+          const latest = new TextDecoder().decode(await vscode.workspace.fs.readFile(target.uri));
+          if (latest !== target.raw)
+            throw new Error(`${target.path} changed while adding MCP servers; please retry.`);
+        } else
+          await vscode.workspace.fs.createDirectory(
+            vscode.Uri.file(getOpenCodePathApi(target.path).dirname(target.path))
+          );
+        await vscode.workspace.fs.writeFile(
+          target.uri,
+          new TextEncoder().encode(raw.endsWith('\n') ? raw : `${raw}\n`)
+        );
+        if (scope === 'global') await this.callbacks.refreshOpenCodeGlobalConfig?.();
+        else
+          await this.callbacks.refreshOpenCodeConfig?.(undefined, undefined, current.workspacePath);
+        return undefined;
+      });
+      if (!retry) return this.readMcpDefaults();
+      snapshot = retry;
+    }
+  }
+
+  async updateMcpDefault(
+    name: string,
+    scope: 'global' | 'project',
+    enabled: boolean | null
+  ): Promise<McpDefaults> {
+    if (enabled === null && scope !== 'project')
+      throw new Error('Only a project MCP override can be cleared');
+    let snapshot = await this.readOpenCodeConfigObject(true);
+    const globalPaths = getOpenCodeConfigPaths();
+    const selectTarget = (current: OpenCodeConfigSnapshot): OpenCodeConfigFile => {
+      if (scope === 'project') return current.target;
+      const candidates = current.files.filter((file) => globalPaths.includes(file.path));
+      const configured = candidates.toReversed().find((file) => this.mcpServer(file.config, name));
+      if (!configured)
+        throw new Error(
+          'This MCP is only configured in the project. Add it globally before changing its global default.'
+        );
+      return configured;
+    };
+    while (true) {
+      const lockPath = getCanonicalOpenCodeConfigPath(selectTarget(snapshot).path);
+      const result = await withOpenCodeConfigUpdateLock(lockPath, async () => {
+        const current = await this.readOpenCodeConfigObject(true);
+        const target = selectTarget(current);
+        if (getCanonicalOpenCodeConfigPath(target.path) !== lockPath) return current;
+        if (
+          vscode.workspace.textDocuments.some(
+            (document) => document.isDirty && isSameWorkspacePath(document.uri.fsPath, target.path)
+          )
+        ) {
+          throw new Error(`${target.path} has unsaved changes; save before changing MCP defaults`);
+        }
+        const native = this.callbacks.server.apiVersion === 2;
+        const resolveServer = (files: OpenCodeConfigFile[]) => {
+          let resolved: Record<string, unknown> | null = null;
+          for (const file of files) {
+            const server = this.mcpServer(file.config, name);
+            if (server) resolved = native ? server : Object.assign({}, resolved, server);
+          }
+          return resolved;
+        };
+        const globalServer = resolveServer(
+          current.files.filter((file) => globalPaths.includes(file.path))
+        );
+        const inherited = scope === 'global' ? globalServer : resolveServer(current.files);
+        if (!inherited) throw new Error(`MCP server ${name} is no longer configured`);
+        const projectFiles = current.files.filter((file) => !globalPaths.includes(file.path));
+        const projectFile = projectFiles.find((file) => file.path === target.path);
+        const projectServer = projectFile ? this.mcpServer(projectFile.config, name) : null;
+        const otherProjectFile = projectFiles.find(
+          (file) => file.path !== target.path && this.mcpServer(file.config, name)
+        );
+        if (enabled === null) {
+          if (!globalServer)
+            throw new Error(`MCP server ${name} has no global configuration to fall back to`);
+          if (otherProjectFile)
+            throw new Error(`MCP server ${name} is also configured in ${otherProjectFile.path}`);
+          if (projectServer && !this.isInheritedMcpCopy(projectServer, globalServer))
+            throw new Error(
+              `${target.path} has its own connection settings for ${name}; edit that file to use the global MCP`
+            );
+        }
+        // Choosing the global value needs no project entry, so later global changes still apply.
+        const canInherit =
+          scope === 'project' &&
+          !otherProjectFile &&
+          globalServer !== null &&
+          enabled === (globalServer.disabled !== true && globalServer.enabled !== false) &&
+          (!projectServer || this.isInheritedMcpCopy(projectServer, globalServer));
+        const removeOverride = enabled === null || canInherit;
+        if (removeOverride && !projectServer) return undefined;
+        const existingMcp = asRecord(target.config.mcp);
+        const path =
+          native && (asRecord(existingMcp?.servers) || !this.mcpServer(target.config, name))
+            ? ['mcp', 'servers', name]
+            : ['mcp', name];
+        const server = { ...inherited };
+        // V2 replaces the entire server entry. Copy its connection fields into a
+        // project override rather than writing a disabled-only, invalid server.
+        if (native && path.length === 3) {
+          server.disabled = enabled === false;
+          delete server.enabled;
+        } else {
+          server.enabled = enabled !== false;
+          delete server.disabled;
+        }
+        const initialStat = await this.readConfigStat(target.uri);
+        let raw = target.raw.trim() ? target.raw : '{}\n';
+        if (!target.config.$schema && !removeOverride)
+          raw = applyJsoncChange(raw, ['$schema'], 'https://opencode.ai/config.json');
+        const configuredServer = this.mcpServer(target.config, name);
+        if (removeOverride) raw = applyJsoncChange(raw, path, undefined);
+        else if (configuredServer) {
+          const key = native && path.length === 3 ? 'disabled' : 'enabled';
+          raw = applyJsoncChange(raw, [...path, key], key === 'disabled' ? !enabled : enabled);
+          const legacyKey = key === 'disabled' ? 'enabled' : 'disabled';
+          if (Object.hasOwn(configuredServer, legacyKey))
+            raw = applyJsoncChange(raw, [...path, legacyKey], undefined);
+        } else raw = applyJsoncChange(raw, path, server);
+        if (!this.areConfigStatsEqual(initialStat, await this.readConfigStat(target.uri))) {
+          throw new Error(`${target.path} changed while updating MCP defaults; please retry`);
+        }
+        if (!initialStat)
+          await vscode.workspace.fs.createDirectory(
+            vscode.Uri.file(getOpenCodePathApi(target.path).dirname(target.path))
+          );
+        await vscode.workspace.fs.writeFile(target.uri, new TextEncoder().encode(raw));
+        if (scope === 'global') await this.callbacks.refreshOpenCodeGlobalConfig?.();
+        else
+          await this.callbacks.refreshOpenCodeConfig?.(undefined, undefined, current.workspacePath);
+        return undefined;
+      });
+      if (!result) return this.readMcpDefaults();
+      snapshot = result;
+    }
   }
 
   async readOpenCodeModelRouting(): Promise<OpenCodeModelRouting> {
@@ -481,12 +816,53 @@ export class OpenCodeConfigService {
     }
   }
 
-  async updateOpenCodeProjectPermission(permission: string, patterns: string[]) {
-    let snapshot = await this.readOpenCodeConfigObject();
+  private usesNativePermissionConfig(config: Record<string, unknown>): boolean {
+    return (
+      Array.isArray(config.permissions) ||
+      (this.callbacks.server.apiVersion === 2 && config.permission === undefined)
+    );
+  }
+
+  private async readPermissionConfigSnapshot(
+    scope: 'project' | 'global'
+  ): Promise<OpenCodeConfigSnapshot> {
+    const snapshot = await this.readOpenCodeConfigObject(scope === 'global');
+    if (scope === 'project') return snapshot;
+    if (this.callbacks.server.apiVersion !== 2)
+      throw new Error('Global permission management requires OpenCode V2');
+    const paths = getOpenCodeConfigPaths();
+    const globalFiles = snapshot.files.filter((file) => paths.includes(file.path));
+    const target = globalFiles.at(-1);
+    if (target)
+      return {
+        ...snapshot,
+        target,
+        config: globalFiles.reduce<Record<string, unknown>>(
+          (merged, file) => mergeOpenCodeConfig(merged, file.config),
+          {}
+        ),
+      };
+    const path = paths.find(
+      (candidate) => getOpenCodePathApi(candidate).basename(candidate) === 'opencode.json'
+    );
+    if (!path) throw new Error('Could not resolve the global OpenCode config');
+    return {
+      ...snapshot,
+      target: { path, uri: vscode.Uri.file(path), raw: '{}\n', config: {} },
+      config: {},
+    };
+  }
+
+  async allowOpenCodeConfigPermission(
+    permission: string,
+    patterns: string[],
+    scope: 'project' | 'global' = 'project'
+  ) {
+    let snapshot = await this.readPermissionConfigSnapshot(scope);
     while (true) {
       const lockPath = getCanonicalOpenCodeConfigPath(snapshot.target.path);
       const result = await withOpenCodeConfigUpdateLock(lockPath, async () => {
-        const currentSnapshot = await this.readOpenCodeConfigObject();
+        const currentSnapshot = await this.readPermissionConfigSnapshot(scope);
         const { target } = currentSnapshot;
         if (getCanonicalOpenCodeConfigPath(target.path) !== lockPath) {
           return { kind: 'retry' as const, snapshot: currentSnapshot };
@@ -500,24 +876,26 @@ export class OpenCodeConfigService {
         );
         if (dirtyDocument) {
           throw new Error(
-            `Project ${target.path.endsWith('.jsonc') ? 'opencode.jsonc' : 'opencode.json'} has unsaved changes; save or revert the document before updating permissions`
+            `${target.path} has unsaved changes; save or revert the document before updating permissions`
           );
         }
 
         const initialStat = await this.readConfigStat(target.uri);
         let nextRaw = target.raw.trim() ? target.raw : '{}\n';
         if (typeof target.config.$schema !== 'string' || !target.config.$schema.trim()) {
-          nextRaw = applyJsoncChange(nextRaw, ['$schema'], 'https://opencode.ai/config.json');
+          nextRaw = applyJsoncChange(
+            nextRaw,
+            ['$schema'],
+            'https://opencode.ai/config.json',
+            Array.isArray(target.config.permissions)
+          );
         }
 
         const targetPermissionConfig = target.config.permission;
         const effectivePermissionConfig = currentSnapshot.config.permission;
         const scalarConfigPermission = isScalarConfigPermission(permission);
-        if (
-          !Array.isArray(target.config.permissions) &&
-          scalarConfigPermission &&
-          patterns.some((pattern) => pattern !== '*')
-        ) {
+        const native = this.usesNativePermissionConfig(target.config);
+        if (!native && scalarConfigPermission && patterns.some((pattern) => pattern !== '*')) {
           throw new Error(
             `Project permission ${permission} only supports the wildcard pattern in OpenCode config`
           );
@@ -527,19 +905,15 @@ export class OpenCodeConfigService {
           : isPermissionAction(effectivePermissionConfig)
             ? effectivePermissionConfig
             : null;
-        if (Array.isArray(target.config.permissions)) {
-          nextRaw = applyJsoncChange(
-            nextRaw,
-            ['permissions'],
-            [
-              ...target.config.permissions,
-              ...patterns.map((resource) => ({
-                action: v2Action(permission),
-                resource,
-                effect: 'allow',
-              })),
-            ]
-          );
+        if (native) {
+          nextRaw = editNativePermissionConfig(nextRaw, [
+            ...(Array.isArray(target.config.permissions) ? target.config.permissions : []),
+            ...patterns.map((resource) => ({
+              action: v2Action(permission),
+              resource,
+              effect: 'allow',
+            })),
+          ]);
         } else if (fallbackAction) {
           const permissionConfig: Record<string, unknown> = { '*': fallbackAction };
           permissionConfig[permission] = scalarConfigPermission
@@ -645,6 +1019,15 @@ export class OpenCodeConfigService {
       | { kind: 'remove'; id: string }
       | { kind: 'update'; id: string; permission: string; pattern: string }
   ): Promise<OpenCodeServerMemoryPermissions> {
+    const serverURL = this.callbacks.server.url;
+    const apiVersion = this.callbacks.server.apiVersion;
+    const assertServerCurrent = () => {
+      if (
+        this.callbacks.server.url !== serverURL ||
+        this.callbacks.server.apiVersion !== apiVersion
+      )
+        throw new Error('OpenCode server changed. Refresh saved approvals before retrying.');
+    };
     const project = asRecord(
       await this.requestServer(
         'GET',
@@ -664,12 +1047,19 @@ export class OpenCodeConfigService {
 
     const current = await list();
     if (!mutation) return current;
+    assertServerCurrent();
     if (!current.supported)
       throw new Error('Saved permissions are unavailable on this OpenCode server');
+    if (current.stale)
+      throw new Error('Could not refresh saved permissions. Retry before changing approvals.');
     if (mutation.id.startsWith('legacy:')) {
       throw new Error('Restart OpenCode to clear this server-memory allowance');
     }
-    const savedRule = current.rules.find(
+    const candidates =
+      mutation.kind === 'remove'
+        ? [...current.rules, ...(current.untrackedRules ?? [])]
+        : current.rules;
+    const savedRule = candidates.find(
       (rule) => rule.id === mutation.id && rule.projectID === projectID
     );
     if (!savedRule) {
@@ -691,6 +1081,7 @@ export class OpenCodeConfigService {
         )
       );
       const updated = asRecord(response?.data);
+      assertServerCurrent();
       if (
         updated?.id !== savedRule.id ||
         updated.projectID !== projectID ||
@@ -708,7 +1099,17 @@ export class OpenCodeConfigService {
       ]);
     } else {
       await this.requestServer('DELETE', path, undefined, { directory });
+      assertServerCurrent();
+      const next = await list();
+      assertServerCurrent();
+      if (!next.supported || next.stale)
+        throw new Error(
+          'Removal was sent, but could not be verified. Refresh saved approvals to check.'
+        );
+      if ([...next.rules, ...(next.untrackedRules ?? [])].some((rule) => rule.id === savedRule.id))
+        throw new Error('OpenCode still reports this saved approval. Refresh before retrying.');
       await this.callbacks.forgetServerMemoryPermission(savedRule);
+      return apiVersion === 2 ? next : list();
     }
     return list();
   }
@@ -717,6 +1118,8 @@ export class OpenCodeConfigService {
     projectID: string,
     directory?: string
   ): Promise<OpenCodeServerMemoryPermissions> {
+    const serverURL = this.callbacks.server.url;
+    const apiVersion = this.callbacks.server.apiVersion;
     const legacyRules = [...this.callbacks.getServerMemoryPermissions(projectID)];
     try {
       const response = await this.requestServer(
@@ -747,17 +1150,20 @@ export class OpenCodeConfigService {
           );
         }
       }
-      const savedRules = values.flatMap((value) => {
+      const savedRules: OpenCodeServerMemoryPermission[] = [];
+      for (const value of values) {
         const saved = asRecord(value);
         if (
           typeof saved?.id !== 'string' ||
           typeof saved.projectID !== 'string' ||
-          saved.projectID !== projectID ||
           typeof saved.action !== 'string' ||
           typeof saved.resource !== 'string'
         ) {
-          return [];
+          throw new Error(
+            'OpenCode returned an invalid saved-permission record. Refresh before retrying.'
+          );
         }
+        if (saved.projectID !== projectID) continue;
         const rule: OpenCodeServerMemoryPermission = {
           id: saved.id,
           projectID: saved.projectID,
@@ -765,9 +1171,13 @@ export class OpenCodeConfigService {
             this.callbacks.server.apiVersion === 2 ? v1Action(saved.action) : saved.action,
           pattern: saved.resource,
         };
-        if (editable) rule.editable = true;
-        return [rule];
-      });
+        savedRules.push(rule);
+      }
+      if (
+        this.callbacks.server.url !== serverURL ||
+        this.callbacks.server.apiVersion !== apiVersion
+      )
+        throw new Error('OpenCode server changed. Refresh saved approvals before retrying.');
       const observedScopes = new Set(
         legacyRules
           .filter((rule) => rule.id.startsWith('legacy:'))
@@ -778,6 +1188,9 @@ export class OpenCodeConfigService {
         (rule) =>
           observedIDs.has(rule.id) || observedScopes.has(`${rule.permission}\0${rule.pattern}`)
       );
+      if (editable) {
+        for (const rule of observedSavedRules) rule.editable = true;
+      }
       const savedScopes = new Set(
         observedSavedRules.map((rule) => `${rule.permission}\0${rule.pattern}`)
       );
@@ -794,7 +1207,7 @@ export class OpenCodeConfigService {
         }
         await this.callbacks.rememberServerMemoryPermissions(observedSavedRules);
       }
-      return {
+      const result: OpenCodeServerMemoryPermissions = {
         supported: true,
         rules: [
           ...observedSavedRules,
@@ -805,16 +1218,27 @@ export class OpenCodeConfigService {
           ),
         ],
       };
+      if (this.callbacks.server.apiVersion === 2) {
+        const managedIDs = new Set(observedSavedRules.map((rule) => rule.id));
+        const untracked = savedRules.filter((rule) => !managedIDs.has(rule.id));
+        if (untracked.length > 0) result.untrackedRules = untracked;
+      }
+      return result;
     } catch (cause) {
-      if (legacyRules.length > 0)
-        return {
+      if (legacyRules.length > 0) {
+        const fallback: OpenCodeServerMemoryPermissions = {
           supported: true,
           rules: legacyRules.map((rule) => {
-            const fallback = { ...rule };
-            delete fallback.editable;
-            return fallback;
+            const cachedRule = { ...rule };
+            delete cachedRule.editable;
+            return cachedRule;
           }),
         };
+        if (this.callbacks.server.apiVersion === 2)
+          fallback.stale =
+            cause instanceof Error ? cause.message : 'Could not refresh saved permissions';
+        return fallback;
+      }
       return {
         supported: false,
         rules: [],
@@ -903,7 +1327,7 @@ export class OpenCodeConfigService {
     const targetPath = getCanonicalOpenCodeConfigPath(snapshot.target.path);
     const globalConfig = await this.readGlobalOpenCodePermissionConfig();
     const effectiveConfig = mergeOpenCodeConfig(globalConfig.config, snapshot.config);
-    return {
+    const result: OpenCodePermissionConfig = {
       targetPath: snapshot.target.path,
       projectRules: this.normalizeOpenCodePermissionRules(
         snapshot.target.config.permissions ?? snapshot.target.config.permission
@@ -930,6 +1354,19 @@ export class OpenCodeConfigService {
       effectiveRules: this.normalizeOpenCodePermissionRules(
         effectiveConfig.permissions ?? effectiveConfig.permission
       ),
+    };
+    if (this.usesNativePermissionConfig(snapshot.target.config)) result.supportsPatterns = true;
+    return result;
+  }
+
+  async readOpenCodeGlobalPermissionConfig(): Promise<OpenCodeGlobalPermissionConfig> {
+    const { target } = await this.readPermissionConfigSnapshot('global');
+    return {
+      targetPath: target.path,
+      rules: this.normalizeOpenCodePermissionRules(
+        target.config.permissions ?? target.config.permission
+      ),
+      supportsPatterns: this.usesNativePermissionConfig(target.config),
     };
   }
 
@@ -961,11 +1398,26 @@ export class OpenCodeConfigService {
   }
 
   async updateOpenCodePermissionConfig(rules: PermissionRule[]): Promise<OpenCodePermissionConfig> {
-    let snapshot = await this.readOpenCodeConfigObject();
+    await this.writeOpenCodePermissionConfig(rules, 'project');
+    return this.readOpenCodePermissionConfig();
+  }
+
+  async updateOpenCodeGlobalPermissionConfig(
+    rules: PermissionRule[]
+  ): Promise<OpenCodeGlobalPermissionConfig> {
+    await this.writeOpenCodePermissionConfig(rules, 'global');
+    return this.readOpenCodeGlobalPermissionConfig();
+  }
+
+  private async writeOpenCodePermissionConfig(
+    rules: PermissionRule[],
+    scope: 'project' | 'global'
+  ): Promise<void> {
+    let snapshot = await this.readPermissionConfigSnapshot(scope);
     while (true) {
       const lockPath = getCanonicalOpenCodeConfigPath(snapshot.target.path);
       const result = await withOpenCodeConfigUpdateLock(lockPath, async () => {
-        const currentSnapshot = await this.readOpenCodeConfigObject();
+        const currentSnapshot = await this.readPermissionConfigSnapshot(scope);
         const { target } = currentSnapshot;
         if (getCanonicalOpenCodeConfigPath(target.path) !== lockPath) {
           return { kind: 'retry' as const, snapshot: currentSnapshot };
@@ -985,13 +1437,18 @@ export class OpenCodeConfigService {
         const initialStat = await this.readConfigStat(target.uri);
         let nextRaw = target.raw.trim() ? target.raw : '{}\n';
         if (typeof target.config.$schema !== 'string' || !target.config.$schema.trim()) {
-          nextRaw = applyJsoncChange(nextRaw, ['$schema'], 'https://opencode.ai/config.json');
+          nextRaw = applyJsoncChange(
+            nextRaw,
+            ['$schema'],
+            'https://opencode.ai/config.json',
+            Array.isArray(target.config.permissions)
+          );
         }
         const permissionConfig: Record<
           string,
           PermissionRule['action'] | Record<string, PermissionRule['action']>
         > = {};
-        const native = Array.isArray(target.config.permissions);
+        const native = this.usesNativePermissionConfig(target.config);
         for (const rule of rules) {
           if (!native && isScalarConfigPermission(rule.permission)) {
             if (rule.pattern !== '*') {
@@ -1008,19 +1465,20 @@ export class OpenCodeConfigService {
           patterns[rule.pattern] = rule.action;
           permissionConfig[rule.permission] = patterns;
         }
-        nextRaw = applyJsoncChange(
-          nextRaw,
-          [native ? 'permissions' : 'permission'],
-          native
-            ? rules.map((rule) => ({
+        nextRaw = native
+          ? editNativePermissionConfig(
+              nextRaw,
+              rules.map((rule) => ({
                 action: v2Action(rule.permission),
                 resource: rule.pattern,
                 effect: rule.action,
               }))
-            : rules.length > 0
-              ? permissionConfig
-              : undefined
-        );
+            )
+          : applyJsoncChange(
+              nextRaw,
+              ['permission'],
+              rules.length > 0 ? permissionConfig : undefined
+            );
 
         const latestStat = await this.readConfigStat(target.uri);
         if (!this.areConfigStatsEqual(initialStat, latestStat)) {
@@ -1036,7 +1494,7 @@ export class OpenCodeConfigService {
         await vscode.workspace.fs.writeFile(target.uri, encoded);
         return { kind: 'complete' as const };
       });
-      if (result.kind === 'complete') return this.readOpenCodePermissionConfig();
+      if (result.kind === 'complete') return;
       snapshot = result.snapshot;
     }
   }
@@ -1202,11 +1660,16 @@ function mergeOpenCodeConfig(
   return merged;
 }
 
-function applyJsoncChange(raw: string, path: (string | number)[], value: unknown) {
+function applyJsoncChange(
+  raw: string,
+  path: (string | number)[],
+  value: unknown,
+  preserveFormatting = false
+) {
   return applyEdits(
     raw,
     modify(raw, path, value, {
-      formattingOptions: { insertSpaces: true, tabSize: 2 },
+      formattingOptions: preserveFormatting ? undefined : { insertSpaces: true, tabSize: 2 },
     })
   );
 }

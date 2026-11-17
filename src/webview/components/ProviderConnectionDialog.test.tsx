@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'solid-js/web';
 import { reconcile } from 'solid-js/store';
+import type { ProviderAuthMethod } from '../../shared/opencode-types';
 import type { Provider } from '../types';
+import { codexLoginWarningDismissal } from '../lib/codex-login-warning';
 import {
   markProviderAuthFailure,
   providerRequiresReconnection,
   resetProviderConnectionState,
 } from '../lib/provider-connection-state';
-import { resetDefaultAppState, setState } from '../lib/state';
+import { resetDefaultAppState, setState, state } from '../lib/state';
 import { ProviderConnectionDialog } from './ProviderConnectionDialog';
 
 type TestRuntimeValue =
@@ -183,6 +185,72 @@ it('finishes an external credential connection without a key, browser handoff, o
   expect(onClose).toHaveBeenCalledOnce();
 });
 
+it.each([false, true])(
+  'uses Claude Code login and waits for confirmation before reconnecting (auth methods loaded: %s)',
+  async (methodsLoaded) => {
+    if (methodsLoaded) {
+      setState('providerAuthMethods', 'claude-agent', [
+        {
+          type: 'external',
+          label: 'Claude Code login (claude auth login)',
+        },
+      ]);
+    }
+    markProviderAuthFailure('claude-agent', 'message-1');
+    clientMocks.authorizeProvider.mockResolvedValue({
+      url: '',
+      method: 'complete',
+      instructions: '',
+    });
+    const onClose = renderDialog({
+      catalogProviders: [catalogProvider('claude-agent', 'Claude Agent')],
+      initialProviderID: 'claude-agent',
+      lockProvider: true,
+      reauthentication: true,
+    });
+    chooseMethod('Claude Code login');
+    expect(dialog()?.textContent).toContain('Claude Code manages this login');
+    expect(dialog()?.querySelector('input[type="password"]')).toBeNull();
+    expect(primaryButton().textContent).toBe("I've signed in");
+
+    findButton('Run claude auth login')!.click();
+    expect(openProviderSetupMock).toHaveBeenCalledWith('claude-agent');
+    expect(clientMocks.authorizeProvider).not.toHaveBeenCalled();
+    expect(providerRequiresReconnection('claude-agent')).toBe(true);
+    expect(onClose).not.toHaveBeenCalled();
+
+    primaryButton().click();
+    await flush();
+    expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
+      { providerID: 'claude-agent', method: 0, inputs: {} },
+      { signal: expect.any(AbortSignal) }
+    );
+    expect(clientMocks.completeProviderAuth).not.toHaveBeenCalled();
+    expect(clientMocks.connectApiProvider).not.toHaveBeenCalled();
+    expect(providerRequiresReconnection('claude-agent')).toBe(false);
+    expect(postMessageMock).toHaveBeenCalledWith({ type: 'providers/auth-changed' });
+    expect(postMessageMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'vscode/open-external' })
+    );
+    expect(onClose).toHaveBeenCalledOnce();
+  }
+);
+
+it('routes Claude Agent terminal fallback to Claude Code without prematurely completing reauthentication', () => {
+  markProviderAuthFailure('claude-agent', 'message-1');
+  const onClose = renderDialog({
+    catalogProviders: [catalogProvider('claude-agent', 'Claude Agent')],
+    initialProviderID: 'claude-agent',
+    lockProvider: true,
+    reauthentication: true,
+  });
+  findButton('Use terminal setup')!.click();
+  expect(openProviderSetupMock).toHaveBeenCalledWith('claude-agent');
+  expect(providerRequiresReconnection('claude-agent')).toBe(true);
+  expect(onClose).not.toHaveBeenCalled();
+  expect(postMessageMock).not.toHaveBeenCalledWith({ type: 'providers/auth-changed' });
+});
+
 beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -208,6 +276,7 @@ beforeEach(() => {
   });
   clientMocks.completeProviderAuth.mockResolvedValue(true);
   clientMocks.connectApiProvider.mockResolvedValue(true);
+  codexLoginWarningDismissal.reset();
   setState('providerAuthMethods', {
     anthropic: [{ type: 'oauth', label: 'Claude subscription' }],
     openai: [{ type: 'api', label: 'API key' }],
@@ -327,6 +396,172 @@ describe('ProviderConnectionDialog provider list', () => {
 });
 
 describe('ProviderConnectionDialog method selection', () => {
+  const openaiMethods: ProviderAuthMethod[] = [
+    { id: 'key', type: 'api', label: 'API key' },
+    { id: 'chatgpt-token-sharing', type: 'oauth', label: 'Sign in with ChatGPT' },
+    { id: 'chatgpt-headless', type: 'oauth', label: 'Codex device code (legacy)' },
+    { id: 'chatgpt-browser', type: 'oauth', label: 'Codex browser (legacy)' },
+  ];
+
+  it.each([true, false])(
+    'preselects Codex browser from a warning without starting OAuth (IDs: %s)',
+    async (withIDs) => {
+      setState(
+        'providerAuthMethods',
+        'openai',
+        openaiMethods.map(({ id, ...method }) => (withIDs ? { id, ...method } : method))
+      );
+      renderDialog({
+        initialProviderID: 'openai',
+        initialMethodID: 'chatgpt-browser',
+        lockProvider: true,
+      });
+      expect(dialog()!.querySelector('.provider-connect-form')).not.toBeNull();
+      expect(clientMocks.authorizeProvider).not.toHaveBeenCalled();
+      primaryButton().click();
+      await flush();
+      expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
+        { providerID: 'openai', method: 3, inputs: {} },
+        { signal: expect.any(AbortSignal) }
+      );
+    }
+  );
+
+  it('leaves method selection open if Codex browser is unavailable', () => {
+    setState('providerAuthMethods', 'openai', [openaiMethods[1]!]);
+    renderDialog({
+      initialProviderID: 'openai',
+      initialMethodID: 'chatgpt-browser',
+      lockProvider: true,
+    });
+    expect(methodButton('ChatGPT token sharing')).toBeInstanceOf(HTMLButtonElement);
+    expect(clientMocks.authorizeProvider).not.toHaveBeenCalled();
+  });
+
+  it('clears the saved notice dismissal only after successful OpenAI authentication', async () => {
+    codexLoginWarningDismissal.dismiss('connection');
+    renderDialog({ initialProviderID: 'openai' });
+    chooseMethod('API key');
+    const input = dialog()!.querySelector<HTMLInputElement>('input[type="password"]')!;
+    type(input, 'test-key');
+    expect(codexLoginWarningDismissal.read()?.dismissed).toBe(true);
+    primaryButton().click();
+    await flush();
+    expect(codexLoginWarningDismissal.read()).toBeNull();
+  });
+
+  it('retains the saved notice dismissal when authentication fails or is cancelled', async () => {
+    codexLoginWarningDismissal.dismiss('connection');
+    clientMocks.authorizeProvider.mockRejectedValue(new Error('Authentication failed'));
+    setState('providerAuthMethods', 'openai', openaiMethods);
+    renderDialog({
+      initialProviderID: 'openai',
+      initialMethodID: 'chatgpt-browser',
+      lockProvider: true,
+    });
+    primaryButton().click();
+    await flush();
+    expect(codexLoginWarningDismissal.read()?.dismissed).toBe(true);
+    findButton('Back to methods')!.click();
+    dialog()!.querySelector<HTMLButtonElement>('[aria-label="Close"]')!.click();
+    expect(codexLoginWarningDismissal.read()?.dismissed).toBe(true);
+  });
+
+  it.each([true, false])(
+    'recommends Codex browser and explains OpenAI methods without changing the catalog (IDs supplied: %s)',
+    (withIDs) => {
+      const methods = openaiMethods.map(({ id, ...method }) =>
+        withIDs ? { id, ...method } : method
+      );
+      setState('providerAuthMethods', 'openai', methods);
+      renderDialog({ initialProviderID: 'openai' });
+
+      const buttons = Array.from(dialog()!.querySelectorAll('.provider-connect-method'));
+      expect(
+        buttons.map(
+          (button) => button.querySelector('.provider-connect-method-heading > span')?.textContent
+        )
+      ).toEqual([
+        'ChatGPT via Codex',
+        'ChatGPT via Codex device code',
+        'ChatGPT token sharing',
+        'OpenAI API key',
+      ]);
+      expect(buttons[0]?.textContent).toContain('Recommended');
+      expect(
+        buttons.map((button) => {
+          const description = button.querySelector('.provider-connect-method-description');
+          expect(description?.getAttribute('title')).toBe(description?.textContent);
+          return description?.textContent;
+        })
+      ).toEqual([
+        'Usage limits and reset credits when available.',
+        'Sign in using a device code.',
+        'View usage limits in ChatGPT settings.',
+        'Uses separate API billing.',
+      ]);
+      expect(dialog()!.querySelectorAll('.provider-connect-method-recommendation')).toHaveLength(1);
+      expect(dialog()!.textContent).not.toContain('(legacy)');
+      expect(state.providerAuthMethods.openai).toEqual(methods);
+    }
+  );
+
+  it.each([
+    ['ChatGPT via Codex', 3],
+    ['ChatGPT via Codex device code', 2],
+    ['ChatGPT token sharing', 1],
+  ] as const)('keeps the original auth index for %s after reordering', async (label, index) => {
+    setState('providerAuthMethods', 'openai', openaiMethods);
+    renderDialog({ initialProviderID: 'openai', lockProvider: true, reauthentication: true });
+    chooseMethod(label);
+    primaryButton().click();
+    await flush();
+
+    expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
+      { providerID: 'openai', method: index, inputs: {} },
+      { signal: expect.any(AbortSignal) }
+    );
+    expect(clientMocks.completeProviderAuth).toHaveBeenCalledWith(
+      { providerID: 'openai', method: index, attemptID: undefined },
+      { signal: expect.any(AbortSignal) }
+    );
+    expect(state.providerAuthMethods.openai).toEqual(openaiMethods);
+  });
+
+  it('uses stable OpenAI IDs even if upstream changes the labels', () => {
+    setState('providerAuthMethods', 'openai', [
+      { id: 'chatgpt-token-sharing', type: 'oauth', label: 'New sharing label' },
+      { id: 'chatgpt-browser', type: 'oauth', label: 'New browser label' },
+    ]);
+    renderDialog({ initialProviderID: 'openai' });
+
+    expect(methodButton('ChatGPT via Codex')?.textContent).toContain('Recommended');
+    expect(methodButton('ChatGPT token sharing')).toBeInstanceOf(HTMLButtonElement);
+  });
+
+  it('leaves unknown OpenAI OAuth methods unchanged and does not recommend a missing browser method', () => {
+    setState('providerAuthMethods', 'openai', [
+      { id: 'custom-login', type: 'oauth', label: 'Codex browser (legacy)' },
+      openaiMethods[1]!,
+    ]);
+    renderDialog({ initialProviderID: 'openai' });
+
+    expect(methodButton('Codex browser (legacy)')).toBeInstanceOf(HTMLButtonElement);
+    expect(dialog()!.querySelector('.provider-connect-method-recommendation')).toBeNull();
+  });
+
+  it('does not relabel or reorder other providers', () => {
+    setState('providerAuthMethods', 'anthropic', openaiMethods);
+    renderDialog({ initialProviderID: 'anthropic' });
+
+    expect(
+      Array.from(dialog()!.querySelectorAll('.provider-connect-method-heading > span')).map(
+        (label) => label.textContent
+      )
+    ).toEqual(openaiMethods.map((method) => method.label));
+    expect(dialog()!.querySelector('.provider-connect-method-recommendation')).toBeNull();
+  });
+
   it('preselects a trimmed initial provider id', () => {
     renderDialog({ initialProviderID: ' openai ' });
 
@@ -835,6 +1070,198 @@ describe('ProviderConnectionDialog API key flow', () => {
 });
 
 describe('ProviderConnectionDialog OAuth flow', () => {
+  async function startPasteFlow(automatic: Promise<boolean>) {
+    clientMocks.authorizeProvider.mockResolvedValue({
+      url: 'https://auth.example.com/oauth',
+      method: 'auto',
+      instructions: 'Sign in',
+      attemptID: 'attempt-paste',
+      paste: true,
+    });
+    clientMocks.completeProviderAuth.mockReturnValueOnce(automatic);
+    const onClose = renderDialog();
+    chooseProvider('Anthropic');
+    chooseMethod('Claude subscription');
+    primaryButton().click();
+    await flush();
+    return onClose;
+  }
+
+  function redirectInput() {
+    return dialog()!.querySelector<HTMLInputElement>(
+      '[aria-describedby="provider-connect-redirect-help"]'
+    )!;
+  }
+
+  it('offers an editable redirect URL while automatic authorization remains active', async () => {
+    const automatic = deferred<boolean>();
+    const onClose = await startPasteFlow(automatic.promise);
+    const input = redirectInput();
+    expect(input.labels?.[0]?.textContent).toContain('Browser redirect URL');
+    expect(input.disabled).toBe(false);
+    expect(input.required).toBe(false);
+    expect(input.autocomplete).toBe('off');
+    expect(dialog()?.textContent).toContain('Automatic sign-in is still active');
+    expect(primaryButton().textContent).toBe('Submit redirect URL');
+    expect(primaryButton().disabled).toBe(true);
+    dialog()!
+      .querySelector('form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flush();
+    expect(clientMocks.completeProviderAuth).toHaveBeenCalledTimes(1);
+    automatic.resolve(true);
+    await flush();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('submits the full redirect URL once without replacing or aborting the automatic callback', async () => {
+    const automatic = deferred<boolean>();
+    const submitted = deferred<boolean>();
+    const onClose = await startPasteFlow(automatic.promise);
+    clientMocks.completeProviderAuth.mockReturnValueOnce(submitted.promise);
+    const redirect = 'http://127.0.0.1:1455/callback?code=a%2Bb&state=opaque%2Fstate';
+    type(redirectInput(), `  ${redirect}  `);
+    const form = dialog()!.querySelector('form')!;
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flush();
+    expect(clientMocks.completeProviderAuth).toHaveBeenCalledTimes(2);
+    expect(clientMocks.completeProviderAuth).toHaveBeenLastCalledWith(
+      {
+        providerID: 'anthropic',
+        method: 0,
+        attemptID: 'attempt-paste',
+        code: redirect,
+        submitOnly: true,
+      },
+      { signal: expect.any(AbortSignal) }
+    );
+    const options: { signal: AbortSignal } = clientMocks.completeProviderAuth.mock.calls[0]![1];
+    expect(options.signal.aborted).toBe(false);
+    expect(redirectInput().disabled).toBe(true);
+    expect(primaryButton().textContent).toBe('Submitting redirect URL...');
+    submitted.resolve(true);
+    await flush();
+    expect(redirectInput().value).toBe('');
+    expect(redirectInput().disabled).toBe(false);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(postMessageMock).not.toHaveBeenCalledWith({ type: 'providers/auth-changed' });
+    automatic.resolve(true);
+    await flush();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it.each(['rejected', 'false'] as const)(
+    'keeps a %s redirect editable for retry without stopping automatic completion',
+    async (failure) => {
+      const automatic = deferred<boolean>();
+      const onClose = await startPasteFlow(automatic.promise);
+      if (failure === 'rejected')
+        clientMocks.completeProviderAuth.mockRejectedValueOnce(new Error('Invalid redirect URL'));
+      else clientMocks.completeProviderAuth.mockResolvedValueOnce(false);
+      type(redirectInput(), 'http://localhost/callback?code=wrong');
+      primaryButton().click();
+      await flush();
+      expect(alertText()).toContain(
+        failure === 'rejected' ? 'Invalid redirect URL' : 'Redirect URL was not accepted'
+      );
+      expect(redirectInput().value).toContain('code=wrong');
+      expect(primaryButton().disabled).toBe(false);
+      const options: { signal: AbortSignal } = clientMocks.completeProviderAuth.mock.calls[0]![1];
+      expect(options.signal.aborted).toBe(false);
+      clientMocks.completeProviderAuth.mockResolvedValueOnce(true);
+      type(redirectInput(), 'http://localhost/callback?code=correct');
+      primaryButton().click();
+      await flush();
+      expect(alertText()).toBe('');
+      expect(onClose).not.toHaveBeenCalled();
+      automatic.resolve(true);
+      await flush();
+      expect(onClose).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('finishes only once if browser authorization completes while URL submission is pending', async () => {
+    const automatic = deferred<boolean>();
+    const submitted = deferred<boolean>();
+    const onClose = await startPasteFlow(automatic.promise);
+    clientMocks.completeProviderAuth.mockReturnValueOnce(submitted.promise);
+    type(redirectInput(), 'http://localhost/callback?code=fixture');
+    primaryButton().click();
+    await flush();
+    const options: { signal: AbortSignal } = clientMocks.completeProviderAuth.mock.calls[1]![1];
+    automatic.resolve(true);
+    await flush();
+    expect(options.signal.aborted).toBe(true);
+    submitted.resolve(true);
+    await flush();
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(
+      postMessageMock.mock.calls.filter(([message]) => message.type === 'providers/auth-changed')
+    ).toHaveLength(1);
+  });
+
+  it.each(['close', 'back', 'unmount'] as const)(
+    'cancels both OAuth requests on %s and ignores their late responses',
+    async (action) => {
+      const automatic = deferred<boolean>();
+      const submitted = deferred<boolean>();
+      const onClose = await startPasteFlow(automatic.promise);
+      clientMocks.completeProviderAuth.mockReturnValueOnce(submitted.promise);
+      type(redirectInput(), 'http://localhost/callback?code=fixture');
+      primaryButton().click();
+      await flush();
+      const options: { signal: AbortSignal }[] = clientMocks.completeProviderAuth.mock.calls.map(
+        ([, requestOptions]) => requestOptions
+      );
+      if (action === 'close')
+        dialog()!.querySelector<HTMLButtonElement>('[aria-label="Close"]')!.click();
+      else if (action === 'back') findButton('Back to methods')!.click();
+      else {
+        cleanup!();
+        cleanup = undefined;
+      }
+      expect(options.every((option) => option.signal.aborted)).toBe(true);
+      automatic.resolve(true);
+      submitted.resolve(true);
+      await flush();
+      expect(onClose).toHaveBeenCalledTimes(action === 'close' ? 1 : 0);
+      expect(postMessageMock).not.toHaveBeenCalledWith({ type: 'providers/auth-changed' });
+    }
+  );
+
+  it('does not let a cancelled URL submission re-enable controls in a newer attempt', async () => {
+    const oldAutomatic = deferred<boolean>();
+    const oldSubmission = deferred<boolean>();
+    const onClose = await startPasteFlow(oldAutomatic.promise);
+    clientMocks.completeProviderAuth.mockReturnValueOnce(oldSubmission.promise);
+    type(redirectInput(), 'http://localhost/callback?code=old');
+    primaryButton().click();
+    await flush();
+    findButton('Back to methods')!.click();
+    const currentAutomatic = deferred<boolean>();
+    const currentSubmission = deferred<boolean>();
+    clientMocks.completeProviderAuth
+      .mockReturnValueOnce(currentAutomatic.promise)
+      .mockReturnValueOnce(currentSubmission.promise);
+    chooseMethod('Claude subscription');
+    primaryButton().click();
+    await flush();
+    type(redirectInput(), 'http://localhost/callback?code=current');
+    primaryButton().click();
+    await flush();
+    oldAutomatic.resolve(true);
+    oldSubmission.resolve(true);
+    await flush();
+    expect(primaryButton().disabled).toBe(true);
+    expect(primaryButton().textContent).toBe('Submitting redirect URL...');
+    expect(onClose).not.toHaveBeenCalled();
+    currentSubmission.resolve(true);
+    currentAutomatic.resolve(true);
+    await flush();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it.each(['auto', 'code'] as const)(
     'copies the full authorization URL during a pending %s exchange without submitting or cancelling',
     async (method) => {

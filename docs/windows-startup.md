@@ -208,6 +208,23 @@ The optional default-model lookup has a one-second cancellable budget and no ret
 a late response cannot overwrite the selected model. Startup errors offer initialization
 retry without restarting a healthy server or clearing unrelated errors.
 
+Startup routing catalogs retry the exact V2 `503 Location plugins did not finish
+activating` response within a sixty-second total catalog budget, with 500 ms gaps.
+Successful agent/command catalogs are retained while providers wait. Other failures
+keep the existing two-attempt bound. The loader displays the plugin-activation wait;
+expiry retains the original 503 in the startup error and offers initialization retry,
+not a server restart. Provider reads have cancellable ten-second attempt deadlines.
+Workspace invalidation cancels the old catalog owner, and aborted or superseded reads
+cannot apply late provider results or update the next workspace's waiting state.
+
+Only after an activation-pending 503, startup may read the current location's plugin
+and MCP failure inventories with a one-second host deadline. This optional read
+never gates readiness and adds no requests to normal startup. Display only bounded
+addon names and failure/timeout categories, never raw stderr, command arguments,
+remote URLs, or credentials. V2's plugin inventory reports active/failed, not setup
+timings or the currently waiting plugin. A named MCP timeout is a reported addon
+failure, not proof that it caused the catalog gate. Keep that uncertainty explicit.
+
 Native todo hydration has a one-second cancellable read budget, with message-derived
 todos as its fallback. Selection resets and native events invalidate older native reads;
 a late success or failure cannot overwrite newer todo state or prolong transcript hydration.
@@ -256,6 +273,14 @@ Global active status and observed attention remain blockers for historical paths
 
 ## Regression checklist for agents
 
+Managed V2 launch config defaults web search to `random` only when no explicit or
+saved preference exists. Inspect the saved `websearch:provider` key in a read-only
+SQLite worker with a two-second deadline; never create or migrate the database.
+Inspection failures preserve OpenCode's selection flow rather than enabling search.
+Before global config reload, recheck the fallback in the temporary runtime config
+under the same private-lease, process-identity, config-owner, and atomic-write checks
+as stream-timeout maintenance. Never rewrite an attached or foreign server's config.
+
 Run the standard lint, format, typecheck, and suggestion checks plus these unit files:
 
 ```sh
@@ -284,6 +309,14 @@ are logged separately using the renderer's clock. Renderer performance entries
 `varro.transcript.hydration-start`, `varro.transcript.ready`, and
 `varro.transcript.hydration` observe the existing transcript-positioning hold. They
 do not shorten that hold or prove OS-displayed paint; retain native visual checks.
+
+Status-bar version and provider ownership checks request server info with
+`includeActiveAgentCount: false`. Full diagnostics enumerate recent session directories
+to count active agents; V2's directory-scoped shell lookup can boot an idle historical
+location, including its watchers, plugins, and MCP connections. The November 2026
+investigation found eight unrelated locations booting during a slow editor reload.
+Keep that inventory out of startup metadata reads. Explicit About/diagnostic commands
+still request the full count, and restart safety checks remain independent.
 
 For real-editor/AI verification follow [AI test workflow](ai-test-workflow.md) and use
 isolated editor/database fixtures. Never restart the user's production server, mutate

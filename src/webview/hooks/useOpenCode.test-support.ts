@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => ({
     providerList: vi.fn(),
     providerLimit: vi.fn(),
     mcpStatus: vi.fn(),
+    mcpDefaults: vi.fn(),
     mcpConnect: vi.fn(),
     mcpAuthenticate: vi.fn(),
     mcpDisconnect: vi.fn(),
@@ -45,6 +46,8 @@ const mocks = vi.hoisted(() => ({
     sessionUpdate: vi.fn(),
     sessionCompact: vi.fn(),
     sessionRespondPermission: vi.fn(),
+    sessionPersistProjectPermissionAllow: vi.fn(),
+    sessionPersistGlobalPermissionAllow: vi.fn(),
     questionReply: vi.fn(),
     questionReject: vi.fn(),
     serverEventsOn: vi.fn(() => () => {}),
@@ -97,6 +100,8 @@ vi.mock('../lib/client', () => ({
       update: clientMocks.sessionUpdate,
       compact: clientMocks.sessionCompact,
       respondPermission: clientMocks.sessionRespondPermission,
+      persistProjectPermissionAllow: clientMocks.sessionPersistProjectPermissionAllow,
+      persistGlobalPermissionAllow: clientMocks.sessionPersistGlobalPermissionAllow,
     },
     agent: {
       list: clientMocks.agentList,
@@ -121,6 +126,7 @@ vi.mock('../lib/client', () => ({
       },
     },
     mcp: {
+      defaults: clientMocks.mcpDefaults,
       status: clientMocks.mcpStatus,
       connect: clientMocks.mcpConnect,
       authenticate: clientMocks.mcpAuthenticate,
@@ -252,6 +258,7 @@ beforeEach(() => {
   clientMocks.providerList.mockReset();
   clientMocks.providerLimit.mockReset();
   clientMocks.mcpStatus.mockReset();
+  clientMocks.mcpDefaults.mockReset();
   clientMocks.mcpConnect.mockReset();
   clientMocks.mcpAuthenticate.mockReset();
   clientMocks.mcpDisconnect.mockReset();
@@ -269,6 +276,8 @@ beforeEach(() => {
   clientMocks.sessionUpdate.mockReset();
   clientMocks.sessionCompact.mockReset();
   clientMocks.sessionRespondPermission.mockReset();
+  clientMocks.sessionPersistProjectPermissionAllow.mockReset();
+  clientMocks.sessionPersistGlobalPermissionAllow.mockReset();
   clientMocks.questionReply.mockReset();
   clientMocks.questionReject.mockReset();
   clientMocks.serverEventsOn.mockReset();
@@ -278,6 +287,12 @@ beforeEach(() => {
   bridgeMocks.onMessage.mockImplementation(() => () => {});
   bridgeMocks.postMessage.mockReset();
   clientMocks.mcpStatus.mockResolvedValue({});
+  clientMocks.mcpDefaults.mockResolvedValue({
+    global: {},
+    project: {},
+    effective: {},
+    editable: true,
+  });
   clientMocks.commandList.mockResolvedValue([]);
   clientMocks.permissionList.mockResolvedValue([]);
   clientMocks.sessionTodos.mockRejectedValue(new Error('404 Not Found'));

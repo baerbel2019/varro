@@ -234,7 +234,18 @@ automatic retry rather than exposing a manual approval that contradicts full acc
 
 Default mode presents `Reject`, `Once`, and an `Always` scope menu.
 The `Allow always` button only opens the menu; it has no default or remembered scope.
-Choosing a scope immediately submits that approval. Dismissing the menu leaves the request pending.
+On V1, choosing a scope immediately submits that approval. On V2, session, project, and global
+choices open a resource-pattern review prefilled from the request's `always` suggestions. V2 WebFetch
+reviews instead use the requested URL resources, falling back to the metadata URL when needed, so a
+wildcard save suggestion does not default to allowing every URL. Same-ID request refreshes must retain
+the review scope, draft, focus, and command expansion; only a different request ID resets them. The user
+may edit those patterns, keep them unchanged, or cancel without resolving the request. Saving requires
+explicit confirmation. The review replaces the ordinary action row with Cancel and Save & allow;
+cancelling restores the original actions without sending a permission reply.
+Patterns are bounded to 1-50 nonempty strings of at most 2000 characters each.
+The server still verifies the pending request ID, owning session, directory, and action. Only the
+patterns may come from manual review; execution input and the displayed command never change.
+Dismissing the menu leaves the request pending. V2's native standing approval is durable, not temporary.
 
 Session and project approval routes authorize the permission-owning session's directory before
 applying workspace guards. They may target another open root or an authorized catalog directory
@@ -245,26 +256,49 @@ ID and owning session against the server before changing rules.
 - `Always allow for this session` adds the request's server-provided `always` patterns to that
   session's permission rules, then replies `once` to the pending request so the approval does not
   enter server-wide memory.
-- `Always allow in server memory` sends OpenCode's `always` response. The resulting rules apply to
-  matching requests across sessions in that server instance until OpenCode restarts.
+- `Until server restart` is available only on V1 and sends OpenCode's `always` response. The resulting
+  rules apply to matching requests across sessions in that server instance until OpenCode restarts.
+  V2's `always` response instead creates durable project-scoped database approvals, so V2 must not
+  offer this temporary scope.
 - `Always allow for this project` first persists the request's server-provided `always` patterns in
-  project OpenCode configuration, then sends the same OpenCode standing response for the current
+  project OpenCode configuration, then replies `once` on V2. The config is the only standing grant;
+  deleting it must not leave a database approval behind. V1 still sends `always` for the current
   runtime. The config write must not call OpenCode's config-update route, dispose an instance, or
-  restart the server. Never derive or broaden project rules from webview display metadata.
-- Project config follows OpenCode's `PermissionConfig` shape. A top-level scalar action represents
+   restart the server. Never derive or broaden project rules from webview display metadata.
+- V2 manual review may replace the suggested session/project patterns explicitly. Global approval
+  writes the reviewed patterns to global OpenCode config and replies `once`, never `always` or a
+  saved-permission PATCH. It requires V2 and a locally managed connection. Attach-only connections
+  cannot edit host files. Global config edits preserve unrelated settings and comments, serialize by
+  canonical file path across windows, and reject dirty documents and concurrent file changes.
+  Native permission-array edits preserve existing entry formatting and comments where possible;
+  appended entries follow the existing compact or multiline style instead of reserializing the array.
+  The Permissions screen edits/removes global config rules independently of project, session, and
+  database approvals. Config changes take effect when OpenCode next loads the configuration; saving
+  must not restart or dispose the active instance.
+- New V2 permission settings use the native `permissions` array with `action`, `resource`, and `effect`
+  fields, including writes from the Permissions screen. Preserve existing legacy `permission` settings
+  rather than implicitly migrating them. Legacy project config follows OpenCode's `PermissionConfig`
+  shape. A top-level scalar action represents
   the `*` permission and `*` pattern and must remain effective when adding a narrower rule.
   `todowrite`, `question`, `webfetch`, `websearch`, and `doom_loop` accept only scalar actions inside
   the permission object; never serialize pattern maps for those names or broaden a non-wildcard
-  standing scope to make it fit.
-- Varro shows only server-memory entries linked to a successful `always` reply it observed. Native
-   saved IDs preserve that link when another client edits the action/resource scope. Confirmed native
+   standing scope to make it fit.
+  These scalar-only restrictions apply only to legacy config syntax. Native V2 permission arrays
+  support resource patterns for these actions, including URL-specific WebFetch rules.
+- Varro's managed server-memory layer contains only entries linked to a successful `always` reply it
+   observed. V2 also shows other native saved rows separately as `Other saved approvals`, with origin
+   explicitly unknown. Listing them must not adopt them as observed user approvals or enable editing;
+   they may include internal or other-client allowances. Explicit removal requires a confirmation in
+   that separate section. Native saved IDs preserve the observed link when another client edits the
+   action/resource scope. Confirmed native
    IDs are stored in workspace state, scoped by server address, API version, and project, so host reloads
    retain the management link. Capture these IDs after successful approval even when the Permissions
    screen is closed. Reconcile restored IDs against the native list and discard removed entries; a
    new ID with the same scope is not proof of user approval. Legacy process-only observations are not
    persisted. OpenCode's
-  saved-permission endpoint can also return internal allowances that the user did not add; those do not
-  belong in the user-managed layer. Legacy OpenCode permission replies keep `always` rules in an
+   saved-permission endpoint can also return internal allowances that the user did not add; those belong
+   only in the separate origin-unknown section, not the observed user-managed layer. Legacy OpenCode
+   permission replies keep `always` rules in an
   internal instance-local array with no list or removal endpoint. Varro mirrors those replies from
   their authoritative request scopes so the layer remains visible; those entries require an OpenCode
   restart to clear.
@@ -279,6 +313,18 @@ saved-permission list and remove endpoints when the server supports them. Removi
 project or session rules. Servers without those endpoints report the layer as unavailable rather than
 blocking the rest of the screen.
 
+V2 labels these database approvals as persistent, not `Until restart`. Host recreation, a changed
+connection address, or a failed native-ID capture must not hide approvals returned by a fresh native
+list; only their observed/untracked classification may change. The panel refreshes on reconnect and
+offers a saved-layer-only Refresh action that preserves unsaved project and session drafts.
+
+All saved-layer mutations require a fresh, validated native list for the selected project and the same
+server connection. Cached observations may be displayed with an explicit stale warning, but must not
+authorize edits or removals. A removal is confirmed only after the native list proves that exact ID is
+absent. A failed or malformed verification keeps the tracking link and reports the uncertainty; an
+empty filtered observed layer alone is not proof of removal. No saved-layer operation changes config,
+session rules, pending permissions, or server credentials, and none requires a server restart.
+
 On servers advertising saved-permission PATCH support, the same layer can edit
 its action/resource patterns. The host validates the owning project and managed
 rule ID, waits for the confirmed update, replaces the tracked scope, and refreshes
@@ -289,14 +335,24 @@ retain the draft and do not replace project/session rules or resolve pending ask
 - A failed response must leave the user with an actionable retry.
 - A successful response records a bounded decision reference for later auto-judge context across the
   same root conversation and its child sessions.
+- Rejection references apply only within the current root user-message turn. A new root user message
+  starts fresh review without the previous turn's rejections; it does not grant permission or clear
+  configured deny rules. Once and Always references retain their existing conversation scope. Root
+  user-message events from another view must advance this boundary even when the conversation is not
+  active locally. Child launch prompts, unrelated conversations, and stale message updates do not
+  advance it. Capture the turn before awaiting a manual reply so a delayed acknowledgement cannot
+  attach an old rejection to a new turn. A late automatic rejection from an earlier turn reveals the
+  pending request for manual approval instead of denying it.
 
 Equivalent pending requests may be grouped for display. Group identity includes type, pattern,
 session ID, title, and metadata, so requests from different sessions are not grouped together.
 
 - `Once` removes only the answered group member and leaves later members actionable.
 - `Reject` explicitly responds to every member represented by the grouped prompt.
-- `Always` sends `always` for the displayed group leader, then removes the matching group after
-  OpenCode accepts the standing response. It does not explicitly reply to every represented ID.
+- Server-memory and V1 project scopes send `always` for the displayed group leader, then remove the
+  matching group after OpenCode accepts the standing response. They do not explicitly reply to every
+  represented ID. V2 project approval replies `once` after persisting config and removes only that
+  answered member; other already-pending requests remain actionable until acknowledged.
 - Reconciliation and reply events must preserve every underlying request ID, not only the displayed
   leader ID.
 

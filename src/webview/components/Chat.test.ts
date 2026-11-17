@@ -47,16 +47,20 @@ import {
   state,
   setSessionFailed,
   setShowModels,
+  setShowMcpSettings,
+  showMcpSettings,
   setShowSessionPicker,
   setSessionUsageLimit,
   setMessagesIncremental,
   removeResolvedQuestion,
   setConnectionInitialized,
   setInputText,
+  inputText,
   setState,
   skipPlanSession,
 } from '../lib/state';
 import { ralphStore } from '../lib/stores/ralph-store';
+import { SessionLifecycleOperations } from '../hooks/session/session-lifecycle';
 import { sessionStore } from '../lib/stores/session-store';
 import { resetMessageEditState, startEditingMessage } from '../lib/message-edit-state';
 import { clearDirectSessionReturn, rememberDirectSessionReturn } from '../lib/session-navigation';
@@ -173,6 +177,7 @@ afterEach(() => {
   setDesktopSessionPaneSide('left');
   setShowSessionPicker(false);
   setShowModels(false);
+  setShowMcpSettings(false);
   setConnectionInitialized(false);
   stopLoading();
   clearDirectSessionReturn();
@@ -235,6 +240,47 @@ it('keeps a transferred conversation visible with an explicit open-folder action
     setInputText('');
   }
 });
+
+it.each([false, true])(
+  'reconciles a verified worktree snapshot without clearing a newer move, newerMove=%s',
+  (newerMove) => {
+    const directory = '/worktrees/feature';
+    const moved = session('session-1', 500, {
+      directory,
+      transfer: { originDirectory: '/repo', available: false },
+    });
+    setState('sessions', [moved]);
+    setState('activeSessionId', moved.id);
+    setState('transferredSessions', { [moved.id]: newerMove ? '/outside' : directory });
+    setConnectionInitialized(true);
+    setInputText('Continue from here');
+    setState('selectedModel', { providerID: 'openai', modelID: 'test-model' });
+    const operations = new SessionLifecycleOperations({
+      getCurrentWorkspacePath: () => '/repo',
+      clearPendingAbort: vi.fn(),
+      clearPendingAbortTree: vi.fn(),
+      resetTodoSync: vi.fn(),
+      resetToolCallExpansionState: vi.fn(),
+      publishSessionModel: vi.fn(),
+    });
+    cleanup = render(() => Chat(), container!);
+    expect(container!.querySelector('.chat-transport-banner')).not.toBeNull();
+    expect(
+      container!.querySelector<HTMLButtonElement>('button[aria-label="Send (Enter)"]')?.disabled
+    ).toBe(true);
+
+    operations.upsertSession({
+      ...moved,
+      transfer: { ...moved.transfer!, available: true },
+    });
+
+    expect(container!.querySelector('.chat-transport-banner') !== null).toBe(newerMove);
+    expect(
+      container!.querySelector<HTMLButtonElement>('button[aria-label="Send (Enter)"]')?.disabled
+    ).toBe(newerMove);
+    expect(inputText()).toBe('Continue from here');
+  }
+);
 
 function assistantMessageEntry(id: string): MessageEntry<AssistantMessage> {
   const info: AssistantMessage = {
@@ -1593,6 +1639,35 @@ describe('header status badges', () => {
     expect(
       container?.querySelector('.session-list-view:not(.session-list-view-sidebar)')
     ).toBeInstanceOf(HTMLDivElement);
+  });
+
+  it('opens MCP settings as a separate screen and returns to the same chat with Escape', async () => {
+    vi.spyOn(client.mcp, 'defaults').mockResolvedValue({
+      global: { docs: false },
+      project: {},
+      effective: { docs: false },
+      editable: true,
+    });
+    setState('sessions', [session('active', 500)]);
+    setState('activeSessionId', 'active');
+    setInputText('Keep this draft');
+    cleanup = render(() => Chat(), container!);
+    setShowMcpSettings(true);
+    expect(
+      container?.querySelector('.mcp-settings-panel [aria-label="Loading MCP settings"]')
+    ).not.toBeNull();
+    await vi.dynamicImportSettled();
+    await Promise.resolve();
+    expect(container?.querySelector('h1')?.textContent).toBe('MCP settings');
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }));
+    await Promise.resolve();
+    expect(showMcpSettings()).toBe(false);
+    expect(container?.querySelector('.mcp-settings-panel')).toBeNull();
+    expect(state.activeSessionId).toBe('active');
+    expect(
+      container?.querySelector('.session-list-view:not(.session-list-view-sidebar)')
+    ).toBeNull();
+    expect(inputText()).toBe('Keep this draft');
   });
 
   it('leaves Escape to nested chat controls that consume it', async () => {
@@ -4055,6 +4130,35 @@ describe('header status badges', () => {
     expect(container?.querySelector('[aria-label="Loading models"]')).toBeNull();
   });
 
+  it('reports the selected provider as visible only while the chat workspace is shown', () => {
+    const sent: WebviewMessage[] = [];
+    // SAFETY: The fixture installs the protocol bridge callback owned by the webview host.
+    const bridgeWindow = window as {
+      __sendToExtension?: (message: WebviewMessage) => void;
+    };
+    const originalSend = bridgeWindow.__sendToExtension;
+    bridgeWindow.__sendToExtension = (message) => sent.push(message);
+    const model = { providerID: 'openai', modelID: 'test-model' };
+    setState('selectedModel', model);
+    try {
+      cleanup = render(() => Chat(), container!);
+      expect(sent.findLast((message) => message.type === 'commands/state')).toMatchObject({
+        payload: { model, modelVisible: true },
+      });
+      setShowModels(true);
+      expect(sent.findLast((message) => message.type === 'commands/state')).toMatchObject({
+        payload: { model, modelVisible: false },
+      });
+      setShowModels(false);
+      expect(sent.findLast((message) => message.type === 'commands/state')).toMatchObject({
+        payload: { model, modelVisible: true },
+      });
+    } finally {
+      if (originalSend) bridgeWindow.__sendToExtension = originalSend;
+      else delete bridgeWindow.__sendToExtension;
+    }
+  });
+
   it.each(['session', 'directory', 'server'] as const)(
     'closes a side-question dialog when its %s changes',
     async (change) => {
@@ -4108,6 +4212,29 @@ describe('header status badges', () => {
     expect(dialog?.textContent).toContain('Login with GitHub Copilot');
     expect(dialog?.textContent).not.toContain('Back to providers');
     expect(dialog?.querySelector('[aria-label="Search providers"]')).toBeNull();
+  });
+
+  it('opens the Codex browser handoff from a usage notice without starting authentication', async () => {
+    vi.spyOn(client.config, 'providerCatalog').mockResolvedValue({
+      all: [{ id: 'openai', name: 'OpenAI', source: 'api', models: {} }],
+      default: {},
+      connected: ['openai'],
+    });
+    const authorize = vi.spyOn(client.config, 'authorizeProvider');
+    setState('providerAuthMethods', {
+      openai: [
+        { id: 'chatgpt-token-sharing', type: 'oauth', label: 'Sign in with ChatGPT' },
+        { id: 'chatgpt-browser', type: 'oauth', label: 'Codex browser (legacy)' },
+      ],
+    });
+    setState('sessions', [session('session-1', 500)]);
+    setState('activeSessionId', 'session-1');
+    cleanup = render(() => Chat(), container!);
+    requestProviderConnection('openai', 'chatgpt-browser');
+    await vi.waitFor(() => expect(document.querySelector('.provider-connect-form')).not.toBeNull());
+    expect(document.querySelector('.provider-connect-oauth-handoff')).not.toBeNull();
+    expect(document.querySelector('.provider-connect-methods')).toBeNull();
+    expect(authorize).not.toHaveBeenCalled();
   });
 
   it('opens the provider picker for a generic connection request', async () => {

@@ -138,6 +138,9 @@ the shared invariants below remain true.
   using the same rules as tool activity. They do not receive prompt numbers or sticky
   navigation entries. Preserve explicit attachment chips while keeping generated prompt text out of
   user previews and edit drafts.
+  Native subagent result notifications render as ordinary automatic-action tools inside Explored,
+  not as a second standalone subagent task card. Preserve their result text, status, and native IDs;
+  the original task card remains the subagent navigation entry.
 - `virtualMetrics.prefix.at(index)` must describe the same ordered ID list used by the renderer.
 - Published prefixes are immutable snapshots. Large prefixes share complete 256-entry chunks;
   a dirty suffix copies its partial boundary chunk before writing. Earlier snapshots must remain
@@ -483,6 +486,12 @@ Direct input acquires ownership only when it can affect the transcript:
   frames agree, then restore normal easing. A follow-frame gap of at least 1,000 ms also catches up
   immediately because host occlusion can suspend frames without a visibility event. This must not
   reattach detached readers or override editing, navigation, diff, or pointer ownership.
+- Resumed bottom-follow retires pre-suspension activity-collapse targets and trailing reserves before
+  choosing its destination, including late restore measurements until the follower settles. A completed
+  turn can otherwise remain at the physical bottom with every real row above the viewport. Check the
+  final answer's visible bounds, not only bottom distance. `scroll-hidden-completion.spec.ts` completes
+  a turn with suspended frames and checks short and virtualized histories, with and without visibility
+  events, while retaining detached reading positions.
 - Keep the transcript hidden behind its loading indicator through initial positioning and any initial
   viewport-filling history fetch. Reaching the end of the first page is not a ready-to-paint state when
   compact tool rows leave that page shorter than the viewport. Reveal only after the final bottom
@@ -651,8 +660,15 @@ Direct input acquires ownership only when it can affect the transcript:
   The model supplies a bounded plain-text summary with zero to three title/prompt pairs; prompt hints
   use the shared tooltip component, and the close control uses the shared icon.
   Suggestions are optional post-message flow chrome outside row-only prefixes. Arrival leaves focus
-  and detached anchors unchanged; dismissal reserves disappearing space through the existing block
-  removal handler. Clicking an action sends its prompt immediately without a confirmation dialog,
+  and detached anchors unchanged. Opening existing history keeps its initial loading cover through a
+  cache-only lookup and final bottom positioning, so cached suggestions are included in the first
+  revealed layout. The lookup never generates or waits for pending inference and holds reveal for at
+  most two seconds. A miss releases the cover before requesting suggestions; later results and fresh
+  live-turn suggestions use normal smooth bottom-follow. Never re-hide an already-open transcript,
+  snap to a late card, or reattach detached readers. `followups.spec.ts` samples from before startup to
+  catch an answer-only frame followed by a layout shift, not just the card's arrival frames.
+  Dismissal reserves disappearing space through the existing block removal handler. Clicking an action
+  sends its prompt immediately without a confirmation dialog,
   using the normal session-targeted send path while preserving the main draft and attachments.
   Remove the suggestion card in the same optimistic-publication batch that inserts its compact
   action row, not after network admission. On rejection, restore it only while the original source

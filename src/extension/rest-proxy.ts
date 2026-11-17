@@ -6,6 +6,7 @@ import type {
   OpenCodeServerMemoryPermission,
   PermissionRule,
   Session,
+  PermissionApprovalRequest,
 } from '../shared/opencode-types';
 import { parseSessionPromptEndpoint } from '../shared/opencode-endpoints';
 import { getSelectionRangesFromEditorContext } from '../shared/context-files';
@@ -25,6 +26,7 @@ import type {
   PermissionMode,
   ServerStatus,
   SessionDiffSummary,
+  SessionLocation,
   SessionHistoryScope,
   SessionWorkspaceScope,
   WebviewMessage,
@@ -60,6 +62,7 @@ import {
 } from './extension-config';
 import { parseSelectedModel } from '../shared/model-preferences';
 import { ModelPricingCatalog } from './model-pricing';
+import { StartupDiagnostics } from './startup-diagnostics';
 import type { ProviderLimitService } from './provider-limit-service';
 import type { PinnedSessionManager } from './pinned-session-manager';
 import type { OpenCodeServer } from './server';
@@ -263,8 +266,8 @@ export class InternalHelperCleanupCoordinator {
 }
 
 type OpenCodePermissionConfigRequest =
-  | { kind: 'get' }
-  | { kind: 'update'; rules: PermissionRule[] };
+  | { kind: 'get'; scope: 'project' | 'global' }
+  | { kind: 'update'; rules: PermissionRule[]; scope: 'project' | 'global' };
 
 type SessionPermissionRulesRequest =
   | { kind: 'get'; sessionID: string }
@@ -294,6 +297,7 @@ type ResolvedSessionCatalogScope =
 type SessionCatalogProject = {
   id: string;
   worktree: string;
+  canonical?: string;
   vcs?: string;
 };
 
@@ -320,7 +324,12 @@ export interface RestProxyCallbacks {
     Partial<Pick<OpenCodeServer, 'isAttachOnly' | 'url'>>;
   contextProvider: Pick<
     ContextProvider,
-    'context' | 'getOpenWorkspaceRoot' | 'readFile' | 'resolvePath'
+    | 'context'
+    | 'getOpenWorkspaceRoot'
+    | 'readFile'
+    | 'resolvePath'
+    | 'validateCitationPaths'
+    | 'resolveCitationSymbols'
   > &
     Partial<Pick<ContextProvider, 'findTerminalText'>>;
   providerLimitService: Pick<ProviderLimitService, 'get'>;
@@ -470,6 +479,12 @@ export class RestProxy {
   private readonly requestWorkspaceDirectory = new AsyncLocalStorage<string | undefined>();
   private sessionDirectories = new Map<string, string>();
   private authorizedSessionDirectories = new Map<string, AuthorizedSessionDirectory>();
+  private readonly authorizedTransferWorktrees = new Map<string, AuthorizedSessionDirectory>();
+  private sessionCatalogGeneration = 0;
+  private readonly projectGitWorktrees = new Map<
+    string,
+    { expiresAt: number; request: Promise<ReadonlySet<string>> }
+  >();
   private authorizedSessionCatalogs = new Map<
     string,
     { rootIdentity: string; sessions: Map<string, AuthorizedSessionDirectory> }
@@ -564,10 +579,13 @@ export class RestProxy {
   }
 
   invalidateSessionCatalog() {
+    this.sessionCatalogGeneration++;
     this.workspaceSessionStatusCoordinator.clearCatalogs();
     this.currentProjects.clear();
     this.sessionEventCatalogRefreshes.clear();
     this.authorizedSessionDirectories.clear();
+    this.authorizedTransferWorktrees.clear();
+    this.projectGitWorktrees.clear();
     this.authorizedSessionCatalogs.clear();
     this.hasSessionDirectorySnapshot = false;
   }
@@ -620,6 +638,7 @@ export class RestProxy {
 
   async authorizeSessionDirectory(sessionID: string, directory: string): Promise<boolean> {
     if (!sessionID.trim() || !normalizeWorkspaceIdentity(directory)) return false;
+    const generation = this.sessionCatalogGeneration;
     try {
       this.requireOpenWorkspaceRoot(directory);
       return true;
@@ -641,17 +660,116 @@ export class RestProxy {
         this.loadWorkspaceStatusSessionCatalog(scope.root, undefined, true, scope)
       )
     );
-    return catalogs.some((catalog) =>
-      catalog.sessions.some(
-        (session) => session.id === sessionID && isSameWorkspacePath(session.directory, directory)
+    if (
+      catalogs.some((catalog) =>
+        catalog.sessions.some(
+          (session) => session.id === sessionID && isSameWorkspacePath(session.directory, directory)
+        )
       )
-    );
+    )
+      return true;
+    return this.authorizeTransferredWorktree(sessionID, directory, generation);
+  }
+
+  private async authorizeTransferredWorktree(
+    sessionID: string,
+    directory: string,
+    generation: number
+  ): Promise<boolean> {
+    const roots = this.getOpenWorkspaceRoots();
+    const transfer = this.callbacks
+      .getTransferredSessions?.(roots, { includeHidden: true })
+      .find(
+        (session) => session.id === sessionID && isSameWorkspacePath(session.directory, directory)
+      );
+    if (!transfer || !isSafePersistedSessionId(sessionID)) return false;
+    const previous = this.authorizedTransferWorktrees.get(sessionID);
+    this.authorizedTransferWorktrees.delete(sessionID);
+    if (previous && this.authorizedSessionDirectories.get(sessionID) === previous) {
+      this.authorizedSessionDirectories.delete(sessionID);
+    }
+    try {
+      const signal = AbortSignal.timeout(5_000);
+      for (const root of roots) {
+        this.requireOpenWorkspaceRoot(root);
+        const project = await this.loadSessionCatalogProject(root, signal);
+        if (project.id === 'global' || project.id !== transfer.projectID) continue;
+        const projects = await this.requestServer('GET', '/project', undefined, {
+          directory: root,
+          signal,
+        });
+        if (
+          !Array.isArray(projects) ||
+          !projects.some((value) => {
+            const info = asRecord(value);
+            return info?.id === project.id && info.vcs === 'git';
+          })
+        )
+          continue;
+        // Saved inventory reads must not initialize configuration in an unapproved destination.
+        const worktrees = await this.requestServer(
+          'GET',
+          `/experimental/worktree?projectID=${encodeURIComponent(project.id)}`,
+          undefined,
+          { directory: root, signal }
+        );
+        if (
+          !Array.isArray(worktrees) ||
+          !worktrees.some((value) => {
+            const info = asRecord(value);
+            const worktreeDirectory = typeof value === 'string' ? value : info?.directory;
+            return (
+              typeof worktreeDirectory === 'string' &&
+              isSameWorkspacePath(worktreeDirectory, directory) &&
+              (info?.strategy === undefined || info.strategy === 'git')
+            );
+          })
+        )
+          continue;
+        const session = asRecord(
+          await this.requestServer('GET', `/session/${encodeURIComponent(sessionID)}`, undefined, {
+            directory: root,
+            signal,
+          })
+        );
+        if (
+          session?.id !== sessionID ||
+          session.projectID !== project.id ||
+          typeof session.directory !== 'string' ||
+          !isSameWorkspacePath(session.directory, directory)
+        )
+          return false;
+        if (
+          this.disposed ||
+          generation !== this.sessionCatalogGeneration ||
+          !this.getOpenWorkspaceRoots().some((candidate) => isSameWorkspacePath(candidate, root))
+        )
+          return false;
+        this.requireOpenWorkspaceRoot(root);
+        const authorized = { directory: session.directory, catalogRoot: root };
+        this.authorizedTransferWorktrees.set(sessionID, authorized);
+        this.authorizedSessionDirectories.set(sessionID, authorized);
+        return true;
+      }
+    } catch (error) {
+      logger.warn(
+        `Could not verify moved conversation worktree: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    return false;
   }
 
   async refreshSessionCatalogEventAuthorization(
     sessionIDs: readonly string[],
     directory?: string
   ): Promise<boolean> {
+    for (const sessionID of sessionIDs) {
+      const authorized = this.authorizedTransferWorktrees.get(sessionID);
+      if (authorized && directory && !isSameWorkspacePath(authorized.directory, directory)) {
+        this.authorizedTransferWorktrees.delete(sessionID);
+        this.authorizedSessionDirectories.delete(sessionID);
+      }
+    }
     const hasDirectoryDrift = Boolean(
       directory &&
       sessionIDs.some((sessionID) => {
@@ -827,6 +945,12 @@ export class RestProxy {
         payload.path,
         payload.body
       );
+      const globalPermissionAllowRequest = this.parsePermissionAllowRequest(
+        VARRO_API_ENDPOINTS.permissionGlobalAllow,
+        method,
+        payload.path,
+        payload.body
+      );
       // Scoped approvals carry their owning session in the body, not the route.
       const nativeFormReply =
         attentionReplyRequestID &&
@@ -841,6 +965,7 @@ export class RestProxy {
         parseDirectSessionID(payload.path) ??
         sessionPermissionAllowRequest?.sessionId ??
         projectPermissionAllowRequest?.sessionId ??
+        globalPermissionAllowRequest?.sessionId ??
         nativeFormSessionID;
       const transfer = directSessionID
         ? this.callbacks
@@ -850,23 +975,33 @@ export class RestProxy {
       const transferRead = Boolean(
         transfer &&
         method === 'GET' &&
-        /^(?:\/session\/[^/]+(?:\/(?:message(?:\/[^/]+(?:\/part\/[^/]+)?)?|diff|todo))?|\/varro\/session\/[^/]+\/diff-summary)$/.test(
+        /^(?:\/session\/[^/]+(?:\/(?:message(?:\/[^/]+(?:\/part\/[^/]+)?)?|diff|todo))?|\/varro\/session\/[^/]+\/(?:diff-summary|location))$/.test(
           new URL(payload.path, 'http://localhost').pathname
         )
       );
-      if (transfer && !transfer.transfer?.available && !transferRead) {
+      if (
+        transferRead &&
+        transfer &&
+        requestedWorkspaceDirectory &&
+        !isSameWorkspacePath(requestedWorkspaceDirectory, transfer.directory) &&
+        !isSameWorkspacePath(requestedWorkspaceDirectory, transfer.transfer?.originDirectory)
+      )
+        throw new Error('404 Session not found');
+      const transferAvailable =
+        transfer &&
+        (transfer.transfer?.available ||
+          (await this.authorizeTransferredWorktree(
+            transfer.id,
+            transfer.directory,
+            this.sessionCatalogGeneration
+          )));
+      if (transfer && !transferAvailable && !transferRead) {
         throw new Error(
           `Conversation moved to ${transfer.directory}. Open its folder to continue.`
         );
       }
       let explicitWorkspaceDirectory: string | null = null;
       if (transferRead && transfer) {
-        if (
-          requestedWorkspaceDirectory &&
-          !isSameWorkspacePath(requestedWorkspaceDirectory, transfer.directory) &&
-          !isSameWorkspacePath(requestedWorkspaceDirectory, transfer.transfer?.originDirectory)
-        )
-          throw new Error('404 Session not found');
         explicitWorkspaceDirectory = transfer.directory;
       } else if (requestedWorkspaceDirectory) {
         if (directSessionID) {
@@ -895,6 +1030,61 @@ export class RestProxy {
         payload.body
       );
       const requestPathname = new URL(payload.path, 'http://localhost').pathname;
+      if (
+        method === 'POST' &&
+        (requestPathname === VARRO_API_ENDPOINTS.citationPaths ||
+          requestPathname === VARRO_API_ENDPOINTS.citationSymbols)
+      ) {
+        const symbolRequest = requestPathname === VARRO_API_ENDPOINTS.citationSymbols;
+        const body = asRecord(payload.body);
+        const paths = symbolRequest ? body?.symbols : body?.paths;
+        if (
+          !Array.isArray(paths) ||
+          paths.length > (symbolRequest ? 32 : 64) ||
+          !paths.every(
+            (path): path is string =>
+              typeof path === 'string' &&
+              path.length > 0 &&
+              path.length <= (symbolRequest ? 128 : 4096)
+          )
+        )
+          throw new Error(symbolRequest ? 'Invalid citation symbols' : 'Invalid citation paths');
+        const requestedDirectory = body?.directory;
+        const sessionID = body?.sessionID;
+        if (
+          requestedDirectory !== undefined &&
+          (typeof requestedDirectory !== 'string' ||
+            !requestedDirectory.trim() ||
+            requestedDirectory.length > 4096)
+        )
+          throw new Error('Invalid citation directory');
+        if (sessionID !== undefined && !isSafePersistedSessionId(sessionID))
+          throw new Error('Invalid citation session');
+        const directory =
+          typeof requestedDirectory === 'string'
+            ? requestedDirectory
+            : this.getCurrentWorkspaceResolutionRoot();
+        if (directory) {
+          if (typeof sessionID === 'string') {
+            if (!(await this.authorizeSessionDirectory(sessionID, directory)))
+              throw new Error('Session workspace folder is not open');
+          } else this.requireOpenWorkspaceRoot(directory);
+        }
+        const data = symbolRequest
+          ? await this.callbacks.contextProvider.resolveCitationSymbols(
+              paths,
+              directory ?? undefined,
+              request?.controller.signal
+            )
+          : await this.callbacks.contextProvider.validateCitationPaths(
+              paths,
+              directory ?? undefined,
+              request?.controller.signal
+            );
+        request?.controller.signal.throwIfAborted();
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
       if (
         method === 'POST' &&
         /^\/question\/[^/]+\/reply$/.test(requestPathname) &&
@@ -1206,7 +1396,7 @@ export class RestProxy {
       );
       if (
         method === 'POST' &&
-        /^\/varro\/session\/[^/]+\/followups(?:\/dismiss)?$/.test(requestPathname)
+        /^\/varro\/session\/[^/]+\/followups(?:\/(?:dismiss|session))?$/.test(requestPathname)
       ) {
         const modelRef = readFollowupModel();
         const model = modelRef
@@ -1218,6 +1408,30 @@ export class RestProxy {
           this.callbacks.server,
           this.callbacks.legacyFollowupPersistence
         );
+        if (requestPathname.endsWith('/session')) {
+          const action = asRecord(asRecord(payload.body)?.action);
+          if (
+            !directSessionID ||
+            this.isHiddenSession(directSessionID) ||
+            !isSafePersistedSessionId(action?.sessionId) ||
+            !/^[\w-]{1,200}$/.test(action.sessionId) ||
+            action.sessionId === directSessionID ||
+            this.isHiddenSession(action.sessionId) ||
+            typeof action.title !== 'string' ||
+            typeof action.prompt !== 'string'
+          )
+            throw new Error('Invalid follow-up session link');
+          const directory = scopedWorkspaceDirectory ?? this.getCurrentWorkspacePath();
+          await this.assertSessionInWorkspace(action.sessionId, directory, directory);
+          const data = await service.linkSession({
+            sessionId: directSessionID,
+            source,
+            directory,
+            action: { title: action.title, prompt: action.prompt, sessionId: action.sessionId },
+          });
+          this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+          return;
+        }
         if (requestPathname.endsWith('/dismiss')) {
           if (!directSessionID || this.isHiddenSession(directSessionID))
             throw new Error('404 Session not found');
@@ -1241,6 +1455,7 @@ export class RestProxy {
                 directory: scopedWorkspaceDirectory ?? this.getCurrentWorkspacePath(),
                 signal: requestSignal,
                 allowGenerate: asRecord(payload.body)?.allowGenerate === true,
+                cacheOnly: asRecord(payload.body)?.cacheOnly === true,
                 isModelCurrent: () => readFollowupsEnabled() && readFollowupModel() === modelRef,
               })
             : EMPTY_FOLLOWUP_SUGGESTIONS;
@@ -1286,6 +1501,49 @@ export class RestProxy {
         this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
         return;
       }
+      if (
+        requestPathname === VARRO_API_ENDPOINTS.mcpConfig ||
+        requestPathname === VARRO_API_ENDPOINTS.mcpConfigOpen
+      ) {
+        const body = asRecord(payload.body);
+        if (method !== 'POST' || (body?.scope !== 'global' && body?.scope !== 'project'))
+          throw new Error('Choose Global or This project for the MCP configuration.');
+        let data;
+        if (requestPathname === VARRO_API_ENDPOINTS.mcpConfigOpen) {
+          await this.openCodeConfig.openMcpConfig(body.scope);
+          data = true;
+        } else {
+          if (
+            typeof body.json !== 'string' ||
+            (body.name !== undefined && typeof body.name !== 'string')
+          )
+            throw new Error('MCP configuration must contain JSON and an optional server name.');
+          data = await this.openCodeConfig.addMcpConfig(body.scope, body.json, body.name);
+        }
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
+      if (requestPathname === VARRO_API_ENDPOINTS.mcpDefaults) {
+        let data;
+        if (method === 'GET') data = await this.openCodeConfig.readMcpDefaults();
+        else {
+          const body = asRecord(payload.body);
+          if (
+            method !== 'POST' ||
+            typeof body?.name !== 'string' ||
+            !body.name ||
+            body.name.length > 512 ||
+            (body.scope !== 'global' && body.scope !== 'project') ||
+            (typeof body.enabled !== 'boolean' &&
+              (body.enabled !== null || body.scope !== 'project'))
+          ) {
+            throw new Error('Invalid MCP default update');
+          }
+          data = await this.openCodeConfig.updateMcpDefault(body.name, body.scope, body.enabled);
+        }
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
       if (openCodeConfigRequest) {
         if (
           openCodeConfigRequest.kind === 'update' &&
@@ -1321,6 +1579,16 @@ export class RestProxy {
         payload.body
       );
       if (permissionConfigRequest) {
+        if (permissionConfigRequest.scope === 'global') {
+          const data =
+            permissionConfigRequest.kind === 'get'
+              ? await this.openCodeConfig.readOpenCodeGlobalPermissionConfig()
+              : await this.openCodeConfig.updateOpenCodeGlobalPermissionConfig(
+                  permissionConfigRequest.rules
+                );
+          this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+          return;
+        }
         const data =
           permissionConfigRequest.kind === 'get'
             ? await this.openCodeConfig.readOpenCodePermissionConfig()
@@ -1489,7 +1757,11 @@ export class RestProxy {
         const data = await this.requestWorkspaceSessions(payload.path, requestSignal);
         this.callbacks.postApiResponse(requestGeneration, {
           id: payload.id,
-          data: this.includeTransferredSessions(data, payload.path),
+          data: await this.annotateSessionWorktrees(
+            this.includeTransferredSessions(data, payload.path),
+            payload.path,
+            requestSignal
+          ),
         });
         return;
       }
@@ -1500,6 +1772,85 @@ export class RestProxy {
       ) {
         const data = await this.requestWorkspaceSessionStatuses(requestSignal);
         this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
+
+      const locationMatch =
+        method === 'GET' && requestPathname.match(/^\/varro\/session\/([^/]+)\/location$/);
+      if (locationMatch) {
+        const sessionID = decodeURIComponent(locationMatch[1]!);
+        if (this.isHiddenSession(sessionID)) throw new Error('404 Session not found');
+        const root =
+          this.authorizedSessionDirectories.get(sessionID)?.catalogRoot ??
+          this.getOpenWorkspaceRoots()[0];
+        const session = asRecord(
+          await this.requestServer('GET', `/session/${encodeURIComponent(sessionID)}`, undefined, {
+            directory: root,
+            signal: requestSignal,
+          })
+        );
+        if (
+          session?.id !== sessionID ||
+          typeof session.directory !== 'string' ||
+          typeof session.projectID !== 'string'
+        ) {
+          throw new Error('Malformed session location');
+        }
+        const sessionDirectory = session.directory;
+        if (
+          explicitWorkspaceDirectory &&
+          !isSameWorkspacePath(session.directory, explicitWorkspaceDirectory)
+        ) {
+          throw new Error('Conversation location changed. Refresh before opening its folder.');
+        }
+        let isGitWorktree = false;
+        try {
+          if (this.callbacks.server.apiVersion === 2 && root) {
+            isGitWorktree = (
+              await this.readProjectGitWorktrees(session.projectID, root, requestSignal)
+            ).has(normalizeWorkspaceIdentity(sessionDirectory)!);
+          } else {
+            const worktrees = await this.requestServer(
+              'GET',
+              `/experimental/worktree?projectID=${encodeURIComponent(session.projectID)}`,
+              undefined,
+              { directory: root, signal: requestSignal }
+            );
+            const match = Array.isArray(worktrees)
+              ? worktrees.find((value) => {
+                  const directory = typeof value === 'string' ? value : asRecord(value)?.directory;
+                  return (
+                    typeof directory === 'string' &&
+                    isSameWorkspacePath(directory, sessionDirectory)
+                  );
+                })
+              : undefined;
+            if (typeof match === 'string' && root) {
+              const project = await this.loadSessionCatalogProject(root, requestSignal);
+              isGitWorktree =
+                project.vcs === 'git' && !isSameWorkspacePath(project.worktree, match);
+            } else {
+              isGitWorktree = asRecord(match)?.strategy === 'git';
+            }
+          }
+        } catch (error) {
+          requestSignal?.throwIfAborted();
+          logger.warn(
+            `Could not read session worktree metadata: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+        const location: SessionLocation = { directory: sessionDirectory, isGitWorktree };
+        if (isGitWorktree && root) {
+          const projectLocation = await this.readWorktreeProjectDirectory(
+            session.projectID,
+            sessionDirectory,
+            root,
+            requestSignal
+          );
+          if (projectLocation.projectDirectory)
+            location.projectDirectory = projectLocation.projectDirectory;
+        }
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data: location });
         return;
       }
 
@@ -1583,6 +1934,18 @@ export class RestProxy {
         return;
       }
 
+      if (globalPermissionAllowRequest) {
+        const directory = explicitWorkspaceDirectory ?? this.getCurrentWorkspaceResolutionRoot();
+        const data = await this.persistProjectPermissionAllow(
+          globalPermissionAllowRequest,
+          directory ?? undefined,
+          requestSignal,
+          'global'
+        );
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
+
       const judgePermissionRequest = this.parseJudgePermissionRequest(
         method,
         payload.path,
@@ -1635,6 +1998,14 @@ export class RestProxy {
       }
 
       const pricingUrl = new URL(payload.path, 'http://localhost');
+      if (method === 'GET' && pricingUrl.pathname === VARRO_API_ENDPOINTS.startupDiagnostics) {
+        const data = await new StartupDiagnostics(this.callbacks.server).read(
+          explicitWorkspaceDirectory ?? this.getCurrentWorkspaceResolutionRoot() ?? undefined,
+          requestSignal
+        );
+        this.callbacks.postApiResponse(requestGeneration, { id: payload.id, data });
+        return;
+      }
       if (method === 'GET' && pricingUrl.pathname === VARRO_API_ENDPOINTS.modelPricing) {
         const data = await this.modelPricing.get(
           pricingUrl.searchParams.get('providerID') ?? '',
@@ -2499,10 +2870,16 @@ export class RestProxy {
           rootStatusRequest,
           this.loadWorkspaceStatusSessionCatalog(root, signal, false, scope),
         ]);
+        // Retained transfers receive live events and appear in the session list,
+        // even when folder-scoped catalogs omit their destination. Poll that
+        // destination too, or a snapshot omission erases their running status.
+        const transfers = this.callbacks.getTransferredSessions?.([root]) ?? [];
+        const statusSessions = [...catalog.sessions, ...transfers];
+        const transferredIDs = new Set(transfers.map((session) => session.id));
         const statusDirectories = new Map<string, string>();
         const rootIdentity = normalizeWorkspaceIdentity(root);
         if (rootIdentity) statusDirectories.set(rootIdentity, root);
-        for (const session of catalog.sessions) {
+        for (const session of statusSessions) {
           const sessionIdentity = normalizeWorkspaceIdentity(session.directory);
           if (sessionIdentity) statusDirectories.set(sessionIdentity, session.directory);
         }
@@ -2529,7 +2906,7 @@ export class RestProxy {
           })
         );
         const sessions = catalog.sessions;
-        const visibleSessions = this.filterWorkspaceVisibleSessions(sessions);
+        const visibleSessions = this.filterWorkspaceVisibleSessions(statusSessions);
         const visibleSessionsByID = new Map(
           visibleSessions.map((session) => [session.id, session] as const)
         );
@@ -2546,6 +2923,7 @@ export class RestProxy {
               .map(([sessionID, status]) => {
                 const sessionDirectory = visibleSessionsByID.get(sessionID)?.directory;
                 const exposeFullStatus =
+                  transferredIDs.has(sessionID) ||
                   !endpointWorkspaceDirectory ||
                   isSameWorkspacePath(sessionDirectory, endpointWorkspaceDirectory);
                 return [
@@ -2881,6 +3259,7 @@ export class RestProxy {
             id: value.id,
             worktree: value.worktree,
           };
+          if (typeof value.canonical === 'string') project.canonical = value.canonical;
           if (typeof value.vcs === 'string') project.vcs = value.vcs;
           return project;
         }),
@@ -2994,9 +3373,9 @@ export class RestProxy {
       sessions: authorized,
     });
     this.authorizedSessionDirectories = new Map(
-      [...this.authorizedSessionCatalogs.values()].flatMap((catalog) => [
-        ...catalog.sessions.entries(),
-      ])
+      [...this.authorizedSessionCatalogs.values()]
+        .flatMap((catalog) => [...catalog.sessions.entries()])
+        .concat([...this.authorizedTransferWorktrees.entries()])
     );
   }
 
@@ -3190,7 +3569,7 @@ export class RestProxy {
     method: string,
     path: string,
     body: unknown
-  ): { sessionId: string; permissionId: string } | null {
+  ): PermissionApprovalRequest | null {
     if (method !== 'POST') return null;
     const url = new URL(path, 'http://localhost');
     if (url.pathname !== endpoint) return null;
@@ -3198,25 +3577,44 @@ export class RestProxy {
     const sessionId = typeof record?.sessionId === 'string' ? record.sessionId.trim() : '';
     const permissionId = typeof record?.permissionId === 'string' ? record.permissionId.trim() : '';
     if (!sessionId || !permissionId) throw new Error('Invalid permission scope request');
-    return { sessionId, permissionId };
+    if (record?.patterns === undefined) return { sessionId, permissionId };
+    if (this.callbacks.server.apiVersion !== 2)
+      throw new Error('Custom approval patterns require OpenCode V2');
+    if (
+      !Array.isArray(record.patterns) ||
+      record.patterns.length === 0 ||
+      record.patterns.length > 50 ||
+      record.patterns.some(
+        (pattern) => typeof pattern !== 'string' || !pattern.trim() || pattern.length > 2000
+      )
+    )
+      throw new Error(
+        'Approval patterns must contain 1 to 50 non-empty patterns of at most 2000 characters'
+      );
+    return {
+      sessionId,
+      permissionId,
+      patterns: [...new Set(record.patterns.map((pattern: string) => pattern.trim()))],
+    };
   }
 
   private async persistProjectPermissionAllow(
-    request: { sessionId: string; permissionId: string },
+    request: PermissionApprovalRequest,
     directory: string | undefined,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    scope: 'project' | 'global' = 'project'
   ) {
     const { permission, patterns } = await this.getPendingPermissionAllowScope(
       request,
       directory,
       signal
     );
-    await this.openCodeConfig.updateOpenCodeProjectPermission(permission, patterns);
+    await this.openCodeConfig.allowOpenCodeConfigPermission(permission, patterns, scope);
     return { permission, patterns };
   }
 
   private async getPendingPermissionAllowScope(
-    request: { sessionId: string; permissionId: string },
+    request: PermissionApprovalRequest,
     directory: string | undefined,
     signal?: AbortSignal
   ) {
@@ -3246,7 +3644,9 @@ export class RestProxy {
       throw new Error('Standing approval scope is unavailable for this request');
     }
 
-    return { permission, patterns };
+    // The action and owning request remain server-authoritative. Only an explicit
+    // manual review may replace the suggested standing patterns.
+    return { permission, patterns: request.patterns ?? patterns };
   }
 
   private async readSessionDiffSummary(sessionID: string): Promise<SessionDiffSummary> {
@@ -3500,6 +3900,102 @@ export class RestProxy {
       return transfer ? { ...result, transfer: transfer.transfer } : result;
     }
     return data;
+  }
+
+  private async readWorktreeProjectDirectory(
+    projectID: string,
+    directory: string,
+    root: string,
+    signal?: AbortSignal
+  ): Promise<{ projectDirectory?: string }> {
+    const project = await this.loadSessionCatalogProject(root, signal);
+    if (project.id !== projectID) return {};
+    const target = isSameWorkspacePath(root, directory)
+      ? (project.canonical ?? project.worktree)
+      : root;
+    return isSameWorkspacePath(target, directory) ? {} : { projectDirectory: target };
+  }
+
+  private readProjectGitWorktrees(
+    projectID: string,
+    root: string,
+    signal?: AbortSignal
+  ): Promise<ReadonlySet<string>> {
+    let cached = this.projectGitWorktrees.get(projectID);
+    if (!cached || cached.expiresAt <= Date.now()) {
+      const entry = {
+        expiresAt: Date.now() + CURRENT_PROJECT_CACHE_TTL_MS,
+        request: this.requestServer(
+          'GET',
+          `/experimental/worktree?projectID=${encodeURIComponent(projectID)}`,
+          undefined,
+          { directory: root, signal: AbortSignal.timeout(5_000) }
+        ).then((value) => {
+          if (!Array.isArray(value)) throw new Error('Malformed project worktree inventory');
+          return new Set(
+            value.flatMap((item) => {
+              const info = asRecord(item);
+              const directory =
+                typeof info?.directory === 'string'
+                  ? normalizeWorkspaceIdentity(info.directory)
+                  : null;
+              return info?.strategy === 'git' && directory ? [directory] : [];
+            })
+          );
+        }),
+      };
+      cached = entry;
+      this.projectGitWorktrees.set(projectID, entry);
+      void entry.request.catch(() => {
+        if (this.projectGitWorktrees.get(projectID) === entry)
+          this.projectGitWorktrees.delete(projectID);
+      });
+    }
+    return raceAgainstAbort(cached.request, signal);
+  }
+
+  private async annotateSessionWorktrees(
+    data: unknown,
+    path: string,
+    signal?: AbortSignal
+  ): Promise<unknown> {
+    if (this.callbacks.server.apiVersion !== 2) return data;
+    const page = asRecord(data);
+    const items = Array.isArray(data) ? data : Array.isArray(page?.items) ? page.items : null;
+    const root = getExplicitWorkspaceDirectory(path) ?? this.getOpenWorkspaceRoots()[0];
+    if (!items || !root) return data;
+    const projectIDs = [
+      ...new Set(
+        items.flatMap((item) => {
+          const projectID = asRecord(item)?.projectID;
+          return typeof projectID === 'string' && projectID !== 'global' ? [projectID] : [];
+        })
+      ),
+    ];
+    const inventories = new Map<string, ReadonlySet<string>>();
+    await mapWithConcurrency(projectIDs, 4, async (projectID) => {
+      try {
+        inventories.set(projectID, await this.readProjectGitWorktrees(projectID, root, signal));
+      } catch (error) {
+        signal?.throwIfAborted();
+        logger.warn(
+          `Could not read catalog worktree metadata: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    });
+    const annotated = items.map((item) => {
+      const session = asRecord(item);
+      const inventory =
+        typeof session?.projectID === 'string' ? inventories.get(session.projectID) : undefined;
+      const directory =
+        typeof session?.directory === 'string'
+          ? normalizeWorkspaceIdentity(session.directory)
+          : null;
+      return inventory && directory
+        ? { ...session, isGitWorktree: inventory.has(directory) }
+        : item;
+    });
+    return Array.isArray(data) ? annotated : { ...page, items: annotated };
   }
 
   private includeTransferredSessions(data: unknown, path: string): unknown {
@@ -4006,9 +4502,11 @@ export class RestProxy {
       typeof record.agent === 'string' && record.agent
         ? `The selected agent for this turn is ${JSON.stringify(record.agent)}. Follow this agent's current instructions and permissions. Earlier turns may have used a different agent; their mode restrictions and statements about being read-only do not define the current mode.`
         : '';
+    const citationPrompt =
+      'When referencing existing local files or folders, use complete paths relative to the session working directory shown above. Do not use a basename unless the file is directly in that directory, and do not use paths relative to a deeper subdirectory. For locations outside that directory, use absolute paths. File citations are linked only when the exact path exists. Include line ranges when relevant. To cite a function, class, or module, use a Markdown link with the symbol as its label and the verified file path and line as its target, such as [`loss_weights()`](src/loss.py:12). Bare symbols and grouped labels such as `transporter / franka / clip` do not identify a file. Do not invent targets for symbols you have not located. Label hypothetical paths and placeholders as examples and keep them in fenced code blocks, not file links.';
     return {
       ...record,
-      system: `${existing ? `${existing}\n\nVS Code workspace context:\n` : ''}${scopePrompt}\n\n${permissionPrompt}${agentPrompt ? `\n\n${agentPrompt}` : ''}`,
+      system: `${existing ? `${existing}\n\nVS Code workspace context:\n` : ''}${scopePrompt}\n\n${citationPrompt}\n\n${permissionPrompt}${agentPrompt ? `\n\n${agentPrompt}` : ''}`,
     };
   }
 
@@ -4490,11 +4988,17 @@ export class RestProxy {
     path: string,
     body: unknown
   ): OpenCodePermissionConfigRequest | null {
-    if (path !== VARRO_API_ENDPOINTS.openCodeConfigPermissions) return null;
-    if (method === 'GET') return { kind: 'get' };
+    const scope =
+      path === VARRO_API_ENDPOINTS.openCodeConfigPermissions
+        ? 'project'
+        : path === VARRO_API_ENDPOINTS.openCodeGlobalPermissions
+          ? 'global'
+          : null;
+    if (!scope) return null;
+    if (method === 'GET') return { kind: 'get', scope };
     if (method !== 'POST') return null;
 
-    return { kind: 'update', rules: this.parsePermissionRules(asRecord(body)?.rules) };
+    return { kind: 'update', rules: this.parsePermissionRules(asRecord(body)?.rules), scope };
   }
 
   private parseSessionPermissionRulesRequest(

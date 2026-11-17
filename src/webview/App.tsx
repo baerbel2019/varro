@@ -1,4 +1,4 @@
-import { ErrorBoundary, Show, onCleanup, onMount } from 'solid-js';
+import { ErrorBoundary, Show, createEffect, onCleanup, onMount } from 'solid-js';
 import { useOpenCode } from './hooks/useOpenCode';
 import { createOpenCodeRuntime, installOpenCodeRuntime } from './hooks/runtime/useOpenCode.runtime';
 import { connectionInitialized, defaultAppState } from './lib/state';
@@ -16,6 +16,7 @@ import { statusIcons } from './lib/status-icons';
 import { wifiIcon } from './lib/ui-icons';
 import { UiIcon } from './components/UiIcon';
 import { RalphForm } from './components/ralph/RalphForm';
+import { requestProviderConnection } from './lib/provider-connection-state';
 
 export function AppRoot() {
   onCleanup(cleanupBridge);
@@ -34,9 +35,8 @@ function InitializedApp() {
 }
 
 const showChat = () =>
-  (defaultAppState.state.serverStatus.state === 'running' ||
-    defaultAppState.state.serverReconnecting) &&
-  !(defaultAppState.state.providersLoaded && defaultAppState.state.providers.length === 0);
+  defaultAppState.state.serverStatus.state === 'running' ||
+  defaultAppState.state.serverReconnecting;
 
 const isRestoringWorkspace = () =>
   defaultAppState.state.serverStatus.state === 'running' &&
@@ -86,6 +86,27 @@ function hasWrappedCause(err: Error): err is Error & { cause: unknown } {
 export function App() {
   useOpenCode();
 
+  let providerSetupOpened = false;
+  createEffect(() => {
+    if (defaultAppState.state.providers.length > 0) {
+      providerSetupOpened = false;
+      return;
+    }
+    if (
+      providerSetupOpened ||
+      !connectionInitialized() ||
+      defaultAppState.state.serverStatus.state !== 'running' ||
+      defaultAppState.state.serverReconnecting ||
+      defaultAppState.state.restartBlocked ||
+      !defaultAppState.state.providersLoaded
+    ) {
+      return;
+    }
+    providerSetupOpened = true;
+    defaultAppState.setShowModels(true);
+    requestProviderConnection();
+  });
+
   onMount(() => {
     ralphRunner.reattachAll();
     const stopObservingSurfaceContrast = observeSurfaceContrast();
@@ -116,9 +137,11 @@ export function App() {
         errorRetry={defaultAppState.errorRetry}
         onDismissError={() => defaultAppState.setError(null)}
         status={() =>
-          isReconnecting()
-            ? { message: 'Reconnecting to server', icon: wifiIcon, tone: 'warning' }
-            : null
+          isReconnecting() && defaultAppState.startupWaitingForPlugins()
+            ? { message: 'Waiting for OpenCode plugins to activate', icon: statusIcons.clock }
+            : isReconnecting()
+              ? { message: 'Reconnecting to server', icon: wifiIcon, tone: 'warning' }
+              : null
         }
       />
     </div>
@@ -133,6 +156,13 @@ function WorkspaceLoading() {
         <span class="loading-dot" style={{ 'animation-delay': '0.3s' }} />
         <span class="loading-dot" style={{ 'animation-delay': '0.6s' }} />
       </div>
+      <Show when={defaultAppState.startupWaitingForPlugins()}>
+        <p class="text-[12px] text-vscode-muted">Waiting for OpenCode plugins to activate</p>
+        <p class="max-w-[420px] px-4 text-center text-[12px] text-vscode-muted">
+          {defaultAppState.startupAddonWarning() ??
+            'OpenCode has not identified which addon is delaying activation. Check its server log for details.'}
+        </p>
+      </Show>
     </div>
   );
 }

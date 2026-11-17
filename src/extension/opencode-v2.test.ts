@@ -28,6 +28,49 @@ import { nativePdfFixture } from '../shared/native-pdf.test-support';
 vi.mock('./logger', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 afterEach(() => vi.unstubAllGlobals());
 
+describe('saved project worktree inventory', () => {
+  it('reads the native bare worktree inventory without loading a destination location', async () => {
+    const worktrees = [{ directory: '/worktrees/feature', strategy: 'git' }];
+    const wire = vi.fn(async () => worktrees);
+    const adapter = new OpenCodeV2Adapter(wire);
+    expect(
+      await adapter.request('GET', '/experimental/worktree?projectID=project%2F1', undefined, {
+        directory: '/repo',
+      })
+    ).toEqual(worktrees);
+    expect(wire).toHaveBeenCalledExactlyOnceWith(
+      'GET',
+      '/api/worktree?projectID=project%2F1',
+      undefined,
+      expect.objectContaining({ unscoped: true })
+    );
+  });
+
+  it('reads the native bare project list without requiring a data envelope or location', async () => {
+    const projects = [{ id: 'project-1', canonical: '/repo', vcs: 'git', sandboxes: [] }];
+    const wire = vi.fn(async () => projects);
+    const adapter = new OpenCodeV2Adapter(wire);
+    expect(await adapter.request('GET', '/project', undefined, { directory: '/repo' })).toEqual(
+      projects
+    );
+    expect(wire).toHaveBeenCalledExactlyOnceWith(
+      'GET',
+      '/api/project',
+      undefined,
+      expect.objectContaining({ unscoped: true })
+    );
+  });
+
+  it('requires an explicit project ID before reading worktree inventory', async () => {
+    const wire = vi.fn();
+    const adapter = new OpenCodeV2Adapter(wire);
+    await expect(adapter.request('GET', '/experimental/worktree', undefined)).rejects.toThrow(
+      'Worktree inventory requires a project ID'
+    );
+    expect(wire).not.toHaveBeenCalled();
+  });
+});
+
 describe('native session forms', () => {
   const form: FormInfo = {
     id: 'frm_fixture',
@@ -839,6 +882,37 @@ describe('v2 authentication fields', () => {
     );
   });
 
+  it('registers Claude Agent through its Claude Code external login without starting OAuth', async () => {
+    const integration = {
+      id: 'claude-agent',
+      methods: [
+        { id: 'claude-login', type: 'external', label: 'Claude Code login (claude auth login)' },
+      ],
+    };
+    const wire = vi.fn(async (_method: string, path: string) => {
+      if (path === '/api/provider') return { data: [] };
+      if (path === '/api/integration') return { data: [integration] };
+      if (path === '/api/provider/claude-agent') return { data: { integrationID: 'claude-agent' } };
+      if (path === '/api/integration/claude-agent') return { data: integration };
+      if (path === '/api/integration/claude-agent/connect/external') return null;
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const adapter = new OpenCodeV2Adapter(wire);
+    expect(await adapter.request('GET', '/provider/auth', undefined)).toMatchObject({
+      'claude-agent': [{ type: 'external', label: 'Claude Code login (claude auth login)' }],
+    });
+    await expect(
+      adapter.request('POST', '/provider/claude-agent/oauth/authorize', { method: 0 })
+    ).resolves.toEqual({ url: '', method: 'complete', instructions: '' });
+    expect(wire).toHaveBeenLastCalledWith(
+      'POST',
+      '/api/integration/claude-agent/connect/external',
+      { methodID: 'claude-login', answer: undefined },
+      expect.anything()
+    );
+    expect(wire.mock.calls.some(([, path]) => path.includes('/connect/oauth'))).toBe(false);
+  });
+
   it('does not report an external connection as complete when the server rejects it', async () => {
     const wire = vi.fn(async (method: string, path: string) => {
       if (path === '/api/provider/azure') return { data: {} };
@@ -889,6 +963,7 @@ describe('v2 authentication fields', () => {
       expect(await adapter.request('GET', '/provider/auth', undefined)).toEqual({
         opencode: [
           {
+            id: 'login',
             type: 'oauth',
             label: 'Sign in',
             prompts: [
@@ -1029,6 +1104,229 @@ describe('v2 authentication fields', () => {
       expect.objectContaining({ signal: undefined, unscoped: true })
     );
   });
+
+  it.each([
+    { mode: 'auto', paste: true },
+    { mode: 'auto', paste: undefined },
+    { mode: 'auto', paste: false },
+    { mode: 'code', paste: undefined },
+  ])('preserves OAuth mode $mode and optional paste=$paste capability', async ({ mode, paste }) => {
+    const wire = vi.fn(async (_method: string, path: string) => {
+      if (path === '/api/provider/fixture') return { data: {} };
+      if (path === '/api/integration/fixture')
+        return { data: { methods: [{ id: 'browser', type: 'oauth' }] } };
+      if (path === '/api/integration/fixture/connect/oauth')
+        return {
+          data: {
+            attemptID: 'attempt-paste',
+            mode,
+            paste,
+            url: 'https://example.test/login',
+            instructions: 'Sign in using your browser',
+          },
+        };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const adapter = new OpenCodeV2Adapter(wire);
+    adapter.setServerVersion(paste === true ? '2.2.6' : '2.0.5');
+    const expected = {
+      attemptID: 'attempt-paste',
+      url: 'https://example.test/login',
+      method: mode,
+      instructions: 'Sign in using your browser',
+    };
+    expect(
+      await adapter.request('POST', '/provider/fixture/oauth/authorize', { method: 0 })
+    ).toStrictEqual(paste === true ? { ...expected, paste: true } : expected);
+  });
+
+  it('submits a pasted redirect URL unchanged and waits for authoritative OAuth completion', async () => {
+    vi.useFakeTimers();
+    try {
+      let statusReads = 0;
+      let firstPoll!: () => void;
+      const polled = new Promise<void>((done) => {
+        firstPoll = done;
+      });
+      const wire = vi.fn(async (method: string, path: string) => {
+        const route = new URL(path, 'http://localhost').pathname;
+        if (route === '/api/provider/fixture') return { data: {} };
+        if (route === '/api/integration/fixture')
+          return { data: { methods: [{ id: 'browser', type: 'oauth' }] } };
+        if (route.endsWith('/connect/oauth'))
+          return { data: { attemptID: 'attempt-paste', mode: 'auto', paste: true } };
+        if (method === 'POST' && route.endsWith('/complete')) return null;
+        if (method === 'GET' && route.endsWith('/attempt-paste')) {
+          firstPoll();
+          return { data: { status: ++statusReads === 1 ? 'pending' : 'complete' } };
+        }
+        throw new Error(`Unexpected request: ${method} ${path}`);
+      });
+      const adapter = new OpenCodeV2Adapter(wire);
+      await adapter.request(
+        'POST',
+        '/provider/fixture/oauth/authorize',
+        { method: 0 },
+        { directory: '/repo' }
+      );
+      const redirect =
+        'http://127.0.0.1:1455/oauth/callback?code=a%2Bb%2Fc&state=opaque%2Fstate#fragment';
+      let finished = false;
+      const completion = adapter
+        .request(
+          'POST',
+          '/provider/fixture/oauth/callback',
+          { attemptID: 'attempt-paste', code: redirect },
+          { directory: '/repo' }
+        )
+        .then((result) => {
+          finished = true;
+          return result;
+        });
+      await polled;
+      expect(finished).toBe(false);
+      expect(wire).toHaveBeenCalledWith(
+        'POST',
+        '/api/integration/fixture/connect/oauth/attempt-paste/complete?location[directory]=%2Frepo',
+        { code: redirect },
+        expect.objectContaining({ unscoped: true })
+      );
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(completion).resolves.toBe(true);
+      expect(statusReads).toBe(2);
+      expect(wire.mock.calls.some(([method]) => method === 'DELETE')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['accepted', 'rejected', 'aborted'] as const)(
+    'keeps the automatic OAuth callback alive after a %s submission-only request',
+    async (outcome) => {
+      let finishPoll!: (value: { data: { status: string } }) => void;
+      let didPoll!: () => void;
+      const polled = new Promise<void>((done) => {
+        didPoll = done;
+      });
+      const pending = new Promise<{ data: { status: string } }>((done) => {
+        finishPoll = done;
+      });
+      const submissionController = new AbortController();
+      let submissions = 0;
+      const wire = vi.fn(async (method: string, path: string) => {
+        const route = new URL(path, 'http://localhost').pathname;
+        if (route === '/api/provider/fixture') return { data: {} };
+        if (route === '/api/integration/fixture')
+          return { data: { methods: [{ id: 'browser', type: 'oauth' }] } };
+        if (route.endsWith('/connect/oauth'))
+          return { data: { attemptID: 'attempt-paste', mode: 'auto', paste: true } };
+        if (method === 'GET' && route.endsWith('/attempt-paste')) {
+          didPoll();
+          return pending;
+        }
+        if (method === 'POST' && route.endsWith('/complete')) {
+          submissions++;
+          if (submissions === 1 && outcome === 'rejected') throw new Error('Invalid redirect URL');
+          if (submissions === 1 && outcome === 'aborted') {
+            submissionController.abort(new Error('Paste cancelled'));
+            submissionController.signal.throwIfAborted();
+          }
+          return null;
+        }
+        throw new Error(`Unexpected request: ${method} ${path}`);
+      });
+      const adapter = new OpenCodeV2Adapter(wire);
+      const options = { directory: '/repo' };
+      await adapter.request('POST', '/provider/fixture/oauth/authorize', { method: 0 }, options);
+      let finished = false;
+      const completion = adapter
+        .request(
+          'POST',
+          '/provider/fixture/oauth/callback',
+          {
+            attemptID: 'attempt-paste',
+          },
+          options
+        )
+        .then((result) => {
+          finished = true;
+          return result;
+        });
+      await polled;
+      const redirect =
+        'http://127.0.0.1:1455/oauth/callback?code=a%2Bb&state=opaque%2Fstate#fragment';
+      const body = { attemptID: 'attempt-paste', code: redirect, submitOnly: true };
+      const submission = adapter.request('POST', '/provider/fixture/oauth/callback', body, {
+        ...options,
+        signal: submissionController.signal,
+      });
+      if (outcome === 'accepted') await expect(submission).resolves.toBe(true);
+      else {
+        await expect(submission).rejects.toThrow(
+          outcome === 'rejected' ? 'Invalid redirect URL' : 'Paste cancelled'
+        );
+        await expect(
+          adapter.request('POST', '/provider/fixture/oauth/callback', body, options)
+        ).resolves.toBe(true);
+      }
+      expect(finished).toBe(false);
+      expect(
+        wire.mock.calls.filter(
+          ([method, path]) => method === 'GET' && path.includes('/attempt-paste')
+        )
+      ).toHaveLength(1);
+      expect(wire.mock.calls.some(([method]) => method === 'DELETE')).toBe(false);
+      expect(wire).toHaveBeenCalledWith(
+        'POST',
+        '/api/integration/fixture/connect/oauth/attempt-paste/complete?location[directory]=%2Frepo',
+        { code: redirect },
+        expect.objectContaining({ unscoped: true })
+      );
+      finishPoll({ data: { status: 'complete' } });
+      await expect(completion).resolves.toBe(true);
+      await expect(
+        adapter.request('POST', '/provider/fixture/oauth/callback', body, options)
+      ).rejects.toThrow('attempt was not started');
+    }
+  );
+
+  it.each([
+    { mode: 'auto', paste: true, code: '  ' },
+    { mode: 'auto', paste: true, code: undefined },
+    { mode: 'auto', paste: undefined, code: 'http://localhost/callback?code=fixture' },
+    { mode: 'code', paste: true, code: 'http://localhost/callback?code=fixture' },
+  ])(
+    'rejects unsupported or empty submission-only OAuth input $mode/$paste/$code without deleting the attempt',
+    async ({ mode, paste, code }) => {
+      const wire = vi.fn(async (method: string, path: string) => {
+        if (path === '/api/provider/fixture') return { data: {} };
+        if (path === '/api/integration/fixture')
+          return { data: { methods: [{ id: 'browser', type: 'oauth' }] } };
+        if (path.endsWith('/connect/oauth'))
+          return { data: { attemptID: 'attempt-paste', mode, paste } };
+        if (method === 'GET' && path.endsWith('/attempt-paste'))
+          return { data: { status: 'complete' } };
+        throw new Error(`Unexpected request: ${method} ${path}`);
+      });
+      const adapter = new OpenCodeV2Adapter(wire);
+      await adapter.request('POST', '/provider/fixture/oauth/authorize', { method: 0 });
+      await expect(
+        adapter.request('POST', '/provider/fixture/oauth/callback', {
+          attemptID: 'attempt-paste',
+          code,
+          submitOnly: true,
+        })
+      ).rejects.toThrow('does not accept a pasted redirect URL');
+      await expect(
+        adapter.request('POST', '/provider/fixture/oauth/callback', {
+          attemptID: 'attempt-paste',
+        })
+      ).resolves.toBe(true);
+      expect(
+        wire.mock.calls.some(([method, path]) => method === 'DELETE' || path.endsWith('/complete'))
+      ).toBe(false);
+    }
+  );
 
   it.each(['/repo-a', '/repo-b'])(
     'isolates overlapping OAuth code attempts when the second view uses %s',
@@ -1365,6 +1663,159 @@ describe('v2 agent icon options', () => {
 describe('v2 configured model catalogs', () => {
   const tier = { tier: { type: 'context', size: 128_000 }, input: 4, output: 16 };
   const base = { input: 2, output: 8, cache: { read: 0.5, write: 1 } };
+
+  it.each([undefined, '2.2.0'])(
+    'filters unsupported subscription models from both catalogs and defaults on %s',
+    async (version) => {
+      const providers = [
+        {
+          id: 'openai',
+          name: 'OpenAI',
+          settings: { baseURL: 'https://chatgpt.com/backend-api/codex' },
+        },
+        {
+          id: 'subscription-alias',
+          name: 'Subscription',
+          settings: { baseURL: 'https://chatgpt.com/backend-api/codex/' },
+        },
+        {
+          id: 'api',
+          name: 'API',
+          settings: { baseURL: 'https://api.openai.com/v1' },
+        },
+      ];
+      const definitions = [
+        { id: 'flex', settings: { serviceTier: 'flex' } },
+        { id: 'renamed-tier', body: { service_tier: 'flex' } },
+        { id: 'gpt-6-cyber', modelID: 'gpt-6-cyber' },
+        { id: 'gpt-5.6-cyber', modelID: 'gpt-5.6-cyber' },
+        { id: 'gpt-6-cyber-fast', modelID: 'gpt-6-cyber', settings: { serviceTier: 'priority' } },
+        { id: 'security-alias', modelID: 'gpt-6-cyber' },
+        { id: 'gpt-5.5-cyber-preview', modelID: 'gpt-5.5-cyber-preview' },
+        { id: 'standard' },
+        { id: 'fast', settings: { serviceTier: 'priority' } },
+        { id: 'flexible-name', name: 'Flex', settings: { serviceTier: 'priority' } },
+        { id: 'cyber-name', name: 'Cyber', modelID: 'gpt-6.1-sol' },
+        { id: 'gpt-6-cyber-alias', modelID: 'gpt-6.1-sol' },
+        {
+          id: 'api-override',
+          settings: { serviceTier: 'flex', baseURL: 'https://api.openai.com/v1' },
+        },
+        {
+          id: 'body-override',
+          settings: { serviceTier: 'flex' },
+          body: { service_tier: 'default' },
+        },
+      ];
+      const models = providers.flatMap((provider) =>
+        definitions.map((definition) => ({
+          modelID: 'gpt-6.1-sol',
+          providerID: provider.id,
+          name: definition.id,
+          capabilities: { tools: true, input: ['text'], output: ['text'] },
+          variants: [],
+          time: { released: 0 },
+          cost: [base],
+          enabled: true,
+          ...definition,
+        }))
+      );
+      const adapter = new OpenCodeV2Adapter(async (_method, path) => {
+        if (path === '/api/provider') return { data: providers };
+        if (path === '/api/model') return { data: models };
+        if (path === '/api/integration') return { data: [] };
+        if (path === '/api/config')
+          return [
+            {
+              info: {
+                providers: {
+                  openai: {
+                    models: {
+                      'configured-flex': { settings: { serviceTier: 'flex' } },
+                      'configured-cyber': { modelID: 'gpt-6-cyber' },
+                    },
+                  },
+                },
+              },
+            },
+          ];
+        throw new Error(`Unexpected request: ${path}`);
+      });
+      adapter.setServerVersion(version);
+      for (const route of ['/provider', '/config/providers']) {
+        const catalog = asRecord(await adapter.request('GET', route, undefined));
+        const entries = catalog?.all ?? catalog?.providers;
+        if (!Array.isArray(entries)) throw new Error('Missing provider catalog');
+        for (const entry of entries) {
+          const provider = asRecord(entry);
+          const available = Object.keys(asRecord(provider?.models) ?? {});
+          expect(available).toEqual(
+            definitions
+              .filter(
+                (definition) =>
+                  provider?.id === 'api' ||
+                  (![
+                    'flex',
+                    'renamed-tier',
+                    'gpt-6-cyber',
+                    'gpt-5.6-cyber',
+                    'gpt-6-cyber-fast',
+                    'security-alias',
+                    'gpt-5.5-cyber-preview',
+                  ].includes(definition.id) &&
+                    !(provider?.id === 'openai' && definition.id === 'api-override'))
+              )
+              .map((definition) => definition.id)
+          );
+        }
+        expect(catalog?.default).toEqual({
+          openai: 'standard',
+          'subscription-alias': 'standard',
+          api: 'flex',
+        });
+      }
+      // Projection must not change the backend's catalog objects.
+      expect(models[0]?.settings).toEqual({ serviceTier: 'flex' });
+      expect(models).toHaveLength(providers.length * definitions.length);
+    }
+  );
+
+  it('restores restricted entries after switching from a subscription endpoint to the API', async () => {
+    let baseURL = 'https://chatgpt.com/backend-api/codex';
+    const adapter = new OpenCodeV2Adapter(async (_method, path) => {
+      if (path === '/api/provider')
+        return { data: [{ id: 'openai', activation: 'enabled', settings: { baseURL } }] };
+      if (path === '/api/model')
+        return {
+          data: [
+            {
+              id: 'flex',
+              providerID: 'openai',
+              settings: { serviceTier: 'flex' },
+              time: { released: 0 },
+              variants: [],
+            },
+            {
+              id: 'gpt-6-cyber',
+              providerID: 'openai',
+              time: { released: 0 },
+              variants: [],
+            },
+          ],
+        };
+      if (path === '/api/integration') return { data: [] };
+      if (path === '/api/config') return [{ info: {} }];
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    expect(await adapter.request('GET', '/config/providers', undefined)).toMatchObject({
+      default: { openai: '' },
+    });
+    baseURL = 'https://api.openai.com/v1';
+    expect(await adapter.request('GET', '/config/providers', undefined)).toMatchObject({
+      default: { openai: 'flex' },
+      providers: [{ models: { flex: expect.any(Object), 'gpt-6-cyber': expect.any(Object) } }],
+    });
+  });
 
   it('keeps modern native catalogs authoritative for chat models and defaults', async () => {
     const adapter = new OpenCodeV2Adapter(async (_method, path) => {
@@ -2197,6 +2648,30 @@ describe('v2 transcript and permission projection', () => {
     expect(unknown).toMatchObject({ sequenceOnly: true, seq: 9 });
   });
 
+  it.each(['session.step.first-token', 'session.step.future'])(
+    'preserves sequence accounting for unprojected step event %s without UI activity',
+    (type) => {
+      const events = projectV2Event({
+        id: 'evt_first_token',
+        created: 50,
+        type,
+        durable: { aggregateID: 'ses_one', seq: 8, version: 1 },
+        location: { directory: '/repo' },
+        data: { sessionID: 'ses_one', assistantMessageID: 'msg_one' },
+      });
+
+      expect(events).toHaveLength(1);
+      expect(parseServerEvent(events[0])).toEqual({
+        id: 'evt_first_token',
+        type: 'session.next.context.updated',
+        sequenceOnly: true,
+        seq: 8,
+        workspaceDirectory: '/repo',
+        properties: { sessionID: 'ses_one' },
+      });
+    }
+  );
+
   it('preserves execution interruption before idle and advances the durable sequence once', () => {
     const events = projectV2Event({
       id: 'evt_interrupted',
@@ -2494,6 +2969,57 @@ describe('v2 transcript and permission projection', () => {
       '/api/session/ses_child/permission/perm_one/reply',
     ]);
   });
+
+  it.each([true, undefined])(
+    'preserves optional paste=%s for MCP OAuth and forwards redirect URLs',
+    async (paste) => {
+      const redirect = 'http://127.0.0.1:1455/callback?code=a%2Bb&state=opaque%2Fstate';
+      const wire = vi.fn(async (method: string, path: string) => {
+        const route = new URL(path, 'http://localhost').pathname;
+        if (route === '/api/mcp')
+          return {
+            data: [
+              {
+                name: 'fixture',
+                integrationID: 'fixture-integration',
+                status: { status: 'connected' },
+              },
+            ],
+          };
+        if (route === '/api/integration/fixture-integration')
+          return { data: { methods: [{ id: 'login', type: 'oauth' }] } };
+        if (route.endsWith('/connect/oauth'))
+          return {
+            data: {
+              attemptID: 'attempt-one',
+              url: 'https://example.test/login',
+              mode: 'auto',
+              paste,
+            },
+          };
+        if (method === 'POST' && route.endsWith('/complete')) return null;
+        if (route.endsWith('/connect/oauth/attempt-one')) return { data: { status: 'complete' } };
+        throw new Error(`Unexpected OAuth request ${method} ${path}`);
+      });
+      const adapter = new OpenCodeV2Adapter(wire);
+      const expected = {
+        authorizationUrl: 'https://example.test/login',
+        oauthState: 'attempt-one',
+      };
+      expect(await adapter.request('POST', '/mcp/fixture/auth', {})).toStrictEqual(
+        paste === true ? { ...expected, paste: true } : expected
+      );
+      expect(
+        await adapter.request('POST', '/mcp/fixture/auth/callback', { code: redirect })
+      ).toEqual({ status: 'connected' });
+      expect(wire).toHaveBeenCalledWith(
+        'POST',
+        '/api/integration/fixture-integration/connect/oauth/attempt-one/complete',
+        { code: redirect },
+        expect.objectContaining({ unscoped: true })
+      );
+    }
+  );
 
   it('uses native OAuth attempts for MCP authentication and waits for completion', async () => {
     const opened = vi.fn(async () => true);

@@ -1,4 +1,5 @@
 import type { WebviewMessage } from '../shared/protocol';
+import type { DroppedContentDirectory } from '../shared/dropped-content-policy';
 import { logger } from './logger';
 
 type ApiRequestPayload = Extract<WebviewMessage, { type: 'api/request' }>['payload'];
@@ -53,15 +54,16 @@ type RalphMessage = Extract<
 >;
 
 export interface MessageRouterCallbacks {
-  requestHandy(
-    payload: Extract<WebviewMessage, { type: 'handy/request' }>['payload']
+  requestDictation(
+    payload: Extract<WebviewMessage, { type: 'dictation/request' }>['payload']
   ): Promise<void>;
   ready(documentId?: number): Promise<void>;
   updateCommandState(
     canAbort: boolean,
     canSwitchSessions: boolean,
     model: CommandStatePayload['model'],
-    sessionId?: string | null
+    sessionId?: string | null,
+    modelVisible?: boolean
   ): void;
   acknowledgeSessionSeen(sessionId: string): void;
   updateSessionReadState(sessionId: string, seenAt: number): Promise<void>;
@@ -95,7 +97,9 @@ export interface MessageRouterCallbacks {
   exportSession(sessionId: string, directory?: string): Promise<void>;
   generateUsageReport(includeAllTime: boolean): Promise<void>;
   reloadWebview(): Promise<void>;
-  openFolder(): Promise<void>;
+  openFolder(
+    payload?: Extract<WebviewMessage, { type: 'vscode/open-folder' }>['payload']
+  ): Promise<void>;
   openTransferredSession?(sessionId: string): Promise<void>;
   openSettings(query?: string): Promise<void>;
   showOutput(): void;
@@ -103,7 +107,10 @@ export interface MessageRouterCallbacks {
   restartServer(force: boolean): Promise<void>;
   checkServerRestart(checkId: number): Promise<void>;
   handleDroppedPaths(paths: string[]): Promise<void>;
-  handleDroppedContent(files: DroppedContentFile[]): Promise<void>;
+  handleDroppedContent(
+    files: DroppedContentFile[],
+    directory?: DroppedContentDirectory
+  ): Promise<void>;
   storePdf(payload: Extract<WebviewMessage, { type: 'pdfs/store' }>['payload']): Promise<void>;
   storeImage(payload: Extract<WebviewMessage, { type: 'images/store' }>['payload']): Promise<void>;
   releaseImages(
@@ -152,8 +159,8 @@ export class MessageRouter {
   async handleMessage(msg: WebviewMessage) {
     try {
       switch (msg.type) {
-        case 'handy/request':
-          await this.callbacks.requestHandy(msg.payload);
+        case 'dictation/request':
+          await this.callbacks.requestDictation(msg.payload);
           break;
         case 'ready':
           await this.handleReadyMessage(msg);
@@ -202,7 +209,8 @@ export class MessageRouter {
             msg.payload.canAbort,
             msg.payload.canSwitchSessions,
             msg.payload.model,
-            msg.payload.sessionId
+            msg.payload.sessionId,
+            msg.payload.modelVisible
           );
           break;
         case 'session/seen':
@@ -297,7 +305,8 @@ export class MessageRouter {
           await this.callbacks.reloadWebview();
           break;
         case 'vscode/open-folder':
-          await this.callbacks.openFolder();
+          if (msg.payload) await this.callbacks.openFolder(msg.payload);
+          else await this.callbacks.openFolder();
           break;
         case 'session/open-transferred':
           await this.callbacks.openTransferredSession?.(msg.payload.sessionId);
@@ -436,7 +445,11 @@ export class MessageRouter {
   private async handleFilesDropContentMessage(
     msg: Extract<WebviewMessage, { type: 'files/drop-content' }>
   ) {
-    await this.callbacks.handleDroppedContent(msg.payload.files);
+    if (msg.payload.directory) {
+      await this.callbacks.handleDroppedContent(msg.payload.files, msg.payload.directory);
+    } else {
+      await this.callbacks.handleDroppedContent(msg.payload.files);
+    }
   }
 
   private handleFilesRemoveMessage(msg: Extract<WebviewMessage, { type: 'files/remove' }>) {

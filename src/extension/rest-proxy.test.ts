@@ -1,5 +1,7 @@
 /* oxlint-disable anti-slop/no-module-mocking, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion -- These proxy tests deliberately exercise malformed HTTP payloads and partial VS Code and service boundaries. */
 import { describe, expect, it, vi, type Mock } from 'vitest';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { join, resolve as resolvePath } from 'node:path';
 
 const mocks = vi.hoisted(() => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -53,6 +55,7 @@ import { RemoteImages } from './remote-images';
 import * as workspaceProblems from './workspace-problems';
 import { OpenCodeResponseTooLargeError } from './open-code-transport';
 import { OpenCodeV2Adapter } from './opencode-v2-adapter';
+import { OpenCodeV2SessionState } from './opencode-v2-session-state';
 import { HiddenSessionManager } from './hidden-session-manager';
 import { PromptCompletionService } from './prompt-completion-service';
 import { FollowupService } from './followup-service';
@@ -60,9 +63,10 @@ import { QueuedMessageStore } from './queued-message-store';
 import { SessionStateManager } from './session-state-manager';
 import { ServerMemoryPermissionStore } from './server-memory-permission-store';
 import { fixture as testFixture } from '../webview/test-fixtures';
-import type { OpenCodeServerMemoryPermission } from '../shared/opencode-types';
+import type { OpenCodeServerMemoryPermission, Session } from '../shared/opencode-types';
 import type { Persistence } from '../shared/persistence';
 import type { RecycleBinEntry } from '../shared/protocol';
+import { asRecord } from '../shared/type-utils';
 
 type SanitizedMessageResponse = {
   id: number;
@@ -107,6 +111,8 @@ function createCallbacks(overrides: Partial<RestProxyCallbacks> = {}): RestProxy
       getOpenWorkspaceRoot: vi.fn((path: string) => path),
       readFile: vi.fn(() => Promise.resolve(null as string | null)),
       resolvePath: vi.fn(() => Promise.resolve(null)),
+      validateCitationPaths: vi.fn(() => Promise.resolve([])),
+      resolveCitationSymbols: vi.fn(() => Promise.resolve([])),
     },
     providerLimitService: {
       get: vi.fn(() =>
@@ -675,6 +681,388 @@ describe('getOpenCodeDirectoryHeaders', () => {
   );
 });
 
+describe('transferred Git worktree authorization', () => {
+  type WorktreeAuthorizationState = {
+    canonical: Session;
+    projectID: string;
+    projects: unknown;
+    worktrees: unknown;
+    roots: string[];
+    known: boolean;
+  };
+
+  function createWorktreeProxy(apiVersion: 1 | 2 = 2) {
+    const moved: Session = {
+      id: 'moved',
+      projectID: 'project-1',
+      directory: '/worktrees/feature',
+      title: 'Moved conversation',
+      version: '2',
+      time: { created: 1, updated: 2 },
+      transfer: { originDirectory: '/repo', available: false },
+    };
+    const state: WorktreeAuthorizationState = {
+      canonical: { ...moved },
+      projectID: 'project-1',
+      projects: [{ id: 'project-1', vcs: 'git' }],
+      worktrees:
+        apiVersion === 1 ? [moved.directory] : [{ directory: moved.directory, strategy: 'git' }],
+      roots: ['/repo'],
+      known: true,
+    };
+    const serverRequest = vi.fn<RestProxyCallbacks['server']['request']>(
+      async (method, path, body) => {
+        const url = new URL(path, 'http://localhost');
+        if (url.pathname === '/project/current') return { id: state.projectID, worktree: '/repo' };
+        if (url.pathname === '/project') return state.projects;
+        if (url.pathname === '/experimental/worktree') return state.worktrees;
+        if (url.pathname === '/session/moved') return { ...state.canonical, ...asRecord(body) };
+        if (url.pathname === '/session/moved/prompt_async' && method === 'POST') return true;
+        if (url.pathname === '/session') return [];
+        throw new Error(`Unexpected request: ${method} ${path}`);
+      }
+    );
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion, request: serverRequest },
+      getSessionHistoryScope: () => 'directory',
+      getTransferredSessions: (): Session[] =>
+        state.known
+          ? [
+              {
+                ...moved,
+                transfer: {
+                  originDirectory: '/repo',
+                  available: proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory),
+                },
+              },
+            ]
+          : [],
+    });
+    vi.mocked(callbacks.contextProvider.getOpenWorkspaceRoot).mockImplementation((path) =>
+      state.roots.includes(path) ? path : null
+    );
+    return { proxy, callbacks, serverRequest, state, moved };
+  }
+
+  it.each([1, 2] as const)(
+    'follows only the known session into a saved Git worktree on v%s without widening history',
+    async (apiVersion) => {
+      const { proxy, callbacks, serverRequest, moved } = createWorktreeProxy(apiVersion);
+      await expect(proxy.authorizeSessionDirectory(moved.id, moved.directory)).resolves.toBe(true);
+      expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(true);
+      expect(proxy.isSessionCatalogEventAuthorized('foreign', moved.directory)).toBe(false);
+      expect(proxy.isSessionCatalogEventAuthorized(moved.id, '/worktrees/other')).toBe(false);
+      expect(
+        serverRequest.mock.calls.every(
+          ([method, , , options]) => method === 'GET' && options?.directory === '/repo'
+        )
+      ).toBe(true);
+
+      // An ordinary directory-only catalog refresh must not drop this session's verified grant.
+      await proxy.handleRequest(makePayload(9030, 'GET', '/session?limit=20&directory=%2Frepo'));
+      expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(true);
+      await proxy.handleRequest(
+        makePayload(9031, 'POST', '/varro/session/moved/activate', {
+          directory: moved.directory,
+        })
+      );
+      expect(callbacks.activateSession).toHaveBeenCalledWith(
+        moved.id,
+        moved.directory,
+        '/repo',
+        expect.any(AbortSignal)
+      );
+      await proxy.handleRequest(
+        makePayload(9032, 'POST', '/session/moved/prompt_async?directory=%2Fworktrees%2Ffeature', {
+          parts: [],
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 9032, data: true });
+      expect(serverRequest).toHaveBeenCalledWith(
+        'POST',
+        expect.stringContaining('/session/moved/prompt_async'),
+        expect.anything(),
+        expect.objectContaining({ directory: moved.directory })
+      );
+      expect(callbacks.updatePermissionMode).not.toHaveBeenCalled();
+    }
+  );
+
+  it('authorizes a retained link through the actual v2 adapter response shapes and admits a prompt', async () => {
+    const { proxy, callbacks, serverRequest, state, moved } = createWorktreeProxy();
+    const parent = resolvePath('artifacts/ai-test-data');
+    await mkdir(parent, { recursive: true });
+    const directory = await mkdtemp(join(parent, 'worktree-wire-'));
+    const nativeSession = {
+      id: moved.id,
+      projectID: moved.projectID,
+      title: moved.title,
+      time: moved.time,
+      location: { directory: moved.directory },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    };
+    const wire = vi.fn<ConstructorParameters<typeof OpenCodeV2Adapter>[0]>(async (method, path) => {
+      const url = new URL(path, 'http://localhost');
+      if (url.pathname === '/api/location') {
+        expect(url.searchParams.get('location[directory]')).toBe('/repo');
+        return {
+          directory: '/repo',
+          project: { id: moved.projectID, directory: '/repo', canonical: '/repo' },
+        };
+      }
+      if (url.pathname === '/api/project') return state.projects;
+      if (url.pathname === '/api/worktree') {
+        expect(url.searchParams.get('projectID')).toBe(moved.projectID);
+        expect(url.searchParams.has('location[directory]')).toBe(false);
+        return state.worktrees;
+      }
+      if (url.pathname === '/api/session/moved') return { data: nativeSession };
+      if (method === 'PUT' && url.pathname.endsWith('/instructions/entries/varro.system')) return;
+      if (method === 'POST' && url.pathname === '/api/session/moved/prompt')
+        return { id: 'msg_fixture' };
+      throw new Error(`Unexpected native request: ${method} ${path}`);
+    });
+    const adapter = new OpenCodeV2Adapter(wire, new OpenCodeV2SessionState(directory));
+    serverRequest.mockImplementation((method, path, body, options) =>
+      adapter.request(method, path, body, options)
+    );
+    try {
+      await proxy.handleRequest(
+        makePayload(9037, 'GET', '/session/moved?directory=%2Fworktrees%2Ffeature')
+      );
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id: 9037,
+        data: expect.objectContaining({
+          directory: moved.directory,
+          transfer: expect.objectContaining({ available: true }),
+        }),
+      });
+      await proxy.handleRequest(
+        makePayload(9038, 'POST', '/session/moved/prompt_async?directory=%2Fworktrees%2Ffeature', {
+          parts: [{ type: 'text', text: 'Continue from here' }],
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id: 9038,
+        data: { id: 'msg_fixture' },
+      });
+      expect(wire).toHaveBeenCalledWith(
+        'POST',
+        '/api/session/moved/prompt',
+        expect.objectContaining({ text: 'Continue from here' }),
+        expect.anything()
+      );
+    } finally {
+      proxy.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    'unrelated project',
+    'not Git',
+    'missing inventory',
+    'path prefix',
+    'custom strategy',
+    'malformed inventory',
+    'wrong session',
+    'stale destination',
+    'canonical project mismatch',
+    'unknown transfer',
+    'global project',
+  ])('keeps %s unapproved', async (failure) => {
+    const { proxy, callbacks, serverRequest, state, moved } = createWorktreeProxy();
+    if (failure === 'unrelated project') state.projectID = 'project-2';
+    if (failure === 'not Git') state.projects = [{ id: 'project-1' }];
+    if (failure === 'missing inventory') state.worktrees = [];
+    if (failure === 'path prefix') state.worktrees = [{ directory: `${moved.directory}-other` }];
+    if (failure === 'custom strategy')
+      state.worktrees = [{ directory: moved.directory, strategy: 'copy' }];
+    if (failure === 'malformed inventory') state.worktrees = [{ directory: 42 }];
+    if (failure === 'wrong session') state.canonical.id = 'foreign';
+    if (failure === 'stale destination') state.canonical.directory = '/outside';
+    if (failure === 'canonical project mismatch') state.canonical.projectID = 'project-2';
+    if (failure === 'unknown transfer') state.known = false;
+    if (failure === 'global project') state.projectID = 'global';
+    await expect(proxy.authorizeSessionDirectory(moved.id, moved.directory)).resolves.toBe(false);
+    expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(false);
+    if (state.known) {
+      await proxy.handleRequest(
+        makePayload(9033, 'POST', '/session/moved/prompt_async?directory=%2Fworktrees%2Ffeature', {
+          parts: [],
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id: 9033,
+        error: `Conversation moved to ${moved.directory}. Open its folder to continue.`,
+      });
+    }
+    expect(serverRequest.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+  });
+
+  it('rechecks a saved link after invalidation and admits a rename in its verified worktree', async () => {
+    const { proxy, callbacks, serverRequest, moved } = createWorktreeProxy();
+    await proxy.authorizeSessionDirectory(moved.id, moved.directory);
+    proxy.invalidateSessionCatalog();
+    expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(false);
+    await proxy.handleRequest(
+      makePayload(9034, 'PATCH', '/session/moved?directory=%2Fworktrees%2Ffeature', {
+        title: 'Renamed',
+      })
+    );
+    expect(serverRequest).toHaveBeenCalledWith(
+      'PATCH',
+      expect.stringContaining('/session/moved'),
+      { title: 'Renamed' },
+      expect.objectContaining({ directory: moved.directory })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9034,
+      data: expect.objectContaining({
+        title: 'Renamed',
+        transfer: expect.objectContaining({ available: true }),
+      }),
+    });
+  });
+
+  it.each([false, true])(
+    'reports session worktree metadata with a registered Git strategy=%s',
+    async (registered) => {
+      const { proxy, callbacks, state, moved } = createWorktreeProxy();
+      state.worktrees = [{ directory: moved.directory, strategy: registered ? 'git' : 'copy' }];
+      await proxy.handleRequest(
+        makePayload(9040, 'GET', '/varro/session/moved/location?directory=%2Fworktrees%2Ffeature')
+      );
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id: 9040,
+        data: registered
+          ? { directory: moved.directory, isGitWorktree: true, projectDirectory: '/repo' }
+          : { directory: moved.directory, isGitWorktree: false },
+      });
+    }
+  );
+
+  it('does not read metadata for an unrelated transfer directory', async () => {
+    const { proxy, callbacks, serverRequest } = createWorktreeProxy();
+    await proxy.handleRequest(
+      makePayload(9041, 'GET', '/varro/session/moved/location?directory=%2Funrelated')
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9041,
+      error: '404 Session not found',
+    });
+    expect(serverRequest).not.toHaveBeenCalled();
+  });
+
+  it('annotates an entire session list with one cached worktree inventory read per project', async () => {
+    const { proxy, callbacks, serverRequest, moved } = createWorktreeProxy();
+    const sessions = Array.from({ length: 222 }, (_, index) => ({
+      ...moved,
+      id: `session-${index}`,
+      directory: '/repo',
+      transfer: undefined,
+    }));
+    const original = serverRequest.getMockImplementation()!;
+    serverRequest.mockImplementation((method, path, body, options) =>
+      new URL(path, 'http://localhost').pathname === '/session'
+        ? Promise.resolve(sessions)
+        : original(method, path, body, options)
+    );
+    for (const id of [9042, 9043]) {
+      await proxy.handleRequest(makePayload(id, 'GET', '/session?limit=300'));
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id,
+        data: expect.objectContaining({
+          items: expect.arrayContaining([
+            expect.objectContaining({ id: moved.id, isGitWorktree: true }),
+            expect.objectContaining({ id: 'session-1', isGitWorktree: false }),
+          ]),
+        }),
+      });
+    }
+    expect(
+      serverRequest.mock.calls.filter(([, path]) => path.startsWith('/experimental/worktree'))
+    ).toHaveLength(1);
+    expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(false);
+  });
+
+  it.each(['invalidation', 'closed root', 'unavailable inventory'])(
+    'fails closed during %s',
+    async (failure) => {
+      const { proxy, serverRequest, state, moved } = createWorktreeProxy();
+      const inventory = deferred<unknown>();
+      state.worktrees = inventory.promise;
+      const pending = proxy.authorizeSessionDirectory(moved.id, moved.directory);
+      await vi.waitFor(() =>
+        expect(serverRequest).toHaveBeenCalledWith(
+          'GET',
+          '/experimental/worktree?projectID=project-1',
+          undefined,
+          expect.anything()
+        )
+      );
+      if (failure === 'invalidation') proxy.invalidateSessionCatalog();
+      if (failure === 'closed root') {
+        state.roots = [];
+        state.known = false;
+      }
+      inventory.resolve(
+        failure === 'unavailable inventory' ? undefined : [{ directory: moved.directory }]
+      );
+      await expect(pending).resolves.toBe(false);
+      expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(false);
+    }
+  );
+
+  it('revokes a worktree grant when the canonical session has moved again', async () => {
+    const { proxy, state, moved } = createWorktreeProxy();
+    await proxy.authorizeSessionDirectory(moved.id, moved.directory);
+    state.canonical.directory = '/outside';
+    await expect(proxy.authorizeSessionDirectory(moved.id, moved.directory)).resolves.toBe(false);
+    expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(false);
+  });
+
+  it('revokes worktree access before routing events from an unrelated destination', async () => {
+    const { proxy, moved } = createWorktreeProxy();
+    await proxy.authorizeSessionDirectory(moved.id, moved.directory);
+    await expect(
+      proxy.refreshSessionCatalogEventAuthorization([moved.id], '/outside')
+    ).resolves.toBe(false);
+    expect(proxy.isSessionCatalogEventAuthorized(moved.id, moved.directory)).toBe(false);
+    expect(proxy.isSessionCatalogEventAuthorized(moved.id, '/outside')).toBe(false);
+  });
+
+  it('keeps history readable when worktree verification fails without authorizing a mutation', async () => {
+    const { proxy, callbacks, serverRequest, moved } = createWorktreeProxy();
+    const original = serverRequest.getMockImplementation()!;
+    serverRequest.mockImplementation((method, path, body, options) => {
+      if (path.startsWith('/experimental/worktree')) throw new Error('Inventory unavailable');
+      return original(method, path, body, options);
+    });
+    await proxy.handleRequest(
+      makePayload(9035, 'GET', '/session/moved?directory=%2Fworktrees%2Ffeature')
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9035,
+      data: expect.objectContaining({
+        id: moved.id,
+        transfer: expect.objectContaining({ available: false }),
+      }),
+    });
+    await proxy.handleRequest(
+      makePayload(9036, 'PATCH', '/session/moved?directory=%2Fworktrees%2Ffeature', {
+        title: 'Blocked',
+      })
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 9036,
+      error: `Conversation moved to ${moved.directory}. Open its folder to continue.`,
+    });
+    expect(serverRequest.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+  });
+});
+
 describe('RestProxy handleRequest', () => {
   it('refuses remote-image requests when disabled without network or server access', async () => {
     const { proxy, callbacks } = createProxy();
@@ -848,6 +1236,46 @@ describe('RestProxy handleRequest', () => {
     }
   });
 
+  it.each([undefined, false, true, 'true'])(
+    'does not forward client-controlled trace fields to follow-up generation: %s',
+    async (trace) => {
+      const { proxy, callbacks } = createProxy();
+      const configuration = mocks.vscode.workspace.getConfiguration.mockReturnValue({
+        get: vi.fn(() => 'true'),
+        inspect: vi.fn((key?: string) => ({
+          globalValue: key === 'chat.promptTrace' ? trace : undefined,
+        })),
+      });
+      const suggest = vi
+        .spyOn(FollowupService.forServer(callbacks.server), 'suggest')
+        .mockResolvedValue({ summary: '', actions: [] });
+      try {
+        await proxy.handleRequest(
+          makePayload(513, 'POST', '/varro/session/session-1/followups', {
+            assistantMessageId: 'a',
+            userMessageId: 'u',
+            userPrompt: 'Review',
+            answer: 'One bug remains',
+            model: { providerID: 'openai', modelID: 'session' },
+            allowGenerate: true,
+            trace: true,
+            rootSessionID: 'forged-root',
+          })
+        );
+        expect(suggest).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'session-1' }));
+        expect(suggest.mock.calls[0]?.[0]).not.toHaveProperty('trace');
+        expect(suggest.mock.calls[0]?.[0]).not.toHaveProperty('rootSessionID');
+      } finally {
+        suggest.mockRestore();
+        configuration.mockReturnValue({
+          get: vi.fn(() => undefined),
+          inspect: vi.fn(() => ({ globalValue: undefined })),
+        });
+        proxy.dispose();
+      }
+    }
+  );
+
   it.each([undefined, 'openai/small'])(
     'uses the session model and reasoning unless an override is set: %s',
     async (override) => {
@@ -919,9 +1347,13 @@ describe('RestProxy handleRequest', () => {
     proxy.dispose();
   });
 
-  it.each([false, true])(
-    'forwards explicit follow-up admission %s to the host service',
-    async (allowGenerate) => {
+  it.each([
+    { allowGenerate: false, cacheOnly: false },
+    { allowGenerate: true, cacheOnly: false },
+    { allowGenerate: false, cacheOnly: true },
+  ])(
+    'forwards explicit follow-up admission $allowGenerate and cache-only $cacheOnly to the host service',
+    async ({ allowGenerate, cacheOnly }) => {
       const { proxy, callbacks } = createProxy();
       const configuration = mocks.vscode.workspace.getConfiguration.mockReturnValue({
         get: vi.fn(() => 'openai/small'),
@@ -938,10 +1370,11 @@ describe('RestProxy handleRequest', () => {
             userPrompt: 'Review',
             answer: 'One bug remains',
             allowGenerate,
+            cacheOnly,
           })
         );
         expect(suggest).toHaveBeenCalledWith(
-          expect.objectContaining({ sessionId: 'session-1', allowGenerate })
+          expect.objectContaining({ sessionId: 'session-1', allowGenerate, cacheOnly })
         );
       } finally {
         suggest.mockRestore();
@@ -976,6 +1409,70 @@ describe('RestProxy handleRequest', () => {
       dismiss.mockRestore();
     }
   });
+
+  it('persists a follow-up action session ID through the host service', async () => {
+    const { proxy, callbacks } = createProxy();
+    const link = vi
+      .spyOn(FollowupService.forServer(callbacks.server), 'linkSession')
+      .mockResolvedValue(true);
+    const source = {
+      assistantMessageId: 'a',
+      userMessageId: 'u',
+      userPrompt: 'Review',
+      answer: 'One bug remains',
+    };
+    const action = {
+      title: 'Fix the bug',
+      prompt: 'Fix the reported bug.',
+      sessionId: 'ses_fork-1',
+    };
+    try {
+      await proxy.handleRequest(
+        makePayload(513, 'POST', '/varro/session/session-1/followups/session', {
+          ...source,
+          action,
+        })
+      );
+      expect(link).toHaveBeenCalledExactlyOnceWith({
+        sessionId: 'session-1',
+        directory: '/repo',
+        source,
+        action,
+      });
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 513, data: true });
+      expect(callbacks.server.request).not.toHaveBeenCalled();
+    } finally {
+      link.mockRestore();
+    }
+  });
+
+  it.each(['', '../other', 'session-1'])(
+    'rejects invalid follow-up session links %j',
+    async (sessionId) => {
+      const { proxy, callbacks } = createProxy();
+      const link = vi
+        .spyOn(FollowupService.forServer(callbacks.server), 'linkSession')
+        .mockResolvedValue(true);
+      try {
+        await proxy.handleRequest(
+          makePayload(514, 'POST', '/varro/session/session-1/followups/session', {
+            assistantMessageId: 'a',
+            userMessageId: 'u',
+            userPrompt: 'Review',
+            answer: 'One bug remains',
+            action: { title: 'Fix the bug', prompt: 'Fix the reported bug.', sessionId },
+          })
+        );
+        expect(link).not.toHaveBeenCalled();
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+          id: 514,
+          error: 'Invalid follow-up session link',
+        });
+      } finally {
+        link.mockRestore();
+      }
+    }
+  );
 
   it.each([false, true])(
     'clears the prior follow-up cache only after accepted prompts, rejected=%s',
@@ -1157,6 +1654,12 @@ describe('RestProxy handleRequest', () => {
     await proxy.handleRequest(
       makePayload(9012, 'POST', '/session/moved/prompt_async?directory=%2Foutside', { parts: [] })
     );
+    expect(
+      serverRequest.mock.calls.every(
+        ([method, path]) => method === 'GET' && path === '/project/current'
+      )
+    ).toBe(true);
+    serverRequest.mockClear();
     await proxy.handleRequest(makePayload(9013, 'GET', '/session/moved?directory=%2Funrelated'));
     expect(serverRequest).not.toHaveBeenCalled();
     expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
@@ -1168,6 +1671,67 @@ describe('RestProxy handleRequest', () => {
       error: '404 Session not found',
     });
   });
+  it.each([
+    { type: 'busy' },
+    { type: 'busy', background: true, backgroundStartedAt: 10, backgroundCommand: 'npm test' },
+    { type: 'retry', attempt: 1, next: 20, message: 'Retrying provider' },
+  ])('retains moved-session status in folder snapshots: %j', async (status) => {
+    const moved = {
+      id: 'moved',
+      projectID: 'project-1',
+      directory: '/outside',
+      title: 'Transferred conversation',
+      version: '2',
+      time: { created: 1, updated: 2 },
+      transfer: { originDirectory: '/repo', available: false },
+    };
+    let retained = false;
+    let completed = false;
+    let destinationUnavailable = false;
+    const serverRequest = vi.fn<RestProxyCallbacks['server']['request']>(
+      async (_method, path, _body, options) => {
+        if (path === '/session/status') {
+          if (options?.directory !== moved.directory) return {};
+          if (destinationUnavailable) throw new Error('Destination status unavailable');
+          if (completed) return {};
+          return { moved: status, unrelated: { type: 'busy' } };
+        }
+        return [];
+      }
+    );
+    const { proxy, callbacks } = createProxy({
+      getTransferredSessions: () => (retained ? [moved] : []),
+      server: { ...createCallbacks().server, request: serverRequest },
+    });
+
+    await proxy.handleRequest(makePayload(9029, 'GET', '/session/status'));
+    expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 9029, data: {} });
+    retained = true;
+    await proxy.handleRequest(makePayload(9030, 'GET', '/session/status'));
+
+    expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+      id: 9030,
+      data: { moved: status },
+    });
+    expect(serverRequest).toHaveBeenCalledWith('GET', '/session/status', undefined, {
+      directory: moved.directory,
+    });
+    expect(proxy.isSessionCatalogEventAuthorized('moved', moved.directory)).toBe(false);
+
+    destinationUnavailable = true;
+    await proxy.handleRequest(makePayload(9031, 'GET', '/session/status'));
+    expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+      id: 9031,
+      error: 'Could not load session statuses from: /repo',
+    });
+
+    destinationUnavailable = false;
+    completed = true;
+    await proxy.handleRequest(makePayload(9032, 'GET', '/session/status'));
+    expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 9032, data: {} });
+    proxy.dispose();
+  });
+
   it.each([undefined, '/repo'])(
     'hides a transferred link locally with scope %s, without mutating the server',
     async (directory) => {
@@ -1364,6 +1928,8 @@ describe('RestProxy handleRequest', () => {
         getOpenWorkspaceRoot: vi.fn((path: string) => path),
         readFile: vi.fn(() => Promise.resolve(null)),
         resolvePath: vi.fn(() => Promise.resolve(null)),
+        validateCitationPaths: vi.fn(() => Promise.resolve([])),
+        resolveCitationSymbols: vi.fn(() => Promise.resolve([])),
       },
     });
 
@@ -1402,6 +1968,12 @@ describe('RestProxy handleRequest', () => {
         'do not retry the denied action or bypass the rejection through another tool, command, or subagent',
         'Continue independent permitted work when possible',
         'explain what is blocked and ask the user how to proceed',
+        'use complete paths relative to the session working directory',
+        'Do not use a basename unless the file is directly in that directory',
+        'For locations outside that directory, use absolute paths',
+        'use a Markdown link with the symbol as its label',
+        'Do not invent targets for symbols you have not located',
+        'keep them in fenced code blocks, not file links',
       ]) {
         expect(body).toEqual(
           expect.objectContaining({ system: expect.stringContaining(instruction) })
@@ -2607,6 +3179,126 @@ describe('RestProxy handleRequest', () => {
     expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 61, data: resolved });
   });
 
+  it('validates citation paths locally without reading file contents or forwarding to OpenCode', async () => {
+    const { proxy, callbacks } = createProxy();
+    vi.mocked(callbacks.contextProvider.validateCitationPaths).mockResolvedValue([
+      '/repo/src/app.ts',
+      '/outside/app.ts',
+      null,
+    ]);
+    await proxy.handleRequest(
+      makePayload(62, 'POST', '/varro/citation-paths', {
+        paths: ['src/app.ts', '/outside/app.ts', 'missing.ts'],
+        directory: '/repo',
+      })
+    );
+    expect(callbacks.contextProvider.validateCitationPaths).toHaveBeenCalledWith(
+      ['src/app.ts', '/outside/app.ts', 'missing.ts'],
+      '/repo',
+      undefined
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 62,
+      data: ['/repo/src/app.ts', '/outside/app.ts', null],
+    });
+    expect(callbacks.contextProvider.readFile).not.toHaveBeenCalled();
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+  });
+
+  it('resolves symbol citations locally without forwarding to OpenCode', async () => {
+    const { proxy, callbacks } = createProxy();
+    const targets = [{ path: '/repo/loss.py', line: 12 }, null];
+    vi.mocked(callbacks.contextProvider.resolveCitationSymbols).mockResolvedValue(targets);
+    await proxy.handleRequest(
+      makePayload(62, 'POST', '/varro/citation-symbols', {
+        symbols: ['loss_weights()', 'CustomMultiTaskRLBenchEnv'],
+        directory: '/repo',
+      })
+    );
+    expect(callbacks.contextProvider.resolveCitationSymbols).toHaveBeenCalledWith(
+      ['loss_weights()', 'CustomMultiTaskRLBenchEnv'],
+      '/repo',
+      undefined
+    );
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 62, data: targets });
+    expect(callbacks.server.request).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    'authorizes the owning symbol session directory, authorized=%s',
+    async (authorized) => {
+      const { proxy, callbacks } = createProxy();
+      const authorize = vi.spyOn(proxy, 'authorizeSessionDirectory').mockResolvedValue(authorized);
+      await proxy.handleRequest(
+        makePayload(63, 'POST', '/varro/citation-symbols', {
+          symbols: ['loss_weights()'],
+          directory: '/repo/packages/app',
+          sessionID: 'session-1',
+        })
+      );
+      expect(authorize).toHaveBeenCalledWith('session-1', '/repo/packages/app');
+      if (authorized) expect(callbacks.contextProvider.resolveCitationSymbols).toHaveBeenCalled();
+      else expect(callbacks.contextProvider.resolveCitationSymbols).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    undefined,
+    ['loss_weights()', 1],
+    ['x'.repeat(129)],
+    Array.from({ length: 33 }, () => 'f()'),
+  ])('rejects malformed or oversized symbol batches', async (symbols) => {
+    const { proxy, callbacks } = createProxy();
+    await proxy.handleRequest(makePayload(64, 'POST', '/varro/citation-symbols', { symbols }));
+    expect(callbacks.contextProvider.resolveCitationSymbols).not.toHaveBeenCalled();
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 64,
+      error: 'Invalid citation symbols',
+    });
+  });
+
+  it.each([true, false])(
+    'authorizes the owning citation session directory, authorized=%s',
+    async (authorized) => {
+      const { proxy, callbacks } = createProxy();
+      const authorize = vi.spyOn(proxy, 'authorizeSessionDirectory').mockResolvedValue(authorized);
+      await proxy.handleRequest(
+        makePayload(63, 'POST', '/varro/citation-paths', {
+          paths: ['src/app.ts'],
+          directory: '/repo/packages/app',
+          sessionID: 'session-1',
+        })
+      );
+      expect(authorize).toHaveBeenCalledWith('session-1', '/repo/packages/app');
+      if (authorized)
+        expect(callbacks.contextProvider.validateCitationPaths).toHaveBeenCalledWith(
+          ['src/app.ts'],
+          '/repo/packages/app',
+          undefined
+        );
+      else {
+        expect(callbacks.contextProvider.validateCitationPaths).not.toHaveBeenCalled();
+        expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+          id: 63,
+          error: 'Session workspace folder is not open',
+        });
+      }
+    }
+  );
+
+  it.each([undefined, ['valid.ts', 1], Array.from({ length: 65 }, () => 'file.ts')])(
+    'rejects malformed or oversized citation batches',
+    async (paths) => {
+      const { proxy, callbacks } = createProxy();
+      await proxy.handleRequest(makePayload(64, 'POST', '/varro/citation-paths', { paths }));
+      expect(callbacks.contextProvider.validateCitationPaths).not.toHaveBeenCalled();
+      expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+        id: 64,
+        error: 'Invalid citation paths',
+      });
+    }
+  );
+
   function setActiveEditorSelection(
     start: { line: number; character: number },
     end: { line: number; character: number },
@@ -2782,6 +3474,27 @@ describe('RestProxy handleRequest', () => {
     );
     expect(callbacks.providerLimitService.get).toHaveBeenCalledWith('openai', 'gpt-4', '/repo');
     expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, { id: 8, data: limitStatus });
+  });
+
+  it('reads bounded startup addon failures only from the selected workspace', async () => {
+    const request = vi.fn(async (_method: string, route: string) => ({
+      data:
+        route === '/api/mcp'
+          ? [{ name: 'atlassian', status: { status: 'failed', error: 'Request timed out' } }]
+          : [],
+    }));
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2, request },
+    });
+    await proxy.handleRequest(makePayload(80, 'GET', '/varro/startup-diagnostics'));
+    expect(request).toHaveBeenCalledWith('GET', '/api/mcp', undefined, {
+      directory: '/repo',
+      signal: expect.any(AbortSignal),
+    });
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 80,
+      data: [{ kind: 'mcp', name: 'atlassian', timedOut: true }],
+    });
   });
 
   it('routes leased auto-approve judge requests after server startup', async () => {
@@ -3422,6 +4135,72 @@ describe('RestProxy handleRequest', () => {
     });
   });
 
+  it('uses reviewed session patterns while retaining the server action and request ownership', async () => {
+    const serverRequest = vi.fn(async (_method: string, path: string) =>
+      path === '/permission'
+        ? [
+            {
+              id: 'perm-1',
+              sessionID: 'session-1',
+              permission: 'bash',
+              always: ['git diff --stat'],
+            },
+          ]
+        : undefined
+    );
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2, request: serverRequest } as never,
+    });
+    await proxy.handleRequest(
+      makePayload(985, 'POST', '/varro/permission/session-allow?directory=%2Frepo', {
+        sessionId: 'session-1',
+        permissionId: 'perm-1',
+        permission: '*',
+        patterns: [' git diff * ', 'git diff *'],
+      })
+    );
+    expect(callbacks.allowPermissionForSession).toHaveBeenCalledWith(
+      'session-1',
+      'bash',
+      ['git diff *'],
+      '/repo'
+    );
+    await proxy.handleRequest(
+      makePayload(986, 'POST', '/varro/permission/session-allow?directory=%2Frepo', {
+        sessionId: 'session-1',
+        permissionId: 'not-pending',
+        patterns: ['*'],
+      })
+    );
+    expect(callbacks.allowPermissionForSession).toHaveBeenCalledTimes(1);
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 986,
+      error: '404 permission request not found',
+    });
+  });
+
+  it.each(
+    [[], [''], ['x'.repeat(2001)], Array.from({ length: 51 }, () => '*'), [4]].map((patterns) => ({
+      patterns,
+    }))
+  )('rejects invalid reviewed patterns %j before mutating permissions', async ({ patterns }) => {
+    const { proxy, callbacks } = createProxy({
+      server: { ...createCallbacks().server, apiVersion: 2 } as never,
+    });
+    await proxy.handleRequest(
+      makePayload(987, 'POST', '/varro/permission/session-allow', {
+        sessionId: 'session-1',
+        permissionId: 'perm-1',
+        patterns,
+      })
+    );
+    expect(callbacks.allowPermissionForSession).not.toHaveBeenCalled();
+    expect(callbacks.postApiResponse).toHaveBeenCalledWith(1, {
+      id: 987,
+      error: expect.stringContaining('Approval patterns'),
+    });
+  });
+
   it('updates current-session permission rules without changing project rules', async () => {
     const rules = [
       { permission: '*', pattern: '*', action: 'ask' as const },
@@ -3599,7 +4378,7 @@ describe('RestProxy handleRequest', () => {
         } as SavedPermissionApiFixture,
         failure: '',
       };
-      const request = vi.fn(async (method: string, path: string, body?: unknown) => {
+      const request = vi.fn<RestProxyCallbacks['server']['request']>(async (method, path, body) => {
         if (method === 'GET' && path === '/permission')
           return state.pending
             ? [
@@ -3690,10 +4469,14 @@ describe('RestProxy handleRequest', () => {
       const reloaded = createProxy({ server: callbacks.server, ...observers });
       const path = '/varro/permission/server-memory?directory=%2Frepo';
       await reloaded.proxy.handleRequest(makePayload(871, 'GET', path));
+      const untrackedRules = [
+        { id: 'internal-1', projectID: 'project-1', permission: 'bash', pattern: 'internal *' },
+      ];
       expect(reloaded.callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
         id: 871,
         data: {
           supported: true,
+          untrackedRules,
           rules: [
             expect.objectContaining({
               id: 'saved-1',
@@ -3710,6 +4493,7 @@ describe('RestProxy handleRequest', () => {
         id: 872,
         data: {
           supported: true,
+          untrackedRules,
           rules: [
             expect.objectContaining({
               id: 'saved-1',
@@ -3723,7 +4507,7 @@ describe('RestProxy handleRequest', () => {
       await reloaded.proxy.handleRequest(makePayload(873, 'DELETE', path, { id: 'saved-1' }));
       expect(reloaded.callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
         id: 873,
-        data: { supported: true, rules: [] },
+        data: { supported: true, rules: [], untrackedRules },
       });
       expect(new ServerMemoryPermissionStore(persistence).get('server', 'project-1')).toEqual([]);
       expect(state.pending).toBe(true);
@@ -3731,7 +4515,7 @@ describe('RestProxy handleRequest', () => {
       expect(state.saved.map((rule) => rule.id)).toEqual(['internal-1']);
     });
 
-    it('does not adopt an unobserved replacement with the same scope as a removed native ID', async () => {
+    it('shows a replacement as untracked without adopting its removed predecessor scope', async () => {
       const { proxy, callbacks, state } = fixture();
       const path = '/varro/permission/server-memory?directory=%2Frepo';
       await proxy.handleRequest(makePayload(870, 'GET', path));
@@ -3739,7 +4523,18 @@ describe('RestProxy handleRequest', () => {
       await proxy.handleRequest(makePayload(871, 'GET', path));
       expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
         id: 871,
-        data: { supported: true, rules: [] },
+        data: {
+          supported: true,
+          rules: [],
+          untrackedRules: [
+            {
+              id: 'internal-replacement',
+              projectID: 'project-1',
+              permission: 'bash',
+              pattern: 'git status *',
+            },
+          ],
+        },
       });
       expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([]);
     });
@@ -3810,6 +4605,227 @@ describe('RestProxy handleRequest', () => {
       expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([]);
     });
 
+    it('lists and revokes an untracked native approval without adopting it or changing other layers', async () => {
+      const { proxy, callbacks, state, request } = fixture({
+        getServerMemoryPermissions: vi.fn(() => []),
+      });
+      const path = '/varro/permission/server-memory?directory=%2Frepo';
+      await proxy.handleRequest(makePayload(880, 'GET', path));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 880,
+        data: {
+          supported: true,
+          rules: [],
+          untrackedRules: [
+            { id: 'saved-1', projectID: 'project-1', permission: 'bash', pattern: 'git status *' },
+          ],
+        },
+      });
+      expect(callbacks.rememberServerMemoryPermissions).toHaveBeenCalledWith([]);
+      await proxy.handleRequest(makePayload(881, 'DELETE', path, { id: 'saved-1' }));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 881,
+        data: { supported: true, rules: [] },
+      });
+      expect(request).toHaveBeenCalledWith(
+        'DELETE',
+        '/api/permission/saved/saved-1',
+        undefined,
+        expect.objectContaining({ directory: '/repo' })
+      );
+      expect(state.saved).toEqual([]);
+      expect(state.pending).toBe(true);
+      expect(callbacks.updatePermissionRulesForSession).not.toHaveBeenCalled();
+      expect(request.mock.calls.some(([method]) => method === 'POST' || method === 'PATCH')).toBe(
+        false
+      );
+    });
+
+    it.each(['address change', 'failed capture'] as const)(
+      'keeps durable approvals visible as untracked after %s and host recreation',
+      async (scenario) => {
+        let stored: unknown;
+        const persistence = testFixture<Persistence>({
+          get: () => structuredClone(stored),
+          set: (_key: string, value: unknown) => {
+            stored = structuredClone(value);
+          },
+          remove: vi.fn(),
+        });
+        let store = new ServerMemoryPermissionStore(persistence);
+        let identity = 'server-a';
+        const { proxy, callbacks, request } = fixture({
+          rememberServerMemoryPermissions: (rules) => store.remember(identity, rules),
+          forgetServerMemoryPermission: (rule) => store.forget(identity, rule),
+          getServerMemoryPermissions: (projectID) => store.get(identity, projectID),
+        });
+        const original = request.getMockImplementation()!;
+        if (scenario === 'failed capture')
+          request.mockImplementation(async (method, path, body) => {
+            if (path.startsWith('/api/permission/saved?')) throw new Error('capture failed');
+            return original(method, path, body);
+          });
+        await proxy.handleRequest(
+          makePayload(882, 'POST', '/permission/perm-1/reply', { reply: 'always' })
+        );
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, { id: 882, data: true });
+        request.mockImplementation(original);
+        if (scenario === 'address change') identity = 'server-b';
+        store = new ServerMemoryPermissionStore(persistence);
+        await proxy.handleRequest(
+          makePayload(883, 'GET', '/varro/permission/server-memory?directory=%2Frepo')
+        );
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+          id: 883,
+          data: {
+            supported: true,
+            rules: [],
+            untrackedRules: [
+              {
+                id: 'saved-1',
+                projectID: 'project-1',
+                permission: 'bash',
+                pattern: 'git status *',
+              },
+            ],
+          },
+        });
+        expect(store.get(identity, 'project-1')).toEqual([]);
+      }
+    );
+
+    it.each(['PATCH', 'DELETE'] as const)(
+      'blocks %s on a stale cached snapshot',
+      async (method) => {
+        const { proxy, callbacks, request } = fixture();
+        const path = '/varro/permission/server-memory?directory=%2Frepo';
+        await proxy.handleRequest(makePayload(884, 'GET', path));
+        const original = request.getMockImplementation()!;
+        request.mockImplementation(async (verb, route, body) => {
+          if (route.startsWith('/api/permission/saved?')) throw new Error('401 Unauthorized');
+          return original(verb, route, body);
+        });
+        await proxy.handleRequest(makePayload(885, 'GET', path));
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+          id: 885,
+          data: {
+            supported: true,
+            rules: [expect.objectContaining({ id: 'saved-1' })],
+            stale: '401 Unauthorized',
+          },
+        });
+        await proxy.handleRequest(
+          makePayload(886, method, path, { id: 'saved-1', permission: 'bash', pattern: '*' })
+        );
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+          id: 886,
+          error: 'Could not refresh saved permissions. Retry before changing approvals.',
+        });
+        expect(request.mock.calls.some(([verb]) => verb === 'PATCH' || verb === 'DELETE')).toBe(
+          false
+        );
+      }
+    );
+
+    it.each(['no-op', 'delete failure', 'verification failure'] as const)(
+      'does not falsely confirm removal after %s',
+      async (failure) => {
+        const { proxy, callbacks, request } = fixture();
+        const path = '/varro/permission/server-memory?directory=%2Frepo';
+        await proxy.handleRequest(makePayload(887, 'GET', path));
+        const original = request.getMockImplementation()!;
+        let deleted = false;
+        request.mockImplementation(async (method, route, body) => {
+          if (method === 'DELETE') {
+            if (failure === 'delete failure') throw new Error('delete failed');
+            deleted = true;
+            if (failure === 'no-op') return true;
+          }
+          if (
+            deleted &&
+            failure === 'verification failure' &&
+            route.startsWith('/api/permission/saved?')
+          )
+            throw new Error('verification failed');
+          return original(method, route, body);
+        });
+        await proxy.handleRequest(makePayload(888, 'DELETE', path, { id: 'saved-1' }));
+        expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+          id: 888,
+          error:
+            failure === 'no-op'
+              ? 'OpenCode still reports this saved approval. Refresh before retrying.'
+              : failure === 'delete failure'
+                ? 'delete failed'
+                : 'Removal was sent, but could not be verified. Refresh saved approvals to check.',
+        });
+        expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([
+          expect.objectContaining({ id: 'saved-1' }),
+        ]);
+      }
+    );
+
+    it('rejects removal outside the current project even if the server returns a foreign saved ID', async () => {
+      const { proxy, callbacks, state, request } = fixture();
+      state.saved.push({ id: 'foreign', projectID: 'project-2', action: 'shell', resource: '*' });
+      await proxy.handleRequest(
+        makePayload(889, 'DELETE', '/varro/permission/server-memory?directory=%2Frepo', {
+          id: 'foreign',
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 889,
+        error: 'Saved permission not found for this project',
+      });
+      expect(request.mock.calls.some(([method]) => method === 'DELETE')).toBe(false);
+    });
+
+    it('does not treat malformed native records as proof that a deleted approval disappeared', async () => {
+      const { proxy, callbacks, request } = fixture();
+      const path = '/varro/permission/server-memory?directory=%2Frepo';
+      await proxy.handleRequest(makePayload(891, 'GET', path));
+      const original = request.getMockImplementation()!;
+      let deleted = false;
+      request.mockImplementation(async (method, route, body) => {
+        if (method === 'DELETE') {
+          deleted = true;
+          return true;
+        }
+        if (deleted && route.startsWith('/api/permission/saved?'))
+          return { data: [{ id: 'saved-1', projectID: 'project-1' }] };
+        return original(method, route, body);
+      });
+      await proxy.handleRequest(makePayload(892, 'DELETE', path, { id: 'saved-1' }));
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 892,
+        error: 'Removal was sent, but could not be verified. Refresh saved approvals to check.',
+      });
+      expect(callbacks.getServerMemoryPermissions('project-1')).toEqual([
+        expect.objectContaining({ id: 'saved-1' }),
+      ]);
+    });
+
+    it('rejects removal when the authenticated server changes during its fresh snapshot', async () => {
+      const { proxy, callbacks, request } = fixture();
+      const original = request.getMockImplementation()!;
+      request.mockImplementation(async (method, route, body) => {
+        const result = await original(method, route, body);
+        if (route.startsWith('/api/permission/saved?'))
+          Object.assign(callbacks.server, { url: 'http://other-server' });
+        return result;
+      });
+      await proxy.handleRequest(
+        makePayload(890, 'DELETE', '/varro/permission/server-memory?directory=%2Frepo', {
+          id: 'saved-1',
+        })
+      );
+      expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
+        id: 890,
+        error: 'OpenCode server changed. Refresh saved approvals before retrying.',
+      });
+      expect(request.mock.calls.some(([method]) => method === 'DELETE')).toBe(false);
+    });
+
     it('keeps list/remove support but rejects edits when PATCH is absent', async () => {
       const { proxy, callbacks, state, request } = fixture();
       state.spec = { paths: {} };
@@ -3842,7 +4858,7 @@ describe('RestProxy handleRequest', () => {
       );
       expect(callbacks.postApiResponse).toHaveBeenLastCalledWith(1, {
         id: 861,
-        error: 'Saved-permission editing is unavailable on this OpenCode server',
+        error: 'Could not refresh saved permissions. Retry before changing approvals.',
       });
       expect(request.mock.calls.some(([method]) => method === 'PATCH')).toBe(false);
     });

@@ -43,6 +43,56 @@ async function loadClient() {
 
 type ClientApi = Awaited<ReturnType<typeof loadClient>>['client'];
 
+it('reads and validates the session location for the header indicator', async () => {
+  const { client } = await loadClient();
+  const location = { directory: '/worktrees/feature', isGitWorktree: true };
+  bridgeMocks.apiCall.mockResolvedValueOnce(location);
+  await expect(
+    client.varro.session.location('session-1', { directory: '/worktrees/feature' })
+  ).resolves.toEqual(location);
+  expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+    'GET',
+    '/varro/session/session-1/location?directory=%2Fworktrees%2Ffeature'
+  );
+  bridgeMocks.apiCall.mockResolvedValueOnce({ directory: '/repo', isGitWorktree: 'yes' });
+  await expect(client.varro.session.location('session-1')).rejects.toThrow('Malformed response');
+});
+
+it('sends reviewed patterns and keeps global config routes separate from saved approvals', async () => {
+  const { client } = await loadClient();
+  const patterns = ['git diff *'];
+  await client.session.persistProjectPermissionAllow('session-1', 'perm-1', {
+    directory: '/repo',
+    patterns,
+  });
+  await client.session.allowPermissionForSession('session-1', 'perm-1', {
+    directory: '/repo',
+    patterns,
+  });
+  await client.session.persistGlobalPermissionAllow('session-1', 'perm-1', {
+    directory: '/repo',
+    patterns,
+  });
+  for (const scope of ['project', 'session', 'global']) {
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'POST',
+      `/varro/permission/${scope}-allow?directory=%2Frepo`,
+      { sessionId: 'session-1', permissionId: 'perm-1', patterns }
+    );
+  }
+  await client.varro.openCodeGlobalPermissionConfig();
+  await client.varro.saveOpenCodeGlobalPermissionConfig([]);
+  expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+    'GET',
+    '/varro/opencode-config/global-permissions'
+  );
+  expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+    'POST',
+    '/varro/opencode-config/global-permissions',
+    { rules: [] }
+  );
+});
+
 it('sends native form replies without a positional answers wrapper', async () => {
   const { client } = await loadClient();
   const reply = {
@@ -84,6 +134,28 @@ afterEach(() => {
 });
 
 describe('client', () => {
+  it.each(['low', undefined])(
+    'forwards command effort %s without adding a default variant',
+    async (variant) => {
+      const { client } = await loadClient();
+      const body: Parameters<ClientApi['session']['command']>[1] = {
+        command: 'find-skills',
+        arguments: 'first\n\nsecond',
+        model: 'openai/gpt-5.5',
+      };
+      if (variant) body.variant = variant;
+
+      await client.session.command('session-1', body, { directory: '/repo' });
+
+      expect(bridgeMocks.apiCall).toHaveBeenCalledExactlyOnceWith(
+        'POST',
+        '/session/session-1/command?directory=%2Frepo',
+        body
+      );
+      if (!variant) expect(bridgeMocks.apiCall.mock.calls[0]?.[2]).not.toHaveProperty('variant');
+    }
+  );
+
   it('hides moved links through a host-owned endpoint scoped to the list folder', async () => {
     const { client } = await loadClient();
     bridgeMocks.apiCall.mockResolvedValue(true);
@@ -573,6 +645,25 @@ describe('client', () => {
     ]);
   });
 
+  it('validates the optional startup failure inventory and passes cancellation', async () => {
+    const { client } = await loadClient();
+    const signal = new AbortController().signal;
+    bridgeMocks.apiCall.mockResolvedValue([
+      { kind: 'mcp', name: 'atlassian', timedOut: true },
+      { kind: 'plugin', name: 'invalid', timedOut: 'yes' },
+      { kind: 'unknown', name: 'invalid', timedOut: false },
+    ]);
+    await expect(client.config.startupDiagnostics(signal)).resolves.toEqual([
+      { kind: 'mcp', name: 'atlassian', timedOut: true },
+    ]);
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'GET',
+      '/varro/startup-diagnostics',
+      undefined,
+      { signal, retries: 0 }
+    );
+  });
+
   it('bounds and cancels an optional default lookup without losing provider metadata', async () => {
     vi.useFakeTimers();
     try {
@@ -602,6 +693,30 @@ describe('client', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('propagates startup cancellation to provider and optional default reads', async () => {
+    const { client } = await loadClient();
+    const controller = new AbortController();
+    const signals = new Map<string, AbortSignal>();
+    bridgeMocks.apiCall.mockImplementation(
+      (_method: string, path: string, _body: undefined, options?: { signal?: AbortSignal }) => {
+        const signal = options?.signal;
+        if (!signal) throw new Error('Expected a cancellable catalog read');
+        signals.set(path, signal);
+        return new Promise((_, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      }
+    );
+    const loading = client.config.providers(controller.signal);
+    await Promise.resolve();
+    expect(signals.get('/config/providers')).toBe(controller.signal);
+    expect(signals.get('/model/default')).toBeInstanceOf(AbortSignal);
+    const rejected = expect(loading).rejects.toThrow('catalog cancelled');
+    controller.abort(new Error('catalog cancelled'));
+    await rejected;
+    expect(signals.get('/model/default')?.aborted).toBe(true);
   });
 
   it('preserves explicit null and falls back when the optional default endpoint is unavailable', async () => {
@@ -1518,20 +1633,86 @@ describe('client', () => {
     });
   });
 
-  it('forwards the OAuth attempt identity on completion', async () => {
+  it.each([true, false, undefined])(
+    'preserves optional paste=%s in MCP OAuth responses',
+    async (paste) => {
+      const { client } = await loadClient();
+      const response = {
+        authorizationUrl: 'https://example.test/login',
+        oauthState: 'attempt-one',
+      };
+      bridgeMocks.apiCall.mockResolvedValue({ ...response, paste });
+      const authorization = await client.mcp.startAuth('fixture');
+      expect(authorization.paste).toBe(paste === true ? true : undefined);
+      expect(authorization).toStrictEqual(paste === true ? { ...response, paste: true } : response);
+    }
+  );
+
+  it('retains the optional OAuth paste capability in authorization responses', async () => {
     const { client } = await loadClient();
-    bridgeMocks.apiCall.mockResolvedValue(true);
-    await client.config.completeProviderAuth({
+    const response = {
+      url: 'https://example.test/login',
+      method: 'auto',
+      instructions: 'Sign in',
+      attemptID: 'attempt-1',
+      paste: true,
+    };
+    bridgeMocks.apiCall.mockResolvedValue(response);
+    const authorization = await client.config.authorizeProvider({
       providerID: 'fixture',
       method: 0,
-      code: 'code',
-      attemptID: 'attempt-1',
     });
+    expect(authorization.paste).toBe(true);
+    expect(authorization).toStrictEqual(response);
+  });
+
+  it.each(['code', 'http://127.0.0.1:1455/callback?code=a%2Bb&state=opaque%2Fstate'])(
+    'forwards the OAuth attempt identity on completion with %s',
+    async (code) => {
+      const { client } = await loadClient();
+      bridgeMocks.apiCall.mockResolvedValue(true);
+      await client.config.completeProviderAuth({
+        providerID: 'fixture',
+        method: 0,
+        code,
+        attemptID: 'attempt-1',
+      });
+      expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+        'POST',
+        '/provider/fixture/oauth/callback',
+        { method: 0, code, attemptID: 'attempt-1' },
+        expect.objectContaining({ retries: 0 })
+      );
+    }
+  );
+
+  it('forwards redirect submission-only requests with their own cancellation signal', async () => {
+    const { client } = await loadClient();
+    const controller = new AbortController();
+    const code = 'http://localhost/callback?code=a%2Bb&state=opaque%2Fstate';
+    bridgeMocks.apiCall.mockResolvedValue(true);
+    await expect(
+      client.config.completeProviderAuth(
+        {
+          providerID: 'fixture',
+          method: 0,
+          attemptID: 'attempt-1',
+          code,
+          submitOnly: true,
+        },
+        { signal: controller.signal }
+      )
+    ).resolves.toBe(true);
     expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
       'POST',
       '/provider/fixture/oauth/callback',
-      { method: 0, code: 'code', attemptID: 'attempt-1' },
-      expect.objectContaining({ retries: 0 })
+      {
+        method: 0,
+        attemptID: 'attempt-1',
+        code,
+        submitOnly: true,
+      },
+      { signal: controller.signal, timeoutMs: 315_000, retries: 0 }
     );
   });
 
@@ -1709,6 +1890,23 @@ describe('client', () => {
       { signal, timeoutMs: 35_000, retries: 0 }
     );
   });
+  it('forwards cache-only opening probes without enabling generation', async () => {
+    const { client } = await loadClient();
+    const signal = new AbortController().signal;
+    const source = {
+      assistantMessageId: 'answer',
+      userMessageId: 'user',
+      userPrompt: 'Review',
+      answer: 'One bug remains.',
+    };
+    await client.varro.followups('s', source, { signal, cacheOnly: true });
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'POST',
+      '/varro/session/s/followups',
+      { ...source, cacheOnly: true, allowGenerate: false, model: undefined },
+      { signal, timeoutMs: 35_000, retries: 0 }
+    );
+  });
   it('persists follow-up dismissal through the scoped host route without retries', async () => {
     const { client } = await loadClient();
     const source = {
@@ -1722,6 +1920,27 @@ describe('client', () => {
       'POST',
       '/varro/session/s/followups/dismiss?directory=%2Ffixture',
       source,
+      { retries: 0 }
+    );
+  });
+  it('stores the follow-up action session ID through the scoped host route', async () => {
+    const { client } = await loadClient();
+    const source = {
+      assistantMessageId: 'a',
+      userMessageId: 'u',
+      userPrompt: 'Review',
+      answer: 'One bug remains',
+    };
+    const action = {
+      title: 'Fix the bug',
+      prompt: 'Fix the reported bug.',
+      sessionId: 'ses_fork-1',
+    };
+    await client.varro.linkFollowupSession('s', source, action, '/fixture');
+    expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+      'POST',
+      '/varro/session/s/followups/session?directory=%2Ffixture',
+      { ...source, action },
       { retries: 0 }
     );
   });
@@ -1764,6 +1983,69 @@ describe('client', () => {
       ['POST', '/mcp/my-server/connect'],
       ['POST', '/mcp/my-server/disconnect'],
     ]);
+  });
+
+  it('reads and updates MCP defaults without connecting a server', async () => {
+    const { client } = await loadClient();
+    const defaults = {
+      global: { rare: false },
+      project: {},
+      effective: { rare: false },
+      editable: true,
+    };
+    bridgeMocks.apiCall.mockResolvedValue(defaults);
+    expect(await client.mcp.defaults()).toEqual(defaults);
+    expect(await client.mcp.setDefault('rare', 'project', true)).toEqual(defaults);
+    expect(await client.mcp.setDefault('rare', 'project', null)).toEqual(defaults);
+    expect(bridgeMocks.apiCall.mock.calls).toEqual([
+      ['GET', '/varro/mcp-defaults'],
+      ['POST', '/varro/mcp-defaults', { name: 'rare', scope: 'project', enabled: true }],
+      ['POST', '/varro/mcp-defaults', { name: 'rare', scope: 'project', enabled: null }],
+    ]);
+  });
+
+  it('preserves OAuth capability names without requiring them from older snapshots', async () => {
+    const { client } = await loadClient();
+    const defaults = {
+      global: { oauth: true },
+      project: {},
+      effective: { oauth: true },
+      editable: true,
+      oauthServers: ['oauth'],
+    };
+    bridgeMocks.apiCall.mockResolvedValue(defaults);
+    expect(await client.mcp.defaults()).toEqual(defaults);
+    bridgeMocks.apiCall.mockResolvedValue({ ...defaults, oauthServers: [42] });
+    await expect(client.mcp.defaults()).rejects.toThrow('MCP OAuth server names');
+  });
+
+  it('opens scoped configuration and submits MCP JSON through extension-owned endpoints', async () => {
+    const { client } = await loadClient();
+    const defaults = {
+      global: { docs: true },
+      project: {},
+      effective: { docs: true },
+      editable: true,
+    };
+    bridgeMocks.apiCall.mockResolvedValue(defaults);
+    await client.mcp.openConfig('global');
+    const json = '{"url":"https://example.com/mcp"}';
+    expect(await client.mcp.addConfig('project', json, 'docs')).toEqual(defaults);
+    expect(bridgeMocks.apiCall.mock.calls).toEqual([
+      ['POST', '/varro/mcp-config/open', { scope: 'global' }],
+      ['POST', '/varro/mcp-config', { scope: 'project', json, name: 'docs' }],
+    ]);
+  });
+
+  it.each([
+    { global: { rare: 'false' }, project: {}, effective: {}, editable: true },
+    { global: {}, project: null, effective: {}, editable: true },
+    { global: {}, project: {}, effective: { rare: 1 }, editable: true },
+    { global: {}, project: {}, effective: {}, editable: 'true' },
+  ])('rejects malformed MCP defaults %#', async (defaults) => {
+    const { client } = await loadClient();
+    bridgeMocks.apiCall.mockResolvedValue(defaults);
+    await expect(client.mcp.defaults()).rejects.toThrow('/varro/mcp-defaults');
   });
 
   it('forwards varro.session.deleteImmediately call', async () => {

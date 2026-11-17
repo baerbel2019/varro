@@ -4,7 +4,7 @@ import { isAbsolute, resolve } from 'node:path';
 import * as vscode from 'vscode';
 import type { ContextProvider } from './context-provider';
 import { logger } from './logger';
-import type { HandyIntegration } from './handy-integration';
+import type { DictationIntegration } from './dictation-integration';
 import type { MessageRouterCallbacks } from './message-router';
 import type { RestProxy } from './rest-proxy';
 import type { SessionExportService } from './session-export-service';
@@ -30,7 +30,7 @@ type ConfigPayload = Extract<
 type OpenPathPayload = Parameters<MessageRouterCallbacks['openPath']>[0];
 
 export interface SidebarProviderActionDeps {
-  handyIntegration: HandyIntegration;
+  dictationIntegration: DictationIntegration;
   contextProvider: ContextProvider;
   extensionId: string;
   webviewSession: {
@@ -38,7 +38,7 @@ export interface SidebarProviderActionDeps {
     reload(): Promise<void>;
   };
   setProviderWatchActive(active: boolean): void;
-  setActiveChatModel(model: ChatModelSelection | null): void;
+  setActiveChatModel(model: ChatModelSelection | null, modelVisible: boolean): void;
   setActiveRoute(sessionId: string | null | undefined): void;
   acknowledgeSessionSeen(sessionId: string): void;
   updateSessionReadState(sessionId: string, seenAt: number): Promise<void>;
@@ -62,9 +62,7 @@ export interface SidebarProviderActionDeps {
   postConfigState(): void;
   handleReadyMessage(documentId?: number): Promise<void>;
   handleDroppedPaths(paths: string[]): Promise<void>;
-  handleDroppedContent(
-    files: Array<{ name: string; content: string; size: number }>
-  ): Promise<void>;
+  handleDroppedContent: MessageRouterCallbacks['handleDroppedContent'];
   storePdf: MessageRouterCallbacks['storePdf'];
   storeImage: MessageRouterCallbacks['storeImage'];
   releaseImages: MessageRouterCallbacks['releaseImages'];
@@ -139,16 +137,20 @@ export function createSidebarProviderActions(
   };
 
   return {
-    requestHandy: async ({ requestId, action }) => {
-      const payload = await deps.handyIntegration.request(action, (status) => {
-        deps.post({ type: 'handy/result', payload: { requestId, ...status } });
-      });
-      deps.post({ type: 'handy/result', payload: { requestId, ...payload } });
+    requestDictation: async ({ requestId, action, provider }) => {
+      const payload = await deps.dictationIntegration.request(
+        action,
+        (status) => {
+          deps.post({ type: 'dictation/result', payload: { requestId, ...status } });
+        },
+        provider
+      );
+      deps.post({ type: 'dictation/result', payload: { requestId, ...payload } });
     },
     ready: (documentId) => deps.handleReadyMessage(documentId),
-    updateCommandState: (canAbort, canSwitchSessions, model, sessionId) => {
+    updateCommandState: (canAbort, canSwitchSessions, model, sessionId, modelVisible) => {
       deps.webviewSession.updateCommandState(canAbort, canSwitchSessions);
-      deps.setActiveChatModel(model);
+      deps.setActiveChatModel(model, modelVisible !== false);
       deps.setActiveRoute(sessionId);
     },
     acknowledgeSessionSeen: (sessionId) => deps.acknowledgeSessionSeen(sessionId),
@@ -261,7 +263,24 @@ export function createSidebarProviderActions(
     },
     generateUsageReport: (includeAllTime) => deps.usageReportService.openReport(includeAllTime),
     reloadWebview: () => deps.webviewSession.reload(),
-    openFolder: async () => {
+    openFolder: async (payload) => {
+      if (payload) {
+        const { sessionId, directory } = payload;
+        if (!isAbsolute(directory)) throw new Error('Session folder must be an absolute path');
+        if (!(await deps.restProxy.authorizeSessionDirectory(sessionId, directory))) {
+          if (!deps.openTransferredSession) throw new Error('Session workspace folder is not open');
+          await deps.openTransferredSession(sessionId);
+          return;
+        }
+        const current = await assertSessionInCurrentWorkspace(
+          deps.sessionServer ?? deps.server,
+          sessionId,
+          directory
+        );
+        if (!current) throw new Error('Session folder is unavailable');
+        await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(current), true);
+        return;
+      }
       await vscode.commands.executeCommand('workbench.action.files.openFolder');
     },
     openSettings: async (query) => {
@@ -279,7 +298,8 @@ export function createSidebarProviderActions(
     },
     checkServerRestart,
     handleDroppedPaths: (paths) => deps.handleDroppedPaths(paths),
-    handleDroppedContent: (files) => deps.handleDroppedContent(files),
+    handleDroppedContent: (files, directory) =>
+      directory ? deps.handleDroppedContent(files, directory) : deps.handleDroppedContent(files),
     storePdf: (payload) => deps.storePdf(payload),
     storeImage: (payload) => deps.storeImage(payload),
     releaseImages: (payload) => deps.releaseImages(payload),
@@ -293,45 +313,58 @@ export function createSidebarProviderActions(
       deps.postContext();
     },
     openPath: async (payload: OpenPathPayload) => {
-      const workspaceDirectory = deps.getWorkspaceDirectory();
-      let fallbackPath = payload.path;
-      if (payload.view === 'diff' && payload.sessionID) {
-        const result = await deps.sessionDiffProvider.open(
-          payload.sessionID,
-          payload.path,
-          payload.directory
-        );
-        if (result !== 'unavailable') {
-          if (payload.requestId !== undefined) {
-            deps.post({
-              type: 'vscode/open-result',
-              payload: {
-                requestId: payload.requestId,
-                status: result === 'opened' ? 'opened' : 'unavailable',
-              },
-            });
-          }
-          return;
-        }
-        if (payload.directory && !isAbsolute(fallbackPath)) {
-          const directory = await getAuthorizedSessionDirectory(
+      try {
+        const workspaceDirectory = deps.getWorkspaceDirectory();
+        let fallbackPath = payload.path;
+        if (payload.view === 'diff' && payload.sessionID) {
+          const result = await deps.sessionDiffProvider.open(
             payload.sessionID,
+            payload.path,
             payload.directory
           );
-          if (directory) fallbackPath = resolve(directory, fallbackPath);
+          if (result !== 'unavailable') {
+            if (payload.requestId !== undefined) {
+              deps.post({
+                type: 'vscode/open-result',
+                payload: {
+                  requestId: payload.requestId,
+                  status: result === 'opened' ? 'opened' : 'unavailable',
+                },
+              });
+            }
+            return;
+          }
         }
-      }
-      const status = await deps.contextProvider.openPath(fallbackPath, {
-        line: payload.line,
-        kind: payload.kind,
-        view: payload.view,
-        workspaceDirectory,
-      });
-      if (payload.requestId !== undefined) {
-        deps.post({
-          type: 'vscode/open-result',
-          payload: { requestId: payload.requestId, status },
+        const sessionDirectory =
+          payload.sessionID && payload.directory
+            ? await getAuthorizedSessionDirectory(payload.sessionID, payload.directory)
+            : undefined;
+        if (payload.view === 'diff' && sessionDirectory && !isAbsolute(fallbackPath)) {
+          fallbackPath = resolve(sessionDirectory, fallbackPath);
+        }
+        const status = await deps.contextProvider.openPath(fallbackPath, {
+          line: payload.line,
+          endLine: payload.endLine,
+          kind: payload.kind,
+          view: payload.view,
+          workspaceDirectory,
+          sessionDirectory,
+          exact: payload.exact,
         });
+        if (payload.requestId !== undefined) {
+          deps.post({
+            type: 'vscode/open-result',
+            payload: { requestId: payload.requestId, status },
+          });
+        }
+      } catch (error) {
+        if (payload.requestId !== undefined) {
+          deps.post({
+            type: 'vscode/open-result',
+            payload: { requestId: payload.requestId, status: 'unavailable' },
+          });
+        }
+        throw error;
       }
     },
     openText: async (payload) => {

@@ -1,5 +1,6 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- SAFETY: These tests inspect controlled private configuration state on the provider fixture. */
 import { dirname } from 'node:path';
+import { parse } from 'jsonc-parser';
 import { describe, expect, it, vi } from 'vitest';
 import {
   attachTestView,
@@ -13,6 +14,442 @@ import { getOpenCodeConfigPaths } from './open-code-process';
 const vscodeMock = getVscodeMock();
 
 describe('SidebarProvider local config routing', () => {
+  it('preserves inline native entries when adding the missing config schema', async () => {
+    const baseline = '{ "action": "shell", "resource": "*", "effect": "ask" }';
+    let raw = `{"permissions":[${baseline}]}`;
+    vscodeMock.workspace.fs.readFile.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath !== '/repo/opencode.json') throw { code: 'FileNotFound' };
+      return new TextEncoder().encode(raw);
+    });
+    vscodeMock.workspace.fs.stat.mockRejectedValue({ code: 'FileNotFound' });
+    vscodeMock.workspace.fs.writeFile.mockImplementation(async (_uri, bytes) => {
+      raw = new TextDecoder().decode(bytes);
+    });
+    const { provider } = await createSidebarProviderInstance({
+      server: createServer({ apiVersion: 2 }),
+    });
+    const { posted } = attachTestView(provider);
+    await provider.handleMessage({
+      type: 'api/request',
+      payload: {
+        id: 997,
+        method: 'POST',
+        path: '/varro/opencode-config/permissions',
+        body: {
+          rules: [
+            { permission: 'bash', pattern: '*', action: 'ask' },
+            { permission: 'webfetch', pattern: 'https://example.com/*', action: 'allow' },
+          ],
+        },
+      },
+    });
+    expect(posted).toContainEqual({
+      type: 'api/response',
+      payload: {
+        id: 997,
+        data: expect.objectContaining({ projectRules: expect.any(Array) }),
+      },
+    });
+    expect(raw).toContain(baseline);
+    expect(parse(raw)).toEqual({
+      $schema: 'https://opencode.ai/config.json',
+      permissions: [
+        { action: 'shell', resource: '*', effect: 'ask' },
+        { action: 'webfetch', resource: 'https://example.com/*', effect: 'allow' },
+      ],
+    });
+  });
+
+  it.each(['project', 'global'] as const)(
+    'preserves compact %s permission entries through approval and panel edits',
+    async (scope) => {
+      const path =
+        scope === 'project'
+          ? '/repo/opencode.jsonc'
+          : getOpenCodeConfigPaths().find((candidate) => candidate.endsWith('/opencode.json'))!;
+      const baseline = '    { "action": "shell", "resource": "*", "effect": "ask" }';
+      let raw = `{\n  // unrelated settings\n  "model": "fixture/existing",\n  "permissions": [\n    // baseline permission\n${baseline} // keep attached\n  ]\n}\n`;
+      vscodeMock.workspace.fs.readFile.mockImplementation(async (uri: { fsPath: string }) => {
+        if (uri.fsPath !== path) throw { code: 'FileNotFound' };
+        return new TextEncoder().encode(raw);
+      });
+      vscodeMock.workspace.fs.stat.mockRejectedValue({ code: 'FileNotFound' });
+      vscodeMock.workspace.fs.writeFile.mockImplementation(async (_uri, bytes) => {
+        raw = new TextDecoder().decode(bytes);
+      });
+      const request = vi.fn(async (_method: string, route: string) => {
+        if (route.startsWith('/session/session-1'))
+          return { id: 'session-1', projectID: 'project-1', directory: '/repo' };
+        if (route === '/permission')
+          return [
+            {
+              id: 'perm-1',
+              sessionID: 'session-1',
+              permission: 'webfetch',
+              always: ['*'],
+            },
+          ];
+        return undefined;
+      });
+      const { provider } = await createSidebarProviderInstance({
+        server: createServer({ apiVersion: 2, request }),
+      });
+      const { posted } = attachTestView(provider);
+      await provider.handleMessage({
+        type: 'api/request',
+        payload: {
+          id: 994,
+          method: 'POST',
+          path: `/varro/permission/${scope}-allow`,
+          body: {
+            sessionId: 'session-1',
+            permissionId: 'perm-1',
+            patterns: ['https://example.com/*'],
+          },
+        },
+      });
+      expect(posted).toContainEqual({
+        type: 'api/response',
+        payload: {
+          id: 994,
+          data: { permission: 'webfetch', patterns: ['https://example.com/*'] },
+        },
+      });
+      expect(raw).toContain(`${baseline}, // keep attached`);
+      expect(raw).toContain(
+        '    { "action": "webfetch", "resource": "https://example.com/*", "effect": "allow" }'
+      );
+
+      const panelPath = `/varro/opencode-config/${scope === 'global' ? 'global-permissions' : 'permissions'}`;
+      await provider.handleMessage({
+        type: 'api/request',
+        payload: {
+          id: 995,
+          method: 'POST',
+          path: panelPath,
+          body: {
+            rules: [
+              { permission: 'bash', pattern: '*', action: 'ask' },
+              { permission: 'webfetch', pattern: 'https://example.com/exact', action: 'allow' },
+            ],
+          },
+        },
+      });
+      expect(raw).toContain(`${baseline}, // keep attached`);
+      expect(raw).toContain(
+        '    { "action": "webfetch", "resource": "https://example.com/exact", "effect": "allow" }'
+      );
+      await provider.handleMessage({
+        type: 'api/request',
+        payload: {
+          id: 996,
+          method: 'POST',
+          path: panelPath,
+          body: { rules: [{ permission: 'bash', pattern: '*', action: 'ask' }] },
+        },
+      });
+      expect(raw).toContain(baseline);
+      expect(raw).toContain('// unrelated settings');
+      expect(raw).toContain('// baseline permission');
+      expect(parse(raw).permissions).toEqual([{ action: 'shell', resource: '*', effect: 'ask' }]);
+      expect(
+        vscodeMock.workspace.fs.writeFile.mock.calls.every(([uri]) => uri.fsPath === path)
+      ).toBe(true);
+      expect(request.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+    }
+  );
+
+  it.each(['dirty', 'concurrent'] as const)(
+    'rejects global permission edits when the config is %s',
+    async (conflict) => {
+      const globalPath = getOpenCodeConfigPaths()[1]!;
+      vscodeMock.workspace.fs.readFile.mockImplementation(async (uri: { fsPath: string }) => {
+        if (uri.fsPath === globalPath) return new TextEncoder().encode('{}');
+        throw { code: 'FileNotFound' };
+      });
+      if (conflict === 'dirty')
+        vscodeMock.workspace.textDocuments = [
+          { isDirty: true, uri: { fsPath: globalPath, toString: () => globalPath } },
+        ];
+      else {
+        vscodeMock.workspace.fs.stat.mockResolvedValueOnce({
+          mtime: 1,
+          size: 2,
+          type: 0,
+          ctime: 0,
+        });
+        vscodeMock.workspace.fs.stat.mockResolvedValueOnce({
+          mtime: 2,
+          size: 2,
+          type: 0,
+          ctime: 0,
+        });
+      }
+      const { provider } = await createSidebarProviderInstance({
+        server: createServer({ apiVersion: 2 }),
+      });
+      const { posted } = attachTestView(provider);
+      await provider.handleMessage({
+        type: 'api/request',
+        payload: {
+          id: 993,
+          method: 'POST',
+          path: '/varro/opencode-config/global-permissions',
+          body: { rules: [] },
+        },
+      });
+      expect(vscodeMock.workspace.fs.writeFile).not.toHaveBeenCalled();
+      expect(posted).toContainEqual({
+        type: 'api/response',
+        payload: {
+          id: 993,
+          error: expect.stringContaining(
+            conflict === 'dirty' ? 'has unsaved changes' : 'changed while updating'
+          ),
+        },
+      });
+    }
+  );
+
+  it('saves reviewed global WebFetch patterns without touching project config or replying always', async () => {
+    const globalPath = getOpenCodeConfigPaths().find((path) => path.endsWith('/opencode.json'))!;
+    let raw = '{\n // keep provider settings\n "model": "fixture/existing", "permissions": []\n}';
+    vscodeMock.workspace.fs.readFile.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath !== globalPath) throw { code: 'FileNotFound' };
+      return new TextEncoder().encode(raw);
+    });
+    vscodeMock.workspace.fs.stat.mockRejectedValue({ code: 'FileNotFound' });
+    vscodeMock.workspace.fs.writeFile.mockImplementation(async (_uri, bytes) => {
+      raw = new TextDecoder().decode(bytes);
+    });
+    const request = vi.fn(async (_method: string, path: string) => {
+      if (path.startsWith('/session/session-1'))
+        return { id: 'session-1', projectID: 'project-1', directory: '/repo' };
+      if (path === '/permission')
+        return [{ id: 'perm-1', sessionID: 'session-1', permission: 'webfetch', always: ['*'] }];
+      return undefined;
+    });
+    const { provider } = await createSidebarProviderInstance({
+      server: createServer({ apiVersion: 2, request }),
+    });
+    const { posted } = attachTestView(provider);
+    await provider.handleMessage({
+      type: 'api/request',
+      payload: {
+        id: 990,
+        method: 'POST',
+        path: '/varro/permission/global-allow',
+        body: {
+          sessionId: 'session-1',
+          permissionId: 'perm-1',
+          patterns: ['https://example.com/*'],
+        },
+      },
+    });
+    expect(posted).toContainEqual({
+      type: 'api/response',
+      payload: { id: 990, data: { permission: 'webfetch', patterns: ['https://example.com/*'] } },
+    });
+    expect(raw).toContain('// keep provider settings');
+    expect(raw).toContain('fixture/existing');
+    expect(raw).toContain('https://example.com/*');
+    expect(
+      vscodeMock.workspace.fs.writeFile.mock.calls.every(([uri]) => uri.fsPath === globalPath)
+    ).toBe(true);
+    expect(request.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+    await provider.handleMessage({
+      type: 'api/request',
+      payload: {
+        id: 991,
+        method: 'POST',
+        path: '/varro/opencode-config/global-permissions',
+        body: { rules: [] },
+      },
+    });
+    expect(posted).toContainEqual({
+      type: 'api/response',
+      payload: { id: 991, data: { targetPath: globalPath, rules: [], supportsPatterns: true } },
+    });
+    expect(raw).not.toContain('https://example.com/*');
+    expect(raw).toContain('// keep provider settings');
+  });
+
+  it.each([1, 2] as const)(
+    'rejects global config writes in attach-only mode on V%s',
+    async (apiVersion) => {
+      const { provider } = await createSidebarProviderInstance({
+        server: createServer({ apiVersion, isAttachOnly: true }),
+      });
+      const { posted } = attachTestView(provider);
+      vscodeMock.workspace.fs.writeFile.mockClear();
+      await provider.handleMessage({
+        type: 'api/request',
+        payload: {
+          id: 992,
+          method: 'POST',
+          path: '/varro/opencode-config/global-permissions',
+          body: { rules: [] },
+        },
+      });
+      expect(posted).toContainEqual({
+        type: 'api/response',
+        payload: { id: 992, error: expect.stringContaining('attach-only') },
+      });
+      expect(vscodeMock.workspace.fs.writeFile).not.toHaveBeenCalled();
+    }
+  );
+
+  describe.each([1, 2] as const)('permission config syntax on V%s', (apiVersion) => {
+    it.each(['missing', 'empty', 'unrelated', 'legacy', 'native'] as const)(
+      'uses the expected syntax for project approval with %s config',
+      async (kind) => {
+        const existing =
+          kind === 'missing'
+            ? undefined
+            : JSON.stringify(
+                kind === 'empty'
+                  ? {}
+                  : kind === 'legacy'
+                    ? { permission: { bash: { '*': 'ask' } } }
+                    : kind === 'native'
+                      ? { permissions: [{ action: 'shell', resource: '*', effect: 'ask' }] }
+                      : { model: 'openai/existing' }
+              );
+        vscodeMock.workspace.fs.readFile.mockImplementation(async (uri: { fsPath: string }) => {
+          if (uri.fsPath !== '/repo/opencode.json' || existing === undefined)
+            throw { code: 'FileNotFound' };
+          return new TextEncoder().encode(existing);
+        });
+        vscodeMock.workspace.fs.stat.mockRejectedValue({ code: 'FileNotFound' });
+        const { provider } = await createSidebarProviderInstance({
+          server: createServer({
+            apiVersion,
+            request: vi.fn(async (_method: string, path: string) => {
+              if (path.startsWith('/session/session-1'))
+                return { id: 'session-1', projectID: 'project-1', directory: '/repo' };
+              if (path === '/permission')
+                return [
+                  { id: 'perm-1', sessionID: 'session-1', permission: 'bash', always: ['echo *'] },
+                ];
+              return undefined;
+            }),
+          }),
+        });
+        const { posted } = attachTestView(provider);
+        await provider.handleMessage({
+          type: 'api/request',
+          payload: {
+            id: 960,
+            method: 'POST',
+            path: '/varro/permission/project-allow',
+            body: { sessionId: 'session-1', permissionId: 'perm-1' },
+          },
+        });
+
+        expect(posted).toContainEqual({
+          type: 'api/response',
+          payload: { id: 960, data: { permission: 'bash', patterns: ['echo *'] } },
+        });
+        const [uri, bytes] = vscodeMock.workspace.fs.writeFile.mock.lastCall as unknown as [
+          { fsPath: string },
+          Uint8Array,
+        ];
+        expect(uri.fsPath).toBe('/repo/opencode.json');
+        const native = kind === 'native' || (apiVersion === 2 && kind !== 'legacy');
+        expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({
+          ...JSON.parse(existing ?? '{}'),
+          $schema: 'https://opencode.ai/config.json',
+          ...(native
+            ? {
+                permissions: [
+                  ...(kind === 'native' ? [{ action: 'shell', resource: '*', effect: 'ask' }] : []),
+                  { action: 'shell', resource: 'echo *', effect: 'allow' },
+                ],
+              }
+            : {
+                permission: {
+                  bash:
+                    kind === 'legacy' ? { '*': 'ask', 'echo *': 'allow' } : { 'echo *': 'allow' },
+                },
+              }),
+        });
+      }
+    );
+
+    it.each(['missing', 'empty', 'unrelated', 'legacy', 'native'] as const)(
+      'uses the expected syntax for panel writes with %s config',
+      async (kind) => {
+        const existing =
+          kind === 'missing'
+            ? undefined
+            : JSON.stringify(
+                kind === 'empty'
+                  ? {}
+                  : kind === 'legacy'
+                    ? { permission: { bash: 'ask' } }
+                    : kind === 'native'
+                      ? { permissions: [] }
+                      : { model: 'openai/existing' }
+              );
+        let raw = existing;
+        vscodeMock.workspace.fs.readFile.mockImplementation(async (uri: { fsPath: string }) => {
+          if (uri.fsPath !== '/repo/opencode.json' || raw === undefined)
+            throw { code: 'FileNotFound' };
+          return new TextEncoder().encode(raw);
+        });
+        vscodeMock.workspace.fs.writeFile.mockImplementation(async (_uri, bytes) => {
+          raw = new TextDecoder().decode(bytes);
+        });
+        vscodeMock.workspace.fs.stat.mockRejectedValue({ code: 'FileNotFound' });
+        const { provider } = await createSidebarProviderInstance({
+          server: createServer({ apiVersion }),
+        });
+        const { posted } = attachTestView(provider);
+        const rules = [
+          { permission: 'bash', pattern: '*', action: 'ask' },
+          { permission: 'bash', pattern: 'echo *', action: 'allow' },
+          { permission: 'task', pattern: 'explore', action: 'deny' },
+          { permission: 'webfetch', pattern: '*', action: 'allow' },
+        ];
+        await provider.handleMessage({
+          type: 'api/request',
+          payload: {
+            id: 961,
+            method: 'POST',
+            path: '/varro/opencode-config/permissions',
+            body: { rules },
+          },
+        });
+
+        const native = kind === 'native' || (apiVersion === 2 && kind !== 'legacy');
+        expect(JSON.parse(raw!)).toEqual({
+          ...JSON.parse(existing ?? '{}'),
+          $schema: 'https://opencode.ai/config.json',
+          ...(native
+            ? {
+                permissions: [
+                  { action: 'shell', resource: '*', effect: 'ask' },
+                  { action: 'shell', resource: 'echo *', effect: 'allow' },
+                  { action: 'subagent', resource: 'explore', effect: 'deny' },
+                  { action: 'webfetch', resource: '*', effect: 'allow' },
+                ],
+              }
+            : {
+                permission: {
+                  bash: { '*': 'ask', 'echo *': 'allow' },
+                  task: { explore: 'deny' },
+                  webfetch: 'allow',
+                },
+              }),
+        });
+        expect(posted).toContainEqual({
+          type: 'api/response',
+          payload: { id: 961, data: expect.objectContaining({ projectRules: rules }) },
+        });
+      }
+    );
+  });
+
   it('creates a global vision agent when no OpenCode configuration exists', async () => {
     const globalPath = getOpenCodeConfigPaths()[1]!;
     vscodeMock.workspace.fs.readFile.mockRejectedValue({ code: 'FileNotFound' });
@@ -603,6 +1040,22 @@ describe('SidebarProvider local config routing', () => {
       type: 'config/update',
       payload: expect.objectContaining({ showEmptyStateHistogram: enabled }),
     });
+  });
+
+  it('updates the pinned limit display when its setting changes', async () => {
+    await createSidebarProviderInstance();
+    const { ProviderLimitStatusBar } = await import('./provider-limit-status-bar');
+    const changed = vi.spyOn(ProviderLimitStatusBar.prototype, 'configurationChanged');
+    const listener = vscodeMock.workspace.onDidChangeConfiguration.mock.calls.at(-1)?.[0];
+    expect(listener).toBeTypeOf('function');
+    await vscodeMock.workspace
+      .getConfiguration('varro')
+      .update('providerLimits.statusBarDisplay', 'all');
+    listener?.({
+      affectsConfiguration: (key: string) => key === 'varro.providerLimits.statusBarDisplay',
+    });
+    expect(changed).toHaveBeenCalledOnce();
+    changed.mockRestore();
   });
 
   it('broadcasts turn-timer configuration changes', async () => {

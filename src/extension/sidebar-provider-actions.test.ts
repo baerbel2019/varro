@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => {
         getConfiguration: vi.fn(() => config),
       },
       Uri: {
+        file: vi.fn((fsPath: string) => ({ fsPath })),
         parse: vi.fn((value: string) => ({ value })),
       },
       ConfigurationTarget: {
@@ -41,7 +42,7 @@ vi.mock('./logger', () => ({ logger: mocks.logger }));
 
 import type { SidebarProviderActionDeps } from './sidebar-provider-actions';
 import { createSidebarProviderActions } from './sidebar-provider-actions';
-import { HandyIntegration } from './handy-integration';
+import { DictationIntegration } from './dictation-integration';
 
 type SessionDiffProvider = Pick<SidebarProviderActionDeps['sessionDiffProvider'], 'open'>;
 type ToolOutputProvider = Pick<SidebarProviderActionDeps['toolOutputProvider'], 'open'>;
@@ -129,7 +130,7 @@ function createActionFixture() {
   };
 
   const deps = {
-    handyIntegration: new HandyIntegration(),
+    dictationIntegration: new DictationIntegration(),
     contextProvider: contextProvider as unknown as SidebarProviderActionDeps['contextProvider'],
     extensionId: 'koltyakov.varro',
     webviewSession,
@@ -290,17 +291,21 @@ const nestedSessionActionCases: Array<{
 ];
 
 describe('createSidebarProviderActions', () => {
-  it('posts correlated Handy status and command results to the requesting view', async () => {
+  it('posts correlated dictation results to the requesting view and routes the provider', async () => {
     const request = vi
-      .spyOn(HandyIntegration.prototype, 'request')
+      .spyOn(DictationIntegration.prototype, 'request')
       .mockResolvedValue({ available: true, running: true, state: 'recording' });
     try {
       const { actions, deps } = createActionFixture();
-      await actions.requestHandy({ requestId: 'handy-1', action: 'start' });
-      expect(request).toHaveBeenCalledWith('start', expect.any(Function));
+      await actions.requestDictation({
+        requestId: 'dictation-1',
+        action: 'start',
+        provider: 'hex',
+      });
+      expect(request).toHaveBeenCalledWith('start', expect.any(Function), 'hex');
       expect(deps.post).toHaveBeenCalledWith({
-        type: 'handy/result',
-        payload: { requestId: 'handy-1', available: true, running: true, state: 'recording' },
+        type: 'dictation/result',
+        payload: { requestId: 'dictation-1', available: true, running: true, state: 'recording' },
       });
     } finally {
       request.mockRestore();
@@ -557,7 +562,9 @@ describe('createSidebarProviderActions', () => {
     actions.updateCommandState(true, false, model);
 
     expect(webviewSession.updateCommandState).toHaveBeenCalledWith(true, false);
-    expect(deps.setActiveChatModel).toHaveBeenCalledWith(model);
+    expect(deps.setActiveChatModel).toHaveBeenCalledWith(model, true);
+    actions.updateCommandState(true, false, model, undefined, false);
+    expect(deps.setActiveChatModel).toHaveBeenLastCalledWith(model, false);
   });
 
   it('forwards session read acknowledgements', () => {
@@ -702,11 +709,84 @@ describe('createSidebarProviderActions', () => {
     const { actions, deps, contextProvider } = createActionFixture();
     contextProvider.openPath.mockResolvedValueOnce('unavailable');
 
-    await actions.openPath({ path: '/repo/missing.ts', kind: 'file', requestId: 41 });
+    await actions.openPath({ path: '/repo/missing.ts', kind: 'file', exact: true, requestId: 41 });
+    expect(contextProvider.openPath).toHaveBeenCalledWith(
+      '/repo/missing.ts',
+      expect.objectContaining({ exact: true })
+    );
 
     expect(deps.post).toHaveBeenCalledWith({
       type: 'vscode/open-result',
       payload: { requestId: 41, status: 'unavailable' },
+    });
+  });
+
+  it.each(['/repo', '/repo/packages/app', '/worktrees/feature', '/scratch/no-project'])(
+    'passes the authorized session directory %s and full range to file resolution',
+    async (directory) => {
+      const { actions, contextProvider, restProxy } = createActionFixture();
+      restProxy.authorizeSessionDirectory.mockResolvedValue(true);
+      await actions.openPath({
+        path: 'models/file.py',
+        line: 710,
+        endLine: 744,
+        sessionID: 'session-1',
+        directory,
+      });
+      expect(restProxy.authorizeSessionDirectory).toHaveBeenCalledWith('session-1', directory);
+      expect(contextProvider.openPath).toHaveBeenCalledWith('models/file.py', {
+        line: 710,
+        endLine: 744,
+        workspaceDirectory: '/repo',
+        sessionDirectory: directory,
+      });
+    }
+  );
+
+  it('does not resolve a file in an unauthorized session directory', async () => {
+    const { actions, contextProvider, restProxy } = createActionFixture();
+    restProxy.authorizeSessionDirectory.mockResolvedValue(false);
+    await expect(
+      actions.openPath({
+        path: 'file.py',
+        sessionID: 'session-1',
+        directory: '/closed-repo',
+      })
+    ).rejects.toThrow('Session workspace folder is not open');
+    expect(contextProvider.openPath).not.toHaveBeenCalled();
+  });
+
+  it.each(['denied', 'error'] as const)(
+    'posts a correlated failure when directory authorization returns %s',
+    async (failure) => {
+      const { actions, deps, contextProvider, restProxy } = createActionFixture();
+      if (failure === 'denied') restProxy.authorizeSessionDirectory.mockResolvedValue(false);
+      else restProxy.authorizeSessionDirectory.mockRejectedValue(new Error('Catalog unavailable'));
+      await expect(
+        actions.openPath({
+          path: 'file.py',
+          sessionID: 'session-1',
+          directory: '/closed-repo',
+          requestId: 42,
+        })
+      ).rejects.toThrow(
+        failure === 'denied' ? 'Session workspace folder is not open' : 'Catalog unavailable'
+      );
+      expect(deps.post).toHaveBeenCalledExactlyOnceWith({
+        type: 'vscode/open-result',
+        payload: { requestId: 42, status: 'unavailable' },
+      });
+      expect(contextProvider.openPath).not.toHaveBeenCalled();
+    }
+  );
+
+  it('posts cancellation without reporting a missing file', async () => {
+    const { actions, deps, contextProvider } = createActionFixture();
+    contextProvider.openPath.mockResolvedValueOnce('cancelled');
+    await actions.openPath({ path: 'shared.ts', requestId: 42 });
+    expect(deps.post).toHaveBeenCalledWith({
+      type: 'vscode/open-result',
+      payload: { requestId: 42, status: 'cancelled' },
     });
   });
 
@@ -718,6 +798,46 @@ describe('createSidebarProviderActions', () => {
     expect(mocks.vscode.commands.executeCommand).toHaveBeenCalledWith(
       'workbench.action.files.openFolder'
     );
+  });
+
+  it.each(['/repo', '/worktrees/feature'])(
+    'opens the verified session folder %s in a new window',
+    async (directory) => {
+      const { actions, restProxy, server } = createActionFixture();
+      restProxy.authorizeSessionDirectory.mockResolvedValue(true);
+      server.request.mockResolvedValue({ id: 'session-1', directory });
+      await actions.openFolder({ sessionId: 'session-1', directory });
+      expect(restProxy.authorizeSessionDirectory).toHaveBeenCalledWith('session-1', directory);
+      expect(mocks.vscode.commands.executeCommand).toHaveBeenCalledWith(
+        'vscode.openFolder',
+        expect.objectContaining({ fsPath: directory }),
+        true
+      );
+    }
+  );
+
+  it('rejects a stale folder target and an unapproved session', async () => {
+    const { actions, restProxy, server } = createActionFixture();
+    restProxy.authorizeSessionDirectory.mockResolvedValue(true);
+    server.request.mockResolvedValue({ id: 'session-1', directory: '/elsewhere' });
+    await expect(
+      actions.openFolder({ sessionId: 'session-1', directory: '/repo' })
+    ).rejects.toThrow('Session does not belong');
+    restProxy.authorizeSessionDirectory.mockResolvedValue(false);
+    await expect(
+      actions.openFolder({ sessionId: 'foreign', directory: '/outside' })
+    ).rejects.toThrow('Session workspace folder is not open');
+    expect(mocks.vscode.commands.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it('uses the existing verified transfer action for an explicitly opened read-only link', async () => {
+    const { deps, restProxy } = createActionFixture();
+    restProxy.authorizeSessionDirectory.mockResolvedValue(false);
+    const openTransferredSession = vi.fn(async () => {});
+    const actions = createSidebarProviderActionsForTest({ ...deps, openTransferredSession });
+    await actions.openFolder({ sessionId: 'session-1', directory: '/outside' });
+    expect(openTransferredSession).toHaveBeenCalledExactlyOnceWith('session-1');
+    expect(mocks.vscode.commands.executeCommand).not.toHaveBeenCalled();
   });
 
   it.each([

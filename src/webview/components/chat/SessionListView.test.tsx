@@ -34,11 +34,13 @@ import {
 import { fixture } from '../../test-fixtures';
 import {
   compressIcon,
+  gitIcon,
   flashSolidIcon,
   forwardMessageIcon,
   hourglassIcon,
 } from '../../lib/ui-icons';
 import { toCssUrl } from '../UiIcon';
+import * as locationActions from '../../lib/session-location-actions';
 
 type TestRuntimeValue =
   | string
@@ -109,6 +111,13 @@ function openSessionActions(row: HTMLElement, x = 40, y = 50) {
       clientY: y,
     })
   );
+}
+
+function restoreRealTimers() {
+  // Unmounting a focused input queues jsdom's focus fixup on its rendering interval.
+  // Finish that frame before discarding fake timers, or later frames can stall.
+  vi.advanceTimersToNextFrame();
+  vi.useRealTimers();
 }
 
 function createDragDataTransfer() {
@@ -361,7 +370,7 @@ describe('SessionListView keyboard recovery', () => {
       } finally {
         cleanup?.();
         cleanup = undefined;
-        vi.useRealTimers();
+        restoreRealTimers();
       }
     }
   );
@@ -392,7 +401,7 @@ describe('SessionListView keyboard recovery', () => {
     } finally {
       cleanup?.();
       cleanup = undefined;
-      vi.useRealTimers();
+      restoreRealTimers();
     }
   });
   it.each(['idle', 'busy'] as const)('mounts a visible %s session with its clocks', (type) => {
@@ -420,6 +429,53 @@ describe('SessionListView keyboard recovery', () => {
 });
 
 describe('SessionListView model details', () => {
+  it.each([false, true])(
+    'offers location actions from a moved row icon, worktree=%s',
+    (worktree) => {
+      const copy = vi.spyOn(locationActions, 'copySessionFolderPath').mockResolvedValue();
+      setSessions([
+        session('moved', Date.now(), {
+          directory: '/outside',
+          isGitWorktree: worktree,
+          transfer: { originDirectory: '/repo', available: true },
+        }),
+      ]);
+      cleanup = render(() => <SessionListView />, container);
+      container
+        .querySelector('.session-item-folder-meta-icon')!
+        .dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+      const items = Array.from(
+        document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')
+      );
+      expect(items.some((item) => item.textContent?.trim() === 'Merge changes')).toBe(worktree);
+      items.find((item) => item.textContent?.trim() === 'Copy folder path')!.click();
+      expect(copy).toHaveBeenCalledExactlyOnceWith('/outside');
+    }
+  );
+
+  it.each([false, true])(
+    'uses the Git icon and path for a verified worktree, moved=%s',
+    (moved) => {
+      setState('editorContext', 'workspacePath', '/repo');
+      setSessions([
+        session('worktree', Date.now(), {
+          directory: '/worktrees/feature',
+          isGitWorktree: true,
+          transfer: moved ? { originDirectory: '/repo', available: true } : undefined,
+        }),
+      ]);
+      cleanup = render(() => <SessionListView />, container);
+      const label = container.querySelector('.session-item-folder')!;
+      expect(label.textContent).toBe('feature');
+      expect(label.textContent).not.toContain('Worktree:');
+      expect(label.textContent).not.toContain('Moved to');
+      expect(label.getAttribute('title')).toBe('/worktrees/feature');
+      const icon = label.querySelector<HTMLElement>('.session-item-folder-meta-icon')!;
+      expect(icon.getAttribute('aria-label')).toBe('Git worktree');
+      expect(icon.style.getPropertyValue('--ui-icon-mask')).toBe(toCssUrl(gitIcon));
+    }
+  );
+
   it('hides a moved link from its origin list without deleting or switching the active conversation', async () => {
     const moved = session('moved', Date.now(), {
       directory: '/outside',
@@ -1621,7 +1677,7 @@ describe('SessionListView diff summaries', () => {
     } finally {
       cleanup?.();
       cleanup = undefined;
-      vi.useRealTimers();
+      restoreRealTimers();
     }
   });
 
@@ -2258,7 +2314,7 @@ describe('SessionListView ordering', () => {
     } finally {
       cleanup?.();
       cleanup = undefined;
-      vi.useRealTimers();
+      restoreRealTimers();
     }
   });
 
@@ -2741,33 +2797,64 @@ describe('SessionListView actions', () => {
     expect(rows[1]!.classList.contains('is-context-obscured')).toBe(false);
   });
 
-  it('renames a session from its row action menu', async () => {
-    vi.spyOn(client.varro.session, 'diffSummary').mockResolvedValue({
-      files: 0,
-      additions: 0,
-      deletions: 0,
-      tokens: 0,
-      durationMs: 0,
-      activeStartedAt: null,
-    });
-    setState('sessions', [session('session-1', Date.now())]);
+  it('disables Rename for a read-only moved link without opening the form', () => {
+    setSessions([
+      session('moved', Date.now(), {
+        directory: '/outside',
+        transfer: { originDirectory: '/repo', available: false },
+      }),
+    ]);
     cleanup = render(() => <SessionListView />, container);
-
     openSessionActions(container.querySelector<HTMLElement>('.session-item')!);
-    Array.from(document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
-      .find((button) => button.textContent?.trim() === 'Rename')!
-      .click();
 
-    const input = document.querySelector<HTMLInputElement>('[id^="session-rename-"]')!;
-    input.value = '  Better title  ';
-    input.dispatchEvent(new InputEvent('input', { bubbles: true }));
-    input.closest('form')!.dispatchEvent(new SubmitEvent('submit', { bubbles: true }));
+    const rename = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')
+    ).find((button) => button.textContent?.trim() === 'Rename')!;
+    expect(rename.disabled).toBe(true);
+    expect(rename.title).toBe('Open the destination folder to rename this moved conversation');
+    rename.click();
 
-    await vi.waitFor(() => {
-      expect(renameSessionMock).toHaveBeenCalledWith('session-1', 'Better title');
-    });
-    await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).toBeNull());
+    expect(document.querySelector('.session-item-rename-form')).toBeNull();
+    expect(renameSessionMock).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    'renames a writable session from its row menu, moved=%s',
+    async (moved) => {
+      vi.spyOn(client.varro.session, 'diffSummary').mockResolvedValue({
+        files: 0,
+        additions: 0,
+        deletions: 0,
+        tokens: 0,
+        durationMs: 0,
+        activeStartedAt: null,
+      });
+      setSessions([
+        session('session-1', Date.now(), {
+          transfer: moved ? { originDirectory: '/other', available: true } : undefined,
+        }),
+      ]);
+      cleanup = render(() => <SessionListView />, container);
+
+      openSessionActions(container.querySelector<HTMLElement>('.session-item')!);
+      const rename = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')
+      ).find((button) => button.textContent?.trim() === 'Rename')!;
+      expect(rename.disabled).toBe(false);
+      expect(rename.hasAttribute('title')).toBe(false);
+      rename.click();
+
+      const input = document.querySelector<HTMLInputElement>('[id^="session-rename-"]')!;
+      input.value = '  Better title  ';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      input.closest('form')!.dispatchEvent(new SubmitEvent('submit', { bubbles: true }));
+
+      await vi.waitFor(() => {
+        expect(renameSessionMock).toHaveBeenCalledWith('session-1', 'Better title');
+      });
+      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).toBeNull());
+    }
+  );
 
   it('opens the row menu at the right-click position without an actions button', () => {
     vi.spyOn(client.varro.session, 'diffSummary').mockResolvedValue({
@@ -3086,7 +3173,7 @@ describe('SessionListView load errors', () => {
     } finally {
       cleanup?.();
       cleanup = undefined;
-      vi.useRealTimers();
+      restoreRealTimers();
     }
   });
 

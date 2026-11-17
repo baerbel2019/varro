@@ -9,6 +9,8 @@ import { getDroppedFileLabel } from '../../lib/path-display';
 import { AttachmentChip } from './AttachmentChip';
 import { ProblemsTooltip } from '../ProblemsTooltip';
 import { getProblemsSeverity } from '../../lib/editor-problems';
+import { getChatAnnotationLabel, readChatAnnotation } from '../../../shared/chat-annotation';
+import { AnnotationTooltip } from './AnnotationTooltip';
 
 type AttachmentStripItem =
   | { type: 'active-context'; value: ActiveContextAttachment }
@@ -45,6 +47,7 @@ export function AttachmentStrip(props: {
   nativePdfs: NativePdfAttachment[];
   nativePdfsSupported: boolean;
   clipboardImagesNeedVision: boolean;
+  clipboardImagesExcludedReason?: string;
   onToggleActiveContext: () => void;
   onPinActiveContext?: () => void;
   onClearTerminalSelection: () => void;
@@ -76,7 +79,17 @@ export function AttachmentStrip(props: {
     ].toSorted((a, b) => getAttachmentSequence(a) - getAttachmentSequence(b));
 
   return (
-    <div class="chat-attachments-container">
+    <div
+      class="chat-attachments-container"
+      role="group"
+      aria-label="Attachments"
+      tabIndex={0}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) {
+          event.currentTarget.focus({ preventScroll: true });
+        }
+      }}
+    >
       <For each={props.extensionContexts}>
         {(context) => (
           <AttachmentChip
@@ -166,25 +179,46 @@ export function AttachmentStrip(props: {
 
           if (item.type === 'file') {
             const database = item.value.database;
+            const annotation = readChatAnnotation(item.value);
             const lineRange = database
               ? databaseAttachmentDetail(database)
               : formatContextLineRanges(item.value.lineRanges);
-            return (
+            const chip = (
               <AttachmentChip
-                label={getDroppedFileLabel(item.value)}
+                label={
+                  annotation
+                    ? getChatAnnotationLabel(annotation.note)
+                    : getDroppedFileLabel(item.value)
+                }
+                preserveExtension={annotation ? false : undefined}
                 path={item.value.relativePath || item.value.path}
                 detail={lineRange}
-                icon={database ? 'table' : item.value.type === 'directory' ? 'folder' : 'file'}
+                icon={
+                  annotation
+                    ? 'message-text'
+                    : database
+                      ? 'table'
+                      : item.value.type === 'directory'
+                        ? 'folder'
+                        : 'file'
+                }
                 title={
-                  database
-                    ? `${database.name}${database.dataSource ? ` · ${database.dataSource}` : ''} · ${lineRange}`
-                    : lineRange
-                      ? `${item.value.relativePath || item.value.path} ${lineRange}`
-                      : item.value.relativePath || item.value.path
+                  annotation
+                    ? undefined
+                    : database
+                      ? `${database.name}${database.dataSource ? ` · ${database.dataSource}` : ''} · ${lineRange}`
+                      : lineRange
+                        ? `${item.value.relativePath || item.value.path} ${lineRange}`
+                        : item.value.relativePath || item.value.path
                 }
                 onClick={props.onOpenFile ? () => props.onOpenFile?.(item.value) : undefined}
                 onRemove={() => props.onRemoveFile(item.value.path)}
               />
+            );
+            return annotation ? (
+              <AnnotationTooltip annotation={annotation}>{chip}</AnnotationTooltip>
+            ) : (
+              chip
             );
           }
 
@@ -193,9 +227,10 @@ export function AttachmentStrip(props: {
               <AttachmentChip
                 label={item.value.filename}
                 path={item.value.filename}
-                disabled={props.clipboardImagesNeedVision}
+                disabled={!!props.clipboardImagesExcludedReason || props.clipboardImagesNeedVision}
                 icon="image"
                 title={
+                  props.clipboardImagesExcludedReason ??
                   props.imageError?.(item.value.id) ??
                   (props.clipboardImagesNeedVision
                     ? `${item.value.filename} · Use a vision-capable model or vision subagent to send this image`
@@ -215,7 +250,11 @@ export function AttachmentStrip(props: {
                     ? undefined
                     : { url: item.value.url, alt: item.value.filename }
                 }
-                compressionHint={props.imageCompressionHint?.(item.value.id)}
+                compressionHint={
+                  props.clipboardImagesExcludedReason
+                    ? undefined
+                    : props.imageCompressionHint?.(item.value.id)
+                }
                 onCompress={
                   props.canCompressImage?.(item.value.id)
                     ? (event) => props.onCompressImage?.(item.value.id, event)

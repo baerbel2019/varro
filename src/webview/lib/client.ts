@@ -1,6 +1,12 @@
 import { apiCall, onMessage, postMessage } from './bridge';
-import type { FollowupSuggestionSet, FollowupSource } from '../../shared/followups';
+import type { FollowupAction, FollowupSuggestionSet, FollowupSource } from '../../shared/followups';
 import { FOLLOWUP_REQUEST_TIMEOUT_MS } from '../../shared/followups';
+import type {
+  PermissionApprovalRequest,
+  ProviderAuthAuthorization,
+  ProviderAuthMethodsByProvider,
+  WorkspaceStatusEntry,
+} from '../../shared/opencode-types';
 import type {
   QuestionAnswer,
   AutoApproveJudgeRequest,
@@ -10,6 +16,7 @@ import type {
   DecisionProviderStatus,
   DroppedFile,
   LspStatus,
+  McpDefaults,
   McpStatus,
   ModelPricing,
   PermissionMode,
@@ -18,12 +25,14 @@ import type {
   ServerEvent,
   ServerEventName,
   SessionDiffSummary,
+  SessionLocation,
   SessionHistoryScope,
   SessionTitleFallbackResponse,
   WorkspaceStatusEventSummary,
   WorkspaceFilePick,
   WorkspaceProblemsSnapshot,
   OpenCodePermissionConfig,
+  OpenCodeGlobalPermissionConfig,
   OpenCodeServerMemoryPermissions,
 } from '../../shared/protocol';
 import {
@@ -60,14 +69,11 @@ import {
 import { parseHealthResponse, type HealthResponse } from '../../shared/health';
 import { normalizeRecycleBinEntries } from '../../shared/recycle-bin';
 import { asRecord, type UnknownRecord } from '../../shared/type-utils';
+import type { McpConfigScope } from '../../shared/mcp-config';
 import { applySessionShareOverride } from './session-share-overrides';
-import type {
-  ProviderAuthAuthorization,
-  ProviderAuthMethodsByProvider,
-  WorkspaceStatusEntry,
-} from '../../shared/opencode-types';
 import { CURRENT_OPENCODE_ENDPOINTS } from '../../shared/opencode-endpoints';
 import { STARTUP_DEFAULT_MODEL_TIMEOUT_MS, withStartupDeadline } from '../../shared/startup';
+import type { StartupAddonFailure } from '../../shared/startup';
 import { isBoolean, isNumber, isString, isObject } from './runtime-values';
 import type {
   ChildTaskControls,
@@ -82,7 +88,7 @@ export type SessionListPage = {
   incomplete?: boolean;
   unavailableDirectories?: string[];
 };
-export type McpAuthStart = { authorizationUrl: string; oauthState: string };
+export type McpAuthStart = { authorizationUrl: string; oauthState: string; paste?: true };
 
 export const client = {
   async health(): Promise<HealthResponse> {
@@ -467,23 +473,44 @@ export const client = {
     async persistProjectPermissionAllow(
       sessionId: string,
       permissionId: string,
-      options?: { directory?: string }
+      options?: { directory?: string; patterns?: string[] }
     ): Promise<void> {
+      const body: PermissionApprovalRequest = {
+        sessionId,
+        permissionId,
+      };
+      if (options?.patterns) body.patterns = options.patterns;
       await apiCall(
         'POST',
         withDirectory(VARRO_API_ENDPOINTS.permissionProjectAllow, options?.directory),
-        { sessionId, permissionId }
+        body
       );
     },
     async allowPermissionForSession(
       sessionId: string,
       permissionId: string,
-      options?: { directory?: string }
+      options?: { directory?: string; patterns?: string[] }
     ): Promise<void> {
+      const body: PermissionApprovalRequest = {
+        sessionId,
+        permissionId,
+      };
+      if (options?.patterns) body.patterns = options.patterns;
       await apiCall(
         'POST',
         withDirectory(VARRO_API_ENDPOINTS.permissionSessionAllow, options?.directory),
-        { sessionId, permissionId }
+        body
+      );
+    },
+    async persistGlobalPermissionAllow(
+      sessionId: string,
+      permissionId: string,
+      options: { directory?: string; patterns: string[] }
+    ): Promise<void> {
+      await apiCall(
+        'POST',
+        withDirectory(VARRO_API_ENDPOINTS.permissionGlobalAllow, options.directory),
+        { sessionId, permissionId, patterns: options.patterns }
       );
     },
     async getPermissionRulesForSession(
@@ -546,6 +573,7 @@ export const client = {
         messageID?: string;
         agent?: string;
         model?: string;
+        variant?: string;
       },
       options?: { directory?: string }
     ): Promise<MessageEntry | void> {
@@ -558,25 +586,44 @@ export const client = {
   },
 
   config: {
+    async startupDiagnostics(signal: AbortSignal): Promise<StartupAddonFailure[]> {
+      const path = VARRO_API_ENDPOINTS.startupDiagnostics;
+      const entries = requireArray<unknown>(
+        await apiCall('GET', path, undefined, { signal, retries: 0 }),
+        path
+      );
+      return entries.slice(0, 5).flatMap((entry) => {
+        const value = asRecord(entry);
+        if (
+          (value?.kind !== 'plugin' && value?.kind !== 'mcp') ||
+          !isString(value.name) ||
+          !isBoolean(value.timedOut)
+        )
+          return [];
+        return [{ kind: value.kind, name: value.name.slice(0, 120), timedOut: value.timedOut }];
+      });
+    },
     modelPricing(providerID: string, modelID: string): Promise<ModelPricing | null> {
       const params = new URLSearchParams({ providerID, modelID });
       return apiCall('GET', `${VARRO_API_ENDPOINTS.modelPricing}?${params}`, undefined, {
         retries: 0,
       });
     },
-    async providers(): Promise<{
+    async providers(signal?: AbortSignal): Promise<{
       providers: Provider[];
       default: Record<string, string>;
       defaultModel: ChatModelSelection | null | undefined;
     }> {
       const path = '/config/providers';
       const [providerResponse, defaultModel] = await Promise.all([
-        apiCall('GET', path),
+        signal ? apiCall('GET', path, undefined, { signal }) : apiCall('GET', path),
         // This endpoint is optional and unsupported servers may return their HTML shell.
         withStartupDeadline(
-          (signal) => apiCall('GET', '/model/default', undefined, { signal, retries: 0 }),
+          (defaultSignal) =>
+            apiCall('GET', '/model/default', undefined, { signal: defaultSignal, retries: 0 }),
           STARTUP_DEFAULT_MODEL_TIMEOUT_MS,
-          'Default model lookup'
+          'Default model lookup',
+          signal
         )
           .then(parseDefaultModel)
           .catch(() => undefined),
@@ -636,17 +683,20 @@ export const client = {
         method: number;
         code?: string;
         attemptID?: string;
+        /** Submit a redirect URL without replacing the callback waiting for completion. */
+        submitOnly?: true;
       },
       options?: { signal?: AbortSignal }
     ): Promise<boolean> {
+      const payload = {
+        method: body.method,
+        code: body.code ? body.code : undefined,
+        attemptID: body.attemptID,
+      };
       return apiCall(
         'POST',
         `/provider/${encodeURIComponent(body.providerID)}/oauth/callback`,
-        {
-          method: body.method,
-          code: body.code ? body.code : undefined,
-          attemptID: body.attemptID,
-        },
+        body.submitOnly ? { ...payload, submitOnly: true } : payload,
         {
           timeoutMs: 315_000,
           retries: 0,
@@ -710,6 +760,28 @@ export const client = {
       },
     },
     session: {
+      async location(
+        sessionID: string,
+        options?: { directory?: string }
+      ): Promise<SessionLocation> {
+        const path = withDirectory(
+          buildVarroSessionEndpoint(sessionID, 'location'),
+          options?.directory
+        );
+        const value = asRecord(await apiCall('GET', path));
+        if (!isString(value?.directory) || !isBoolean(value.isGitWorktree)) {
+          throw new Error(`Malformed response from ${path}`);
+        }
+        if (value.projectDirectory !== undefined && !isString(value.projectDirectory)) {
+          throw new Error(`Malformed response from ${path}`);
+        }
+        const location: SessionLocation = {
+          directory: value.directory,
+          isGitWorktree: value.isGitWorktree,
+        };
+        if (isString(value.projectDirectory)) location.projectDirectory = value.projectDirectory;
+        return location;
+      },
       async hideTransfer(sessionID: string, options?: { directory?: string }): Promise<boolean> {
         return apiCall(
           'POST',
@@ -841,26 +913,33 @@ export const client = {
         signal: AbortSignal;
         directory?: string;
         allowGenerate?: boolean;
+        cacheOnly?: boolean;
         model?: ChatModelSelection | null;
       }
     ): Promise<FollowupSuggestionSet> {
+      const body: FollowupSource & {
+        allowGenerate: boolean;
+        cacheOnly?: boolean;
+        model?: ChatModelSelection;
+      } = {
+        ...source,
+        allowGenerate: options.allowGenerate === true,
+        model: options.model
+          ? {
+              providerID: options.model.providerID,
+              modelID: options.model.modelID,
+              variant: options.model.variant,
+            }
+          : undefined,
+      };
+      if (options.cacheOnly) body.cacheOnly = true;
       return apiCall(
         'POST',
         withDirectory(
           `${VARRO_API_ENDPOINTS.session}/${encodeURIComponent(sessionId)}/followups`,
           options.directory
         ),
-        {
-          ...source,
-          allowGenerate: options.allowGenerate === true,
-          model: options.model
-            ? {
-                providerID: options.model.providerID,
-                modelID: options.model.modelID,
-                variant: options.model.variant,
-              }
-            : undefined,
-        },
+        body,
         { signal: options.signal, timeoutMs: FOLLOWUP_REQUEST_TIMEOUT_MS, retries: 0 }
       );
     },
@@ -876,6 +955,22 @@ export const client = {
           directory
         ),
         source,
+        { retries: 0 }
+      );
+    },
+    async linkFollowupSession(
+      sessionId: string,
+      source: FollowupSource,
+      action: FollowupAction & { sessionId: string },
+      directory?: string
+    ): Promise<boolean> {
+      return apiCall(
+        'POST',
+        withDirectory(
+          `${VARRO_API_ENDPOINTS.session}/${encodeURIComponent(sessionId)}/followups/session`,
+          directory
+        ),
+        { ...source, action },
         { retries: 0 }
       );
     },
@@ -908,6 +1003,14 @@ export const client = {
     },
     async openCodePermissionConfig(): Promise<OpenCodePermissionConfig> {
       return apiCall('GET', VARRO_API_ENDPOINTS.openCodeConfigPermissions);
+    },
+    async openCodeGlobalPermissionConfig(): Promise<OpenCodeGlobalPermissionConfig> {
+      return apiCall('GET', VARRO_API_ENDPOINTS.openCodeGlobalPermissions);
+    },
+    async saveOpenCodeGlobalPermissionConfig(
+      rules: PermissionRule[]
+    ): Promise<OpenCodeGlobalPermissionConfig> {
+      return apiCall('POST', VARRO_API_ENDPOINTS.openCodeGlobalPermissions, { rules });
     },
     async saveOpenCodePermissionConfig(rules: PermissionRule[]): Promise<OpenCodePermissionConfig> {
       return apiCall('POST', VARRO_API_ENDPOINTS.openCodeConfigPermissions, { rules });
@@ -1017,6 +1120,26 @@ export const client = {
   },
 
   mcp: {
+    async openConfig(scope: McpConfigScope): Promise<void> {
+      await apiCall('POST', VARRO_API_ENDPOINTS.mcpConfigOpen, { scope });
+    },
+    async addConfig(scope: McpConfigScope, json: string, name?: string): Promise<McpDefaults> {
+      return parseMcpDefaults(
+        await apiCall('POST', VARRO_API_ENDPOINTS.mcpConfig, { scope, json, name })
+      );
+    },
+    async defaults(): Promise<McpDefaults> {
+      return parseMcpDefaults(await apiCall('GET', VARRO_API_ENDPOINTS.mcpDefaults));
+    },
+    async setDefault(
+      name: string,
+      scope: 'global' | 'project',
+      enabled: boolean | null
+    ): Promise<McpDefaults> {
+      return parseMcpDefaults(
+        await apiCall('POST', VARRO_API_ENDPOINTS.mcpDefaults, { name, scope, enabled })
+      );
+    },
     async status(): Promise<Record<string, McpStatus>> {
       // SAFETY: The surrounding shape or discriminator check establishes the Record<string, McpStatus> contract used below.
       return requireRecord(await apiCall('GET', '/mcp'), '/mcp') as Record<string, McpStatus>;
@@ -1036,10 +1159,11 @@ export const client = {
       if (!isString(response.authorizationUrl) || !isString(response.oauthState)) {
         throw malformedResponse(path, 'an MCP OAuth authorization response');
       }
-      return {
+      const authorization = {
         authorizationUrl: response.authorizationUrl,
         oauthState: response.oauthState,
       };
+      return response.paste === true ? { ...authorization, paste: true } : authorization;
     },
     async completeAuth(name: string, code: string): Promise<McpStatus> {
       return apiCall('POST', `/mcp/${encodeURIComponent(name)}/auth/callback`, { code });
@@ -1114,6 +1238,32 @@ function requireArray<T, V = unknown>(value: V, path: string): T[] {
   // SAFETY: The surrounding shape or discriminator check establishes the T contract used below.
   return value as T[];
 }
+
+/* oxlint-disable anti-slop/no-unknown-parameters -- Validate the untrusted MCP defaults REST response at the client boundary. */
+function parseMcpDefaults(value: unknown): McpDefaults {
+  const path = VARRO_API_ENDPOINTS.mcpDefaults;
+  const record = requireRecord(value, path);
+  const parseDefaults = (candidate: unknown): Record<string, boolean> => {
+    const entries = Object.entries(requireRecord(candidate, path));
+    if (entries.some(([, enabled]) => !isBoolean(enabled)))
+      throw malformedResponse(path, 'MCP defaults');
+    return Object.fromEntries(entries.map(([name, enabled]) => [name, enabled === true]));
+  };
+  if (!isBoolean(record.editable)) throw malformedResponse(path, 'MCP defaults');
+  const defaults: McpDefaults = {
+    global: parseDefaults(record.global),
+    project: parseDefaults(record.project),
+    effective: parseDefaults(record.effective),
+    editable: record.editable,
+  };
+  if (record.oauthServers !== undefined) {
+    if (!Array.isArray(record.oauthServers) || !record.oauthServers.every(isString))
+      throw malformedResponse(path, 'MCP OAuth server names');
+    defaults.oauthServers = record.oauthServers;
+  }
+  return defaults;
+}
+/* oxlint-enable anti-slop/no-unknown-parameters */
 
 function requireRecord<T>(value: T, path: string): UnknownRecord {
   if (!value || !isObject(value) || Array.isArray(value)) {

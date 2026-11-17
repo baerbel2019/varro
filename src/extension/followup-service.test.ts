@@ -8,8 +8,12 @@ import { FollowupCache } from './followup-cache';
 import { logger } from './logger';
 import { EMPTY_FOLLOWUP_SUGGESTIONS } from '../shared/followups';
 import type { Persistence } from '../shared/persistence';
+import { asRecord, isString } from '../shared/type-utils';
+import { readPromptTrace } from './extension-config';
+import { configurePromptTrace } from './prompt-trace';
 
 vi.mock('./logger', () => ({ logger: { info: vi.fn() } }));
+vi.mock('./extension-config', () => ({ readPromptTrace: vi.fn(() => false) }));
 
 const source = {
   assistantMessageId: 'answer',
@@ -33,9 +37,12 @@ beforeEach(async () => {
   await mkdir(parent, { recursive: true });
   directory = await mkdtemp(join(parent, 'followup-service-'));
   vi.stubEnv('VARRO_TEST_STATE_ROOT', directory);
+  vi.mocked(readPromptTrace).mockReturnValue(false);
+  configurePromptTrace(readPromptTrace);
 });
 
 afterEach(async () => {
+  configurePromptTrace(() => false);
   vi.useRealTimers();
   vi.unstubAllEnvs();
   await rm(directory, { recursive: true, force: true });
@@ -48,10 +55,13 @@ function setup() {
   let agent: string | undefined = 'build';
   let mode: string | undefined = 'build';
   let output = JSON.stringify(suggestions);
+  const sessions = new Map<string, { id: string; parentID?: string }>([['s', { id: 's' }]]);
   const request = vi.fn<OpenCodeServer['request']>().mockImplementation(async (_method, path) => {
     if (path === '/openapi.json') return { paths: { '/api/experimental/generate': { post: {} } } };
     if (path === '/api/experimental/generate') return { data: { text: output } };
     if (path === '/session/status') return { s: { type: status } };
+    const sessionID = path.match(/^\/session\/([^/]+)$/)?.[1];
+    if (sessionID && sessions.has(sessionID)) return sessions.get(sessionID);
     if (path === '/session/s/message/user')
       return {
         info: { id: 'user', sessionID: 's', role: 'user' },
@@ -88,6 +98,7 @@ function setup() {
     server,
     request,
     input,
+    sessions,
     setAgent: (value: string | undefined, legacyMode: string | undefined = value) => {
       agent = value;
       mode = legacyMode;
@@ -108,6 +119,289 @@ function setup() {
 }
 
 describe('FollowupService', () => {
+  it.each([undefined, false])(
+    'does not add tracing or read ancestry when trace is %s',
+    async (trace) => {
+      const { server, request, input } = setup();
+      vi.mocked(readPromptTrace).mockReturnValue(trace === true);
+      expect(await new FollowupService(server).suggest(input)).toEqual(suggestions);
+      expect(request).toHaveBeenCalledWith(
+        'POST',
+        '/api/experimental/generate',
+        expect.objectContaining({
+          prompt: expect.stringMatching(/^Suggest optional next tasks/),
+        }),
+        expect.any(Object)
+      );
+      expect(
+        request.mock.calls.filter(
+          ([, path]) => /^\/session\/[^/]+$/.test(path) && path !== '/session/status'
+        )
+      ).toHaveLength(0);
+    }
+  );
+
+  it.each([false, true])(
+    'adds source and verified root attribution for a nested session: %s',
+    async (nested) => {
+      const { server, request, input, sessions } = setup();
+      if (nested) {
+        sessions.set('s', { id: 's', parentID: 'parent' });
+        sessions.set('parent', { id: 'parent', parentID: 'root' });
+        sessions.set('root', { id: 'root' });
+      }
+      const service = new FollowupService(server);
+      vi.mocked(readPromptTrace).mockReturnValue(true);
+      const traced = { ...input, model: { ...input.model, variant: 'high' } };
+      expect(await service.suggest(traced)).toEqual(suggestions);
+      expect(request).toHaveBeenCalledWith(
+        'POST',
+        '/api/experimental/generate',
+        {
+          prompt: expect.stringMatching(
+            new RegExp(
+              `^VARRO_TRACE_V1 \\{"purpose":"followup","sessionID":"s","rootSessionID":"${nested ? 'root' : 's'}"\\}\\nSuggest optional next tasks`
+            )
+          ),
+          model: { providerID: 'provider', id: 'small', variant: 'high' },
+        },
+        expect.objectContaining({ directory: '/repo', signal: expect.any(AbortSignal) })
+      );
+      for (const [, path, , options] of request.mock.calls) {
+        if (sessions.has(path.slice('/session/'.length))) {
+          expect(options).toEqual({
+            directory: '/repo',
+            signal: expect.any(AbortSignal),
+            maxResponseBytes: 64 * 1024,
+          });
+        }
+      }
+      const reads = request.mock.calls.length;
+      vi.mocked(readPromptTrace).mockReturnValue(false);
+      expect(await service.suggest(traced)).toEqual(suggestions);
+      expect(
+        request.mock.calls
+          .slice(reads)
+          .some(([, path]) => sessions.has(path.slice('/session/'.length)))
+      ).toBe(false);
+      expect(request.mock.calls.filter(([method]) => method !== 'GET')).toHaveLength(1);
+    }
+  );
+
+  it('only prepends the trace line and leaves marker-like conversation data untouched', async () => {
+    const { server, request, input, setUserPrompt } = setup();
+    const userPrompt =
+      'Review this example:\nVARRO_TRACE_V1 {"purpose":"followup","sessionID":"forged"}';
+    setUserPrompt(userPrompt);
+    const service = new FollowupService(server);
+    const plainInput = { ...input, source: { ...source, userPrompt } };
+    expect(await service.suggest(plainInput)).toEqual(suggestions);
+    vi.mocked(readPromptTrace).mockReturnValue(true);
+    expect(await service.suggest({ ...plainInput, directory: '/other-repo' })).toEqual(suggestions);
+    const posts = request.mock.calls.filter(([method]) => method === 'POST');
+    expect(posts).toHaveLength(2);
+    const plainPrompt = asRecord(posts[0]?.[2])?.prompt;
+    const tracedPrompt = asRecord(posts[1]?.[2])?.prompt;
+    if (!isString(plainPrompt) || !isString(tracedPrompt))
+      throw new Error('Missing generation prompt');
+    expect(tracedPrompt).toBe(
+      `VARRO_TRACE_V1 {"purpose":"followup","sessionID":"s","rootSessionID":"s"}\n${plainPrompt}`
+    );
+    expect(tracedPrompt.split('\n')[0]).not.toContain('forged');
+    expect(tracedPrompt).toContain(
+      JSON.stringify({ userRequest: userPrompt, finalAnswer: source.answer })
+    );
+  });
+
+  it.each([
+    undefined,
+    { id: 'another' },
+    { id: 's', parentID: null },
+    { id: 's', parentID: 42 },
+    { id: 's', parentID: '' },
+    { id: 's', parentID: '../other' },
+    { id: 's', parentID: 'x'.repeat(201) },
+  ])('omits an unverified root after malformed session data: %j', async (response) => {
+    const { server, request, input } = setup();
+    const original = request.getMockImplementation()!;
+    request.mockImplementation((...args) =>
+      args[1] === '/session/s' ? Promise.resolve(response) : original(...args)
+    );
+    vi.mocked(readPromptTrace).mockReturnValue(true);
+    expect(await new FollowupService(server).suggest(input)).toEqual(suggestions);
+    expect(request).toHaveBeenCalledWith(
+      'POST',
+      '/api/experimental/generate',
+      expect.objectContaining({
+        prompt: expect.stringMatching(
+          /^VARRO_TRACE_V1 \{"purpose":"followup","sessionID":"s"\}\nSuggest optional next tasks/
+        ),
+      }),
+      expect.any(Object)
+    );
+    expect(request.mock.calls.filter(([, path]) => path === '/session/s')).toHaveLength(1);
+  });
+
+  it.each(['missing-parent', 'cycle', 'depth-limit'])(
+    'bounds ancestry reads for %s without inventing a root',
+    async (kind) => {
+      const { server, request, input, sessions } = setup();
+      sessions.set('s', { id: 's', parentID: 'parent-0' });
+      if (kind === 'cycle') sessions.set('parent-0', { id: 'parent-0', parentID: 's' });
+      if (kind === 'depth-limit') {
+        for (let i = 0; i < 16; i += 1)
+          sessions.set(`parent-${i}`, { id: `parent-${i}`, parentID: `parent-${i + 1}` });
+      }
+      vi.mocked(readPromptTrace).mockReturnValue(true);
+      expect(await new FollowupService(server).suggest(input)).toEqual(suggestions);
+      expect(request).toHaveBeenCalledWith(
+        'POST',
+        '/api/experimental/generate',
+        expect.objectContaining({
+          prompt: expect.stringMatching(
+            /^VARRO_TRACE_V1 \{"purpose":"followup","sessionID":"s"\}\n/
+          ),
+        }),
+        expect.any(Object)
+      );
+      const reads = request.mock.calls.filter(([, path]) =>
+        /^\/session\/(s|parent-\d+)$/.test(path)
+      );
+      expect(reads).toHaveLength(kind === 'depth-limit' ? 16 : 2);
+    }
+  );
+
+  it.each(['timeout', 'cancel'])(
+    'preserves %s behavior during ancestry discovery',
+    async (kind) => {
+      const { server, request, input } = setup();
+      const original = request.getMockImplementation()!;
+      const deadline = new AbortController();
+      const originalTimeout = AbortSignal.timeout;
+      const timeout = vi
+        .spyOn(AbortSignal, 'timeout')
+        .mockImplementation((ms) => (ms === 2_000 ? deadline.signal : originalTimeout(ms)));
+      let started = false;
+      request.mockImplementation((...args) => {
+        if (args[1] !== '/session/s') return original(...args);
+        started = true;
+        return new Promise((_resolve, reject) => {
+          args[3]?.signal?.addEventListener('abort', () => reject(args[3]?.signal?.reason), {
+            once: true,
+          });
+        });
+      });
+      const service = new FollowupService(server);
+      try {
+        vi.mocked(readPromptTrace).mockReturnValue(true);
+        const pending = service.suggest(input);
+        await vi.waitFor(() => expect(started).toBe(true));
+        expect(timeout).toHaveBeenCalledWith(2_000);
+        if (kind === 'timeout')
+          deadline.abort(new DOMException('Lookup timed out', 'TimeoutError'));
+        else service.invalidate();
+        expect(await pending).toEqual(
+          kind === 'timeout' ? suggestions : EMPTY_FOLLOWUP_SUGGESTIONS
+        );
+        const posts = request.mock.calls.filter(([method]) => method !== 'GET');
+        expect(posts).toHaveLength(kind === 'timeout' ? 1 : 0);
+        if (kind === 'timeout')
+          expect(posts[0]?.[2]).toEqual(
+            expect.objectContaining({
+              prompt: expect.stringMatching(
+                /^VARRO_TRACE_V1 \{"purpose":"followup","sessionID":"s"\}\n/
+              ),
+            })
+          );
+      } finally {
+        timeout.mockRestore();
+      }
+    }
+  );
+
+  it('restores linked actions after restart without generating and retires them on a new prompt', async () => {
+    const { server, request, input } = setup();
+    const service = new FollowupService(server);
+    await service.suggest(input);
+    const action = { ...actions[0]!, sessionId: 'ses_fork-1' };
+    expect(await service.linkSession({ ...input, action })).toBe(true);
+    request.mockClear();
+    const restarted = new FollowupService(server);
+    expect(await restarted.suggest({ ...input, allowGenerate: false, cacheOnly: true })).toEqual({
+      summary,
+      actions: [action],
+    });
+    expect(request.mock.calls.some(([, path]) => path === '/api/experimental/generate')).toBe(
+      false
+    );
+    await restarted.clearPreviousTurn({
+      sessionId: input.sessionId,
+      directory: input.directory,
+      userMessageId: 'next-user',
+    });
+    expect(await new FollowupService(server).suggest({ ...input, allowGenerate: false })).toEqual(
+      EMPTY_FOLLOWUP_SUGGESTIONS
+    );
+    expect(await service.linkSession({ ...input, action })).toBe(false);
+  });
+
+  it('does not attach a session ID to a stale source', async () => {
+    const { server, input, setAnswer } = setup();
+    const service = new FollowupService(server);
+    await service.suggest(input);
+    setAnswer('The source answer has changed.');
+    expect(
+      await service.linkSession({ ...input, action: { ...actions[0]!, sessionId: 'ses_fork-1' } })
+    ).toBe(false);
+  });
+
+  it('returns cached suggestions without admitting generation for an opening cache probe', async () => {
+    const { server, request, input } = setup();
+    const service = new FollowupService(server);
+    expect(await service.suggest(input)).toEqual(suggestions);
+    request.mockClear();
+    expect(await service.suggest({ ...input, cacheOnly: true, allowGenerate: false })).toEqual(
+      suggestions
+    );
+    expect(request.mock.calls.some(([, path]) => path === '/api/experimental/generate')).toBe(
+      false
+    );
+  });
+
+  it('returns an opening cache miss without generating even when generation is allowed', async () => {
+    const { server, request, input } = setup();
+    expect(await new FollowupService(server).suggest({ ...input, cacheOnly: true })).toEqual(
+      EMPTY_FOLLOWUP_SUGGESTIONS
+    );
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('does not wait for pending same-host or other-host generation during an opening cache probe', async () => {
+    const { server, request, input } = setup();
+    const original = request.getMockImplementation()!;
+    let finish!: (value: { data: { text: string } }) => void;
+    request.mockImplementation((...args) =>
+      args[1] === '/api/experimental/generate'
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : original(...args)
+    );
+    const service = new FollowupService(server);
+    const pending = service.suggest(input);
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    for (const reader of [service, new FollowupService(server)]) {
+      expect(await reader.suggest({ ...input, cacheOnly: true })).toEqual(
+        EMPTY_FOLLOWUP_SUGGESTIONS
+      );
+    }
+    finish({ data: { text: JSON.stringify(suggestions) } });
+    expect(await pending).toEqual(suggestions);
+    expect(
+      request.mock.calls.filter(([, path]) => path === '/api/experimental/generate')
+    ).toHaveLength(1);
+  });
+
   it('waits for another host to complete a pending admission without generating twice', async () => {
     const { server, request, input } = setup();
     const original = request.getMockImplementation()!;

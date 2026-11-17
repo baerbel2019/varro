@@ -3,17 +3,21 @@
 import type {
   EditorContext,
   InitialWebviewState,
+  McpDefaults,
   PermissionMode,
   RecycleBinEntry,
   ServerStatus,
   WebviewMessage,
   WebviewThemeKind,
 } from '../../src/shared/protocol';
-import { isPermissionMode } from '../../src/shared/protocol';
+import { isPermissionMode, VARRO_API_ENDPOINTS } from '../../src/shared/protocol';
+import { parseMcpConfigSnippet } from '../../src/shared/mcp-config';
 import { BACKGROUND_OUTPUT_CHUNK_BYTES } from '../../src/shared/background-process';
 import type { BackgroundProcess } from '../../src/shared/background-process';
+import type { FollowupSuggestionSet } from '../../src/shared/followups';
 import { getSessionPermissionRulesForMode } from '../../src/shared/permission-rules';
 import { normalizeWorkspaceIdentity } from '../../src/shared/workspace-path';
+import { isAbsolutePath, normalizePath } from '../../src/shared/path-display';
 import type {
   Agent,
   AssistantMessage,
@@ -167,6 +171,7 @@ type ScenarioState = {
       error?: string;
     }
   >;
+  mcpDefaults?: McpDefaults;
   storedState: {
     sessionSelectedAgents?: Record<string, string>;
     sessionSelectedMcps?: Record<string, string[]>;
@@ -187,6 +192,12 @@ type ScenarioState = {
   nextSequence: number;
   healthFailuresRemaining: number;
   showFileDiffs?: boolean;
+  followups?: {
+    cached: FollowupSuggestionSet;
+    cacheDelayMs: number;
+    generated?: FollowupSuggestionSet;
+    generationDelayMs?: number;
+  };
 };
 
 export type HarnessComposerState = {
@@ -210,6 +221,7 @@ type HarnessWindow = Window & {
   varroPlaybackCapture?: {
     session: Session;
     initialMessages: MessageEntry[];
+    followups?: ScenarioState['followups'];
   };
   __varroE2E?: {
     requests: RequestLog[];
@@ -226,7 +238,9 @@ type HarnessWindow = Window & {
     updateMessageInfo?: (info: Message) => void;
     updateMessagePart?: (part: Part) => void;
     updateSessionStatus?: (sessionId: string, status: SessionStatus) => void;
+    updateMcpStatus?: (name: string, status: ScenarioState['mcpStatus'][string]) => void;
     releaseHistoryRequests?: () => void;
+    releaseStartup?: () => void;
     releaseNextHistoryRequest?: () => boolean;
     pendingHistoryRequestCount?: () => number;
     getSessionMessages?: (sessionId: string) => MessageEntry[];
@@ -241,6 +255,7 @@ const NO_PROJECT = new URLSearchParams(window.location.search).get('noProject') 
 const WORKSPACE_PATH = NO_PROJECT ? '/varro/scratch' : '/workspace/varro';
 const TMP_WORKSPACE_PATH = '/workspace/varro/tmp/e2e-workspace';
 const BASE_TIME = Date.now();
+const loggedOutMcpNames = new Set<string>();
 const THEME = getThemeKind();
 const deferredHistoryRequestResolves: Array<() => void> = [];
 const PERSISTED_MESSAGE_STATE_KEY = 'varro.e2ePersistedMessageState';
@@ -834,7 +849,13 @@ function createScenarioState(name: ScenarioName): ScenarioState {
     messageCursorTokensByBoundary: new Map(),
     nextMessageCursorSequence: 0,
     latestMessageRequestCounts: {},
-    readyStatus: { state: 'running', url: 'mock://opencode', eventStream: 'healthy' },
+    // Fixtures use the V1 API unless a scenario explicitly selects V2.
+    readyStatus: {
+      state: 'running',
+      url: 'mock://opencode',
+      apiVersion: 1,
+      eventStream: 'healthy',
+    },
     nextSequence: 0,
     healthFailuresRemaining: 0,
   };
@@ -847,6 +868,10 @@ function createScenarioState(name: ScenarioName): ScenarioState {
     state.messagesBySessionId[capture.session.id] = structuredClone(capture.initialMessages);
     state.sessionStatuses[capture.session.id] = { type: 'idle' };
     state.persistedActiveSessionId = capture.session.id;
+    if (capture.followups) {
+      state.followups = capture.followups;
+      state.readyStatus = { state: 'running', url: 'mock://opencode', apiVersion: 2 };
+    }
     state.nextSequence = 300;
     return state;
   }
@@ -2319,9 +2344,28 @@ function createScenarioState(name: ScenarioName): ScenarioState {
       playwright: { status: 'disabled' },
       github: { status: 'failed', error: 'CLI not authenticated' },
     };
+    if (new URLSearchParams(window.location.search).has('mcpAuth')) {
+      state.mcpStatus = {
+        atlassian: {
+          status: 'needs_auth',
+          error: 'MCP server "https://mcp.atlassian.com/v2/mcp" requires a login',
+        },
+        'browser-bridge': { status: 'disabled' },
+        lightpanda: { status: 'disabled' },
+      };
+    }
+    if (new URLSearchParams(window.location.search).has('mcpEmpty')) state.mcpStatus = {};
+    if (new URLSearchParams(window.location.search).has('mcpAccount')) {
+      state.mcpStatus = {
+        atlassian: { status: 'connected' },
+        'browser-bridge': { status: 'connected' },
+      };
+    }
     state.storedState = {
       sessionSelectedMcps: {
-        [session.id]: ['chrome'],
+        [session.id]: new URLSearchParams(window.location.search).has('mcpAccount')
+          ? ['atlassian', 'browser-bridge']
+          : ['chrome'],
       },
     };
     state.nextSequence = 110;
@@ -3440,7 +3484,7 @@ function createScenarioState(name: ScenarioName): ScenarioState {
         parent.id,
         'native-result',
         ['<subagent sessionID="session-child-b">\nAudit result\n</subagent>'],
-        BASE_TIME - 200
+        BASE_TIME + 10
       );
       result.parts = result.parts.map((part) =>
         part.type === 'text'
@@ -3516,7 +3560,11 @@ function createScenarioState(name: ScenarioName): ScenarioState {
       };
       assistant.parts = [task];
       if (childTaskState === 'running') markAssistantInProgress(assistant);
-      state.messagesBySessionId[parent.id] = [user, assistant];
+      state.messagesBySessionId[parent.id] = [
+        user,
+        assistant,
+        ...(state.messagesBySessionId[parent.id] ?? []),
+      ];
       state.sessionStatuses[parent.id] = { type: childTaskState === 'running' ? 'busy' : 'idle' };
       state.sessionStatuses[childA.id] = { type: childTaskState === 'running' ? 'busy' : 'idle' };
       if (new URLSearchParams(window.location.search).has('nestedChildTask')) {
@@ -3868,8 +3916,15 @@ function createScenarioState(name: ScenarioName): ScenarioState {
         '- CommonJS script: **`scripts/vscode-sandbox/suite.cjs`**',
         '- Tool configuration: **`.oxlintrc.json`**',
         '- Markdown guide: `docs/architecture.md`',
-        '- Review finding: `MarkdownRenderer.tsx (line 1447)`',
+        '- Review finding: [MarkdownRenderer.tsx](src/webview/components/MarkdownRenderer.tsx#L1447)',
         '- Missing reference: `missing-file.ts`',
+        ...(new URLSearchParams(window.location.search).has('symbolCitations')
+          ? [
+              '',
+              'Symbols: `loss_weights()`, `soft_updates()`, `stack_on_channel()`, and `CustomMultiTaskRLBenchEnv`.',
+              'Grouped modules: `transporter / franka / clip`.',
+            ]
+          : []),
       ].join('\n'),
       BASE_TIME - 4_000
     );
@@ -5498,6 +5553,7 @@ function buildInitialState(state: ScenarioState): InitialWebviewState {
     droppedFiles: [],
     emptyStateLogoUri: '/assets/icon.png',
     showFileDiffs: state.showFileDiffs,
+    followupModel: state.followups ? 'test/small' : undefined,
     showEmptyStateHistogram:
       new URLSearchParams(window.location.search).get('showEmptyStateHistogram') === 'true',
     defaultPermissionMode: 'default',
@@ -5730,6 +5786,64 @@ async function handleApiRequest(
 ) {
   const url = new URL(rawPath, 'http://varro.test');
   const path = url.pathname;
+
+  if (
+    method === 'GET' &&
+    /^\/varro\/session\/[^/]+\/diff-summary$/.test(path) &&
+    new URLSearchParams(window.location.search).has('locationAlignment')
+  ) {
+    return {
+      files: 0,
+      additions: 0,
+      deletions: 0,
+      tokens: 0,
+      durationMs: 358_000,
+      activeStartedAt: null,
+    };
+  }
+
+  if (method === 'POST' && /^\/varro\/session\/[^/]+\/followups$/.test(path) && state.followups) {
+    const fixture = state.followups;
+    const cacheOnly = asRecord(body).cacheOnly === true;
+    const delayMs = cacheOnly ? fixture.cacheDelayMs : (fixture.generationDelayMs ?? 0);
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return cacheOnly ? fixture.cached : (fixture.generated ?? fixture.cached);
+  }
+
+  if (method === 'POST' && path === '/varro/citation-symbols') {
+    const request = asRecord(body);
+    if (!Array.isArray(request.symbols)) throw new Error('Missing citation symbols');
+    const delayMs = Number(new URLSearchParams(window.location.search).get('citationCheckDelayMs'));
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, 2000)));
+    const targets = new Map([
+      ['loss_weights()', { path: `${WORKSPACE_PATH}/src/loss.py`, line: 12 }],
+      ['stack_on_channel()', { path: `${WORKSPACE_PATH}/src/stack.py`, line: 56 }],
+      ['CustomMultiTaskRLBenchEnv', { path: `${WORKSPACE_PATH}/src/env.py`, line: 78 }],
+    ]);
+    // soft_updates has ambiguous definitions in this fixture and must remain code.
+    return request.symbols.map((value) =>
+      typeof value === 'string' ? (targets.get(value) ?? null) : null
+    );
+  }
+
+  if (method === 'POST' && path === '/varro/citation-paths') {
+    const request = asRecord(body);
+    const paths = request.paths;
+    if (!Array.isArray(paths)) throw new Error('Missing citation paths');
+    const delayMs = Number(new URLSearchParams(window.location.search).get('citationCheckDelayMs'));
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, 2000)));
+    const directory = typeof request.directory === 'string' ? request.directory : WORKSPACE_PATH;
+    // Scenario citations represent existing fixture files except explicitly missing references.
+    return paths.map((value) => {
+      if (typeof value !== 'string' || /(?:^|[/\\])missing-file\.ts$/.test(value)) return null;
+      const normalized = normalizePath(value);
+      if (isAbsolutePath(normalized)) return normalized;
+      return decodeURIComponent(new URL(normalized, `file://${directory}/`).pathname).replace(
+        /\/$/,
+        ''
+      );
+    });
+  }
 
   if (method === 'GET' && /^\/session\/[^/]+\/child-task-controls$/.test(path)) {
     const id = decodeURIComponent(path.split('/')[2]!);
@@ -5976,6 +6090,81 @@ async function handleApiRequest(
     return state.mcpStatus;
   }
 
+  const mcpAuth = path.match(/^\/mcp\/([^/]+)\/auth(?:\/(callback))?$/);
+  if (mcpAuth && method === 'DELETE') {
+    const name = decodeURIComponent(mcpAuth[1]!);
+    loggedOutMcpNames.add(name);
+    state.mcpStatus[name] = { status: 'needs_auth' };
+    return { success: true };
+  }
+  if (mcpAuth && method === 'POST') {
+    const name = decodeURIComponent(mcpAuth[1]!);
+    if (mcpAuth[2] === 'callback') {
+      if (asRecord(body)?.code !== 'test-oauth-code') throw new Error('Invalid test OAuth code');
+      state.mcpStatus[name] = { status: 'connected' };
+      loggedOutMcpNames.delete(name);
+      return state.mcpStatus[name];
+    }
+    return { authorizationUrl: 'https://mcp.example.com/authorize', oauthState: 'test-state' };
+  }
+
+  if (path === VARRO_API_ENDPOINTS.mcpConfigOpen && method === 'POST') return true;
+  if (path === VARRO_API_ENDPOINTS.mcpConfig && method === 'POST') {
+    const bodyRecord = asRecord(body);
+    if (
+      !state.mcpDefaults ||
+      typeof bodyRecord?.json !== 'string' ||
+      (bodyRecord.scope !== 'global' && bodyRecord.scope !== 'project')
+    )
+      throw new Error('Invalid MCP import fixture request');
+    const { servers } = parseMcpConfigSnippet(
+      bodyRecord.json,
+      typeof bodyRecord.name === 'string' ? bodyRecord.name : undefined
+    );
+    const target = state.mcpDefaults[bodyRecord.scope];
+    if (Object.keys(servers).some((name) => Object.hasOwn(target, name)))
+      throw new Error('MCP server is already configured in this scope');
+    for (const [name, server] of Object.entries(servers)) {
+      target[name] = server.disabled !== true && server.enabled !== false;
+      state.mcpStatus[name] = { status: 'disabled' };
+    }
+    state.mcpDefaults.effective = { ...state.mcpDefaults.global, ...state.mcpDefaults.project };
+    return structuredClone(state.mcpDefaults);
+  }
+  if (path === VARRO_API_ENDPOINTS.mcpDefaults) {
+    if (!state.mcpDefaults) {
+      const global = Object.fromEntries(
+        Object.entries(state.mcpStatus).map(([name, status]) => [
+          name,
+          status.status === 'connected',
+        ])
+      );
+      state.mcpDefaults = { global, project: {}, effective: { ...global }, editable: true };
+      const oauthServers = Object.keys(state.mcpStatus).filter(
+        (name) => name === 'atlassian' || name === 'figma'
+      );
+      if (oauthServers.length) state.mcpDefaults.oauthServers = oauthServers;
+    }
+    if (method === 'POST') {
+      const update = asRecord(body);
+      if (
+        typeof update?.name !== 'string' ||
+        !Object.hasOwn(state.mcpStatus, update.name) ||
+        (update.scope !== 'global' && update.scope !== 'project') ||
+        (typeof update.enabled !== 'boolean' && update.enabled !== null)
+      )
+        throw new Error('Invalid MCP default update');
+      if (
+        update.enabled === null ||
+        (update.scope === 'project' && state.mcpDefaults.global[update.name] === update.enabled)
+      )
+        delete state.mcpDefaults.project[update.name];
+      else state.mcpDefaults[update.scope][update.name] = update.enabled;
+      state.mcpDefaults.effective = { ...state.mcpDefaults.global, ...state.mcpDefaults.project };
+    }
+    return structuredClone(state.mcpDefaults);
+  }
+
   if (method === 'GET' && path === '/question') {
     return state.questions;
   }
@@ -6000,7 +6189,12 @@ async function handleApiRequest(
     const action = match?.[2];
     if (name && state.mcpStatus[name]) {
       if (action === 'connect') {
-        state.mcpStatus[name] = { status: 'connected' };
+        state.mcpStatus[name] = {
+          status:
+            loggedOutMcpNames.has(name) || state.mcpStatus[name]?.status === 'needs_auth'
+              ? 'needs_auth'
+              : 'connected',
+        };
       } else {
         state.mcpStatus[name] = { status: 'disabled' };
       }
@@ -6649,9 +6843,9 @@ function installBridge(state: ScenarioState) {
     const webviewMessage = message as WebviewMessage;
 
     switch (webviewMessage.type) {
-      case 'handy/request':
+      case 'dictation/request':
         dispatchToWebview({
-          type: 'handy/result',
+          type: 'dictation/result',
           payload: {
             requestId: webviewMessage.payload.requestId,
             available: false,
@@ -6687,8 +6881,18 @@ function installBridge(state: ScenarioState) {
           payload: buildInitialState(state).editorContext,
         });
         queueMicrotask(() => {
-          for (const msg of state.postReadyMessages) {
-            dispatchPostReadyMessage(msg);
+          const dispatch = () => {
+            for (const msg of state.postReadyMessages) {
+              dispatchPostReadyMessage(msg);
+            }
+          };
+          if (
+            state.scenarioName === 'dispose-during-start' &&
+            new URLSearchParams(window.location.search).has('holdStartup')
+          ) {
+            harnessWindow.__varroE2E!.releaseStartup = dispatch;
+          } else {
+            dispatch();
           }
         });
         return;
@@ -6829,7 +7033,7 @@ function installBridge(state: ScenarioState) {
           harnessWindow.__varroE2E?.openTargets?.push(openTarget);
         }
         if (typeof webviewMessage.payload.requestId === 'number') {
-          const status = webviewMessage.payload.path.endsWith('/missing-file.ts')
+          const status = /(?:^|[/\\])missing-file\.ts$/.test(webviewMessage.payload.path)
             ? 'unavailable'
             : 'opened';
           queueMicrotask(() => {
@@ -6969,6 +7173,10 @@ function setUpHarness() {
     },
     updateSessionStatus: (sessionId, status) => {
       scenarioState.sessionStatuses[sessionId] = status;
+    },
+    updateMcpStatus: (name, status) => {
+      scenarioState.mcpStatus[name] = status;
+      if (status.status === 'connected') loggedOutMcpNames.delete(name);
     },
     replayServerEvent: (event, projectedMessage) =>
       replayServerEvent(scenarioState, event, projectedMessage),

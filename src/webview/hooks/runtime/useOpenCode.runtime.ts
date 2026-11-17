@@ -53,6 +53,10 @@ export async function applySessionMcps(names: string[], sessionId?: string | nul
   await getCurrentOpenCodeRuntime().applySessionMcps(names, sessionId);
 }
 
+export async function refreshSessionMcps(sessionId?: string | null) {
+  await getCurrentOpenCodeRuntime().refreshSessionMcps(sessionId);
+}
+
 export async function selectSession(id: string, options?: SessionSelectionOptions) {
   await getCurrentOpenCodeRuntime().selectSession(id, options);
 }
@@ -83,8 +87,8 @@ export async function renameSession(id: string, title: string) {
   return getCurrentOpenCodeRuntime().renameSession(id, title);
 }
 
-export async function forkSession(id: string, messageID?: string) {
-  return getCurrentOpenCodeRuntime().forkSession(id, messageID);
+export async function forkSession(id: string, messageID?: string, options?: { select?: boolean }) {
+  return getCurrentOpenCodeRuntime().forkSession(id, messageID, options);
 }
 
 export async function deleteSession(id: string) {
@@ -211,12 +215,40 @@ export async function respondPermission(
   await getCurrentOpenCodeRuntime().respondPermission(sessionId, permissionId, response, options);
 }
 
-export async function alwaysAllowPermissionForProject(sessionId: string, permissionId: string) {
-  await getCurrentOpenCodeRuntime().alwaysAllowPermissionForProject(sessionId, permissionId);
+export async function alwaysAllowPermissionForProject(
+  sessionId: string,
+  permissionId: string,
+  patterns?: string[]
+) {
+  await getCurrentOpenCodeRuntime().alwaysAllowPermissionForProject(
+    sessionId,
+    permissionId,
+    patterns
+  );
 }
 
-export async function alwaysAllowPermissionForSession(sessionId: string, permissionId: string) {
-  await getCurrentOpenCodeRuntime().alwaysAllowPermissionForSession(sessionId, permissionId);
+export async function alwaysAllowPermissionForSession(
+  sessionId: string,
+  permissionId: string,
+  patterns?: string[]
+) {
+  await getCurrentOpenCodeRuntime().alwaysAllowPermissionForSession(
+    sessionId,
+    permissionId,
+    patterns
+  );
+}
+
+export async function alwaysAllowPermissionForGlobal(
+  sessionId: string,
+  permissionId: string,
+  patterns: string[]
+) {
+  await getCurrentOpenCodeRuntime().alwaysAllowPermissionForGlobal(
+    sessionId,
+    permissionId,
+    patterns
+  );
 }
 
 export async function respondQuestion(

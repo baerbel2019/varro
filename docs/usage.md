@@ -71,7 +71,7 @@ For WSL, open the project in a VS Code WSL window, then install and authenticate
 
 | Version | Minimum supported | Tested with this release | npm package |
 | --- | --- | --- | --- |
-| v2, recommended | 2.0.5 | 2.2.1 | `@opencode/cli` |
+| v2, recommended | 2.0.5 | 2.3.0 | `@opencode/cli` |
 | v1, still supported | 1.16.0 | 1.19.5 | `opencode-ai` |
 
 To keep using v1, retain your installation or run `npm install -g opencode-ai`. Set `varro.server.command` to its executable path. Setting it to `opencode` selects v1 only if that command resolves to a v1 installation. Varro detects the API automatically.
@@ -220,6 +220,8 @@ Use any of these flows to add more context.
 - With an editor selection, use the editor context menu entry that also appears as `Varro: Add to Context`, or press `Cmd+Shift+K` / `Ctrl+Shift+K`.
 - Select terminal text and choose `Varro: Add to Context` from the terminal context menu, or press `Cmd+Shift+K` / `Ctrl+Shift+K`.
 - Drag files or folders into the composer.
+
+  For reliable drag and drop in VS Code, hold `Shift` before moving the drag into the VS Code window and keep it held until you drop. Drops without Shift can work when they enter Varro directly, but VS Code can intercept them before Varro receives any drag events. Waiting or hovering longer does not reliably release that interception. The attachment button avoids this routing issue.
 - Use the attachment button beside the composer.
 - Paste an image or PDF into the composer.
 - Type `@path/to/file` to search files across all open roots. Multi-root results include their folder label.
@@ -227,6 +229,8 @@ Use any of these flows to add more context.
 - Type `&` to search recent root sessions and insert a stable `session:<id>` reference. Session references in the composer and rendered responses open the referenced session.
 
 Varro keeps at most five pasted images, with a maximum size of 5 MiB per image. In environments where other dropped items do not expose local paths, content-only drops are limited to 20 files, 10 MiB per file, and 50 MiB in total.
+
+External folder drops without local paths attach a temporary copy, preserving nested files and empty folders. Each copied folder is limited to 20 files and 200 total entries, with the same size limits as content-only file drops. Folders that exceed these limits are rejected rather than partially attached. Use the attachment picker to reference larger folders available to the extension host.
 
 ### PDF attachments
 
@@ -381,7 +385,37 @@ Commands offered in slash-command completion include:
 
 Custom OpenCode commands loaded from your local config also appear in the same completion list. Skill-sourced commands are browsed through `/skills` instead of being mixed into the main slash-command list.
 
-`/stats` scans the last 30 days of retained OpenCode history across projects and opens an untitled Markdown report. It reads and aggregates the local OpenCode SQLite database in a worker so large transcripts do not block the extension host. It groups token use and total completed assistant duration by provider and model. Use `/stats all` when you need the slower all-time scan. To keep extension-host work bounded, local reports stop with an error above 250,000 qualifying assistant messages or 4,096 provider/model routes. Deleted OpenCode history cannot be included.
+`/stats` scans the last 30 days of retained OpenCode history across projects and opens an untitled Markdown report. It reads and aggregates the local OpenCode SQLite database in a worker so large transcripts do not block the extension host. It groups token use and total completed assistant duration by provider and model. Use `/stats all` when you need the slower all-time scan, including preserved usage archives. All-time reports have no message-count cap and deduplicate prompt identities in temporary SQLite storage rather than retaining them in JavaScript sets. They can run for up to 10 minutes while rows advance and stop after 60 seconds without row progress. Recent reports keep their 30-second limit, 250,000 qualifying-message aggregation cap, and 1,000,000-message scan cap. Both modes stop above 4,096 provider/model routes. History deleted without a usage archive cannot be recovered.
+
+Both report modes abbreviate token counts with up to one decimal place, such as `1.3K`,
+`35.1M`, or `1B`. Prompt counts remain exact. Cache rate is
+`cache read / (input + cache read + cache write) × 100`; each model and the total row
+use summed token counts rather than averaged percentages. A dash means no input-side
+tokens were recorded. These columns use the existing usage aggregates without extra
+history or timing reads. Generation speed, TTFT, and request logs are not included.
+CSV exports retain exact token counts.
+
+V2 reports also include native usage records for side questions, cache warming,
+session titles, and compaction. Side questions and warming share the **Session
+generation** row. These rows are **Unattributed** because OpenCode does not record
+their provider/model identity. They contribute tokens and cache rates, not user
+prompt counts or completed assistant duration. Activity dates come from each usage
+event, even when the session's last-update timestamp has not changed.
+
+Default V2 servers do not retain event history. Varro also reconciles cumulative
+native session counters against message and retained-event usage. The remainder
+appears under **Undated session usage**, not in Today or the rolling windows. It
+is included in **All time**. This remainder can include side questions, warming,
+titles, compaction, or usage whose history is missing; its date, model, and request
+count cannot be recovered. `/stats` reconciles the sessions selected for its recent
+scan; use `/stats all` for older sessions too. Old assistant-only archives cannot
+recover counters they did not preserve.
+
+API-only V2 reports read finite, byte-bounded session logs as well as message
+histories. Missing, oversized, or malformed logs produce an auxiliary-usage warning
+instead of a silently complete total. These reports inspect retained sessions
+without a last-update date filter, still capped at 250 sessions; run reports on
+the server host for larger histories. They do not read an unrelated local database.
 
 Some commands only appear when they apply. `/ralph` appears before a session exists, `/export` appears after one exists, and `/init` appears when the workspace can be initialized.
 
@@ -389,7 +423,40 @@ Some commands only appear when they apply. `/ralph` appears before a session exi
 
 Use `Varro: Open Global AGENTS.md` to edit OpenCode's global instructions. `Varro: Initialize Project AGENTS.md` creates the project file when needed, opens it, and starts a new chat with `/init` ready to send using the current model.
 
+### Export all-time usage as CSV
+
+Run **Varro: Export All-Time Usage to CSV** from the Command Palette and choose a `.csv` destination. Cancelling the save dialog does not query history or write a file. The command reads the local OpenCode database and `opencode-stats.db` without starting the server or fetching full transcripts through the API. It refuses attach-only connections rather than exporting an unrelated local database. Run it on the OpenCode server host.
+
+Each row groups recorded usage by **UTC day, provider, model, reasoning setting, and usage source**. Imported V1/V2 copies and live/archive duplicates use the same newest-complete-snapshot selection as `/stats`. Assistant days use recorded completion time, with pause and original migration-time corrections; unfinished records fall back to creation time. Auxiliary days use the usage event's timestamp. The export reads large assistant envelopes without the interactive report's message-body-size filter.
+
+Columns:
+
+```text
+day_utc,provider,model,reasoning_setting,messages,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,reported_cost_usd,costed_messages,usage_source,auxiliary_requests,costed_auxiliary_requests
+```
+
+- `reasoning_setting` is the model variant recorded on that assistant message, not an inference from current model configuration. Missing values, including older archives that did not retain this field, are `unknown`. New cleanup archives preserve the recorded variant. `reasoning_tokens` is a separate token count.
+- `messages` counts contributing assistant message records, not user prompts or conversation turns. It is zero for auxiliary usage rows.
+- `usage_source` is `assistant`, `generate`, `title`, `compaction`, or `unrecorded`. `generate` includes side questions and cache warming when events were retained; the backend does not distinguish them. `unrecorded` is the reconciled remainder of native session counters and uses `unknown` as its day. Auxiliary rows use `unknown` for provider, model, and reasoning setting rather than inferring current session settings.
+- `auxiliary_requests` counts contributing native usage events. `costed_auxiliary_requests` counts those with recorded nonnegative costs. Both are zero for assistant rows and blank for `unrecorded` rows, where request counts are unknown.
+- `total_tokens` uses the reported total when present, otherwise the sum of the exported token components. Missing component counts follow `/stats` and contribute zero. Provider-specific accounting can differ from invoice totals.
+- `reported_cost_usd` sums only recorded nonnegative costs and is blank when none are known. `costed_messages` shows assistant-message coverage; `costed_auxiliary_requests` shows auxiliary coverage. Zero reported cost is distinct from an unknown cost. Prices are not recomputed from today's model catalog. Provider-side activity outside retained history is not included.
+
+For `unrecorded` rows, the cost is the remaining native session cost after known
+message and event costs. Request-coverage columns stay blank because the backend
+did not retain a request count. Floating-point subtraction noise is ignored.
+
+Output is UTF-8 with a BOM and CRLF line endings for spreadsheet compatibility. Commas, quotes, and line breaks in identifiers are quoted correctly. Formula-like identifiers are prefixed with an apostrophe so spreadsheets treat them as text. No prompts, responses, tool output, or attachment data are exported. Database and archive files, symlinks, and hard-linked aliases of database files are refused as save destinations.
+
+Aggregation runs in a cancellable database worker. Large CSV exports can run for up to ten minutes, but stop after 60 seconds without an increasing scanned-row count. Repeated phase messages do not extend that timeout. Progress reports every 10,000 records and periodically during slower scans; Cancel terminates the worker before a CSV is written. Existing destination files remain untouched on query failure or cancellation. Interactive usage reports and cleanup retain their separate 30-second deadlines.
+
+The CSV query extracts one compact scalar tuple per usage record and avoids unused prompt-parent lookups and full-body length scans. It does not load transcript bodies into the extension host. The export still stops with an error above one million scanned usage records, 100,000 daily rows, or 64 MB of CSV output. The live database and archives are read-only throughout export.
+
 ## Sessions
+
+**Varro: Delete Old OpenCode Sessions** removes history across all projects, oldest activity first, after preserving usage statistics. On V2 it includes dormant V1 records in the matching database, not just sessions visible through the API. The confirmation shows legacy counts and warns that V1 maintenance stops and restarts OpenCode, requires idle work, and needs other clients closed. Original timings needed by retained V2 usage are preserved first. Optional trimmed transcripts retain parent prompts and responses but omit subagent sessions. Progress uses stable stages; **Show details** opens diagnostics. See [session cleanup](session-cleanup.md) for retention, recovery, and attachment protection.
+
+About's **History age** uses the oldest remaining stored session, including retained V1 history, rather than the database file creation date. **Reusable space** shows freed SQLite pages that have not been returned to disk. Use **Varro: Compact OpenCode Database** or About's **Compact database...** button for separately confirmed offline compaction. It requires a local managed server, stops and restarts OpenCode, and checks available disk space before maintenance. Back up first and close other clients.
 
 Sessions from every open workspace root appear in one catalog. Use the folder filter above search to narrow the list; it defaults to `All folders`. Folder labels appear only when multiple roots are open. The default list is split into `Recent`, `Archive`, and `Recycle Bin`. `Archive` is a UI grouping for older ordinary sessions; opening it does not alter those sessions in OpenCode. Pinned and active-state sessions remain surfaced, while other sessions are ordered approximately by activity age.
 
@@ -465,6 +532,48 @@ External edits to project-level OpenCode configuration may not be detected. If a
 - In the Models view, right-click a model to assign it to project `small_model`, an available sub-agent, commit-message generation, or the auto-approve judge. Small-model and ordinary agent assignments update the project OpenCode configuration after checking for unsaved or concurrent changes. The vision-agent assignment writes to global OpenCode configuration and is available across workspaces; its menu entry is available even before the agent is configured. Only image-capable models can be assigned to vision. Commit-message and auto-approve assignments update their VS Code user settings instead. Model tags include inherited global assignments, with project overrides taking precedence. Open Models views refresh their tags when shared configuration changes.
 
 The Models view also shows whether a model exposes tools, variants, vision support, and a known context-window size. A lightning marker identifies GPT model names containing `Fast`; its tooltip notes that fast models can be more expensive.
+
+### Web search
+
+Web search lets the agent look up current information beyond its training data and cite sources. OpenCode supplies the search tool and providers; Varro displays their results and any requests for input.
+
+When Varro launches an OpenCode V2 server and no search preference exists, it supplies this temporary runtime default:
+
+```jsonc
+{
+  "websearch": {
+    "provider": "random",
+  },
+}
+```
+
+This avoids interrupting the first search with a provider-selection prompt and does not prefer a particular provider. In `random` mode, OpenCode selects an available provider and keeps it for that session. After an HTTP 429 rate-limit response, it retries with another available provider. If every provider is cooling down, the search fails.
+
+Varro preserves explicit search configuration and choices previously saved through OpenCode's selection prompt, including disabled search. The fallback does not edit your config files or saved preferences, change tool permissions, or make searches by itself. V1 and externally managed servers keep their existing behavior. Caller-provided `OPENCODE_CONFIG` also disables Varro's runtime injection.
+
+Search queries are sent to external search providers. Available providers, credentials, rate limits, and possible charges depend on your OpenCode setup. Selecting `random` does not provision accounts or guarantee free searches. See [OpenCode's web search documentation](https://opencode.ai/docs/websearch) for provider details.
+
+To choose a provider explicitly, add this to your global `~/.config/opencode/opencode.jsonc` or project `opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "websearch": {
+    "provider": "tavily",
+  },
+}
+```
+
+To disable the built-in web search tool instead:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "websearch": false,
+}
+```
+
+Global config refresh rechecks the fallback before reloading OpenCode. For external project config edits that do not take effect, use `Varro: Restart Server` after active work finishes. Attached servers must be configured on their host.
 
 ### Configure Primary Agents
 
@@ -855,6 +964,7 @@ Editable user messages expose an edit action. Sending the replacement removes th
 - `Varro: Open Settings`
 - `Varro: Show File Diffs` or `Varro: Hide File Diffs`
 - `Varro: Usage Stats`
+- `Varro: Export All-Time Usage to CSV`
 - `Varro: Abort Session`
 - `Varro: Previous Session`
 - `Varro: Next Session`
@@ -907,7 +1017,7 @@ There are also deprecated debug-only settings used for development and recovery 
 ## Troubleshooting
 
 - OpenCode CLI missing: install v2 with `npm install -g @opencode/cli` on macOS, Linux, or WSL, or download the native Windows CLI from the [v2 install page](https://opencode.ai/v2/docs/). V1 remains available with `npm install -g opencode-ai`.
-- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.5` and v2 `2.2.1`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
+- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.5` and v2 `2.3.0`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
 - OpenCode v2 authentication: Varro captures managed-server credentials automatically and redacts them from output. Existing local services use their registered credentials. An externally managed server can also use `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` from the extension host's environment.
 - OpenCode v2 session settings: Varro stores mutable session annotations locally because the released v2 API cannot update session metadata. Session sharing is unavailable through this API, so its menu action is disabled. Existing v1-format configuration remains supported.
 - CLI not on `PATH`: set `varro.server.command` to the executable path.

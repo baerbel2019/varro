@@ -18,7 +18,7 @@ import { VALID_WEBVIEW_MESSAGES } from './util/webview-message.test-support';
 
 function createCallbacks(): MessageRouterCallbacks {
   return {
-    requestHandy: vi.fn(() => Promise.resolve()),
+    requestDictation: vi.fn(() => Promise.resolve()),
     ready: vi.fn(() => Promise.resolve()),
     updateCommandState: vi.fn(),
     acknowledgeSessionSeen: vi.fn(),
@@ -171,7 +171,7 @@ describe('MessageRouter', () => {
       payload: { canAbort: true, canSwitchSessions: false, model },
     });
 
-    expect(cb.updateCommandState).toHaveBeenCalledWith(true, false, model, undefined);
+    expect(cb.updateCommandState).toHaveBeenCalledWith(true, false, model, undefined, undefined);
   });
 
   it('dispatches session read acknowledgements', async () => {
@@ -280,6 +280,14 @@ describe('MessageRouter', () => {
     expect(cb.openFolder).toHaveBeenCalledOnce();
   });
 
+  it('dispatches a session-scoped folder opening without discarding its target', async () => {
+    const cb = createCallbacks();
+    const router = new MessageRouter(cb);
+    const payload = { sessionId: 'session-1', directory: '/repo' };
+    await router.handleMessage({ type: 'vscode/open-folder', payload });
+    expect(cb.openFolder).toHaveBeenCalledWith(payload);
+  });
+
   it('dispatches webview/reload', async () => {
     const cb = createCallbacks();
     const router = new MessageRouter(cb);
@@ -336,6 +344,15 @@ describe('MessageRouter', () => {
     const files = [{ name: 'a.ts', content: 'hi', size: 2 }];
     await router.handleMessage({ type: 'files/drop-content', payload: { files } });
     expect(cb.handleDroppedContent).toHaveBeenCalledWith(files);
+  });
+
+  it('preserves copied folder metadata when dispatching dropped content', async () => {
+    const cb = createCallbacks();
+    const router = new MessageRouter(cb);
+    const files = [{ name: 'nested/a.ts', content: 'QQ==', size: 1 }];
+    const directory = { name: 'external', directories: ['nested', 'empty'] };
+    await router.handleMessage({ type: 'files/drop-content', payload: { files, directory } });
+    expect(cb.handleDroppedContent).toHaveBeenCalledWith(files, directory);
   });
 
   it('preserves sent attachment ownership through parsing and dispatch', async () => {
@@ -480,8 +497,8 @@ type DispatchExpectation = {
  * that no other callback fired.
  */
 const DISPATCH_EXPECTATIONS = {
-  'handy/request': [
-    { callback: 'requestHandy', args: [{ requestId: 'handy-1', action: 'start' }] },
+  'dictation/request': [
+    { callback: 'requestDictation', args: [{ requestId: 'dictation-1', action: 'start' }] },
   ],
   ready: [{ callback: 'ready', args: [undefined] }],
   'context/request': [{ callback: 'requestContext', args: [] }],
@@ -505,7 +522,13 @@ const DISPATCH_EXPECTATIONS = {
   'commands/state': [
     {
       callback: 'updateCommandState',
-      args: [true, false, { providerID: 'anthropic', modelID: 'claude-opus-5' }, 'session-1'],
+      args: [
+        true,
+        false,
+        { providerID: 'anthropic', modelID: 'claude-opus-5' },
+        'session-1',
+        undefined,
+      ],
     },
   ],
   'session/seen': [{ callback: 'acknowledgeSessionSeen', args: ['session-1'] }],

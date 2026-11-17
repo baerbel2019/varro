@@ -61,6 +61,18 @@ vi.mock('./chat/SessionActionFeedback', () => ({
   showSessionActionFeedback: showSessionActionFeedbackMock,
 }));
 vi.mock('mermaid', () => ({ default: mermaidMock }));
+// These existing tokenizer/action tests assume the cited files are valid.
+// The real asynchronous validation is covered in MarkdownRenderer.citations.test.tsx.
+vi.mock('./markdown-citation-links', () => ({
+  MarkdownCitationLinks: class {
+    hydrate(root?: HTMLElement) {
+      for (const anchor of root?.querySelectorAll<HTMLElement>('a[data-file]') ?? []) {
+        anchor.dataset.fileValidated = 'true';
+      }
+    }
+    dispose() {}
+  },
+}));
 
 beforeAll(installHighlightWorker);
 
@@ -101,6 +113,7 @@ function withoutLinkTooltipAttributes(html: string) {
   for (const anchor of root.querySelectorAll('a')) {
     anchor.removeAttribute('title');
     anchor.removeAttribute('aria-describedby');
+    anchor.removeAttribute('data-file-validated');
   }
   return root.innerHTML;
 }
@@ -260,7 +273,7 @@ describe('MarkdownRenderer', () => {
   });
 
   it.each([false, true])(
-    'preserves compact file links across lightweight transitions starting at %s',
+    'preserves full inferred paths across lightweight transitions starting at %s',
     async (initialLightweight) => {
       const [lightweight, setLightweight] = createSignal(initialLightweight);
       cleanup = render(
@@ -281,8 +294,10 @@ describe('MarkdownRenderer', () => {
         await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
         expect(
           [...container!.querySelectorAll('a.file-path-link')].map((link) => link.textContent)
-        ).toEqual(['MarkdownRenderer.tsx (line 100-120)', 'MessageList.tsx (line 200-220)']);
-        expect(container!.textContent).not.toContain('/repo/src/webview/components/');
+        ).toEqual([
+          '/repo/src/webview/components/MarkdownRenderer.tsx:100-120',
+          '/repo/src/webview/components/MessageList.tsx:200-220',
+        ]);
       }
     }
   );
@@ -1861,8 +1876,9 @@ $$`,
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open',
       payload: {
-        path: '/repo/src/webview/App.tsx',
+        path: './src/webview/App.tsx',
         kind: 'file',
+        exact: true,
         line: undefined,
         requestId: expect.any(Number),
       },
@@ -1879,12 +1895,31 @@ $$`,
 
   it.each([
     ['/other/dap/dashboard.sql#L68', '/other/dap/dashboard.sql', 68],
-    ['./src/query.py#L91', '/repo/src/query.py', 91],
-    ['./src/query.py#L91-L105', '/repo/src/query.py', 91],
-    ['./src/query.py#L91-105', '/repo/src/query.py', 91],
+    [
+      '/repo/reports/Varro%20startup%20performance.md#L10-L12',
+      '/repo/reports/Varro startup performance.md',
+      10,
+      12,
+    ],
+    [
+      './reports/Varro%20startup%20performance.md#L10-L12',
+      './reports/Varro startup performance.md',
+      10,
+      12,
+    ],
+    ['./reports/literal%2520name.md#L10', './reports/literal%20name.md', 10],
+    ['./reports/caf%C3%A9.md#L10', './reports/café.md', 10],
+    ['./reports/notes%23L12.md#L10', './reports/notes#L12.md', 10],
+    ['./reports/literal%3A12#L10', './reports/literal:12', 10],
+    ['./reports/100%.md#L10', './reports/100%.md', 10],
+    ['file:///repo/reports/literal%2520name.md#L10', '/repo/reports/literal%20name.md', 10],
+    ['C:/repo/reports/Varro%20startup.md#L10', 'C:/repo/reports/Varro startup.md', 10],
+    ['./src/query.py#L91', './src/query.py', 91],
+    ['./src/query.py#L91-L105', './src/query.py', 91, 105],
+    ['./src/query.py#L91-105', './src/query.py', 91, 105],
     ['C:/work/query.py#L91', 'C:/work/query.py', 91],
     ['file:///other/dashboard.sql#L68', '/other/dashboard.sql', 68],
-  ])('opens the file and line in Markdown target %s', (href, path, line) => {
+  ])('opens the file and line in Markdown target %s', (href, path, line, endLine?: number) => {
     const send = vi.fn();
     window.__sendToExtension = send;
     setState('editorContext', {
@@ -1903,16 +1938,20 @@ $$`,
     );
 
     const link = container?.querySelector<HTMLAnchorElement>('a.file-path-link');
-    expect(link?.dataset.file).toBe(JSON.stringify({ path, line }));
-    if (!path.startsWith('C:')) expect(link?.getAttribute('href')).toBe(`${path}:${line}`);
+    expect(link?.dataset.file).toBe(JSON.stringify({ path, line, endLine }));
+    const absolutePath = path.replace(/^\.\//, '/repo/');
+    if (!path.startsWith('C:'))
+      expect(link?.getAttribute('href')).toBe(
+        `${absolutePath}:${line}${endLine ? `-${endLine}` : ''}`
+      );
     expect(JSON.parse(link?.getAttribute('data-vscode-context') ?? '{}')).toMatchObject({
-      varroFilePath: path,
+      varroFilePath: absolutePath,
       webviewSection: 'varroFileLink',
     });
     dispatchAnchorClick(link);
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open',
-      payload: { path, line, kind: 'file', requestId: expect.any(Number) },
+      payload: { path, line, endLine, kind: 'file', exact: true, requestId: expect.any(Number) },
     });
     const requestId = send.mock.calls[0]![0].payload.requestId;
     window.dispatchEvent(
@@ -1920,6 +1959,39 @@ $$`,
         data: { type: 'vscode/open-result', payload: { requestId, status: 'opened' } },
       })
     );
+  });
+
+  it.each([
+    '[startup performance report](/repo/reports/Varro%20startup%20performance.md)',
+    '<a href="/repo/reports/Varro%20startup%20performance.md">startup performance report</a>',
+    '[startup performance report](file:///repo/reports/Varro%20startup%20performance.md)',
+  ])('decodes report link %s and consumes its native host click', (content) => {
+    const send = vi.fn();
+    const hostClick = vi.fn();
+    window.__sendToExtension = send;
+    cleanup = render(() => MarkdownRenderer({ content }), container!);
+    const link = container!.querySelector<HTMLAnchorElement>('a')!;
+    const path = '/repo/reports/Varro startup performance.md';
+    expect(JSON.parse(link.getAttribute('data-vscode-context') ?? '{}')).toMatchObject({
+      varroFilePath: path,
+    });
+    document.addEventListener('click', hostClick);
+    try {
+      dispatchAnchorClick(link);
+      expect(send).toHaveBeenCalledWith({
+        type: 'vscode/open',
+        payload: { path, kind: 'file', exact: true, requestId: expect.any(Number) },
+      });
+      expect(hostClick).not.toHaveBeenCalled();
+      const requestId = send.mock.lastCall![0].payload.requestId;
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { type: 'vscode/open-result', payload: { requestId, status: 'opened' } },
+        })
+      );
+    } finally {
+      document.removeEventListener('click', hostClick);
+    }
   });
 
   it.each([false, true])(
@@ -1983,7 +2055,7 @@ $$`,
         dispatchAnchorClick(link);
         expect(send).toHaveBeenLastCalledWith({
           type: 'vscode/open',
-          payload: { path, line, kind: 'file', requestId: expect.any(Number) },
+          payload: { path, line, kind: 'file', exact: true, requestId: expect.any(Number) },
         });
         const requestId = send.mock.lastCall![0].payload.requestId;
         window.dispatchEvent(
@@ -2006,7 +2078,14 @@ $$`,
     dispatchAnchorClick(container?.querySelector<HTMLAnchorElement>('a'));
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open',
-      payload: { path: '/other/query.py', line: 91, kind: 'file', requestId: expect.any(Number) },
+      payload: {
+        path: '/other/query.py',
+        line: 91,
+        endLine: 105,
+        kind: 'file',
+        exact: true,
+        requestId: expect.any(Number),
+      },
     });
     const requestId = send.mock.calls[0]![0].payload.requestId;
     window.dispatchEvent(
@@ -2056,7 +2135,13 @@ $$`,
     dispatchAnchorClick(link);
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open',
-      payload: { path: '/repo/go.mod', line: 3, kind: 'file', requestId: expect.any(Number) },
+      payload: {
+        path: 'go.mod',
+        line: 3,
+        kind: 'file',
+        exact: true,
+        requestId: expect.any(Number),
+      },
     });
     // SAFETY: The fixture provides the { payload: { requestId: number } } fields read by this statement.
     const requestId = (send.mock.calls[0]![0] as { payload: { requestId: number } }).payload
@@ -2064,6 +2149,212 @@ $$`,
     window.dispatchEvent(
       new MessageEvent('message', {
         data: { type: 'vscode/open-result', payload: { requestId, status: 'opened' } },
+      })
+    );
+  });
+
+  it.each([
+    'perceiver_lang_io.py (line 710-744)',
+    '`models/perceiver_lang_io.py:710-744`',
+    '[Source](models/perceiver_lang_io.py#L710-L744)',
+    '<a href="models/perceiver_lang_io.py#L710-L744">Source</a>',
+  ])('preserves the relative reference and range in %s', (content) => {
+    const send = vi.fn();
+    window.__sendToExtension = send;
+    setState('editorContext', 'workspacePath', '/other-workspace');
+    setState('activeSessionId', 'different-session');
+    setState('sessions', [
+      {
+        id: 'owner-session',
+        projectID: 'project',
+        directory: '/repo/packages/app',
+        title: 'Nested session',
+        version: '1',
+        time: { created: 0, updated: 0 },
+      },
+    ]);
+    cleanup = render(
+      () => MarkdownRenderer({ content, sessionID: 'owner-session', cacheByContent: true }),
+      container!
+    );
+    const link = container!.querySelector<HTMLAnchorElement>('a')!;
+    expect(JSON.parse(link.getAttribute('data-vscode-context') ?? '{}').varroFilePath).toBe(
+      content.startsWith('perceiver')
+        ? '/repo/packages/app/perceiver_lang_io.py'
+        : '/repo/packages/app/models/perceiver_lang_io.py'
+    );
+    dispatchAnchorClick(container?.querySelector<HTMLAnchorElement>('a'));
+    expect(send).toHaveBeenCalledWith({
+      type: 'vscode/open',
+      payload: {
+        path: content.startsWith('perceiver')
+          ? 'perceiver_lang_io.py'
+          : 'models/perceiver_lang_io.py',
+        line: 710,
+        endLine: 744,
+        kind: 'file',
+        exact: true,
+        sessionID: 'owner-session',
+        directory: '/repo/packages/app',
+        requestId: expect.any(Number),
+      },
+    });
+    const requestId = send.mock.lastCall![0].payload.requestId;
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { type: 'vscode/open-result', payload: { requestId, status: 'opened' } },
+      })
+    );
+  });
+
+  it.each(['/repo', '/repo/packages/app', '/worktrees/feature', '/scratch/no-project'])(
+    'uses the supplied modal session directory %s without relying on the session list',
+    (directory) => {
+      const send = vi.fn();
+      window.__sendToExtension = send;
+      setState('activeSessionId', 'other');
+      setState('editorContext', 'workspacePath', '/other');
+      cleanup = render(
+        () =>
+          MarkdownRenderer({
+            content: '`app.ts`',
+            sessionID: 'modal-session',
+            directory,
+          }),
+        container!
+      );
+      dispatchAnchorClick(container?.querySelector<HTMLAnchorElement>('a'));
+      expect(send).toHaveBeenCalledWith({
+        type: 'vscode/open',
+        payload: {
+          path: 'app.ts',
+          sessionID: 'modal-session',
+          directory,
+          kind: 'file',
+          exact: true,
+          requestId: expect.any(Number),
+        },
+      });
+      const requestId = send.mock.lastCall![0].payload.requestId;
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { type: 'vscode/open-result', payload: { requestId, status: 'opened' } },
+        })
+      );
+    }
+  );
+
+  it.each([
+    '`src/app.ts:10-12`',
+    'src/app.ts (line 10-12)',
+    '[Source](src/app.ts#L10-L12)',
+    '<a href="src/app.ts#L10-L12">Source</a>',
+  ])('scopes cached link metadata to each session directory for %s', async (content) => {
+    vi.useFakeTimers();
+    const sanitize = vi.spyOn(DOMPurify, 'sanitize');
+    setState('activeSessionId', 'other');
+    setState('editorContext', 'workspacePath', '/other-workspace');
+    for (const directory of ['/repo/packages/app', '/worktrees/feature', '/repo/packages/app']) {
+      cleanup = render(
+        () =>
+          MarkdownRenderer({
+            content,
+            sessionID: 'owner-session',
+            directory,
+            cacheByContent: true,
+          }),
+        container!
+      );
+      const link = container!.querySelector<HTMLAnchorElement>('a')!;
+      expect(JSON.parse(link.getAttribute('data-vscode-context') ?? '{}').varroFilePath).toBe(
+        `${directory}/src/app.ts`
+      );
+      if (link.classList.contains('file-path-link')) {
+        expect(link.getAttribute('href')).toBe(`${directory}/src/app.ts:10-12`);
+        link.dispatchEvent(new MouseEvent('mouseenter'));
+        await vi.advanceTimersByTimeAsync(400);
+        expect(document.querySelector('[role="tooltip"]')?.textContent).toBe(
+          `${directory}/src/app.ts (line 10-12)`
+        );
+        link.dispatchEvent(new MouseEvent('mouseleave'));
+      }
+      cleanup();
+      cleanup = undefined;
+    }
+    expect(sanitize).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves absolute link metadata when a session directory is supplied', () => {
+    cleanup = render(
+      () =>
+        MarkdownRenderer({
+          content: '`/shared/src/app.ts:10-12`',
+          sessionID: 'owner-session',
+          directory: '/repo/packages/app',
+          cacheByContent: true,
+        }),
+      container!
+    );
+    const link = container!.querySelector<HTMLAnchorElement>('a')!;
+    expect(link.getAttribute('href')).toBe('/shared/src/app.ts:10-12');
+    expect(JSON.parse(link.getAttribute('data-vscode-context') ?? '{}').varroFilePath).toBe(
+      '/shared/src/app.ts'
+    );
+  });
+
+  it('updates stable and tail link metadata when the owning session directory changes', async () => {
+    const [directory, setDirectory] = createSignal('/repo/packages/app');
+    const content = '`src/stable.ts`\n\n`src/tail.ts`';
+    cleanup = render(
+      () =>
+        createComponent(MarkdownRenderer, {
+          content,
+          sessionID: 'owner-session',
+          get directory() {
+            return directory();
+          },
+        }),
+      container!
+    );
+    const linkPaths = () =>
+      Array.from(container!.querySelectorAll('a')).map(
+        (link) => JSON.parse(link.getAttribute('data-vscode-context') ?? '{}').varroFilePath
+      );
+    expect(linkPaths()).toEqual([
+      '/repo/packages/app/src/stable.ts',
+      '/repo/packages/app/src/tail.ts',
+    ]);
+    setDirectory('/worktrees/feature');
+    await vi.waitFor(() =>
+      expect(linkPaths()).toEqual([
+        '/worktrees/feature/src/stable.ts',
+        '/worktrees/feature/src/tail.ts',
+      ])
+    );
+  });
+
+  it('keeps an ambiguous link clickable after cancelling the file picker', async () => {
+    const send = vi.fn();
+    window.__sendToExtension = send;
+    cleanup = render(() => MarkdownRenderer({ content: '`shared.ts`' }), container!);
+    const link = container?.querySelector<HTMLAnchorElement>('a.file-path-link');
+    dispatchAnchorClick(link);
+    const requestId = send.mock.lastCall![0].payload.requestId;
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { type: 'vscode/open-result', payload: { requestId, status: 'cancelled' } },
+      })
+    );
+    await Promise.resolve();
+    expect(link?.classList.contains('is-unavailable')).toBe(false);
+    expect(link?.hasAttribute('href')).toBe(true);
+    expect(showSessionActionFeedbackMock).not.toHaveBeenCalled();
+    dispatchAnchorClick(link);
+    expect(send).toHaveBeenCalledTimes(2);
+    const retryId = send.mock.lastCall![0].payload.requestId;
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { type: 'vscode/open-result', payload: { requestId: retryId, status: 'opened' } },
       })
     );
   });
@@ -2365,13 +2656,113 @@ $$`,
 
     const link = container?.querySelector('a.file-path-link');
     expect(link?.getAttribute('href')).toBe('/repo/src/webview/App.tsx');
-    expect(link?.getAttribute('data-file')).toContain('/repo/src/webview/App.tsx');
+    expect(link?.getAttribute('data-file')).toBe(JSON.stringify({ path: './src/webview/App.tsx' }));
     expect(JSON.parse(link?.getAttribute('data-vscode-context') ?? '{}')).toEqual({
       preventDefaultContextMenuItems: true,
       varroLinkText: 'Open file',
       webviewSection: 'varroFileLink',
       varroFilePath: '/repo/src/webview/App.tsx',
     });
+  });
+
+  it.each([
+    'A link opening `/repo/packages/app/src/app.ts` can therefore copy and display `/other-workspace/src/app.ts`.',
+    '- A link opening `/repo/packages/app/src/app.ts` can therefore copy and display `/other-workspace/src/app.ts`.',
+    'For example, `/repo/packages/app/src/app.ts` and `/other-workspace/src/app.ts` are different paths.',
+    'The reference `/repo/packages/app/src/app.ts` becomes `/other-workspace/src/app.ts`.',
+    '| Example |\n| --- |\n| Suppose `/repo/packages/app/src/app.ts` resolves to `/other-workspace/src/app.ts`. |',
+  ])('preserves illustrative inline-code paths in %s', (content) => {
+    container!.innerHTML = __parseMarkdownForTests(content, { cacheByContent: true });
+
+    expect([...container!.querySelectorAll('code')].map((code) => code.textContent)).toEqual([
+      '/repo/packages/app/src/app.ts',
+      '/other-workspace/src/app.ts',
+    ]);
+    expect(container!.querySelector('a.file-path-link')).toBeNull();
+    expect(container!.querySelector('[data-inferred-code-path]')).toBeNull();
+  });
+
+  it('limits illustrative prose to its block and preserves explicit Markdown links', () => {
+    container!.innerHTML = __parseMarkdownForTests(
+      'For example, `/repo/packages/app/src/app.ts` could display `/other-workspace/src/app.ts`. ' +
+        'See [`src/app.ts`](src/app.ts#L10-L12).\n\n' +
+        'Updated `src/examples/app.ts` and `src/other/app.ts`.',
+      { cacheByContent: true }
+    );
+
+    const links = [...container!.querySelectorAll<HTMLAnchorElement>('a.file-path-link')];
+    expect(links.map((link) => link.textContent)).toEqual([
+      'app.ts (line 10-12)',
+      'src/examples/app.ts',
+      'src/other/app.ts',
+    ]);
+    expect(links.map((link) => JSON.parse(link.dataset.file!))).toEqual([
+      { path: 'src/app.ts', line: 10, endLine: 12 },
+      { path: 'src/examples/app.ts' },
+      { path: 'src/other/app.ts' },
+    ]);
+    expect(container!.querySelectorAll('code')).toHaveLength(2);
+  });
+
+  it('strips inline code backticks from symbol labels of file links', () => {
+    container!.innerHTML = __parseMarkdownForTests(
+      '- [`preprocess()`](src/utils.py:12): normalizes inputs',
+      { cacheByContent: true }
+    );
+
+    const link = container!.querySelector<HTMLAnchorElement>('a.file-path-link');
+    expect(link?.textContent).toBe('preprocess()');
+    expect(JSON.parse(link!.dataset.file!)).toEqual({ path: 'src/utils.py', line: 12 });
+  });
+
+  it('keeps the screenshot example filename as code during streaming and after completion', async () => {
+    const [content, setContent] = createSignal(
+      'The new regressions pass, including the two `app.ts` example paths'
+    );
+    const [streaming, setStreaming] = createSignal(true);
+    cleanup = render(
+      () =>
+        createComponent(MarkdownRenderer, {
+          get content() {
+            return content();
+          },
+          get forceStreaming() {
+            return streaming();
+          },
+        }),
+      container!
+    );
+
+    for (const complete of [false, true]) {
+      if (complete) {
+        setContent(
+          'The new regressions pass, including the two `app.ts` example paths and ordinary references that should stay clickable. ' +
+            'All 341 renderer tests pass, and both type checks are clean.'
+        );
+        setStreaming(false);
+      }
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      expect(container!.querySelector('code')?.textContent).toBe('app.ts');
+      expect(container!.querySelector('a.file-path-link')).toBeNull();
+    }
+  });
+
+  it.each([
+    '`src/first/app.ts:10-12` and `src/second/app.ts:20-22`',
+    'You can open `src/first/app.ts:10-12` and `src/second/app.ts:20-22`.',
+    'src/first/app.ts:10-12 and src/second/app.ts:20-22',
+  ])('retains full inferred path text and ranges in %s', (content) => {
+    container!.innerHTML = __parseMarkdownForTests(content, { cacheByContent: true });
+
+    const links = [...container!.querySelectorAll<HTMLAnchorElement>('a.file-path-link')];
+    expect(links.map((link) => link.textContent)).toEqual([
+      'src/first/app.ts:10-12',
+      'src/second/app.ts:20-22',
+    ]);
+    expect(links.map((link) => JSON.parse(link.dataset.file!))).toEqual([
+      { path: 'src/first/app.ts', line: 10, endLine: 12 },
+      { path: 'src/second/app.ts', line: 20, endLine: 22 },
+    ]);
   });
 
   it('links file-only inline code but not ordinary inline or fenced code', async () => {
@@ -2396,12 +2787,12 @@ $$`,
 
     const link = container?.querySelector<HTMLAnchorElement>('a.file-path-link');
     expect(container?.querySelectorAll('a.file-path-link')).toHaveLength(1);
-    expect(link?.textContent).toBe('protocol.ts');
+    expect(link?.textContent).toBe('src/shared/protocol.ts');
     expect(link?.querySelector('code')).toBeNull();
     expect(link?.getAttribute('href')).toBe('/repo/src/shared/protocol.ts');
     expect(link?.querySelector('.file-path-icon')).toBeInstanceOf(HTMLImageElement);
     expect(link?.firstElementChild?.classList).toContain('link-leading-content');
-    expect(link?.querySelector('.link-leading-label')?.textContent).toBe('protocol.ts');
+    expect(link?.querySelector('.link-leading-label')?.textContent).toBe('src/shared/protocol.ts');
     expect(container?.querySelector('pre a.file-path-link')).toBeNull();
     expect(container?.textContent).toContain('spotlight');
 
@@ -2409,9 +2800,10 @@ $$`,
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open',
       payload: {
-        path: '/repo/src/shared/protocol.ts',
+        path: 'src/shared/protocol.ts',
         line: undefined,
         kind: 'file',
+        exact: true,
         requestId: expect.any(Number),
       },
     });
@@ -2453,17 +2845,17 @@ $$`,
   it.each([
     {
       content: '`src/shared/protocol.ts`',
-      label: 'protocol.ts',
+      label: 'src/shared/protocol.ts',
       path: '/repo/src/shared/protocol.ts',
     },
     {
       content: 'Review src/shared/protocol.ts.',
-      label: 'protocol.ts',
+      label: 'src/shared/protocol.ts',
       path: '/repo/src/shared/protocol.ts',
     },
     {
       content: '`src/shared/protocol.ts:12-15`',
-      label: 'protocol.ts (line 12-15)',
+      label: 'src/shared/protocol.ts:12-15',
       path: '/repo/src/shared/protocol.ts',
     },
     {
@@ -2473,7 +2865,7 @@ $$`,
     },
     {
       content: '`C:\\repo\\src\\App.tsx:12`',
-      label: 'App.tsx (line 12)',
+      label: 'C:\\repo\\src\\App.tsx:12',
       path: 'C:/repo/src/App.tsx',
     },
     { content: '[Project folder](src)', label: 'Project folder', path: '/repo/src' },
@@ -2535,7 +2927,7 @@ $$`,
     expect(metadata?.getAttribute('aria-label')).toBe('docs/guide.md');
     const links = root.querySelectorAll<HTMLAnchorElement>('a.file-path-link');
     expect(links).toHaveLength(1);
-    expect(links[0]?.textContent).toBe('protocol.ts');
+    expect(links[0]?.textContent).toBe('src/shared/protocol.ts');
     expect(links[0]?.title).toBe('/repo/src/shared/protocol.ts');
   });
 
@@ -2994,7 +3386,7 @@ $$`,
 
     expect(stableLinks).toHaveLength(0);
     expect(tailLinks).toHaveLength(1);
-    expect(tailLinks?.[0]?.textContent).toBe('App.tsx');
+    expect(tailLinks?.[0]?.textContent).toBe('./src/webview/App.tsx');
     expect(tailLinks?.[0]?.getAttribute('href')).toBe('/repo/src/webview/App.tsx');
   });
 
@@ -3034,11 +3426,11 @@ $$`,
     await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
 
     const link = container?.querySelector<HTMLAnchorElement>('a.file-path-link');
-    expect(link?.textContent).toBe('MarkdownRenderer.test.ts');
+    expect(link?.textContent).toBe('src/webview/components/MarkdownRenderer.test.ts');
     expect(link?.getAttribute('href')).toBe(
       '/repo/src/webview/components/MarkdownRenderer.test.ts'
     );
-    expect(container?.textContent).not.toContain('src/webview/components/');
+    expect(container?.textContent).toContain('src/webview/components/MarkdownRenderer.test.ts');
     expect(container?.querySelector('.streaming-markdown-pending')).toBeNull();
   });
 
@@ -3383,7 +3775,7 @@ $$`,
       await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
 
       const link = container?.querySelector<HTMLAnchorElement>('a.file-path-link');
-      expect(link?.textContent).toBe('FileTypeIcon.tsx');
+      expect(link?.textContent).toBe(testCase.complete);
       expect(link?.getAttribute('href')).toBe(testCase.title);
       expect(container?.querySelector('.streaming-markdown-pending')).toBeNull();
 
@@ -3458,7 +3850,7 @@ $$`,
 
     const links = container?.querySelectorAll<HTMLAnchorElement>('a.file-path-link');
     expect(links).toHaveLength(2);
-    expect(links?.[0]?.textContent).toBe('App.tsx');
+    expect(links?.[0]?.textContent).toBe('C:\\work\\project\\App.tsx');
     expect(links?.[0]?.dataset.file).toBe(JSON.stringify({ path: 'C:/work/project/App.tsx' }));
     expect(links?.[1]?.textContent).toBe('open it');
     expect(links?.[1]?.dataset.file).toBe(JSON.stringify({ path: 'C:/work/project/App.tsx' }));
@@ -3516,17 +3908,17 @@ $$`,
     await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
     const streamingLinks = container?.querySelectorAll<HTMLAnchorElement>('a.file-path-link');
     expect(streamingLinks).toHaveLength(2);
-    expect(streamingLinks?.[0]?.textContent).toBe('protocol.ts');
-    expect(streamingLinks?.[1]?.textContent).toBe('onboarding-verification.md');
+    expect(streamingLinks?.[0]?.textContent).toBe('src/shared/protocol.ts');
+    expect(streamingLinks?.[1]?.textContent).toBe('docs/onboarding-verification.md');
 
     setCompleted(true);
     await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
 
     const links = container?.querySelectorAll<HTMLAnchorElement>('a.file-path-link');
     expect(links).toHaveLength(2);
-    expect(links?.[0]?.textContent).toBe('protocol.ts');
+    expect(links?.[0]?.textContent).toBe('src/shared/protocol.ts');
     expect(links?.[0]?.getAttribute('href')).toBe('/repo/src/shared/protocol.ts');
-    expect(links?.[1]?.textContent).toBe('onboarding-verification.md');
+    expect(links?.[1]?.textContent).toBe('docs/onboarding-verification.md');
     expect(links?.[1]?.getAttribute('href')).toBe('/repo/docs/onboarding-verification.md');
     expect(container?.querySelectorAll('.file-path-icon')).toHaveLength(2);
     expect(links?.[0]).toBe(streamingLinks?.[0]);
@@ -3600,7 +3992,7 @@ $$`,
     const stableParagraph = stableSegment?.firstElementChild;
     const streamingLink = container?.querySelector('a.file-path-link');
     expect(stableParagraph?.textContent).toBe('Stable paragraph.');
-    expect(streamingLink?.textContent).toBe('protocol.ts');
+    expect(streamingLink?.textContent).toBe('src/shared/protocol.ts');
 
     setCompleted(true);
     await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
@@ -3632,7 +4024,7 @@ $$`,
     );
     await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
     const streamingLink = container?.querySelector('a.file-path-link');
-    expect(streamingLink?.textContent).toBe('protocol.ts');
+    expect(streamingLink?.textContent).toBe('src/shared/protocol.ts');
 
     setCompleted(true);
     await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
@@ -3753,7 +4145,7 @@ $$`,
     );
 
     const link = container?.querySelector<HTMLAnchorElement>('a.file-path-link');
-    expect(link?.textContent).toBe('global.d.ts');
+    expect(link?.textContent).toBe('src/webview/global.d.ts');
     expect(container?.textContent).not.toContain('`');
     expect(link?.getAttribute('href')).toBe('/repo/src/webview/global.d.ts');
     expect(link?.querySelector('.file-path-icon')).toBeInstanceOf(HTMLImageElement);

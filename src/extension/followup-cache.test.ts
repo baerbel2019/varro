@@ -70,6 +70,59 @@ afterEach(async () => {
 });
 
 describe('FollowupCache', () => {
+  it('stores action session IDs in the existing JSON and restores them across cache instances', async () => {
+    const cache = new FollowupCache();
+    const key = hash('linked-turn');
+    await cache.claim(key, digest, sessionKey);
+    await cache.complete(key, digest, suggestions);
+    const action = { ...suggestions.actions[0]!, sessionId: 'ses_fork-1' };
+    expect(await cache.linkSession(key, digest, action)).toBe(true);
+    const linked = { ...suggestions, actions: [action] };
+    expect(await new FollowupCache().get(key, digest)).toEqual(linked);
+    expect(JSON.parse(await readFile(path, 'utf8')).entries[key].suggestions).toEqual(linked);
+    expect(await new FollowupCache().linkSession(key, digest, action)).toBe(true);
+    expect(await cache.linkSession(key, digest, { ...action, sessionId: 'ses_other' })).toBe(false);
+    expect(await new FollowupCache().get(key, digest)).toEqual(linked);
+  });
+
+  it('merges concurrent links on different actions without losing either session ID', async () => {
+    const key = hash('parallel-links');
+    const second = { title: 'Inspect parser', prompt: 'Inspect the reported parser issue.' };
+    const cache = new FollowupCache();
+    await cache.claim(key, digest, sessionKey);
+    await cache.complete(key, digest, {
+      ...suggestions,
+      actions: [...suggestions.actions, second],
+    });
+    const linked = [
+      { ...suggestions.actions[0]!, sessionId: 'ses_first' },
+      { ...second, sessionId: 'ses_second' },
+    ];
+    expect(
+      await Promise.all(
+        linked.map((action) => new FollowupCache().linkSession(key, digest, action))
+      )
+    ).toEqual([true, true]);
+    expect(await new FollowupCache().get(key, digest)).toEqual({ ...suggestions, actions: linked });
+  });
+
+  it('does not revive linked follow-ups retired by a new prompt', async () => {
+    const cache = new FollowupCache();
+    const key = hash('old-linked-turn');
+    const action = { ...suggestions.actions[0]!, sessionId: 'ses_fork-1' };
+    await cache.claim(key, digest, sessionKey);
+    await cache.complete(key, digest, suggestions);
+    expect(await cache.linkSession(key, hash('different-digest'), action)).toBe(false);
+    expect(await cache.linkSession(key, digest, { ...action, prompt: 'Different action' })).toBe(
+      false
+    );
+    expect(await cache.linkSession(key, digest, action)).toBe(true);
+    await cache.clearSession(sessionKey);
+    expect(await new FollowupCache().linkSession(key, digest, action)).toBe(false);
+    expect(await new FollowupCache().get(key, digest)).toEqual(EMPTY_FOLLOWUP_SUGGESTIONS);
+    expect(await readFile(path, 'utf8')).not.toContain('ses_fork-1');
+  });
+
   it('distinguishes a pending admission from a completed empty result across cache instances', async () => {
     const writer = new FollowupCache();
     const reader = new FollowupCache();
@@ -136,18 +189,29 @@ describe('FollowupCache', () => {
       const cache = new FollowupCache();
       await cache.claim(hash('turn'), digest, sessionKey);
       await cache.complete(hash('turn'), digest, suggestions);
+      const startedAt = Date.now();
       const child = spawn(
         'powershell.exe',
         [
           '-NoProfile',
           '-NonInteractive',
-          '-Command',
-          `
+          // Keep the script in one argument, independent of Windows command-line quoting.
+          '-EncodedCommand',
+          Buffer.from(
+            `
       $ErrorActionPreference = 'Stop'
+      [Console]::WriteLine('starting')
+      [Console]::Out.Flush()
       $file = [System.IO.File]::Open($env:VARRO_FOLLOWUP_TEST_FILE, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-      try { [Console]::WriteLine('locked'); [Console]::ReadLine() | Out-Null }
+      try {
+        [Console]::WriteLine('locked')
+        [Console]::Out.Flush()
+        [Console]::ReadLine() | Out-Null
+      }
       finally { $file.Dispose() }
     `,
+            'utf16le'
+          ).toString('base64'),
         ],
         {
           env: { ...process.env, VARRO_FOLLOWUP_TEST_FILE: path },
@@ -163,14 +227,25 @@ describe('FollowupCache', () => {
         stderr += chunk.toString();
       });
       let stdout = '';
+      const diagnostics = () =>
+        JSON.stringify({
+          elapsedMs: Date.now() - startedAt,
+          pid: child.pid,
+          exitCode: child.exitCode,
+          signal: child.signalCode,
+          killed: child.killed,
+          stdout,
+          stderr,
+        });
       const acquired = new Promise<void>((done, reject) => {
         child.once('error', reject);
         child.stdout.on('data', (chunk: Buffer) => {
           stdout += chunk.toString();
-          if (stdout.includes('locked')) done();
+          if (stdout.split(/\r?\n/).includes('locked')) done();
         });
-        child.once('exit', () =>
-          reject(new Error(`Windows handle fixture exited before acquisition: ${stderr}`))
+        // close follows stdout/stderr drainage, so early-exit diagnostics include all output.
+        child.once('close', () =>
+          reject(new Error(`Windows handle fixture closed before acquisition: ${diagnostics()}`))
         );
       });
       const exited = new Promise<number | null>((done) => {
@@ -194,7 +269,8 @@ describe('FollowupCache', () => {
           }
         });
         await cache.dismiss(hash('turn'), digest);
-        expect(await exited, `Windows handle fixture failed: ${stderr}`).toBe(0);
+        const exitCode = await exited;
+        expect(exitCode, `Windows handle fixture failed: ${diagnostics()}`).toBe(0);
         expect(sharingFailures).toBeGreaterThan(0);
         expect(await new FollowupCache().get(hash('turn'), digest)).toEqual(
           EMPTY_FOLLOWUP_SUGGESTIONS

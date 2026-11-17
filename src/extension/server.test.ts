@@ -48,6 +48,9 @@ const { getConfigurationMock, loggerMock, mkdirMock, spawnMock, vscodeMock, writ
   }));
 
 vi.mock('./logger', () => ({ logger: loggerMock }));
+vi.mock('./websearch-preference', () => ({
+  hasStoredWebSearchPreference: vi.fn().mockResolvedValue(false),
+}));
 vi.mock('./server-connection-info', () => ({
   readLocalServerConnectionInfo: vi.fn(async () => ({
     startedAt: null,
@@ -168,6 +171,125 @@ describe('OpenCodeServer port validation', () => {
       expect(() => new OpenCodeServer(port, true)).toThrow('varro.server.port');
     }
   );
+});
+
+describe('offline database maintenance', () => {
+  function fixture() {
+    const server = new OpenCodeServer(4096, true);
+    const state = server as unknown as {
+      _status: ServerStatus;
+      processManager: OpenCodeProcess;
+      ensureSafeToStopLiveServer(): Promise<void>;
+      transport: {
+        waitForRequestsToSettle(): Promise<void>;
+        request: RealOpenCodeServer['request'];
+      };
+    };
+    state._status = { state: 'running', url: server.url };
+    vi.spyOn(server, 'isAttachOnly', 'get').mockReturnValue(false);
+    const idle = vi.spyOn(state, 'ensureSafeToStopLiveServer').mockResolvedValue(undefined);
+    vi.spyOn(state.transport, 'waitForRequestsToSettle').mockResolvedValue(undefined);
+    const wire = vi.spyOn(state.transport, 'request').mockResolvedValue([]);
+    const release = vi.fn(async () => {});
+    const claim = vi
+      .spyOn(state.processManager, 'acquireManagedServerRestartOwnership')
+      .mockResolvedValue(release);
+    const stop = vi
+      .spyOn(state.processManager, 'stopServerForRestart')
+      .mockResolvedValue(undefined);
+    const start = vi.spyOn(server, 'start').mockImplementation(async () => {
+      state._status = { state: 'running', url: server.url };
+      return server.url;
+    });
+    return { server, state, idle, wire, release, claim, stop, start };
+  }
+
+  it('holds restart ownership and blocks public requests until database work has finished', async () => {
+    const f = fixture();
+    const gate = deferred<string>();
+    const work = vi.fn(() => gate.promise);
+    const operation = f.server.withStoppedServer(work);
+    const request = f.server.request('GET', '/project');
+    await flushMicrotasks();
+    expect(f.idle).toHaveBeenCalledOnce();
+    expect(f.claim).toHaveBeenCalledOnce();
+    expect(f.stop).toHaveBeenCalledOnce();
+    expect(work).toHaveBeenCalledOnce();
+    expect(f.release).not.toHaveBeenCalled();
+    expect(f.start).not.toHaveBeenCalled();
+    expect(f.wire).not.toHaveBeenCalled();
+    gate.resolve('compacted');
+    await expect(operation).resolves.toBe('compacted');
+    await request;
+    expect(f.start).toHaveBeenCalledOnce();
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.wire).toHaveBeenCalledOnce();
+  });
+
+  it('restarts the server before reporting a failed or cancelled maintenance task', async () => {
+    const f = fixture();
+    await expect(
+      f.server.withStoppedServer(async () => {
+        throw new Error('VACUUM cancelled');
+      })
+    ).rejects.toThrow('VACUUM cancelled');
+    expect(f.start).toHaveBeenCalledOnce();
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.server.status.state).toBe('running');
+  });
+
+  it('refuses maintenance when idle or ownership checks fail, without touching the database', async () => {
+    const f = fixture();
+    f.idle.mockRejectedValue(new Error('Active sessions block maintenance'));
+    const work = vi.fn(async () => 'unused');
+    await expect(f.server.withStoppedServer(work)).rejects.toThrow('Active sessions');
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(work).not.toHaveBeenCalled();
+  });
+
+  it('does not stop the server or run maintenance when restart ownership cannot be verified', async () => {
+    const f = fixture();
+    f.claim.mockRejectedValue(new Error('Restart ownership could not be verified'));
+    const work = vi.fn(async () => 'unused');
+    await expect(f.server.withStoppedServer(work)).rejects.toThrow(
+      'ownership could not be verified'
+    );
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(work).not.toHaveBeenCalled();
+  });
+
+  it('reports restart failures instead of returning a successful maintenance result', async () => {
+    const f = fixture();
+    f.start.mockRejectedValue(new Error('OpenCode restart failed'));
+    await expect(f.server.withStoppedServer(async () => 'compacted')).rejects.toThrow(
+      'OpenCode restart failed'
+    );
+    expect(f.release).toHaveBeenCalledOnce();
+  });
+
+  it('does not run database work when stopping the managed process fails', async () => {
+    const f = fixture();
+    f.stop.mockRejectedValue(new Error('Ownership changed before stop'));
+    const work = vi.fn(async () => 'unused');
+    await expect(f.server.withStoppedServer(work)).rejects.toThrow('Ownership changed');
+    expect(work).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledOnce();
+  });
+
+  it('rejects attach-only and overlapping maintenance operations', async () => {
+    const f = fixture();
+    vi.spyOn(f.server, 'isAttachOnly', 'get').mockReturnValue(true);
+    const work = vi.fn(async () => 'unused');
+    await expect(f.server.withStoppedServer(work)).rejects.toThrow('verified local');
+    expect(work).not.toHaveBeenCalled();
+    vi.spyOn(f.server, 'isAttachOnly', 'get').mockReturnValue(false);
+    const gate = deferred<void>();
+    const active = f.server.withStoppedServer(() => gate.promise);
+    await expect(f.server.withStoppedServer(work)).rejects.toThrow('already restarting');
+    gate.resolve();
+    await active;
+    expect(work).not.toHaveBeenCalled();
+  });
 });
 
 describe('startup wait bounds', () => {
@@ -2074,6 +2196,41 @@ describe('OpenCodeServer event stream', () => {
 });
 
 describe('OpenCodeServer runtime config injection', () => {
+  it('rechecks search defaults before a global config reload', async () => {
+    const server = new OpenCodeServer(4096, true, 'opencode');
+    const state = server as unknown as {
+      processManager: OpenCodeProcess;
+      transport: { request(method: string, path: string): Promise<unknown> };
+    };
+    const order: string[] = [];
+    const reconcile = vi
+      .spyOn(state.processManager, 'reconcileInjectedWebSearch')
+      .mockImplementation(async () => {
+        order.push('reconcile');
+      });
+    vi.spyOn(state.transport, 'request').mockImplementation(async () => {
+      order.push('reload');
+    });
+    await server.request('POST', '/global/dispose');
+    expect(order).toEqual(['reconcile', 'reload']);
+    await server.request('GET', '/config');
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reload config when search-default reconciliation fails', async () => {
+    const server = new OpenCodeServer(4096, true, 'opencode');
+    const state = server as unknown as {
+      processManager: OpenCodeProcess;
+      transport: { request(method: string, path: string): Promise<unknown> };
+    };
+    vi.spyOn(state.processManager, 'reconcileInjectedWebSearch').mockRejectedValue(
+      new Error('config write failed')
+    );
+    const request = vi.spyOn(state.transport, 'request');
+    await expect(server.request('POST', '/global/dispose')).rejects.toThrow('config write failed');
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it('injects runtime defaults without overriding caller compaction configuration', async () => {
     const actualFs = await vi.importActual<typeof FsPromisesModule>('fs/promises');
     const os = await import('os');
@@ -2393,6 +2550,38 @@ describe('OpenCodeServer maintenance', () => {
       unscoped: true,
     });
     expect(info.workspaceCwd).toBe(getVarroStateDirectory('scratch'));
+  });
+
+  it('reads startup metadata without initializing historical session directories', async () => {
+    const server = new OpenCodeServer(4096, true);
+    const api = server as unknown as {
+      readInstalledCliVersion: () => Promise<string | null>;
+      readHealthInfo: () => Promise<{ healthy: boolean; version?: string }>;
+    };
+    setRunning(server);
+    api.readInstalledCliVersion = vi.fn().mockResolvedValue('2.2.5');
+    api.readHealthInfo = vi.fn().mockResolvedValue({ healthy: true, version: '2.2.5' });
+    const request = vi.spyOn(server, 'request').mockImplementation(async (_method, path) => {
+      if (path === '/experimental/session?limit=100') {
+        return Array.from({ length: 100 }, (_, index) => ({ directory: `/history/${index % 12}` }));
+      }
+      if (path.startsWith('/session/status?directory=')) return {};
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    const info = await server.readServerInfo({ includeActiveAgentCount: false });
+
+    expect(info).toMatchObject({
+      cliVersion: '2.2.5',
+      health: { healthy: true, version: '2.2.5' },
+      activeAgentCount: null,
+      activeAgentError: null,
+    });
+    expect(request).not.toHaveBeenCalled();
+
+    // Full diagnostics retain their global activity count when explicitly opened.
+    expect((await server.readServerInfo()).activeAgentCount).toBe(0);
+    expect(request).toHaveBeenCalledTimes(14);
   });
 
   it('reports the current status when health collection outlives a startup transition', async () => {

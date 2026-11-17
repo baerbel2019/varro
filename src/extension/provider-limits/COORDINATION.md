@@ -14,9 +14,14 @@ Supported identities:
   probes remain local. JWT claims are not used as an account-sharing shortcut.
   ChatGPT token-sharing OAuth is not Codex OAuth. Its grants cannot read these
   endpoints. Preserve the credential's method ID and skip polling and coordination
-  for token sharing. Numeric limits and reset credits require the Codex browser
-  login. Never substitute an inactive Codex credential or a local Codex account
+  for token sharing. Numeric limits and reset credits require a Codex login,
+  shown as "ChatGPT via Codex" in Varro. Never substitute an inactive Codex
+  credential or a local Codex account
   for the selected token-sharing connection.
+  Token sharing returns an explicit Codex-login notice with a hashed saved-credential
+  identity. Its dismissal survives polling and token rotation, but resets after an
+  explicit OpenAI login or account change. Opening the notice only preselects the
+  existing Codex browser flow; authorization still requires user confirmation.
   V2 attach-only connections read the active OpenAI OAuth credential through the
   authenticated server's `/api/credential` endpoint. They never read the extension
   host's credential database or fall back to local Codex files, inactive accounts,
@@ -30,6 +35,11 @@ Supported identities:
    observation; the next demand resolves the new identity outside the old lock.
    The identity-change signal also bypasses process-local fallback caching. Refresh
    initiated by the lock holder still runs normally under its captured identity.
+  The official `claude-agent` provider instead uses Claude Code's login: an explicit
+  `CLAUDE_CODE_OAUTH_TOKEN`, macOS Keychain, then the Claude credentials file. It never
+  substitutes OpenCode's separate Anthropic account. All Claude Agent credential
+  sources are read-only; Claude Code owns their rotation through `claude auth login`.
+  Provider IDs keep their own shared snapshots even when the resolved tokens match.
 - Claude Code IPC: validated literal-loopback descriptor URL and exact bearer token.
   Requests still reject redirects. Different bridge ports, paths or tokens do not
   share, even if the bridges happen to use the same subscription. The descriptor
@@ -94,6 +104,12 @@ Provider requests remain demand-driven. Webviews poll every 30 seconds while any
 known session uses the selected provider, including while the sidebar is hidden,
 or every 120 seconds while visible and idle. A completion refresh follows after
 31 seconds to allow the successful cache TTL to expire.
+
+Pinned status-bar providers also poll every 120 seconds from the extension host,
+even with no open webview or running session. Missing limits stay hidden without
+unpinning the provider or stopping retries. Claude Agent can use the quota-only
+OAuth endpoint while idle, provided its Claude Code login is valid; quota polling
+does not run a model request or renew Claude Code-owned credentials.
 
 One host timer reconciles recently requested shared snapshots every two seconds
 without fetching providers. A bounded set of observations expires after five idle

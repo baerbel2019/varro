@@ -2,11 +2,13 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import crossSpawn from 'cross-spawn';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import type { Duplex } from 'node:stream';
+import type { ProgressOptions, Uri } from 'vscode';
 import { setTimeout as delay } from 'node:timers/promises';
 import { asRecord, isString, type UnknownRecord } from '../shared/type-utils';
 import { parseServerEvent } from '../shared/protocol';
@@ -25,6 +27,13 @@ import { readLocalSessionSummary } from './local-session-summary';
 import { sessionSummary } from './session-summary';
 import { formatSkillAttachment, parseSkillAttachment } from '../shared/skill-reference';
 import { completeTestCleanup, IsolatedProcessTree } from './isolated-process.test-support';
+import { OpenCodeConfigService } from './opencode-config-service';
+import { ServerMemoryPermissionStore } from './server-memory-permission-store';
+import type { RestProxyCallbacks } from './rest-proxy';
+import type { Persistence } from '../shared/persistence';
+import type { OpenCodeServerMemoryPermission, PermissionRule } from '../shared/opencode-types';
+import { fixture } from '../webview/test-fixtures';
+import { readAllTimeUsageCsv, UsageReportService } from './usage-report-service';
 
 const exportEditor = vi.hoisted(() => ({
   openTextDocument: vi.fn(async (options: { content: string; language: string }) => options),
@@ -32,10 +41,13 @@ const exportEditor = vi.hoisted(() => ({
   showErrorMessage: vi.fn(),
 }));
 vi.mock('vscode', () => ({
+  ProgressLocation: { Notification: 15 },
+  commands: { executeCommand: vi.fn() },
   workspace: { openTextDocument: exportEditor.openTextDocument },
   window: {
     showTextDocument: exportEditor.showTextDocument,
     showErrorMessage: exportEditor.showErrorMessage,
+    withProgress: async (_options: ProgressOptions, task: () => Promise<string>) => task(),
   },
 }));
 
@@ -342,6 +354,201 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
       },
     ]);
   });
+
+  it('reads native bare project and worktree inventories for move authorization', async (context) => {
+    if (transport.version !== 2) return context.skip();
+    const project = asRecord(await transport.request('GET', '/project/current'));
+    if (!isString(project?.id)) throw new Error('Missing isolated workspace project');
+    const projects = await transport.request('GET', '/project');
+    expect(Array.isArray(projects)).toBe(true);
+    expect(projects).toContainEqual(expect.objectContaining({ id: project.id, vcs: 'git' }));
+    const worktrees = await transport.request(
+      'GET',
+      `/experimental/worktree?projectID=${encodeURIComponent(project.id)}`
+    );
+    expect(Array.isArray(worktrees)).toBe(true);
+    expect(worktrees).toContainEqual(
+      expect.objectContaining({ directory: join(root, 'workspace') })
+    );
+    expect(modelRequests).toHaveLength(0);
+  });
+
+  it('continues a real isolated conversation after moving into a registered Git worktree', async (context) => {
+    if (transport.version !== 2) return context.skip();
+    const workspace = join(root, 'worktree-project');
+    const hooks = join(root, 'empty-git-hooks');
+    await mkdir(workspace);
+    await mkdir(hooks);
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_'))
+    );
+    for (const args of [
+      ['init', '--quiet', '--template='],
+      [
+        '-c',
+        'user.name=Varro test',
+        '-c',
+        'user.email=varro-test@example.invalid',
+        '-c',
+        `core.hooksPath=${hooks}`,
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '--quiet',
+        '--allow-empty',
+        '-m',
+        'Isolated worktree fixture',
+      ],
+    ]) {
+      const result = spawnSync('git', args, { cwd: workspace, env, encoding: 'utf8' });
+      if (result.status !== 0)
+        throw new Error(`Could not initialize worktree fixture: ${result.stderr}`);
+    }
+    const project = asRecord(
+      await transport.request('GET', '/project/current', undefined, {
+        directory: workspace,
+      })
+    );
+    if (!isString(project?.id)) throw new Error('Missing isolated Git project');
+    const worktree = asRecord(
+      await transport.request(
+        'POST',
+        '/api/worktree',
+        {
+          projectID: project.id,
+          directory: join(root, 'worktrees'),
+          name: 'continued-chat',
+        },
+        { directory: workspace }
+      )
+    );
+    if (!isString(worktree?.directory)) throw new Error('Missing isolated worktree');
+    const created = asRecord(
+      await transport.request(
+        'POST',
+        '/session',
+        {
+          title: 'Worktree continuation fixture',
+          model: { providerID: 'fixture', modelID: 'fixture' },
+        },
+        { directory: workspace }
+      )
+    );
+    if (!isString(created?.id)) throw new Error('Missing isolated continuation session');
+    const id = created.id;
+    try {
+      await transport.request('POST', `/api/session/${id}/move`, { directory: worktree.directory });
+      await vi.waitFor(async () => {
+        const moved = await transport.request('GET', `/session/${id}`);
+        expect(moved).toMatchObject({ projectID: project.id, directory: worktree.directory });
+      });
+      const inventory = await transport.request(
+        'GET',
+        `/experimental/worktree?projectID=${encodeURIComponent(project.id)}`
+      );
+      expect(inventory).toContainEqual(expect.objectContaining({ directory: worktree.directory }));
+      const reply = await transport.request(
+        'POST',
+        `/session/${id}/message`,
+        {
+          parts: [{ type: 'text', text: 'Continue from this worktree. Do not call tools.' }],
+          model: { providerID: 'fixture', modelID: 'fixture' },
+        },
+        { directory: worktree.directory }
+      );
+      expect(reply).toMatchObject({
+        parts: expect.arrayContaining([
+          expect.objectContaining({ type: 'text', text: 'Adapter stream verified.' }),
+        ]),
+      });
+    } finally {
+      await transport.request('DELETE', `/session/${id}`);
+    }
+  }, 30_000);
+
+  it('reports native side-question and warming usage without adding assistant messages', async (context) => {
+    const health = await transport.readHealthInfo();
+    if (transport.version !== 2 || compareVersions(health.version ?? '0', '2.2.7') < 0)
+      return context.skip();
+    const created = asRecord(
+      await transport.request('POST', '/session', {
+        title: 'Auxiliary usage fixture',
+        model: { providerID: 'fixture', modelID: 'fixture' },
+      })
+    );
+    if (!isString(created?.id)) throw new Error('Missing isolated auxiliary usage session');
+    const id = created.id;
+    try {
+      vi.stubEnv('OPENCODE_DB', join(root, 'data/probe.db'));
+      vi.stubEnv('VARRO_TEST_STATE_ROOT', join(root, 'usage-state'));
+      expect(
+        await transport.request('POST', `/session/${id}/side-question`, { question: 'Why?' })
+      ).toEqual({ text: 'Adapter stream verified.' });
+      await transport.request('POST', `/api/session/${id}/generate`, {
+        prompt: 'This is a keep-alive request. Reply with exactly: OK',
+      });
+      expect(await transport.request('GET', `/session/${id}/message`)).toEqual([]);
+      const csv = await readAllTimeUsageCsv();
+      const database = new DatabaseSync(join(root, 'data/probe.db'), { readOnly: true });
+      try {
+        await writeFile(
+          join(root, 'auxiliary-events.json'),
+          JSON.stringify(
+            database.prepare('SELECT type,data FROM event WHERE aggregate_id=?').all(id),
+            null,
+            2
+          )
+        );
+      } finally {
+        database.close();
+      }
+      await writeFile(join(root, 'auxiliary-usage.csv'), csv.csv);
+      await writeFile(
+        join(root, 'auxiliary-usage.log'),
+        String(
+          await transport.request('GET', `/api/experimental/session/${id}/log?follow=false&after=0`)
+        )
+      );
+      const generation = csv.csv.split('\r\n').find((row) => row.includes(',unrecorded,'));
+      expect(generation?.split(',')).toEqual([
+        'unknown',
+        'unknown',
+        'unknown',
+        'unknown',
+        '0',
+        '20',
+        '6',
+        '0',
+        '0',
+        '0',
+        '26',
+        '0.000088',
+        '0',
+        'unrecorded',
+        '',
+        '',
+      ]);
+      let report = '';
+      const request = async (...args: Parameters<OpenCodeTransport['request']>) =>
+        args[1].startsWith('/experimental/session')
+          ? [await transport.request('GET', `/session/${id}`)]
+          : transport.request(...args);
+      await new UsageReportService(
+        { request, apiVersion: 2, isAttachOnly: true },
+        async () => undefined,
+        null,
+        async (content) => {
+          report = content;
+          return fixture<Uri>({ scheme: 'untitled', path: '/usage' });
+        }
+      ).openReport();
+      expect(report).toContain('| Unattributed | Other session usage | 0 | 26 | - |');
+      expect(report).not.toContain('## Warnings');
+    } finally {
+      vi.unstubAllEnvs();
+      await transport.request('DELETE', `/session/${id}`);
+    }
+  }, 30000);
 
   it('bounds silent provider WebSockets after reloading an old runtime timeout policy', async (context) => {
     const health = await transport.readHealthInfo();
@@ -995,6 +1202,358 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
         JSON.stringify({ native, archived, canonical, restored }, null, 2)
       );
     } finally {
+      await transport.request('DELETE', `/session/${id}`);
+    }
+  }, 30000);
+
+  it('keeps config-backed once approvals out of saved permissions and asks after config deletion', async (context) => {
+    if (transport.version !== 2) return context.skip();
+    const directory = join(root, 'workspace/permission-lifetime');
+    const configDirectory = join(directory, '.opencode');
+    const configPath = join(configDirectory, 'opencode.json');
+    const options = { directory };
+    await mkdir(configDirectory, { recursive: true });
+    await writeFile(
+      join(directory, 'opencode.json'),
+      JSON.stringify({ permissions: [{ action: 'read', resource: '*', effect: 'ask' }] })
+    );
+    const sessions: string[] = [];
+    const createSession = async () => {
+      const session = asRecord(
+        await transport.request(
+          'POST',
+          '/session',
+          { title: 'Project approval lifetime', agent: 'build' },
+          options
+        )
+      );
+      if (!isString(session?.id)) throw new Error('Missing isolated permission lifetime session');
+      sessions.push(session.id);
+      return session.id;
+    };
+    const runRead = (id: string) =>
+      transport.request(
+        'POST',
+        `/session/${id}/prompt_async`,
+        {
+          agent: 'build',
+          model: { providerID: 'fixture', modelID: 'fixture' },
+          parts: [{ type: 'text', text: 'RUN_READ_FIXTURE project approval lifetime' }],
+        },
+        options
+      );
+    const pendingRead = async (id: string) => {
+      let request: UnknownRecord | undefined;
+      await vi.waitFor(
+        async () => {
+          request = (
+            (await transport.request('GET', '/permission', undefined, options)) as UnknownRecord[]
+          ).find((entry) => entry.sessionID === id);
+          expect(request?.permission).toBe('read');
+        },
+        { timeout: 10000 }
+      );
+      return request!;
+    };
+    const completedRead = (id: string) =>
+      vi.waitFor(
+        async () => {
+          const messages = (await transport.request(
+            'GET',
+            `/session/${id}/message`,
+            undefined,
+            options
+          )) as Array<{
+            info: UnknownRecord;
+            parts: UnknownRecord[];
+          }>;
+          expect(
+            messages.some((message) =>
+              message.parts.some(
+                (part) =>
+                  part.type === 'tool' &&
+                  part.tool === 'read' &&
+                  asRecord(part.state)?.status === 'completed'
+              )
+            )
+          ).toBe(true);
+          const status = asRecord(
+            await transport.request('GET', '/session/status', undefined, options)
+          )?.[id];
+          expect(status === undefined || asRecord(status)?.type === 'idle').toBe(true);
+        },
+        { timeout: 10000 }
+      );
+    const saved = async () => {
+      const values = asRecord(
+        await transport.request('GET', '/api/permission/saved', undefined, options)
+      )?.data;
+      if (!Array.isArray(values)) throw new Error('Missing isolated saved-permission list');
+      return values;
+    };
+    try {
+      const first = await createSession();
+      const savedBefore = await saved();
+      await runRead(first);
+      const pending = await pendingRead(first);
+      if (!Array.isArray(pending.always) || pending.always.length === 0)
+        throw new Error('Missing project approval patterns');
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          permissions: pending.always.map((resource) => ({
+            action: 'read',
+            resource,
+            effect: 'allow',
+          })),
+        })
+      );
+      await transport.request(
+        'POST',
+        `/permission/${pending.id}/reply`,
+        { reply: 'once' },
+        options
+      );
+      await completedRead(first);
+      expect(await saved()).toEqual(savedBefore);
+
+      // Reload only the isolated location to prove the standing grant comes from config.
+      await transport.request('POST', '/instance/dispose', undefined, options);
+      const second = await createSession();
+      await runRead(second);
+      await completedRead(second);
+      expect(await saved()).toEqual(savedBefore);
+
+      await unlink(configPath);
+      await transport.request('POST', '/instance/dispose', undefined, options);
+      const third = await createSession();
+      await runRead(third);
+      const afterDeletion = await pendingRead(third);
+      await transport.request(
+        'POST',
+        `/permission/${afterDeletion.id}/reply`,
+        { reply: 'once' },
+        options
+      );
+      await completedRead(third);
+      expect(await saved()).toEqual(savedBefore);
+    } finally {
+      for (const id of sessions) {
+        await transport.request('POST', `/session/${id}/abort`, {}, options);
+        await transport.request('DELETE', `/session/${id}`, undefined, options);
+      }
+    }
+  }, 30000);
+
+  it('loads and revokes URL-specific global config rules across projects without database grants', async (context) => {
+    if (transport.version !== 2) return context.skip();
+    const globalPath = join(root, 'config/opencode/opencode.json');
+    const original = await readFile(globalPath, 'utf8');
+    const config = asRecord(JSON.parse(original));
+    const savedBefore = await transport.request('GET', '/api/permission/saved');
+    const sessions: string[] = [];
+    let expectedRules: PermissionRule[] = [
+      { permission: 'webfetch', pattern: '*', action: 'ask' },
+      { permission: 'webfetch', pattern: 'https://trusted.example/*', action: 'allow' },
+    ];
+    const askInProject = async (name: string, resource: string) => {
+      const directory = join(root, 'workspace', `global-rule-${name}`);
+      await mkdir(directory, { recursive: true });
+      const git = spawnSync('git', ['init', '--quiet'], { cwd: directory });
+      expect(git.status).toBe(0);
+      const options = { directory };
+      const session = asRecord(
+        await transport.request(
+          'POST',
+          '/session',
+          { title: `Global config ${name}`, agent: 'build' },
+          options
+        )
+      );
+      if (!isString(session?.id)) throw new Error('Missing global config fixture session');
+      const id = session.id;
+      sessions.push(id);
+      // Catalogs can return before config plugins activate, including on the V2 floor.
+      // Wait for the effective agent rules, then issue exactly one permission check.
+      await expect
+        .poll(
+          async () => {
+            const agents = await transport.request('GET', '/agent', undefined, options);
+            if (!Array.isArray(agents)) throw new Error('Missing isolated agent catalog');
+            const build = agents.map(asRecord).find((agent) => agent?.name === 'build');
+            return Array.isArray(build?.permission)
+              ? build.permission.map(asRecord).filter((rule) => rule?.permission === 'webfetch')
+              : [];
+          },
+          { timeout: 5000 }
+        )
+        .toEqual(expectedRules);
+      await writeFile(
+        join(root, `global-rule-${name}.json`),
+        JSON.stringify(
+          {
+            session,
+            config: await transport.request('GET', '/config', undefined, options),
+            agents: await transport.request('GET', '/agent', undefined, options),
+          },
+          null,
+          2
+        )
+      );
+      const result = asRecord(
+        asRecord(
+          await transport.request(
+            'POST',
+            `/api/session/${id}/permission`,
+            { action: 'webfetch', resources: [resource], save: [resource] },
+            options
+          )
+        )?.data
+      );
+      if (result?.effect === 'ask')
+        await transport.request(
+          'POST',
+          `/permission/${result.id}/reply`,
+          { reply: 'once' },
+          options
+        );
+      return result?.effect;
+    };
+    try {
+      await writeFile(
+        globalPath,
+        JSON.stringify({
+          ...config,
+          permissions: expectedRules.map((rule) => ({
+            action: rule.permission,
+            resource: rule.pattern,
+            effect: rule.action,
+          })),
+        })
+      );
+      expect(await askInProject('one', 'https://trusted.example/one')).toBe('allow');
+      expect(await askInProject('two', 'https://trusted.example/two')).toBe('allow');
+      expect(await askInProject('other', 'https://other.example/')).toBe('ask');
+      expectedRules = [{ permission: 'webfetch', pattern: '*', action: 'ask' }];
+      await writeFile(
+        globalPath,
+        JSON.stringify({
+          ...config,
+          permissions: expectedRules.map((rule) => ({
+            action: rule.permission,
+            resource: rule.pattern,
+            effect: rule.action,
+          })),
+        })
+      );
+      expect(await askInProject('revoked', 'https://trusted.example/revoked')).toBe('ask');
+      expect(await transport.request('GET', '/api/permission/saved')).toEqual(savedBefore);
+    } finally {
+      await writeFile(globalPath, original);
+      for (const id of sessions) await transport.request('DELETE', `/session/${id}`);
+    }
+  }, 30000);
+
+  it('displays and revokes untracked saved approvals through the authenticated Varro host path', async (context) => {
+    if (transport.version !== 2) return context.skip();
+    expect(authorization).toBeTruthy();
+    expect((await fetch(`${url}/api/permission/saved`)).status).toBe(401);
+    const created = asRecord(
+      await transport.request('POST', '/session', {
+        title: 'Untracked saved approval fixture',
+        permission: [{ permission: '*', pattern: '*', action: 'ask' }],
+      })
+    );
+    if (!isString(created?.id)) throw new Error('Missing isolated saved-approval session');
+    const id = created.id;
+    const directory = join(root, 'workspace');
+    const resource = 'printf varro-untracked-approval *';
+    const ask = () =>
+      transport.request('POST', `/api/session/${id}/permission`, {
+        action: 'shell',
+        resources: [resource],
+        save: [resource],
+      });
+    const values = new Map<string, unknown>();
+    const persistence = fixture<Persistence>({
+      get: (key: string) => structuredClone(values.get(key)),
+      set: (
+        key: string,
+        value: Array<{ server: string; rule: OpenCodeServerMemoryPermission }>
+      ) => {
+        values.set(key, structuredClone(value));
+      },
+      remove: (key: string) => {
+        values.delete(key);
+      },
+    });
+    let store = new ServerMemoryPermissionStore(persistence);
+    const identity = `2:${url}`;
+    const service = new OpenCodeConfigService(
+      fixture<RestProxyCallbacks>({
+        server: { apiVersion: 2, url },
+        getServerMemoryPermissions: (projectID: string) => store.get(identity, projectID),
+        rememberServerMemoryPermissions: (
+          rules: Parameters<ServerMemoryPermissionStore['remember']>[1]
+        ) => store.remember(identity, rules),
+        forgetServerMemoryPermission: (
+          rule: Parameters<ServerMemoryPermissionStore['forget']>[1]
+        ) => store.forget(identity, rule),
+      }),
+      transport.request.bind(transport),
+      () => directory
+    );
+    let savedID: string | undefined;
+    try {
+      const requested = asRecord(asRecord(await ask())?.data);
+      expect(requested?.effect).toBe('ask');
+      await transport.request('POST', `/permission/${requested?.id}/reply`, { reply: 'always' });
+      const list = asRecord(await transport.request('GET', '/api/permission/saved'))?.data;
+      if (!Array.isArray(list)) throw new Error('Missing isolated saved-approval list');
+      const saved = list.map(asRecord).find((rule) => rule?.resource === resource);
+      if (!isString(saved?.id) || !isString(saved.projectID))
+        throw new Error('Missing isolated native approval');
+      savedID = saved.id;
+      expect(asRecord(asRecord(await ask())?.data)?.effect).toBe('allow');
+      // Recreate the host with observations from a different connection identity.
+      await store.remember('2:http://prior-connection', [
+        { id: savedID, projectID: saved.projectID, permission: 'bash', pattern: resource },
+      ]);
+      store = new ServerMemoryPermissionStore(persistence);
+      const panel = await service.readServerMemoryPermissions(id, directory);
+      expect(panel).toMatchObject({
+        supported: true,
+        rules: [],
+        untrackedRules: [expect.objectContaining({ id: savedID, pattern: resource })],
+      });
+      expect(store.get(identity, saved.projectID)).toEqual([]);
+      const sessionBefore = asRecord(await transport.request('GET', `/session/${id}`));
+      const configBefore = await readFile(join(directory, 'opencode.json'), 'utf8');
+      const removed = await service.readServerMemoryPermissions(id, directory, {
+        kind: 'remove',
+        id: savedID,
+      });
+      expect(removed).toEqual({ supported: true, rules: [] });
+      const native = asRecord(await transport.request('GET', '/api/permission/saved'))?.data;
+      if (!Array.isArray(native)) throw new Error('Missing post-removal native snapshot');
+      expect(native.map(asRecord).some((rule) => rule?.id === savedID)).toBe(false);
+      expect(asRecord(await transport.request('GET', `/session/${id}`))?.permission).toEqual(
+        sessionBefore?.permission
+      );
+      expect(await readFile(join(directory, 'opencode.json'), 'utf8')).toBe(configBefore);
+      const afterRemoval = asRecord(asRecord(await ask())?.data);
+      expect(afterRemoval?.effect).toBe('ask');
+      await transport.request('POST', `/permission/${afterRemoval?.id}/reply`, { reply: 'once' });
+      await writeFile(
+        join(root, 'saved-approval-management.json'),
+        JSON.stringify(
+          { panel, removed, authenticationRequired: true, asksAfterRemoval: true },
+          null,
+          2
+        )
+      );
+    } finally {
+      if (savedID) await transport.request('DELETE', `/api/permission/saved/${savedID}`);
       await transport.request('DELETE', `/session/${id}`);
     }
   }, 30000);

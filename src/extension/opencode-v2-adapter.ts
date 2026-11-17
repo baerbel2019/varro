@@ -16,6 +16,7 @@ import type {
   SessionsResponse,
   ModelRef,
   ShellInfo,
+  JobInfo,
   SkillInfo,
 } from '@opencode/client';
 import { randomUUID } from 'node:crypto';
@@ -43,6 +44,7 @@ import {
   MAX_SIDE_QUESTION_CONTEXT_LENGTH,
 } from '../shared/side-question';
 import type { SideQuestionTurn } from '../shared/side-question';
+import { tracePrompt } from './prompt-trace';
 import type {
   ProviderAuthMethod,
   ProviderAuthPromptCondition,
@@ -137,11 +139,41 @@ function connectionInfo(integration: IntegrationInfo | undefined) {
   };
 }
 
+function isUnsupportedSubscriptionModel(provider: UnknownRecord, model: UnknownRecord): boolean {
+  const providerSettings = asRecord(provider.options);
+  const modelSettings = asRecord(model.settings) ?? asRecord(model.options);
+  const tier =
+    asRecord(model.body)?.service_tier ??
+    asRecord(provider.body)?.service_tier ??
+    modelSettings?.serviceTier ??
+    providerSettings?.serviceTier;
+  // Cyber models need separately approved Daybreak API access, not a Codex-plan login.
+  const modelID = model.modelID ?? asRecord(model.api)?.id ?? model.id;
+  const isCyber = isString(modelID) && /^gpt-\d+(?:\.\d+)?-cyber(?:-|$)/.test(modelID);
+  if (tier !== 'flex' && !isCyber) return false;
+  const baseURL = modelSettings?.baseURL ?? providerSettings?.baseURL;
+  if (!isString(baseURL) || !URL.canParse(baseURL)) return false;
+  let url = new URL(baseURL);
+  // OpenAI's subscription request hook redirects API-origin model overrides too.
+  if (
+    provider.id === 'openai' &&
+    url.origin === 'https://api.openai.com' &&
+    isString(providerSettings?.baseURL) &&
+    URL.canParse(providerSettings.baseURL)
+  )
+    url = new URL(providerSettings.baseURL);
+  return (
+    (url.hostname === 'chatgpt.com' || url.hostname === 'chat.openai.com') &&
+    (url.pathname === '/backend-api/codex' || url.pathname.startsWith('/backend-api/codex/'))
+  );
+}
+
 function v1AuthMethods(integration: IntegrationInfo | undefined): ProviderAuthMethod[] {
   return (
     integration?.methods
       .filter((item) => item.type === 'oauth' || item.type === 'key' || item.type === 'external')
       .map((item) => ({
+        id: item.type === 'key' ? undefined : item.id,
         type: item.type === 'key' ? 'api' : item.type,
         label: item.label ?? 'API key',
         prompts: item.form?.flatMap<NonNullable<ProviderAuthMethod['prompts']>[number]>((field) => {
@@ -237,6 +269,31 @@ function nextBackgroundReviewAt(startedAt: number, now: number): number {
   return startedAt + nextMinute * 60_000;
 }
 
+function parseBackgroundJobs(value: unknown): JobInfo[] {
+  if (!Array.isArray(value)) throw new Error('Invalid OpenCode v2 background-job list');
+  for (const item of value) {
+    const job = asRecord(item);
+    const time = asRecord(job?.time);
+    if (
+      !job ||
+      !isString(job.id) ||
+      !isString(job.sessionID) ||
+      !isString(job.status) ||
+      !['running', 'completed', 'error', 'cancelled'].includes(String(job.status)) ||
+      !isNumber(time?.started) ||
+      !Number.isFinite(time.started) ||
+      (job.title !== undefined && !isString(job.title)) ||
+      !(job.kind === 'shell'
+        ? isString(job.shellID) && isString(job.command)
+        : job.kind === 'subagent'
+          ? isString(job.childSessionID) && isString(job.agent) && isString(job.description)
+          : job.kind === 'image' && isString(job.path) && isString(job.model))
+    )
+      throw new Error('Invalid OpenCode v2 background job');
+  }
+  return value as JobInfo[];
+}
+
 export class OpenCodeV2Adapter {
   private readonly backgroundWork = new OpenCodeV2BackgroundWork();
   private readonly backgroundServices: OpenCodeV2SessionState;
@@ -255,9 +312,16 @@ export class OpenCodeV2Adapter {
   private taskControlsGeneration = 0;
   private apiCapabilities: Promise<ReturnType<typeof getOpenCodeApiCapabilities>> | undefined;
   private serverVersion: string | undefined;
+  private backgroundJobsAvailable: boolean | undefined;
   private readonly oauth = new Map<
     string,
-    { integrationID: string; attemptID: string; providerID: string; directory?: string }
+    {
+      integrationID: string;
+      attemptID: string;
+      providerID: string;
+      directory?: string;
+      paste: boolean;
+    }
   >();
 
   constructor(
@@ -285,7 +349,10 @@ export class OpenCodeV2Adapter {
     created?: unknown,
     sequence?: unknown
   ): void {
-    if (type === 'server.connected') this.apiCapabilities = undefined;
+    if (type === 'server.connected') {
+      this.apiCapabilities = undefined;
+      this.backgroundJobsAvailable = undefined;
+    }
     this.generationTiming.observe(type, data, created, sequence);
     if ((type === 'shell.exited' || type === 'shell.deleted') && isString(data.id))
       this.cancelBackgroundReview(data.id);
@@ -353,11 +420,14 @@ export class OpenCodeV2Adapter {
   }
 
   setServerVersion(version: string | undefined): void {
-    this.serverVersion = version ? (extractVersion(version) ?? undefined) : undefined;
+    const next = version ? (extractVersion(version) ?? undefined) : undefined;
+    if (next !== this.serverVersion) this.backgroundJobsAvailable = undefined;
+    this.serverVersion = next;
   }
 
   reset(): void {
     this.serverVersion = undefined;
+    this.backgroundJobsAvailable = undefined;
     this.apiCapabilities = undefined;
     for (const controller of this.backgroundJudgments.values()) controller.abort();
     this.backgroundJudgments.clear();
@@ -547,26 +617,39 @@ export class OpenCodeV2Adapter {
     }
     if (route === '/session/status') {
       const version = this.backgroundWork.snapshotVersion();
-      const [active, shells] = await Promise.all([
+      const generation = this.taskControlsGeneration;
+      const [active, shells, jobs] = await Promise.all([
         data<Record<string, SessionActive>>('GET', '/api/session/active'),
         data<ShellInfo[]>('GET', query('/api/shell', true)),
+        this.readBackgroundJobs((target) => data<unknown>('GET', target), directory),
       ]);
-      const choices = await this.readBackgroundServiceChoices(shells);
-      const serviceIDs = new Set(
-        shells
+      const nativeShells = [...(jobs?.values() ?? [])].flat().filter((job) => job.kind === 'shell');
+      const choices = await this.readBackgroundServiceChoices(
+        shells,
+        nativeShells.map((job) => job.sessionID)
+      );
+      options.signal?.throwIfAborted();
+      if (generation !== this.taskControlsGeneration)
+        throw new Error('OpenCode background status was reset');
+      const serviceIDs = new Set([
+        ...shells
           .filter(
             (shell) =>
               isString(shell.metadata.sessionID) &&
               choices.get(shell.metadata.sessionID)?.[shell.id] === true
           )
-          .map((shell) => shell.id)
-      );
+          .map((shell) => shell.id),
+        ...nativeShells
+          .filter((job) => choices.get(job.sessionID)?.[job.shellID] === true)
+          .map((job) => job.shellID),
+      ]);
       const waiting = this.backgroundWork.reconcile(
         shells,
         new Set(Object.keys(active)),
         directory,
         version,
-        serviceIDs
+        serviceIDs,
+        jobs
       );
       for (const shell of shells) {
         const sessionID = shell.metadata.sessionID;
@@ -886,21 +969,27 @@ export class OpenCodeV2Adapter {
           );
         }
         const result = await data<unknown>('POST', `${endpoint}/generate`, {
-          prompt: [
-            'The user is asking a quick side question about the conversation so far.',
-            'Answer directly and concisely in Markdown from what you already know.',
-            'Do not call any tools and do not take any actions.',
-            'File and line references do not imply file contents. Use only included text or existing conversation context, and do not claim to read files.',
-            ...(turns.length
-              ? [
-                  'Previous side questions and answers, for context only:',
-                  JSON.stringify(turns),
-                  'Answer the following follow-up:',
-                ]
-              : []),
-            '',
-            input.question.trim(),
-          ].join('\n'),
+          prompt: await tracePrompt(this, {
+            purpose: 'side-question',
+            sessionID,
+            directory,
+            signal: options.signal,
+            prompt: [
+              'The user is asking a quick side question about the conversation so far.',
+              'Answer directly and concisely in Markdown from what you already know.',
+              'Do not call any tools and do not take any actions.',
+              'File and line references do not imply file contents. Use only included text or existing conversation context, and do not claim to read files.',
+              ...(turns.length
+                ? [
+                    'Previous side questions and answers, for context only:',
+                    JSON.stringify(turns),
+                    'Answer the following follow-up:',
+                  ]
+                : []),
+              '',
+              input.question.trim(),
+            ].join('\n'),
+          }),
         });
         const text = asRecord(result)?.text;
         if (!isString(text) || !text.trim()) {
@@ -1532,7 +1621,13 @@ export class OpenCodeV2Adapter {
           })),
       ];
     }
-    if (['/skill', '/project', '/vcs', '/vcs/status'].includes(route) && method === 'GET')
+    if (route === '/experimental/worktree' && method === 'GET') {
+      const projectID = url.searchParams.get('projectID');
+      if (!projectID) throw new Error('Worktree inventory requires a project ID');
+      return raw('GET', `/api/worktree?projectID=${encodeURIComponent(projectID)}`);
+    }
+    if (route === '/project' && method === 'GET') return raw('GET', '/api/project');
+    if (['/skill', '/vcs', '/vcs/status'].includes(route) && method === 'GET')
       return data('GET', query(`/api${route}`, true));
     if (route === '/project/current' || route === '/path') {
       const location = await raw('GET', query('/api/location', true));
@@ -1567,8 +1662,13 @@ export class OpenCodeV2Adapter {
       );
       if (!isString(authorization?.url))
         throw new Error('OpenCode did not provide an MCP authentication URL');
-      if (mcpAuth[2] !== 'authenticate')
-        return { authorizationUrl: authorization.url, oauthState: authorization.attemptID };
+      if (mcpAuth[2] !== 'authenticate') {
+        const started = {
+          authorizationUrl: authorization.url,
+          oauthState: authorization.attemptID,
+        };
+        return authorization.paste === true ? { ...started, paste: true } : started;
+      }
       if (!(await this.openExternal(authorization.url)))
         throw new Error('Could not open the MCP authentication page');
       await this.authenticate(
@@ -1603,14 +1703,16 @@ export class OpenCodeV2Adapter {
   }
 
   private async readBackgroundServiceChoices(
-    shells: ShellInfo[]
+    shells: ShellInfo[],
+    jobSessionIDs: readonly string[] = []
   ): Promise<ReadonlyMap<string, UnknownRecord>> {
     const sessionIDs = [
-      ...new Set(
-        shells.flatMap((shell) =>
+      ...new Set([
+        ...jobSessionIDs,
+        ...shells.flatMap((shell) =>
           isString(shell.metadata.sessionID) ? [shell.metadata.sessionID] : []
-        )
-      ),
+        ),
+      ]),
     ];
     return new Map(
       await Promise.all(
@@ -1619,6 +1721,83 @@ export class OpenCodeV2Adapter {
         )
       )
     );
+  }
+
+  private async readBackgroundJobs(
+    load: (path: string) => Promise<unknown>,
+    directory?: string
+  ): Promise<ReadonlyMap<string, readonly JobInfo[]> | undefined> {
+    // The experimental route first shipped in 2.2.6. Do not probe older servers or
+    // turn authentication, network, or malformed-response failures into an idle snapshot.
+    if (
+      !this.serverVersion ||
+      compareVersions(this.serverVersion, '2.2.6') < 0 ||
+      this.backgroundJobsAvailable === false
+    )
+      return undefined;
+    const generation = this.taskControlsGeneration;
+    let response: unknown;
+    try {
+      response = await load('/api/experimental/job');
+    } catch (error: unknown) {
+      if (!isNotFoundError(error)) throw error;
+      if (generation === this.taskControlsGeneration) this.backgroundJobsAvailable = false;
+      return undefined;
+    }
+    const jobs = parseBackgroundJobs(response).filter((job) => job.status !== 'cancelled');
+    const sessions = new Map<
+      string,
+      Promise<{ directory: string; parentID?: string } | undefined>
+    >();
+    const session = (id: string) => {
+      let pending = sessions.get(id);
+      if (!pending) {
+        pending = load(`/api/session/${encodeURIComponent(id)}`)
+          .then((value) => {
+            const info = asRecord(value);
+            const location = asRecord(info?.location);
+            if (
+              !info ||
+              info.id !== id ||
+              !isString(location?.directory) ||
+              (info.parentID !== undefined && !isString(info.parentID))
+            )
+              throw new Error('Invalid OpenCode v2 background-job session');
+            return { directory: location.directory, parentID: info.parentID };
+          })
+          .catch((error: unknown) => {
+            // Deletion may race the job snapshot. Other failures must not erase pending work.
+            if (isNotFoundError(error)) return undefined;
+            throw error;
+          });
+        sessions.set(id, pending);
+      }
+      return pending;
+    };
+    const owners = await Promise.all(
+      jobs.map(async (job) => {
+        const included: string[] = [];
+        const seen = new Set<string>();
+        let id: string | undefined = job.sessionID;
+        while (id && !seen.has(id)) {
+          seen.add(id);
+          const info = await session(id);
+          if (!info) break;
+          if (!directory || isSameWorkspacePath(info.directory, directory)) included.push(id);
+          id = info.parentID;
+        }
+        return included;
+      })
+    );
+    const grouped = new Map<string, JobInfo[]>();
+    for (const [index, job] of jobs.entries()) {
+      for (const id of owners[index] ?? []) {
+        const items = grouped.get(id) ?? [];
+        items.push(job);
+        grouped.set(id, items);
+      }
+    }
+    return grouped;
   }
 
   private scheduleBackgroundJudgment(
@@ -1927,6 +2106,15 @@ export class OpenCodeV2Adapter {
         };
       }
     }
+    // The native catalog can offer Flex and Cyber despite the subscription route rejecting them.
+    // Filter after legacy config restoration too, and before selecting defaults.
+    for (const provider of all) {
+      provider.models = Object.fromEntries(
+        Object.entries(provider.models).filter(
+          ([, model]) => !isUnsupportedSubscriptionModel(provider, model)
+        )
+      );
+    }
     const defaults = Object.fromEntries(
       all.map((provider) => [
         provider.id,
@@ -2047,13 +2235,15 @@ export class OpenCodeV2Adapter {
         attemptID: result.attemptID,
         providerID,
         directory,
+        paste: result.mode === 'auto' && result.paste === true,
       });
-      return {
+      const authorization = {
         attemptID: result.attemptID,
         url: result.url,
         method: result.mode === 'code' ? 'code' : 'auto',
         instructions: result.instructions ?? '',
       };
+      return result.paste === true ? { ...authorization, paste: true } : authorization;
     }
     if (action === 'callback') {
       const candidates = [...this.oauth.values()].filter(
@@ -2066,6 +2256,14 @@ export class OpenCodeV2Adapter {
           : undefined;
       if (!attempt) throw new Error('OpenCode OAuth attempt was not started');
       const attemptPath = `/api/integration/${encodeURIComponent(attempt.integrationID)}/connect/oauth/${encodeURIComponent(attempt.attemptID)}`;
+      if (input.submitOnly === true) {
+        if (!attempt.paste || !isString(input.code) || !input.code.trim())
+          throw new Error('This OAuth attempt does not accept a pasted redirect URL');
+        // The existing callback owns polling and cancellation. A rejected paste must
+        // leave that callback and its native attempt alive so the user can retry.
+        await raw('POST', `${attemptPath}/complete`, { code: input.code });
+        return true;
+      }
       let completed = false;
       try {
         if (input.code) await raw('POST', `${attemptPath}/complete`, { code: input.code });

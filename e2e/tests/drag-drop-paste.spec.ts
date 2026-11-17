@@ -1,5 +1,6 @@
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-returns -- Playwright callbacks inspect browser clipboard and request payloads whose values cross an untyped browser boundary. */
 /* oxlint-disable anti-slop/require-safety-comment-for-type-assertion -- SAFETY: Assertions bridge controlled clipboard, drag, and harness request fixtures to the shapes under test. */
+import { mkdir, writeFile } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
 import { getE2EState } from './helpers';
 
@@ -24,49 +25,314 @@ test('shows the drop overlay when a drag enters and hides on dragleave', async (
   await expect(page.getByText('Drop to add to context')).toHaveCount(0);
 });
 
-test('delivers a Shift file drop when the drag source only permits move', async ({ page }) => {
+test('does not show the drop overlay while dragging a chat link out of the webview', async ({
+  page,
+}) => {
+  await page.goto('/e2e/harness/index.html?scenario=blank');
+  await expect(page.locator('.rich-composer').first()).toBeVisible();
+
+  await page.evaluate(() => {
+    const source = document.createElement('a');
+    source.id = 'outgoing-chat-link';
+    source.href = 'https://example.com/chat-link';
+    source.textContent = 'Drag chat link';
+    source.style.cssText = 'position:fixed;top:20px;left:20px;z-index:9999';
+    document.body.append(source);
+
+    const outside = document.createElement('iframe');
+    outside.id = 'outside-chat';
+    outside.style.cssText =
+      'position:fixed;top:80px;left:20px;width:200px;height:100px;z-index:9999';
+    document.body.append(outside);
+    const target = outside.contentDocument!.body;
+    target.textContent = 'Drop outside chat';
+    target.addEventListener('dragover', (event) => event.preventDefault());
+    target.addEventListener('drop', (event) => {
+      event.preventDefault();
+      target.textContent = event.dataTransfer!.getData('text/uri-list');
+    });
+    // Observe transient overlays as well as the final state after the drag.
+    document.body.dataset.dropOverlayShown = 'false';
+    new MutationObserver((records) => {
+      for (const record of records) {
+        if (
+          Array.from(record.addedNodes).some(
+            (node) => node instanceof Element && node.matches('.chat-drop-overlay')
+          )
+        ) {
+          document.body.dataset.dropOverlayShown = 'true';
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  });
+
+  const source = await page.locator('#outgoing-chat-link').boundingBox();
+  const target = await page.locator('#outside-chat').boundingBox();
+  if (!source || !target) throw new Error('Expected outgoing drag source and target');
+  await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(source.x + source.width / 2 + 15, source.y + source.height / 2, {
+    steps: 5,
+  });
+  await expect(page.locator('.chat-drop-overlay')).toHaveCount(0);
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 10 });
+  await page.mouse.up();
+
+  await expect(page.frameLocator('#outside-chat').locator('body')).toHaveText(
+    'https://example.com/chat-link'
+  );
+  await expect(page.locator('body')).toHaveAttribute('data-drop-overlay-shown', 'false');
+  await expect(page.locator('.chat-drop-overlay')).toHaveCount(0);
+});
+
+for (const { name, value, resource, icon } of [
+  {
+    name: 'README.md',
+    value: '/workspace/varro/README.md',
+    resource: 'file:///workspace/varro/README.md',
+    icon: false,
+  },
+  {
+    name: 'README.md',
+    value: '/workspace/varro/README.md',
+    resource: 'file:///workspace/varro/README.md',
+    icon: true,
+  },
+  { name: 'release notes', value: 'https://example.com/varro/releases', resource: '', icon: false },
+]) {
+  test(`drags ${name}${icon ? ' icon' : ''} into an external text target as its value`, async ({
+    page,
+  }) => {
+    await page.goto('/e2e/harness/index.html?scenario=message-rendering');
+    const link = page.getByRole('link', { name, exact: true });
+    await expect(link).toBeVisible();
+    await link.scrollIntoViewIfNeeded();
+
+    await page.evaluate(() => {
+      // Observe the payload after MarkdownRenderer's delegated dragstart handler.
+      document.addEventListener(
+        'dragstart',
+        (event) => {
+          document.body.dataset.dragUri = event.dataTransfer!.getData('text/uri-list');
+        },
+        { once: true }
+      );
+      const outside = document.createElement('iframe');
+      outside.id = 'external-text-target';
+      outside.style.cssText =
+        'position:fixed;top:20px;right:20px;width:240px;height:100px;z-index:9999';
+      document.body.append(outside);
+      const target = outside.contentDocument!.createElement('textarea');
+      target.id = 'drop-value';
+      target.style.cssText = 'width:200px;height:60px';
+      target.addEventListener('drop', (event) => {
+        target.dataset.resource = event.dataTransfer!.getData('ResourceURLs');
+        target.dataset.uri = event.dataTransfer!.getData('text/uri-list');
+      });
+      outside.contentDocument!.body.append(target);
+    });
+
+    const target = page.frameLocator('#external-text-target').locator('#drop-value');
+    const sourceBox = await (icon ? link.locator('.file-path-icon') : link).boundingBox();
+    const targetBox = await target.boundingBox();
+    if (!sourceBox || !targetBox) throw new Error('Expected link drag source and text target');
+    await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(
+      sourceBox.x + sourceBox.width / 2 + 15,
+      sourceBox.y + sourceBox.height / 2,
+      {
+        steps: 5,
+      }
+    );
+    await expect(page.locator('body')).toHaveAttribute('data-drag-uri', resource || value);
+    await expect(page.locator('.chat-drop-overlay')).toHaveCount(0);
+    await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, {
+      steps: 10,
+    });
+    await page.mouse.up();
+
+    await expect(target).toHaveValue(value);
+    // Chromium sanitizes file:// URI-list entries from an HTTP page across frames.
+    // Plain text and VS Code's resource list must still reach the native drop target intact.
+    await expect(target).toHaveAttribute('data-uri', resource ? 'about:blank#blocked' : value);
+    await expect(target).toHaveAttribute(
+      'data-resource',
+      resource ? JSON.stringify([resource]) : ''
+    );
+    await expect(page.locator('.chat-drop-overlay')).toHaveCount(0);
+  });
+}
+
+for (const cancelledChatDrag of [false, true]) {
+  test(`delivers a Shift move-only file drop, cancelled chat drag=${cancelledChatDrag}`, async ({
+    page,
+  }) => {
+    await page.goto('/e2e/harness/index.html?scenario=blank');
+    const composer = page.locator('.rich-composer').first();
+    await expect(composer).toBeVisible();
+
+    if (cancelledChatDrag) {
+      await page.evaluate(() => {
+        const source = document.createElement('a');
+        source.id = 'cancelled-chat-drag';
+        source.href = 'https://example.com/chat-link';
+        source.textContent = 'Cancelled chat drag';
+        source.style.cssText = 'position:fixed;top:120px;left:20px;z-index:9999';
+        source.addEventListener('dragstart', (event) => {
+          event.preventDefault();
+          source.dataset.cancelled = 'true';
+        });
+        document.body.append(source);
+      });
+      const source = page.locator('#cancelled-chat-drag');
+      await source.dragTo(composer);
+      await expect(source).toHaveAttribute('data-cancelled', 'true');
+      await source.evaluate((node) => node.remove());
+    }
+
+    await page.evaluate(() => {
+      const harness = window as Window & {
+        attachmentDrops?: unknown[];
+      };
+      harness.attachmentDrops = [];
+      const send = harness.__sendToExtension;
+      if (!send) throw new Error('Expected the E2E extension bridge');
+      harness.__sendToExtension = (message) => {
+        if ((message as { type?: string }).type === 'files/drop') {
+          harness.attachmentDrops!.push(message);
+        }
+        return send(message);
+      };
+      // An iframe keeps the native source outside the chat document, as in VS Code's explorer.
+      const outside = document.createElement('iframe');
+      outside.id = 'outside-file-source';
+      outside.style.cssText =
+        'position:fixed;top:20px;left:20px;width:200px;height:80px;z-index:9999';
+      document.body.append(outside);
+      const sourceDocument = outside.contentDocument!;
+      const source = sourceDocument.createElement('div');
+      source.id = 'windows-file-drag';
+      source.draggable = true;
+      source.textContent = 'Drag Windows file';
+      source.style.cssText =
+        'position:fixed;top:20px;left:20px;width:180px;height:40px;z-index:9999';
+      source.addEventListener('dragstart', (event) => {
+        event.dataTransfer!.effectAllowed = 'move';
+        event.dataTransfer!.setData('CodeFiles', JSON.stringify(['C:\\repo\\src\\example.ts']));
+      });
+      sourceDocument.body.append(source);
+    });
+
+    const source = await page
+      .frameLocator('#outside-file-source')
+      .locator('#windows-file-drag')
+      .boundingBox();
+    const target = await composer.boundingBox();
+    if (!source || !target) throw new Error('Expected incoming file drag source and target');
+    await page.keyboard.down('Shift');
+    try {
+      await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(source.x + source.width / 2 + 15, source.y + source.height / 2, {
+        steps: 5,
+      });
+      await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, {
+        steps: 10,
+      });
+      await page.mouse.up();
+    } finally {
+      await page.keyboard.up('Shift');
+    }
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as Window & { attachmentDrops?: unknown[] }).attachmentDrops)
+      )
+      .toEqual([{ type: 'files/drop', payload: { paths: ['C:\\repo\\src\\example.ts'] } }]);
+    await expect(page.getByText('Drop to add to context')).toHaveCount(0);
+  });
+}
+
+test('delivers a native external folder drop without Shift after crossing the chat', async ({
+  page,
+}, testInfo) => {
+  const folder = testInfo.outputPath('external-folder');
+  await mkdir(`${folder}/nested`, { recursive: true });
+  await mkdir(`${folder}/empty`, { recursive: true });
+  await writeFile(`${folder}/nested/note.txt`, 'hello');
+
+  await page.addInitScript(() => {
+    // Model VS Code's window-level forwarding, installed before extension code.
+    const claimDrag = (event: DragEvent) => {
+      if (event.type === 'dragenter' && event.defaultPrevented) return;
+      if (event.shiftKey || !event.dataTransfer?.items.length) return;
+      if (!Array.from(event.dataTransfer.items).every((item) => item.kind === 'file')) return;
+      document.body.dataset.hostDragTakeovers = String(
+        Number(document.body.dataset.hostDragTakeovers ?? '0') + 1
+      );
+    };
+    window.addEventListener('dragenter', claimDrag);
+    window.addEventListener('dragover', claimDrag);
+  });
   await page.goto('/e2e/harness/index.html?scenario=blank');
   const composer = page.locator('.rich-composer').first();
   await expect(composer).toBeVisible();
-
   await page.evaluate(() => {
-    const harness = window as Window & {
-      attachmentDrops?: unknown[];
-    };
+    const harness = window as Window & { attachmentDrops?: unknown[] };
     harness.attachmentDrops = [];
     const send = harness.__sendToExtension;
     if (!send) throw new Error('Expected the E2E extension bridge');
     harness.__sendToExtension = (message) => {
-      if ((message as { type?: string }).type === 'files/drop') {
+      if ((message as { type?: string }).type === 'files/drop-content') {
         harness.attachmentDrops!.push(message);
       }
       return send(message);
     };
-    const source = document.createElement('div');
-    source.id = 'windows-file-drag';
-    source.draggable = true;
-    source.textContent = 'Drag Windows file';
-    source.style.cssText = 'position:fixed;top:20px;left:20px;width:180px;height:40px;z-index:9999';
-    source.addEventListener('dragstart', (event) => {
-      event.dataTransfer!.effectAllowed = 'move';
-      event.dataTransfer!.setData('CodeFiles', JSON.stringify(['C:\\repo\\src\\example.ts']));
-    });
-    document.body.append(source);
   });
 
-  await page.keyboard.down('Shift');
+  const target = await composer.boundingBox();
+  if (!target) throw new Error('Expected incoming folder drop target');
+  const cdp = await page.context().newCDPSession(page);
+  const data = { items: [], files: [folder], dragOperationsMask: 1 };
   try {
-    await page.locator('#windows-file-drag').dragTo(composer);
+    await cdp.send('Input.dispatchDragEvent', {
+      type: 'dragEnter',
+      x: 20,
+      y: 20,
+      data,
+      modifiers: 0,
+    });
+    await cdp.send('Input.dispatchDragEvent', {
+      type: 'dragOver',
+      x: 20,
+      y: 20,
+      data,
+      modifiers: 0,
+    });
+    await expect(page.getByText('Drop to add to context')).toBeVisible();
+    const x = target.x + target.width / 2;
+    const y = target.y + target.height / 2;
+    await cdp.send('Input.dispatchDragEvent', { type: 'dragOver', x, y, data, modifiers: 0 });
+    await cdp.send('Input.dispatchDragEvent', { type: 'drop', x, y, data, modifiers: 0 });
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as Window & { attachmentDrops?: unknown[] }).attachmentDrops)
+      )
+      .toEqual([
+        {
+          type: 'files/drop-content',
+          payload: {
+            directory: { name: 'external-folder', directories: ['empty', 'nested'] },
+            files: [{ name: 'nested/note.txt', content: 'aGVsbG8=', size: 5 }],
+          },
+        },
+      ]);
+    expect(await page.locator('body').getAttribute('data-host-drag-takeovers')).toBeNull();
+    await expect(page.getByText('Drop to add to context')).toHaveCount(0);
   } finally {
-    await page.keyboard.up('Shift');
+    await cdp.detach();
   }
-
-  await expect
-    .poll(() =>
-      page.evaluate(() => (window as Window & { attachmentDrops?: unknown[] }).attachmentDrops)
-    )
-    .toEqual([{ type: 'files/drop', payload: { paths: ['C:\\repo\\src\\example.ts'] } }]);
-  await expect(page.getByText('Drop to add to context')).toHaveCount(0);
 });
 
 test('displays files received from files/dropped in the attachment strip', async ({ page }) => {

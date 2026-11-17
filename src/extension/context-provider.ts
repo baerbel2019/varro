@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
-import { readdir, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, join, parse, relative, sep } from 'path';
+import { realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, parse, relative, resolve as resolvePath, sep } from 'path';
 import type { EditorContext, EditorTextContext } from '../shared/protocol';
 import { asRecord, isNumber, isString } from '../shared/type-utils';
 import { isSameWorkspacePath } from '../shared/workspace-path';
@@ -14,6 +14,8 @@ import {
 } from './util/path';
 import { delay } from './server-utils';
 import { getWorkingFolder, getWorkingFolders } from './working-folders';
+import { CitationFileSearch } from './citation-file-search';
+import { CitationSymbolSearch } from './citation-symbol-search';
 
 export type WorkspaceResolutionOptions = {
   /** Resolve paths that do not exist on disk yet (e.g. a deleted file in a diff). */
@@ -75,6 +77,12 @@ export class ContextProvider implements vscode.Disposable {
   private _lastDiagnosticsSourceKey: string | null = null;
   private onChange: (ctx: EditorContext) => void;
   private selectedWorkspacePath: string | null;
+  private readonly citationFileSearch = new CitationFileSearch();
+  private readonly citationSymbolSearch = new CitationSymbolSearch();
+  private readonly citationPathCache = new Map<
+    string,
+    { expiresAt: number; result: Promise<string | null> }
+  >();
 
   constructor(
     onChange: (ctx: EditorContext) => void,
@@ -796,37 +804,100 @@ export class ContextProvider implements vscode.Disposable {
     }
   }
 
+  resolveCitationSymbols(symbols: readonly string[], directory?: string, signal?: AbortSignal) {
+    return this.citationSymbolSearch.find(symbols, directory, signal);
+  }
+
+  /** Metadata-only checks against one project root, never basename discovery. */
+  async validateCitationPaths(
+    paths: readonly string[],
+    directory?: string,
+    signal?: AbortSignal
+  ): Promise<Array<string | null>> {
+    const results: Array<string | null> = Array.from({ length: paths.length }, () => null);
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(8, paths.length) }, async () => {
+        while (next < paths.length) {
+          signal?.throwIfAborted();
+          const index = next++;
+          const input = paths[index]!.trim();
+          if (!input || (!isAbsolute(input) && !directory)) continue;
+          const path = isAbsolute(input) ? resolvePath(input) : resolvePath(directory!, input);
+          // References outside the project must be absolute, not ../ aliases.
+          const fromRoot = directory ? relative(directory, path) : '';
+          if (
+            !isAbsolute(input) &&
+            (isAbsolute(fromRoot) || fromRoot === '..' || fromRoot.startsWith(`..${sep}`))
+          )
+            continue;
+          let cached = this.citationPathCache.get(path);
+          if (!cached || cached.expiresAt <= Date.now()) {
+            const result = vscode.workspace.fs.stat(vscode.Uri.file(path)).then(
+              (stat) =>
+                stat.type & (vscode.FileType.File | vscode.FileType.Directory) ? path : null,
+              () => null // Missing or inaccessible paths remain plain code.
+            );
+            cached = { result: Promise.resolve(result), expiresAt: Infinity };
+            this.citationPathCache.delete(path);
+            this.citationPathCache.set(path, cached);
+            if (this.citationPathCache.size > 2048) {
+              this.citationPathCache.delete(this.citationPathCache.keys().next().value!);
+            }
+          }
+          const value = await cached.result;
+          if (cached.expiresAt === Infinity) {
+            cached.expiresAt = Date.now() + (value ? 15_000 : 1_000);
+          }
+          results[index] = value;
+        }
+      })
+    );
+    signal?.throwIfAborted();
+    return results;
+  }
+
   async openPath(
     path: string,
     options?: {
       line?: number;
+      endLine?: number;
       kind?: 'auto' | 'file' | 'directory';
       view?: 'diff';
       workspaceDirectory?: string;
+      /** Session directory already authorized by the action handler, including nested projects. */
+      sessionDirectory?: string;
+      exact?: boolean;
     }
-  ): Promise<'opened' | 'unavailable'> {
+  ): Promise<'opened' | 'unavailable' | 'cancelled'> {
     try {
       const input = path.trim();
+      if (!input) return 'unavailable';
       if (
         !isAbsolute(input) &&
+        !options?.sessionDirectory &&
         options?.workspaceDirectory &&
         !this.getOpenWorkspaceFolder(options.workspaceDirectory)
       ) {
         return 'unavailable';
       }
-      let resolved = await this.resolveWorkspaceUri(path, {
+      const targetPath =
+        !isAbsolute(input) && options?.sessionDirectory
+          ? join(options.sessionDirectory, input)
+          : path;
+      let resolved = await this.resolveWorkspaceUri(targetPath, {
         allowMissing: options?.view === 'diff',
         workspaceDirectory: options?.workspaceDirectory,
       });
-      if (!resolved && options?.view !== 'diff') {
-        const basenameOnly = !isAbsolute(input) && !/[\\/]/.test(input);
+      if (!resolved && !options?.exact && options?.view !== 'diff') {
         const missingAbsolute = isAbsolute(input);
-        const filename = basenameOnly
-          ? input
-          : missingAbsolute
-            ? input.split(/[\\/]/).at(-1) || ''
-            : '';
-        if (/^[\w.@+-]+$/.test(filename)) {
+        const suffix = missingAbsolute
+          ? input.split(/[\\/]/).at(-1) || ''
+          : input.replace(/\\/g, '/').replace(/^(\.\/)+/, '');
+        if (
+          /^[\w.@+ -]+(?:\/[\w.@+ -]+)*$/.test(suffix) &&
+          !suffix.split('/').some((part) => part === '..' || part === '.')
+        ) {
           const workspaceFolder =
             !isAbsolute(input) && options?.workspaceDirectory
               ? this.getOpenWorkspaceFolder(options.workspaceDirectory)
@@ -836,31 +907,50 @@ export class ContextProvider implements vscode.Disposable {
             ? parentDirectory !== parse(parentDirectory).root
               ? vscode.Uri.file(parentDirectory)
               : undefined
-            : workspaceFolder?.uri;
+            : options?.sessionDirectory
+              ? vscode.Uri.file(options.sessionDirectory)
+              : workspaceFolder?.uri;
           // An absolute reference must not resolve to a namesake in another project.
           // A filesystem-root reference also has no bounded project to search.
           if (missingAbsolute && !searchRoot) return 'unavailable';
-          const matches = await vscode.workspace.findFiles(
-            searchRoot
-              ? new vscode.RelativePattern(searchRoot, `**/${filename}`)
-              : `**/${filename}`,
-            null,
-            2
+          const matches = await this.citationFileSearch.find(
+            suffix,
+            searchRoot ? [searchRoot] : getWorkingFolders().map((folder) => folder.uri)
           );
-          const searchRoots = searchRoot ? [searchRoot] : undefined;
-          let uri =
-            matches.length === 1
-              ? matches[0]
-              : matches.length === 0
-                ? await this.findUniqueWorkspaceFile(filename, searchRoots)
-                : undefined;
-          if (!uri && matches.length === 0 && parentDirectory) {
-            const localPath = await this.findUniqueLocalFile(parentDirectory, filename);
-            if (localPath) uri = vscode.Uri.file(localPath);
+          if (!matches) return 'cancelled';
+          let uri = matches[0];
+          if (matches.length > 1) {
+            const picked = await vscode.window.showQuickPick(
+              matches.map((candidate) => ({
+                label: searchRoot
+                  ? relative(searchRoot.fsPath, candidate.fsPath)
+                  : vscode.workspace.asRelativePath(candidate),
+                description: candidate.fsPath,
+                uri: candidate,
+              })),
+              { placeHolder: `Choose a file for ${input}`, matchOnDescription: true }
+            );
+            if (!picked) return 'cancelled';
+            uri = picked.uri;
           }
           if (uri) {
             resolved = { uri, workspaceFolder: vscode.workspace.getWorkspaceFolder(uri) };
           }
+        }
+      }
+      // Search the owning session before accepting a namesake at the workspace root.
+      if (
+        !resolved &&
+        !options?.exact &&
+        !isAbsolute(input) &&
+        options?.sessionDirectory &&
+        options.view !== 'diff'
+      ) {
+        const sessionWorkspace = getWorkingFolder(vscode.Uri.file(options.sessionDirectory));
+        if (sessionWorkspace) {
+          resolved = await this.resolveWorkspaceUri(input, {
+            workspaceDirectory: sessionWorkspace.uri.fsPath,
+          });
         }
       }
       const uri = resolved?.uri;
@@ -901,106 +991,24 @@ export class ContextProvider implements vscode.Disposable {
       const doc = await vscode.workspace.openTextDocument(uri);
       const editor = await vscode.window.showTextDocument(doc, { preview: false });
       if (options?.line !== undefined && options.line >= 1) {
-        const position = new vscode.Position(options.line - 1, 0);
-        editor.selection = new vscode.Selection(position, position);
-        editor.revealRange(
-          new vscode.Range(position, position),
-          vscode.TextEditorRevealType.InCenter
-        );
+        const startLine = Math.min(options.line - 1, doc.lineCount - 1);
+        const position = new vscode.Position(startLine, 0);
+        const endLine =
+          options.endLine === undefined
+            ? startLine
+            : Math.min(Math.max(options.endLine - 1, startLine), doc.lineCount - 1);
+        const end =
+          options.endLine === undefined
+            ? position
+            : new vscode.Position(endLine, doc.lineAt(endLine).text.length);
+        editor.selection = new vscode.Selection(position, end);
+        editor.revealRange(new vscode.Range(position, end), vscode.TextEditorRevealType.InCenter);
       }
       return 'opened';
     } catch (err) {
       logger.error(`Failed to open file ${path}:`, err);
       return 'unavailable';
     }
-  }
-
-  private async findUniqueWorkspaceFile(
-    filename: string,
-    searchRoots?: vscode.Uri[]
-  ): Promise<vscode.Uri | undefined> {
-    const ignoredDirectories = new Set([
-      '.git',
-      '.next',
-      '.turbo',
-      'build',
-      'coverage',
-      'dist',
-      'node_modules',
-      'out',
-    ]);
-    const pending = searchRoots ?? getWorkingFolders().map((folder) => folder.uri);
-    let match: vscode.Uri | undefined;
-    let visitedEntries = 0;
-
-    while (pending.length > 0) {
-      const directory = pending.shift()!;
-      let entries: [string, vscode.FileType][];
-      try {
-        entries = await vscode.workspace.fs.readDirectory(directory);
-      } catch {
-        continue;
-      }
-
-      visitedEntries += entries.length;
-      if (visitedEntries > 20_000) return undefined;
-      for (const [name, type] of entries) {
-        const uri = vscode.Uri.joinPath(directory, name);
-        if (type & vscode.FileType.Directory) {
-          if (!ignoredDirectories.has(name)) pending.push(uri);
-          continue;
-        }
-        if (name !== filename) continue;
-        if (match) return undefined;
-        match = uri;
-      }
-    }
-
-    return match;
-  }
-
-  private async findUniqueLocalFile(
-    rootDirectory: string,
-    filename: string
-  ): Promise<string | undefined> {
-    const ignoredDirectories = new Set([
-      '.git',
-      '.next',
-      '.turbo',
-      'build',
-      'coverage',
-      'dist',
-      'node_modules',
-      'out',
-    ]);
-    const pending = [rootDirectory];
-    let match: string | undefined;
-    let visitedEntries = 0;
-
-    while (pending.length > 0) {
-      const directory = pending.shift()!;
-      let entries;
-      try {
-        entries = await readdir(directory, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-
-      visitedEntries += entries.length;
-      if (visitedEntries > 20_000) return undefined;
-      for (const entry of entries) {
-        const entryPath = join(directory, entry.name);
-        if (entry.isDirectory()) {
-          if (!ignoredDirectories.has(entry.name)) pending.push(entryPath);
-          continue;
-        }
-        if (entry.name !== filename) continue;
-        if (match) return undefined;
-        match = entryPath;
-      }
-    }
-
-    return match;
   }
 
   private async resolveWorkspaceUri(
@@ -1108,6 +1116,9 @@ export class ContextProvider implements vscode.Disposable {
   }
 
   dispose() {
+    this.citationFileSearch.dispose();
+    this.citationSymbolSearch.dispose();
+    this.citationPathCache.clear();
     if (this.terminalHistorySaveTimer) {
       clearTimeout(this.terminalHistorySaveTimer);
       this.terminalHistorySaveTimer = null;

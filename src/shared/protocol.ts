@@ -1,4 +1,5 @@
 import type { OpenCodeInstallMethod } from './opencode-install';
+import type { DroppedContentDirectory } from './dropped-content-policy';
 import type { ExtensionContext } from './extension-context';
 import type { ContextBreakdownSegment } from './context-breakdown';
 import type { NativePdfAttachment } from './native-pdf';
@@ -293,6 +294,12 @@ export type SessionTokenBreakdown = {
   subagentCount: number;
 };
 
+export type SessionLocation = {
+  directory: string;
+  isGitWorktree: boolean;
+  projectDirectory?: string;
+};
+
 export type SessionDiffSummary = {
   files: number;
   filesTruncated?: boolean;
@@ -349,6 +356,7 @@ export type ProviderLimitStatus =
       source: 'opencode' | 'provider';
       checkedAt: number;
       note: string;
+      codexLoginRequired?: { connectionID: string };
     };
 
 export type ProviderLimitUpdate = {
@@ -467,12 +475,16 @@ export const VARRO_API_ENDPOINTS = {
   promptCompletionModels: `${VARRO_API_NAMESPACE}/prompt-completion/models`,
   promptCompletionTest: `${VARRO_API_NAMESPACE}/prompt-completion/test`,
   modelPricing: `${VARRO_API_NAMESPACE}/model-pricing`,
+  startupDiagnostics: `${VARRO_API_NAMESPACE}/startup-diagnostics`,
   providerLimit: `${VARRO_API_NAMESPACE}/provider-limit`,
   planOpen: `${VARRO_API_NAMESPACE}/plan/open`,
   openCodeConfig: `${VARRO_API_NAMESPACE}/opencode-config`,
   openCodeConfigModelRouting: `${VARRO_API_NAMESPACE}/opencode-config/model-routing`,
   openCodeConfigDisableProvider: `${VARRO_API_NAMESPACE}/opencode-config/disable-provider`,
   openCodeConfigPermissions: `${VARRO_API_NAMESPACE}/opencode-config/permissions`,
+  mcpDefaults: `${VARRO_API_NAMESPACE}/mcp-defaults`,
+  mcpConfig: `${VARRO_API_NAMESPACE}/mcp-config`,
+  mcpConfigOpen: `${VARRO_API_NAMESPACE}/mcp-config/open`,
   session: `${VARRO_API_NAMESPACE}/session`,
   sessionTrash: `${VARRO_API_NAMESPACE}/session-trash`,
   sessionHistoryScope: `${VARRO_API_NAMESPACE}/session-history-scope`,
@@ -481,6 +493,8 @@ export const VARRO_API_ENDPOINTS = {
   workspaceFilePick: `${VARRO_API_NAMESPACE}/workspace-file/pick`,
   workspaceProblems: `${VARRO_API_NAMESPACE}/workspace-problems`,
   workspacePathResolve: `${VARRO_API_NAMESPACE}/workspace-path/resolve`,
+  citationPaths: `${VARRO_API_NAMESPACE}/citation-paths`,
+  citationSymbols: `${VARRO_API_NAMESPACE}/citation-symbols`,
   copiedSelectionMatch: `${VARRO_API_NAMESPACE}/copied-selection/match`,
   permissionJudge: `${VARRO_API_NAMESPACE}/permission/judge`,
   permissionJudgeModel: `${VARRO_API_NAMESPACE}/permission/judge/model`,
@@ -488,8 +502,18 @@ export const VARRO_API_ENDPOINTS = {
   permissionSessionRules: `${VARRO_API_NAMESPACE}/permission/session-rules`,
   permissionServerMemory: `${VARRO_API_NAMESPACE}/permission/server-memory`,
   permissionProjectAllow: `${VARRO_API_NAMESPACE}/permission/project-allow`,
+  permissionGlobalAllow: `${VARRO_API_NAMESPACE}/permission/global-allow`,
+  openCodeGlobalPermissions: `${VARRO_API_NAMESPACE}/opencode-config/global-permissions`,
   decisionProviders: `${VARRO_API_NAMESPACE}/decision-providers`,
 } as const;
+
+export interface McpDefaults {
+  global: Record<string, boolean>;
+  project: Record<string, boolean>;
+  effective: Record<string, boolean>;
+  editable: boolean;
+  oauthServers?: string[];
+}
 
 export interface ModelPricing {
   input?: number;
@@ -499,6 +523,7 @@ export interface ModelPricing {
 }
 
 export type VarroSessionEndpointAction =
+  | 'location'
   | 'activate'
   | 'delete'
   | 'diff-summary'
@@ -518,6 +543,7 @@ export type {
   OpenCodeModelRoute,
   OpenCodeModelRouting,
   OpenCodePermissionConfig,
+  OpenCodeGlobalPermissionConfig,
   OpenCodePermissionConfigSource,
   OpenCodeServerMemoryPermission,
   OpenCodeServerMemoryPermissions,
@@ -807,6 +833,8 @@ export type ModelPreferences = {
   lastSelectedModel?: ChatModelSelection;
   modelVariantSelections: Record<string, string | null>;
   providerOrder: string[];
+  /** Pinned provider IDs mapped to optional status-bar display names. */
+  providerLimitPins?: Record<string, string>;
   modelOrder: string[];
   hiddenProviders: string[];
   hiddenModels: string[];
@@ -854,6 +882,7 @@ export type QueuedMessageSnapshot = {
   messageId?: string;
   sessionId: string;
   text: string;
+  followupTitle?: string;
   agent?: string;
   paused?: boolean;
   droppedFiles: DroppedFile[];
@@ -944,21 +973,23 @@ export type RalphStatePayload = {
   activeIds: string[];
 };
 
-export type HandyAction = 'status' | 'start' | 'stop' | 'cancel';
-export type HandyRecordingState = 'idle' | 'recording' | 'processing' | 'unknown';
+export type DictationProvider = 'handy' | 'hex';
+export type DictationAction = 'status' | 'start' | 'stop' | 'cancel';
+export type DictationRecordingState = 'idle' | 'recording' | 'processing' | 'unknown';
+export type DictationStatus = {
+  available: boolean;
+  running: boolean;
+  state: DictationRecordingState;
+  provider?: DictationProvider;
+  /** Orders state observations and unsolicited updates within this host. */
+  revision?: number;
+  error?: string;
+};
 
 export type ExtensionMessage =
   | {
-      type: 'handy/result';
-      payload: {
-        requestId: string;
-        available: boolean;
-        running: boolean;
-        state: HandyRecordingState;
-        /** Orders state observations and unsolicited updates within this host. */
-        revision?: number;
-        error?: string;
-      };
+      type: 'dictation/result';
+      payload: DictationStatus & { requestId: string };
     }
   | { type: 'server/status'; payload: ServerStatus }
   | { type: 'server/restart-blocked'; payload: RestartBlockedState }
@@ -1002,7 +1033,7 @@ export type ExtensionMessage =
     }
   | {
       type: 'vscode/open-result';
-      payload: { requestId: number; status: 'opened' | 'unavailable' };
+      payload: { requestId: number; status: 'opened' | 'unavailable' | 'cancelled' };
     }
   | {
       type: 'api/response';
@@ -1090,8 +1121,8 @@ export type ExtensionMessage =
 
 export type WebviewMessage =
   | {
-      type: 'handy/request';
-      payload: { requestId: string; action: HandyAction };
+      type: 'dictation/request';
+      payload: { requestId: string; action: DictationAction; provider?: DictationProvider };
     }
   | { type: 'context/request' }
   | { type: 'workspace/select'; payload: { path: string; requestId: number } }
@@ -1101,6 +1132,7 @@ export type WebviewMessage =
         canAbort: boolean;
         canSwitchSessions: boolean;
         model: ChatModelSelection | null;
+        modelVisible?: boolean;
         sessionId?: string | null;
       };
     }
@@ -1167,7 +1199,7 @@ export type WebviewMessage =
   | { type: 'session/export'; payload: { sessionId: string; directory?: string } }
   | { type: 'usage/report'; payload: { includeAllTime: boolean } }
   | { type: 'webview/reload' }
-  | { type: 'vscode/open-folder' }
+  | { type: 'vscode/open-folder'; payload?: { sessionId: string; directory: string } }
   | { type: 'vscode/open-settings'; payload: { query?: string } }
   | { type: 'vscode/show-output' }
   | { type: 'vscode/mermaid-preview'; payload: { open: boolean } }
@@ -1176,7 +1208,10 @@ export type WebviewMessage =
   | { type: 'files/drop'; payload: { paths: string[] } }
   | {
       type: 'files/drop-content';
-      payload: { files: Array<{ name: string; content: string; size: number }> };
+      payload: {
+        files: Array<{ name: string; content: string; size: number }>;
+        directory?: DroppedContentDirectory;
+      };
     }
   | {
       type: 'pdfs/store';
@@ -1228,11 +1263,13 @@ export type WebviewMessage =
       payload: {
         path: string;
         line?: number;
+        endLine?: number;
         kind?: 'auto' | 'file' | 'directory';
         view?: 'diff';
         sessionID?: string;
         directory?: string;
         requestId?: number;
+        exact?: boolean;
       };
     }
   | { type: 'vscode/open-external'; payload: { url: string } }

@@ -2695,6 +2695,11 @@
   text-decoration: none;
 }
 
+.chat-codex-login-warning .chat-quota-warning-usage {
+  color: color-mix(in srgb, var(--quota-warning-color) 70%, var(--color-vscode-fg));
+  text-align: left;
+}
+
 .chat-quota-warning-close {
   display: inline-flex;
   align-items: center;
@@ -2931,6 +2936,11 @@
     100%,
     max(var(--attachment-chip-pair-min-width), calc((100% - var(--attachment-chip-gap)) / 2))
   );
+}
+
+.chat-attachments-container:focus {
+  /* The enclosing composer supplies the focus ring. */
+  outline: none;
 }
 
 .chat-attachment-chip {

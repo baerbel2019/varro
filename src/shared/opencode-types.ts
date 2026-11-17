@@ -70,6 +70,24 @@ export type OpenCodePermissionConfig = {
   projectRules: PermissionRule[];
   inheritedSources: OpenCodePermissionConfigSource[];
   effectiveRules: PermissionRule[];
+  supportsPatterns?: boolean;
+};
+
+export type OpenCodeGlobalPermissionConfig = {
+  targetPath: string;
+  rules: PermissionRule[];
+  supportsPatterns: boolean;
+};
+
+export type PermissionApprovalRequest = {
+  sessionId: string;
+  permissionId: string;
+  patterns?: string[];
+};
+
+export type PermissionApprovalOptions = {
+  directory?: string;
+  patterns?: string[];
 };
 
 export type OpenCodeServerMemoryPermission = {
@@ -82,7 +100,14 @@ export type OpenCodeServerMemoryPermission = {
 };
 
 export type OpenCodeServerMemoryPermissions =
-  | { supported: true; rules: OpenCodeServerMemoryPermission[] }
+  | {
+      supported: true;
+      rules: OpenCodeServerMemoryPermission[];
+      /** Native approvals whose origin this Varro workspace has not observed. */
+      untrackedRules?: OpenCodeServerMemoryPermission[];
+      /** Cached observations only; a fresh native snapshot is required before mutations. */
+      stale?: string;
+    }
   | { supported: false; rules: []; reason: string };
 
 export type ProviderAuthError = {
@@ -216,6 +241,8 @@ export type FilePart = {
   mime: string;
   filename?: string;
   url: string;
+  /** Bounded display context supplied by the host before deferring annotation contents. */
+  annotation?: { selectedText: string; note: string; sourceSessionId?: string };
   source?: {
     text: { value: string; start: number; end: number };
     type: 'file' | 'symbol' | 'resource';
@@ -394,6 +421,8 @@ export type Session = {
   workspaceID?: string;
   directory: string;
   workspaceScope?: SessionWorkspaceScope;
+  /** Presentation-only metadata from the server's saved Git worktree inventory. */
+  isGitWorktree?: boolean;
   /** Local link retained in the workspace where this session was transferred from. */
   transfer?: {
     originDirectory: string;
@@ -855,6 +884,7 @@ export type ProviderAuthPromptSelect = {
 };
 
 export type ProviderAuthMethod = {
+  id?: string;
   type: 'oauth' | 'api' | 'external';
   label: string;
   prompts?: Array<ProviderAuthPromptText | ProviderAuthPromptSelect>;
@@ -867,6 +897,8 @@ export type ProviderAuthAuthorization = {
   method: 'auto' | 'code' | 'complete';
   instructions: string;
   attemptID?: string;
+  /** An automatic attempt also accepts a pasted browser redirect URL as its code. */
+  paste?: true;
 };
 
 type DeferredToolEventDetails = {

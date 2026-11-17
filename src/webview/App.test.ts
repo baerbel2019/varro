@@ -48,9 +48,13 @@ import {
   errorRetry,
   resetDefaultAppState,
   setConnectionInitialized,
+  setStartupWaitingForPlugins,
+  setStartupAddonWarning,
   setError,
   setErrorRetry,
   setState,
+  setShowModels,
+  showModels,
   state,
 } from './lib/state';
 import { ralphStore } from './lib/stores/ralph-store';
@@ -58,6 +62,10 @@ import { showSessionActionFeedback } from './components/chat/SessionActionFeedba
 import { wifiIcon } from './lib/ui-icons';
 import { statusIcons } from './lib/status-icons';
 import { toCssUrl } from './components/UiIcon';
+import {
+  providerConnectionRequest,
+  resetProviderConnectionState,
+} from './lib/provider-connection-state';
 
 let container: HTMLDivElement | null = null;
 let cleanup: (() => void) | undefined;
@@ -69,6 +77,7 @@ function mountAppRoot() {
 describe('AppRoot', () => {
   beforeEach(() => {
     resetDefaultAppState();
+    resetProviderConnectionState();
     appMocks.ralphError.current = null;
     ralphStore.setShowRalphForm(false);
     appMocks.cleanupBridge.mockReset();
@@ -86,6 +95,7 @@ describe('AppRoot', () => {
     container?.remove();
     container = null;
     resetDefaultAppState();
+    resetProviderConnectionState();
     vi.useRealTimers();
   });
 
@@ -154,6 +164,72 @@ describe('AppRoot', () => {
 
     expect(container?.querySelector('[role="status"]')).toBeNull();
     expect(container?.textContent).toContain('New Chat');
+  });
+
+  it('opens provider management and add dialog only after empty-provider startup is ready', () => {
+    setState('serverStatus', { state: 'running', url: 'http://127.0.0.1:4096' });
+    setState('providersLoaded', true);
+    setState('providers', []);
+    mountAppRoot();
+
+    expect(showModels()).toBe(false);
+    expect(providerConnectionRequest()).toBeNull();
+    expect(appMocks.chatMountCount).toBe(0);
+
+    setConnectionInitialized(true);
+
+    expect(appMocks.chatMountCount).toBe(1);
+    expect(container?.textContent).not.toContain('No providers configured');
+    expect(showModels()).toBe(true);
+    const request = providerConnectionRequest();
+    expect(request).not.toBeNull();
+
+    setShowModels(false);
+    setState('serverReconnecting', true);
+    setConnectionInitialized(false);
+    setConnectionInitialized(true);
+    setState('serverReconnecting', false);
+    expect(showModels()).toBe(false);
+    expect(providerConnectionRequest()).toBe(request);
+    expect(appMocks.chatMountCount).toBe(1);
+  });
+
+  it('shows plugin activation waiting without exposing an uninitialized chat', () => {
+    setState('serverStatus', { state: 'running', url: 'http://127.0.0.1:4096' });
+    mountAppRoot();
+    setStartupWaitingForPlugins(true);
+    expect(container?.querySelector('[role="status"]')?.textContent).toContain(
+      'Waiting for OpenCode plugins to activate'
+    );
+    expect(appMocks.chatMountCount).toBe(0);
+    setStartupWaitingForPlugins(false);
+    setConnectionInitialized(true);
+    expect(container?.textContent).not.toContain('Waiting for OpenCode plugins to activate');
+    expect(appMocks.chatMountCount).toBe(1);
+  });
+
+  it('shows OpenCode-reported addon failures separately from the unknown activation cause', () => {
+    setState('serverStatus', { state: 'running', url: 'http://127.0.0.1:4096' });
+    mountAppRoot();
+    setStartupWaitingForPlugins(true);
+    expect(container?.textContent).toContain('OpenCode has not identified which addon');
+    setStartupAddonWarning(
+      'OpenCode also reports: MCP "atlassian" timed out. These failures may be separate from plugin activation.'
+    );
+    expect(container?.textContent).toContain('MCP "atlassian" timed out');
+    expect(container?.textContent).toContain('may be separate');
+  });
+
+  it('does not open provider setup for configured providers', () => {
+    setState('serverStatus', { state: 'running', url: 'http://127.0.0.1:4096' });
+    setState('providersLoaded', true);
+    setState('providers', [{ id: 'openai', name: 'OpenAI', source: 'api', models: {} }]);
+    setConnectionInitialized(true);
+    mountAppRoot();
+
+    expect(showModels()).toBe(false);
+    expect(providerConnectionRequest()).toBeNull();
+    expect(appMocks.chatMountCount).toBe(1);
   });
 
   it('keeps the mounted chat visible while a running server reconnects', () => {

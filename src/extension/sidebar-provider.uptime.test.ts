@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { readMaximumTestedOpenCodeVersion } from './extension-manifest';
 import {
   createServer,
   createSidebarProviderInstance,
   getVscodeMock,
+  loadSidebarProvider,
 } from './sidebar-provider.test-support';
 
 const MINUTE = 60_000;
@@ -19,6 +20,11 @@ function getVersionItem() {
 }
 
 describe('SidebarProvider server uptime', () => {
+  beforeEach(async () => {
+    // The shared hook resets modules; keep cold imports outside each test's deadline.
+    await loadSidebarProvider();
+  }, 30_000);
+
   it.each([false, true])(
     'shows the connected server PID when attach-only is %s',
     async (isAttachOnly) => {
@@ -148,6 +154,7 @@ describe('SidebarProvider server uptime', () => {
       await vi.advanceTimersByTimeAsync(MINUTE);
       expect(item.tooltip).toContain('Server uptime: 2 hrs');
       expect(server.readServerInfo).toHaveBeenCalledTimes(1);
+      expect(server.readServerInfo).toHaveBeenCalledWith({ includeActiveAgentCount: false });
 
       statusHandler?.({ state: 'stopped' });
       expect(item.tooltip).not.toContain('Server uptime:');

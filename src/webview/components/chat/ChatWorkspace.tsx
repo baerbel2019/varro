@@ -10,8 +10,14 @@ import type { SlowApiRequest } from '../../lib/bridge';
 import { onMessage, postMessage } from '../../lib/bridge';
 import { editingMessage, inlineEditMount } from '../../lib/message-edit-state';
 import { ralphStore } from '../../lib/stores/ralph-store';
-import { state } from '../../lib/state';
+import {
+  setShowMcpSettings,
+  setShowModels,
+  setShowPermissionSettings,
+  state,
+} from '../../lib/state';
 import { ManagedSubagentFooter } from './ManagedSubagentFooter';
+import { SettingsPanelBoundary } from './SettingsPanelBoundary';
 
 const LazyRalphDashboard = lazy(() =>
   import('../ralph/RalphDashboard').then((module) => ({ default: module.RalphDashboard }))
@@ -23,6 +29,9 @@ const LazyPermissionSettingsPanel = lazy(() =>
   import('../PermissionSettingsPanel').then((module) => ({
     default: module.PermissionSettingsPanel,
   }))
+);
+const LazyMcpSettingsPanel = lazy(() =>
+  import('../McpSettingsPanel').then((module) => ({ default: module.McpSettingsPanel }))
 );
 
 function activeRalphSessionId() {
@@ -78,6 +87,7 @@ export function ChatWorkspace(props: {
   showSessionPicker: boolean;
   showModels: boolean;
   showPermissionSettings: boolean;
+  showMcpSettings: boolean;
   showReconnectBanner: boolean;
   slowApiRequests: readonly SlowApiRequest[];
   sessionFilter: SessionListFilter | null;
@@ -339,7 +349,7 @@ export function ChatWorkspace(props: {
 
   return (
     <div
-      class={`interactive-session${props.showModels ? ' interactive-session-showing-models' : ''}`}
+      class={`interactive-session${props.showModels ? ' interactive-session-showing-models' : ''}${props.showMcpSettings ? ' interactive-session-showing-mcp-settings' : ''}`}
     >
       <WindowChatThemeToggle />
       <Show when={props.showSessionHeader}>
@@ -394,24 +404,57 @@ export function ChatWorkspace(props: {
       </Show>
 
       <Show when={props.showModels}>
-        <Suspense
-          fallback={
-            <div class="models-panel">
-              <div class="chat-messages-loading" role="status" aria-label="Loading models">
-                <span class="chat-messages-loading-dot" />
-                <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.3s' }} />
-                <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.6s' }} />
-              </div>
-            </div>
-          }
+        <SettingsPanelBoundary
+          name="Models"
+          panelClass="models-panel"
+          onClose={() => setShowModels(false)}
         >
-          <LazyModelsPanel />
-        </Suspense>
+          <Suspense
+            fallback={
+              <div class="models-panel">
+                <div class="chat-messages-loading" role="status" aria-label="Loading models">
+                  <span class="chat-messages-loading-dot" />
+                  <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.3s' }} />
+                  <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.6s' }} />
+                </div>
+              </div>
+            }
+          >
+            <LazyModelsPanel />
+          </Suspense>
+        </SettingsPanelBoundary>
       </Show>
       <Show when={props.showPermissionSettings}>
-        <Suspense>
-          <LazyPermissionSettingsPanel />
-        </Suspense>
+        <SettingsPanelBoundary
+          name="Permission settings"
+          panelClass="permission-settings-panel"
+          onClose={() => setShowPermissionSettings(false)}
+        >
+          <Suspense>
+            <LazyPermissionSettingsPanel />
+          </Suspense>
+        </SettingsPanelBoundary>
+      </Show>
+      <Show when={props.showMcpSettings}>
+        <SettingsPanelBoundary
+          name="MCP settings"
+          panelClass="mcp-settings-panel"
+          onClose={() => setShowMcpSettings(false)}
+        >
+          <Suspense
+            fallback={
+              <section class="mcp-settings-panel" aria-label="MCP settings">
+                <div class="chat-messages-loading" role="status" aria-label="Loading MCP settings">
+                  <span class="chat-messages-loading-dot" />
+                  <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.3s' }} />
+                  <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.6s' }} />
+                </div>
+              </section>
+            }
+          >
+            <LazyMcpSettingsPanel />
+          </Suspense>
+        </SettingsPanelBoundary>
       </Show>
 
       <Show

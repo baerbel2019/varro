@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProviderLimitStatus, RecycleBinEntry } from '../../shared/protocol';
-import type { Agent, Command, QuestionRequest, Session, SessionStatus } from '../types';
+import type { Agent, Command, Provider, QuestionRequest, Session, SessionStatus } from '../types';
 import {
   applyModelPreferencesSnapshot,
   getModelPreferencesSnapshot,
@@ -45,6 +45,8 @@ const clientMocks = getClientMocks();
 function createLoaderDeps(overrides: Partial<DataLoaderDependencies> = {}): DataLoaderDependencies {
   return {
     listMcpStatus: async () => ({}),
+    listMcpDefaults: async () => ({ global: {}, project: {}, effective: {}, editable: true }),
+    setMcpDefaults: vi.fn(),
     setMcpStatus: vi.fn(),
     getActiveSessionId: () => null,
     getComposerSessionId: () => null,
@@ -117,6 +119,229 @@ function deferred<T>() {
 }
 
 describe('data loaders', () => {
+  const activationError = () => new Error('503 Location plugins did not finish activating');
+
+  it('waits and retries activation-pending startup providers beyond two attempts', async () => {
+    vi.useFakeTimers();
+    const onWaitingForPlugins = vi.fn();
+    const deps = createLoaderDeps({
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockRejectedValueOnce(activationError())
+        .mockRejectedValueOnce(activationError())
+        .mockResolvedValue({ providers: [], default: {} }),
+      listAgents: vi.fn(async () => []),
+      listCommands: vi.fn(async () => []),
+    });
+    const operations = createDataLoaderOperations(deps);
+    const startup = operations.loadEssentialSnapshots({ onWaitingForPlugins });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onWaitingForPlugins).toHaveBeenLastCalledWith(true);
+    expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(startup).resolves.toEqual({ state: 'loaded', failed: [] });
+    expect(deps.listProviders).toHaveBeenCalledTimes(3);
+    expect(deps.listAgents).toHaveBeenCalledOnce();
+    expect(deps.listCommands).toHaveBeenCalledOnce();
+    expect(vi.mocked(deps.listProviders).mock.calls.every(([signal]) => signal?.aborted)).toBe(
+      true
+    );
+    expect(onWaitingForPlugins).toHaveBeenLastCalledWith(false);
+    expect(deps.finishWorkspaceCatalogReload).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('retains the activation 503 when the startup budget expires', async () => {
+    vi.useFakeTimers();
+    const onWaitingForPlugins = vi.fn();
+    const deps = createLoaderDeps({ listProviders: vi.fn().mockRejectedValue(activationError()) });
+    const operations = createDataLoaderOperations(deps);
+    const startup = operations.loadEssentialSnapshots({ onWaitingForPlugins });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(onWaitingForPlugins).toHaveBeenLastCalledWith(true);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(startup).resolves.toEqual({
+      state: 'failed',
+      failed: ['routing catalogs'],
+      error: '503 Location plugins did not finish activating',
+    });
+    const calls = vi.mocked(deps.listProviders).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(deps.listProviders).toHaveBeenCalledTimes(calls);
+    expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
+    expect(onWaitingForPlugins).toHaveBeenLastCalledWith(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels timed-out startup reads and ignores their late provider results', async () => {
+    vi.useFakeTimers();
+    const pending = deferred<{ providers: Provider[]; default: Record<string, string> }>();
+    const signals: Array<AbortSignal | undefined> = [];
+    const deps = createLoaderDeps({
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockRejectedValueOnce(activationError())
+        .mockImplementation((signal) => {
+          signals.push(signal);
+          return pending.promise;
+        }),
+    });
+    const operations = createDataLoaderOperations(deps);
+    const startup = operations.loadEssentialSnapshots();
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(startup).resolves.toMatchObject({
+      state: 'failed',
+      error: '503 Location plugins did not finish activating',
+    });
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every((signal) => signal?.aborted)).toBe(true);
+    pending.resolve({ providers: [provider('late', {})], default: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deps.setProviders).not.toHaveBeenCalled();
+    expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    '503 Service unavailable',
+    '401 Authentication failed',
+    '403 Location plugins did not finish activating',
+    'listener changed',
+  ])('does not extend startup retries for other failures: %s', async (message) => {
+    const onWaitingForPlugins = vi.fn();
+    const deps = createLoaderDeps({ listProviders: vi.fn().mockRejectedValue(new Error(message)) });
+    const operations = createDataLoaderOperations(deps);
+    await expect(operations.loadEssentialSnapshots({ onWaitingForPlugins })).resolves.toEqual({
+      state: 'failed',
+      failed: ['routing catalogs'],
+    });
+    expect(deps.listProviders).toHaveBeenCalledTimes(2);
+    expect(onWaitingForPlugins).not.toHaveBeenCalledWith(true);
+  });
+
+  it('stops activation retries when the workspace changes without affecting the next startup', async () => {
+    vi.useFakeTimers();
+    const onWaitingForPlugins = vi.fn();
+    const deps = createLoaderDeps({
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockRejectedValueOnce(activationError())
+        .mockResolvedValue({ providers: [], default: {} }),
+    });
+    const operations = createDataLoaderOperations(deps);
+    const oldStartup = operations.loadEssentialSnapshots({ onWaitingForPlugins });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onWaitingForPlugins).toHaveBeenLastCalledWith(true);
+    operations.invalidateWorkspace();
+    const newWaiting = vi.fn();
+    const newStartup = operations.loadEssentialSnapshots({ onWaitingForPlugins: newWaiting });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(oldStartup).resolves.toEqual({ state: 'superseded', failed: [] });
+    await expect(newStartup).resolves.toEqual({ state: 'loaded', failed: [] });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(deps.listProviders).toHaveBeenCalledTimes(2);
+    expect(onWaitingForPlugins).not.toHaveBeenCalledWith(false);
+    expect(deps.finishWorkspaceCatalogReload).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps background activation failures on the ordinary two-attempt bound', async () => {
+    const deps = createLoaderDeps({ listProviders: vi.fn().mockRejectedValue(activationError()) });
+    const operations = createDataLoaderOperations(deps);
+    await expect(operations.reloadWorkspaceCatalogs()).resolves.toBe(false);
+    expect(deps.listProviders).toHaveBeenCalledTimes(2);
+    expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
+  });
+
+  it('does not read addon diagnostics on the normal startup path', async () => {
+    const readStartupDiagnostics = vi.fn(async () => []);
+    const operations = createDataLoaderOperations(createLoaderDeps({ readStartupDiagnostics }));
+    await expect(operations.loadEssentialSnapshots()).resolves.toMatchObject({ state: 'loaded' });
+    expect(readStartupDiagnostics).not.toHaveBeenCalled();
+  });
+
+  it('reports a bounded named addon failure without blaming it for activation', async () => {
+    vi.useFakeTimers();
+    const readStartupDiagnostics = vi.fn(async () => [
+      { kind: 'mcp' as const, name: 'atlassian', timedOut: true },
+    ]);
+    const onAddonWarning = vi.fn();
+    const operations = createDataLoaderOperations(
+      createLoaderDeps({
+        listProviders: vi.fn().mockRejectedValue(activationError()),
+        readStartupDiagnostics,
+      })
+    );
+    const startup = operations.loadEssentialSnapshots({ onAddonWarning });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onAddonWarning).toHaveBeenCalledWith(
+      'OpenCode also reports: MCP "atlassian" timed out. These failures may be separate from plugin activation.'
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(startup).resolves.toMatchObject({
+      state: 'failed',
+      error: expect.stringContaining('MCP "atlassian" timed out'),
+    });
+    expect(readStartupDiagnostics).toHaveBeenCalledOnce();
+  });
+
+  it('does not let an unavailable addon inventory delay otherwise recoverable startup', async () => {
+    vi.useFakeTimers();
+    const onAddonWarning = vi.fn();
+    const operations = createDataLoaderOperations(
+      createLoaderDeps({
+        listProviders: vi
+          .fn<DataLoaderDependencies['listProviders']>()
+          .mockRejectedValueOnce(activationError())
+          .mockResolvedValue({ providers: [], default: {} }),
+        readStartupDiagnostics: () => new Promise(() => {}),
+      })
+    );
+    const startup = operations.loadEssentialSnapshots({ onAddonWarning });
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(startup).resolves.toMatchObject({ state: 'loaded' });
+    expect(onAddonWarning).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('stops extending retries if activation pending changes to a different error', async () => {
+    vi.useFakeTimers();
+    const deps = createLoaderDeps({
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockRejectedValueOnce(activationError())
+        .mockRejectedValueOnce(activationError())
+        .mockRejectedValue(new Error('401 Authentication failed')),
+    });
+    const operations = createDataLoaderOperations(deps);
+    const startup = operations.loadEssentialSnapshots();
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(startup).resolves.toEqual({ state: 'failed', failed: ['routing catalogs'] });
+    expect(deps.listProviders).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('inherits an event-driven startup provider success instead of retaining an obsolete 503', async () => {
+    vi.useFakeTimers();
+    const old = deferred<Awaited<ReturnType<DataLoaderDependencies['listProviders']>>>();
+    const deps = createLoaderDeps({
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockRejectedValueOnce(activationError())
+        .mockReturnValueOnce(old.promise)
+        .mockResolvedValue({ providers: [provider('latest', {})], default: {} }),
+    });
+    const operations = createDataLoaderOperations(deps);
+    const startup = operations.loadEssentialSnapshots();
+    await vi.advanceTimersByTimeAsync(500);
+    await operations.refreshRoutingState();
+    old.resolve({ providers: [provider('stale', {})], default: {} });
+    await expect(startup).resolves.toEqual({ state: 'loaded', failed: [] });
+    expect(deps.setProviders).toHaveBeenCalledExactlyOnceWith([provider('latest', {})], {}, []);
+    expect(deps.listProviders).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('shares essential in-flight snapshots and reports failed and superseded readiness', async () => {
     const pending = deferred<Session[]>();
     const deps = createLoaderDeps({ listSessions: vi.fn(() => pending.promise) });
@@ -200,9 +425,15 @@ describe('data loaders', () => {
     expect(setSelectedAgent).toHaveBeenCalledWith(expected, { persistGlobal: false });
   });
 
-  it('hydrates connected mcps into the active session when none are selected', async () => {
+  it('loads configured defaults independently of shared connection status', async () => {
     const setMcpStatus = vi.fn();
-    const setSelectedMcpsForSession = vi.fn();
+    const setMcpDefaults = vi.fn();
+    const defaults = {
+      global: { alpha: true, gamma: false },
+      project: { beta: true },
+      effective: { alpha: true, beta: true, gamma: false },
+      editable: true,
+    };
     const logError = vi.fn();
 
     await loadMcpsWithDependencies(
@@ -213,9 +444,8 @@ describe('data loaders', () => {
           gamma: { status: 'connected' },
         }),
         setMcpStatus,
-        getActiveSessionId: () => 'session-1',
-        getSelectedMcpsForSession: () => null,
-        setSelectedMcpsForSession,
+        listMcpDefaults: async () => defaults,
+        setMcpDefaults,
       },
       logError
     );
@@ -225,27 +455,32 @@ describe('data loaders', () => {
       beta: { status: 'disabled' },
       gamma: { status: 'connected' },
     });
-    expect(setSelectedMcpsForSession).toHaveBeenCalledWith('session-1', ['alpha', 'gamma']);
+    expect(setMcpDefaults).toHaveBeenCalledWith(defaults);
     expect(logError).not.toHaveBeenCalled();
   });
 
-  it('does not overwrite an explicitly empty MCP selection during status hydration', async () => {
-    const setSelectedMcpsForSession = vi.fn();
+  it('does not apply status when configured defaults cannot be loaded', async () => {
+    const setMcpStatus = vi.fn();
+    const setMcpDefaults = vi.fn();
+    const logError = vi.fn();
 
     await loadMcpsWithDependencies(
       {
         listMcpStatus: async () => ({
           alpha: { status: 'connected' },
         }),
-        setMcpStatus: vi.fn(),
-        getActiveSessionId: () => 'session-1',
-        getSelectedMcpsForSession: () => [],
-        setSelectedMcpsForSession,
+        setMcpStatus,
+        listMcpDefaults: async () => {
+          throw new Error('Config unavailable');
+        },
+        setMcpDefaults,
       },
-      vi.fn()
+      logError
     );
 
-    expect(setSelectedMcpsForSession).not.toHaveBeenCalled();
+    expect(setMcpStatus).not.toHaveBeenCalled();
+    expect(setMcpDefaults).not.toHaveBeenCalled();
+    expect(logError).toHaveBeenCalledWith('loadMcps', new Error('Config unavailable'));
   });
 
   it('applies only the latest overlapping MCP status response', async () => {
@@ -327,26 +562,26 @@ describe('data loaders', () => {
     expect(setMcpStatus).toHaveBeenCalledWith({ beta: { status: 'connected' } });
   });
 
-  it('does not initialize MCP selection for a session activated while status was loading', async () => {
+  it('does not apply MCP defaults after workspace invalidation', async () => {
     const response = deferred<Record<string, { status: 'connected' }>>();
-    const activeSession = { value: 'session-a' };
-    const setSelectedMcpsForSession = vi.fn();
+    let current = true;
+    const setMcpDefaults = vi.fn();
 
     const load = loadMcpsWithDependencies(
       {
         listMcpStatus: () => response.promise,
         setMcpStatus: vi.fn(),
-        getActiveSessionId: () => activeSession.value,
-        getSelectedMcpsForSession: () => null,
-        setSelectedMcpsForSession,
+        listMcpDefaults: async () => ({ global: {}, project: {}, effective: {}, editable: true }),
+        setMcpDefaults,
       },
-      vi.fn()
+      vi.fn(),
+      () => current
     );
-    activeSession.value = 'session-b';
+    current = false;
     response.resolve({ alpha: { status: 'connected' } });
     await load;
 
-    expect(setSelectedMcpsForSession).not.toHaveBeenCalled();
+    expect(setMcpDefaults).not.toHaveBeenCalled();
   });
 
   it('preserves unavailable selected models when providers load', async () => {

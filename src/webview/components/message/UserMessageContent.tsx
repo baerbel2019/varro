@@ -19,6 +19,11 @@ import type { ExtensionContext } from '../../../shared/extension-context';
 import { readLegacyExtensionContext, showAttachmentDetails } from '../../host/extensions';
 import { Portal } from 'solid-js/web';
 import { createPastedText, readPastedTextDataUrl } from '../../../shared/pasted-text';
+import {
+  getChatAnnotationLabel,
+  readChatAnnotationFilePart,
+} from '../../../shared/chat-annotation';
+import { AnnotationTooltip } from '../chat-input/AnnotationTooltip';
 import { SESSION_RESUME_PROMPT } from '../../../shared/session-pauses';
 import type {
   DatabaseContext,
@@ -85,7 +90,7 @@ import { AgentChip } from './AgentChip';
 import { InlineMessageImage } from '../InlineMessageImage';
 import { MaterialChipIcon } from '../MaterialChipIcon';
 import { isFunction } from '../../lib/runtime-values';
-import { navArrowLeftIcon, navArrowRightIcon } from '../../lib/ui-icons';
+import { messageTextIcon, navArrowLeftIcon, navArrowRightIcon } from '../../lib/ui-icons';
 import { UiIcon } from '../UiIcon';
 import { formatSkillReference, parseSkillAttachment } from '../../lib/skill-reference';
 import {
@@ -430,7 +435,8 @@ function automaticActionPart(part: TextPart, title: string): ToolPart {
       messageID: part.messageID,
       sessionID: part.sessionID,
       type: 'tool',
-      tool: 'task',
+      // A result is a notification, not another subagent invocation.
+      tool: 'automatic_action',
       callID: `automatic:${part.id}`,
       state:
         result.state === 'completed'
@@ -1297,6 +1303,7 @@ export function UserMessageContent(props: {
           when={hasImageTiles()}
           fallback={
             <UserMessageTextList
+              sessionID={props.parts[0]?.sessionID}
               messageTexts={messageTexts()}
               attachments={indexedAttachments()}
               imageParts={imageParts()}
@@ -1318,6 +1325,7 @@ export function UserMessageContent(props: {
               )}
             </Show>
             <UserMessageTextList
+              sessionID={props.parts[0]?.sessionID}
               messageTexts={messageTexts()}
               attachments={indexedAttachments()}
               imageParts={imageParts()}
@@ -1360,6 +1368,7 @@ export function UserMessageContent(props: {
 }
 
 function UserMessageTextList(props: {
+  sessionID?: string;
   messageTexts: string[];
   attachments: IndexedMessageAttachment[];
   fileParts: FilePart[];
@@ -1375,6 +1384,7 @@ function UserMessageTextList(props: {
       <For each={props.messageTexts}>
         {(text) => (
           <UserMessageTextContent
+            sessionID={props.sessionID}
             text={text}
             attachments={props.attachments}
             fileParts={props.fileParts}
@@ -1453,6 +1463,7 @@ function getDisplayAgentParts(parsed: ParsedUserMessageContent): AgentPart[] {
 }
 
 function UserMessageTextContent(props: {
+  sessionID?: string;
   text: string;
   attachments: IndexedMessageAttachment[];
   fileParts: FilePart[];
@@ -1522,6 +1533,7 @@ function UserMessageTextContent(props: {
         ) : hasUserMarkdownSyntax(segment.content) ? (
           <Show when={segment.content.length > 0}>
             <MarkdownRenderer
+              sessionID={props.sessionID}
               content={segment.content}
               cacheByContent
               class="user-message-text user-message-markdown user-message-code-block"
@@ -2792,6 +2804,7 @@ function getInlineFileMarker(part: FilePart): string | null {
 }
 
 function MessageFileAttachment(props: { part: FilePart; inline?: boolean; marker?: string }) {
+  const annotation = createMemo(() => readChatAnnotationFilePart(props.part));
   const label = () => getMessageFileAttachmentLabel(props.part);
   const path = () => props.part.source?.path || props.part.filename;
   const canOpen = () =>
@@ -2827,7 +2840,7 @@ function MessageFileAttachment(props: { part: FilePart; inline?: boolean; marker
     }
   };
 
-  return (
+  const chip = (
     <span
       class={
         props.inline
@@ -2835,7 +2848,7 @@ function MessageFileAttachment(props: { part: FilePart; inline?: boolean; marker
           : 'chat-attachment-chip message-attachment-chip'
       }
       data-copy-marker={props.marker}
-      title={error() || label()}
+      title={annotation() ? undefined : error() || label()}
       aria-label={error() ? `${label()}: ${error()}. Click to retry` : label()}
       aria-busy={loading()}
       role={canOpen() ? 'button' : undefined}
@@ -2851,13 +2864,22 @@ function MessageFileAttachment(props: { part: FilePart; inline?: boolean; marker
         }
       }}
     >
-      <FileTypeIcon path={path()} class="chip-icon" />
-      <AttachmentLabel label={label()} preserveExtension />
+      <Show when={annotation()} fallback={<FileTypeIcon path={path()} class="chip-icon" />}>
+        <UiIcon source={messageTextIcon} class="chip-icon" width={12} height={12} />
+      </Show>
+      <AttachmentLabel label={label()} preserveExtension={!annotation()} />
     </span>
+  );
+  return (
+    <Show when={annotation()} fallback={chip}>
+      {(value) => <AnnotationTooltip annotation={value()}>{chip}</AnnotationTooltip>}
+    </Show>
   );
 }
 
 function getMessageFileAttachmentLabel(part: FilePart): string {
+  const annotation = readChatAnnotationFilePart(part);
+  if (annotation) return getChatAnnotationLabel(annotation.note);
   const path = part.source?.path || part.filename;
   return path ? formatDisplayPath(path, state.editorContext.workspacePath) : '(file)';
 }

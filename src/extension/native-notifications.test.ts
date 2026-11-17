@@ -16,48 +16,49 @@ const TARGET_URL = 'vscode://file/Users/test/Project%20name';
 describe('NativeNotifications', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('checks visibility for the originating macOS editor process', async () => {
-    const visible = vi
-      .spyOn(MacOSNotificationHelper.prototype, 'isEditorVisible')
-      .mockResolvedValue(true);
+  it('plays macOS sound without installing the helper or checking editor visibility', async () => {
+    const executable = vi.spyOn(MacOSNotificationHelper.prototype, 'executable');
+    const visible = vi.spyOn(MacOSNotificationHelper.prototype, 'isEditorVisible');
     const run = vi.fn<RunCommand>(async () => {});
-    const notifications = new NativeNotifications(
-      SOUND,
-      APP_ID,
-      'darwin',
-      run,
-      '/storage',
-      undefined,
-      1234
+    const notifications = new NativeNotifications(SOUND, APP_ID, 'darwin', run, '/storage');
+    await notifications.playSound();
+    expect(executable).not.toHaveBeenCalled();
+    expect(visible).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledExactlyOnceWith(
+      { file: '/usr/bin/afplay', args: [SOUND] },
+      expect.any(AbortSignal)
     );
-    expect(await notifications.isEditorVisible()).toBe(true);
-    expect(visible).toHaveBeenCalledExactlyOnceWith(1234);
-    expect(run).not.toHaveBeenCalled();
   });
 
-  it('passes macOS notification text as arguments and plays the bundled sound separately', async () => {
-    const run = vi.fn<RunCommand>(async () => {});
-    const executable = '/storage with spaces/Varro.app/Contents/MacOS/varro-notifier';
-    vi.spyOn(MacOSNotificationHelper.prototype, 'executable').mockResolvedValue(executable);
-    const notifications = new NativeNotifications(
-      SOUND,
-      APP_ID,
-      'darwin',
-      run,
-      '/storage with spaces',
-      async () => TARGET_URL
-    );
-    const message = '" & do shell script "touch /bad"\n$HOME';
-    await notifications.show({ ...NOTIFICATION, message });
-    const command = run.mock.calls[0]?.[0];
-    expect(command).toEqual({
-      file: executable,
-      args: ['--notify', 'Project', 'Fix tests', message, expect.any(String), TARGET_URL],
-      timeout: 50_000,
-    });
-    await notifications.playSound();
-    expect(run.mock.calls[1]?.[0]).toEqual({ file: '/usr/bin/afplay', args: [SOUND] });
-  });
+  it.each([
+    TARGET_URL,
+    'vscode://koltyakov.varro/notification?session=child&root=root&directory=%2Fvarro%2Fscratch&windowId=42',
+  ])(
+    'passes macOS text and target URL unchanged and plays sound separately: %s',
+    async (targetUrl) => {
+      const run = vi.fn<RunCommand>(async () => {});
+      const executable = '/storage with spaces/Varro.app/Contents/MacOS/varro-notifier';
+      vi.spyOn(MacOSNotificationHelper.prototype, 'executable').mockResolvedValue(executable);
+      const notifications = new NativeNotifications(
+        SOUND,
+        APP_ID,
+        'darwin',
+        run,
+        '/storage with spaces',
+        async () => targetUrl
+      );
+      const message = '" & do shell script "touch /bad"\n$HOME';
+      await notifications.show({ ...NOTIFICATION, message });
+      const command = run.mock.calls[0]?.[0];
+      expect(command).toEqual({
+        file: executable,
+        args: ['--notify', 'Project', 'Fix tests', message, expect.any(String), targetUrl],
+        timeout: 50_000,
+      });
+      await notifications.playSound();
+      expect(run.mock.calls[1]?.[0]).toEqual({ file: '/usr/bin/afplay', args: [SOUND] });
+    }
+  );
 
   it('reports helper installation failures while allowing macOS sound independently', async () => {
     const run = vi.fn<RunCommand>(async () => {});

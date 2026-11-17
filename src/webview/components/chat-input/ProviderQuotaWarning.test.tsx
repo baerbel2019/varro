@@ -100,6 +100,19 @@ function dismiss() {
 }
 
 describe('ProviderQuotaWarning', () => {
+  it('renders the Codex sign-in notice in the quota warning area for token-sharing connections', () => {
+    mount({
+      providerID: 'openai',
+      status: 'unsupported',
+      source: 'provider',
+      checkedAt: NOW,
+      note: 'Token sharing cannot read quotas',
+      codexLoginRequired: { connectionID: 'integration-test-connection' },
+    });
+    expect(banner()?.textContent).toContain('Sign in via Codex to see usage limits');
+    expect(container.querySelectorAll('.chat-quota-warning')).toHaveLength(1);
+  });
+
   function withResets(expirations: (number | null)[], providerID = 'openai') {
     return {
       ...snapshot([quota('weekly', 80)], providerID),
@@ -557,6 +570,7 @@ describe('ProviderQuotaWarning', () => {
   it.each([
     ['openai', 'https://chatgpt.com/settings/usage?tab=overview'],
     ['anthropic', 'https://claude.ai/settings/usage'],
+    ['claude-agent', 'https://claude.ai/settings/usage'],
   ])('opens reset details before linking to %s usage', (providerID, url) => {
     const expiresAt = NOW + HOUR;
     mount({

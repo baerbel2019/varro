@@ -33,6 +33,11 @@ const workerMocks = vi.hoisted(() => {
       this.listeners.set(event, listener);
       return this;
     }
+
+    on(event: string, listener: (...args: unknown[]) => void): this {
+      this.listeners.set(event, listener);
+      return this;
+    }
   }
 
   const instances: FakeWorker[] = [];
@@ -56,7 +61,12 @@ vi.mock('vscode', () => ({
 }));
 
 import type { OpenCodeServer } from './server';
-import { UsageReportService } from './usage-report-service';
+import {
+  archiveSessionUsage,
+  readAllTimeUsageCsv,
+  readUsageCleanupArtifacts,
+  UsageReportService,
+} from './usage-report-service';
 
 type Request = OpenCodeServer['request'];
 
@@ -120,6 +130,130 @@ afterEach(() => {
 });
 
 describe('UsageReportService', () => {
+  it('keeps API counter remainders undated and refreshes them without a session timestamp change', async () => {
+    let input = 20;
+    const tokens = { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 1 } };
+    const request = vi.fn<Request>(async (_method, path) => {
+      if (path.startsWith('/experimental/session'))
+        return [
+          {
+            id: 'one',
+            directory: '/remote',
+            time: { updated: NOW.getTime() },
+            model: { providerID: 'configured', modelID: 'not-recorded' },
+            tokens: { input, output: 10, reasoning: 4, cache: { read: 6, write: 2 } },
+          },
+        ];
+      if (path.startsWith('/session/one/message')) return [];
+      return [
+        {
+          id: 'evt_one',
+          type: 'session.usage.recorded',
+          created: NOW.getTime(),
+          durable: { aggregateID: 'one', seq: 1 },
+          data: { sessionID: 'one', source: 'generate', cost: 0, tokens },
+        },
+        { type: 'log.synced', aggregateID: 'one', seq: 1 },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join('');
+    });
+    const service = new UsageReportService({ request, apiVersion: 2, isAttachOnly: true }, vi.fn());
+    await service.openReport(true);
+    expect(reportSection(reportContent(), 'Today')).toContain('| **Total** |  | 0 | 21 | - |');
+    expect(reportSection(reportContent(), 'All time')).toContain('| **Total** |  | 0 | 42 | - |');
+    expect(reportSection(reportContent(), 'Undated session usage')).toContain(
+      '| **Total** |  | 0 | 21 | - |'
+    );
+    expect(reportContent()).not.toContain('not-recorded');
+    input = 30;
+    await service.openReport(true);
+    expect(reportSection(reportContent(), 'All time')).toContain('| **Total** |  | 0 | 52 | - |');
+    expect(reportSection(reportContent(), 'Undated session usage')).toContain(
+      '| **Total** |  | 0 | 31 | - |'
+    );
+  });
+
+  it('reads native auxiliary usage on every report even when session activity time is unchanged', async () => {
+    const now = NOW.getTime();
+    const event = (id: string) => ({
+      id,
+      type: 'session.usage.recorded',
+      created: now,
+      durable: { aggregateID: 'idle', seq: 1 },
+      data: {
+        sessionID: 'idle',
+        source: 'generate',
+        cost: 0.001,
+        tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 1 } },
+      },
+    });
+    let events = [event('side-question'), event('side-question')];
+    const request = vi.fn<Request>(async (_method, path) => {
+      if (path.startsWith('/experimental/session'))
+        return [session('idle', '/remote', now - 60 * 86400000)];
+      if (path.startsWith('/session/idle/message')) return [];
+      if (path.includes('/log?'))
+        return [...events, { type: 'log.synced', aggregateID: 'idle' }]
+          .map((value) => `data: ${JSON.stringify(value)}\n\n`)
+          .join('');
+      throw new Error(`Unexpected path ${path}`);
+    });
+    const service = new UsageReportService({ request, apiVersion: 2, isAttachOnly: true }, vi.fn());
+    await service.openReport();
+    expect(reportSection(reportContent(), 'Today')).toContain('| **Total** |  | 0 | 21 | - |');
+    events = [event('side-question'), event('warming')];
+    await service.openReport();
+    expect(reportSection(reportContent(), 'Today')).toContain(
+      '| Unattributed | Session generation | 0 | 42 | - |'
+    );
+    expect(request.mock.calls.filter(([, path]) => path.includes('/log?'))).toHaveLength(2);
+    expect(request.mock.calls.every(([method]) => method === 'GET')).toBe(true);
+    expect(new URL(request.mock.calls[0]![1], 'http://fixture').searchParams.has('start')).toBe(
+      false
+    );
+  });
+
+  it.each(['truncated', 'foreign', 'malformed', 'unavailable'])(
+    'warns instead of presenting partial auxiliary totals for a %s log',
+    async (kind) => {
+      const request = vi.fn<Request>(async (_method, path) => {
+        if (path.startsWith('/experimental/session'))
+          return [session('one', '/remote', NOW.getTime())];
+        if (path.startsWith('/session/one/message')) return [assistant('reply', NOW.getTime())];
+        if (kind === 'unavailable') throw new Error('404 Unsupported endpoint');
+        const usage = {
+          id: 'evt_one',
+          type: 'session.usage.recorded',
+          created: NOW.getTime(),
+          durable: { aggregateID: kind === 'foreign' ? 'other' : 'one', seq: 1 },
+          data: {
+            sessionID: 'one',
+            source: 'generate',
+            cost: 0,
+            tokens: {
+              input: kind === 'malformed' ? -1 : 10,
+              output: 5,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+          },
+        };
+        return (
+          `data: ${JSON.stringify(usage)}\n\n` +
+          (kind === 'truncated' ? '' : 'data: {"type":"log.synced","aggregateID":"one"}\n\n')
+        );
+      });
+      await new UsageReportService(
+        { request, apiVersion: 2, isAttachOnly: true },
+        vi.fn()
+      ).openReport();
+      expect(reportContent()).toContain('Could not read auxiliary usage');
+      expect(reportContent()).not.toContain('| Unattributed |');
+      expect(reportSection(reportContent(), 'Today')).toContain('| **Total** |  | 1 | 190 |');
+    }
+  );
+
   it('excludes paused time from API usage and invalidates timing when a pause annotation arrives', async () => {
     const now = NOW.getTime();
     let pauses: Array<{ messageId: string; pausedAt: number }> = [];
@@ -188,7 +322,7 @@ describe('UsageReportService', () => {
     expect(workerMocks.instances).toHaveLength(0);
   });
 
-  it('opens the report as a named Markdown preview', async () => {
+  it('opens the report as a named Markdown preview without an explanatory preamble', async () => {
     const uri = {
       scheme: 'varro-tool-output',
       path: '/id/OpenCode Usage Report.md',
@@ -204,7 +338,9 @@ describe('UsageReportService', () => {
     await service.openReport();
 
     expect(openDocument).toHaveBeenCalledWith(
-      expect.stringContaining('# OpenCode Usage Report'),
+      expect.stringContaining(
+        `# OpenCode Usage Report\n\nGenerated ${NOW.toLocaleString()} from 0 sessions scanned.\n\n## Today\n`
+      ),
       'OpenCode Usage Report'
     );
     expect(mocks.executeCommand).toHaveBeenCalledWith('markdown.showPreview', uri);
@@ -317,6 +453,233 @@ describe('UsageReportService', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it('forwards archive phase updates without treating them as completion', async () => {
+    const progress = vi.fn();
+    const operation = archiveSessionUsage(
+      [{ id: 'old', directory: '/project', updated: 1 }],
+      progress
+    );
+    const worker = workerMocks.instances.at(-1)!;
+    worker.listeners.get('message')?.({ progress: 'Resolving usage identities' });
+    worker.listeners.get('message')?.({ progress: 'Collecting owned artifacts for old' });
+    expect(progress.mock.calls).toEqual([
+      ['Resolving usage identities'],
+      ['Collecting owned artifacts for old'],
+    ]);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    worker.listeners.get('message')?.({ archived: 1 });
+    await operation;
+    expect(worker.terminate).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the bounded archive timeout and reports its last phase', async () => {
+    const operation = archiveSessionUsage([{ id: 'old', directory: '/project', updated: 1 }]);
+    const worker = workerMocks.instances.at(-1)!;
+    worker.listeners.get('message')?.({ progress: 'Collecting owned artifacts for old' });
+    const rejected = expect(operation).rejects.toThrow(
+      'Last phase: Collecting owned artifacts for old'
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    expect(worker.terminate).toHaveBeenCalledOnce();
+  });
+
+  it('lets a progressing artifact scan pass 30 seconds and counts more than one million rows', async () => {
+    const operation = readUsageCleanupArtifacts(['old']);
+    const worker = workerMocks.instances.at(-1)!;
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    worker.listeners.get('message')?.({
+      progress: 'Checked artifact references',
+      processed: 2_000_000,
+    });
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    worker.listeners.get('message')?.([{ id: 'old', paths: [] }]);
+    expect(await operation).toEqual(new Map([['old', []]]));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([100, 50, -1, 100.5, Number.NaN])(
+    'does not extend an artifact scan for repeated or invalid progress %s',
+    async (processed) => {
+      const operation = readUsageCleanupArtifacts(['old']);
+      const rejected = expect(operation).rejects.toThrow(
+        'artifact reference scan made no row progress for 60 seconds'
+      );
+      const worker = workerMocks.instances.at(-1)!;
+      await vi.advanceTimersByTimeAsync(20_000);
+      worker.listeners.get('message')?.({ progress: 'Checked 100 rows', processed: 100 });
+      await vi.advanceTimersByTimeAsync(20_000);
+      worker.listeners.get('message')?.({ progress: 'Still scanning', processed });
+      await vi.advanceTimersByTimeAsync(39_999);
+      expect(worker.terminate).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await rejected;
+      expect(worker.terminate).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
+
+  it('keeps an absolute ten-minute artifact scan deadline despite increasing progress', async () => {
+    const operation = readUsageCleanupArtifacts(['old']);
+    const rejected = expect(operation).rejects.toThrow(
+      'artifact reference scan exceeded the 10-minute scan limit'
+    );
+    const worker = workerMocks.instances.at(-1)!;
+    for (let index = 1; index <= 11; index++) {
+      await vi.advanceTimersByTimeAsync(50_000);
+      worker.listeners.get('message')?.({
+        progress: 'Checking artifact references',
+        processed: index * 1000,
+      });
+    }
+    expect(worker.terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(50_000);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('terminates an artifact scan on cancellation and ignores a late successful reply', async () => {
+    const controller = new AbortController();
+    const progress = vi.fn();
+    const operation = readUsageCleanupArtifacts(['old'], progress, controller.signal);
+    const rejected = expect(operation).rejects.toThrow('cancelled');
+    const worker = workerMocks.instances.at(-1)!;
+    controller.abort();
+    await rejected;
+    worker.listeners.get('message')?.([{ id: 'old', paths: [] }]);
+    worker.listeners.get('message')?.({ progress: 'Late progress', processed: 5000 });
+    expect(progress).not.toHaveBeenCalled();
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('lets a progressing CSV export run beyond the interactive 30-second deadline', async () => {
+    const operation = readAllTimeUsageCsv();
+    const outcome = operation.catch((error: unknown) => error);
+    const worker = workerMocks.instances.at(-1)!;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    worker.listeners.get('message')?.({
+      progress: 'Read 10,000 assistant messages',
+      processed: 10_000,
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    worker.listeners.get('message')?.({ csv: 'header\r\n', rowCount: 0 });
+    expect(await outcome).toEqual({ csv: 'header\r\n', rowCount: 0 });
+  });
+
+  it('lets an all-time report keep scanning past 30 seconds while rows advance', async () => {
+    const request = vi.fn<Request>();
+    const service = new UsageReportService({ request }, vi.fn());
+    const report = service.openReport(true);
+    const worker = workerMocks.instances.at(-1)!;
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    worker.listeners.get('message')?.({
+      progress: 'Read assistant messages',
+      processed: 1_000_001,
+    });
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    worker.listeners.get('message')?.({
+      sessionCount: 1,
+      windows: Array.from({ length: 5 }, () => ({ totalPromptCount: 0, groups: [] })),
+    });
+    await report;
+    expect(reportContent()).toContain('## All time');
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([10_000, 5_000, -1, 100.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1, undefined])(
+    'does not extend an all-time report for invalid or repeated row progress %s',
+    async (processed) => {
+      const request = vi.fn<Request>();
+      const service = new UsageReportService({ request }, vi.fn());
+      const report = service.openReport(true);
+      const rejected = expect(report).rejects.toThrow(
+        'Local OpenCode all-time usage query made no row progress for 60 seconds. Last phase: Still reading.'
+      );
+      const worker = workerMocks.instances.at(-1)!;
+      await vi.advanceTimersByTimeAsync(20_000);
+      worker.listeners.get('message')?.({ progress: 'Read assistant messages', processed: 10_000 });
+      await vi.advanceTimersByTimeAsync(20_000);
+      worker.listeners.get('message')?.({ progress: 'Still reading', processed });
+      await vi.advanceTimersByTimeAsync(39_999);
+      expect(worker.terminate).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await rejected;
+      expect(worker.terminate).toHaveBeenCalledOnce();
+      expect(request).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
+
+  it('keeps an absolute ten-minute all-time report deadline despite row progress', async () => {
+    const service = new UsageReportService({ request: vi.fn<Request>() }, vi.fn());
+    const report = service.openReport(true);
+    const rejected = expect(report).rejects.toThrow(
+      'Local OpenCode all-time usage query exceeded the 10-minute scan limit'
+    );
+    const worker = workerMocks.instances.at(-1)!;
+    for (let index = 1; index <= 11; index++) {
+      await vi.advanceTimersByTimeAsync(50_000);
+      worker.listeners.get('message')?.({ progress: 'Reading usage', processed: index * 10_000 });
+    }
+    expect(worker.terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(50_000);
+    await rejected;
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('times out a stalled CSV even if it repeats the same row count or phase messages', async () => {
+    const operation = readAllTimeUsageCsv();
+    const rejected = expect(operation).rejects.toThrow('made no row progress for 60 seconds');
+    const worker = workerMocks.instances.at(-1)!;
+    await vi.advanceTimersByTimeAsync(20_000);
+    worker.listeners.get('message')?.({
+      progress: 'Read 10,000 assistant messages',
+      processed: 10_000,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    worker.listeners.get('message')?.({ progress: 'Still reading', processed: 10_000 });
+    await vi.advanceTimersByTimeAsync(39_999);
+    expect(worker.terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    expect(worker.terminate).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an absolute ten-minute CSV deadline despite increasing row progress', async () => {
+    const operation = readAllTimeUsageCsv();
+    const rejected = expect(operation).rejects.toThrow('exceeded the 10-minute export limit');
+    const worker = workerMocks.instances.at(-1)!;
+    for (let index = 1; index <= 11; index++) {
+      await vi.advanceTimersByTimeAsync(50_000);
+      worker.listeners.get('message')?.({ progress: 'Reading usage', processed: index * 10_000 });
+    }
+    expect(worker.terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(50_000);
+    await rejected;
+  });
+
+  it('terminates CSV work on cancellation and ignores a late successful reply', async () => {
+    const controller = new AbortController();
+    const operation = readAllTimeUsageCsv(undefined, controller.signal);
+    const rejected = expect(operation).rejects.toThrow('cancelled');
+    const worker = workerMocks.instances.at(-1)!;
+    controller.abort();
+    await rejected;
+    worker.listeners.get('message')?.({ csv: 'late\r\n', rowCount: 0 });
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('renders compact aggregates returned by the local database worker', async () => {
     const request = vi.fn<Request>();
     const service = new UsageReportService(
@@ -329,7 +692,7 @@ describe('UsageReportService', () => {
     await Promise.resolve();
     workerMocks.instances.at(-1)?.listeners.get('message')?.({
       sessionCount: 2_209,
-      windows: Array.from({ length: 3 }, () => ({
+      windows: Array.from({ length: 4 }, () => ({
         totalPromptCount: 9,
         groups: [
           {
@@ -353,7 +716,132 @@ describe('UsageReportService', () => {
     expect(request).not.toHaveBeenCalled();
     expect(reportContent()).toContain('from 2,209 sessions scanned');
     expect(reportSection(reportContent(), 'Today')).toContain(
-      '| openai | gpt-5.6-sol | 9 | 35,101,345 | 9s |'
+      '| openai | gpt-5.6-sol | 9 | 35.1M | 9s | 1.7M | 61K | 136.6K | 33.2M | 0 | 95.0% |'
+    );
+  });
+
+  it.each([
+    [0, '0'],
+    [999, '999'],
+    [1_000, '1K'],
+    [1_250, '1.3K'],
+    [12_345, '12.3K'],
+    [999_949, '999.9K'],
+    [999_950, '1M'],
+    [1_000_000, '1M'],
+    [1_234_567, '1.2M'],
+    [1_000_000_000, '1B'],
+  ])('formats %s tokens as %s in every token column', async (count, formatted) => {
+    const request = vi.fn<Request>(async (_method, path) =>
+      path.startsWith('/experimental/session')
+        ? [session('session-1', '/repo', 10)]
+        : [
+            assistant('reply', NOW.getTime(), {
+              tokens: {
+                total: Math.max(count, 1),
+                input: count,
+                output: count,
+                reasoning: count,
+                cache: { read: count, write: count },
+              },
+            }),
+          ]
+    );
+    const { service } = createService(request);
+
+    await service.openReport();
+
+    expect(reportSection(reportContent(), 'Today')).toContain(
+      `| provider-a | model-a | 1 | ${count === 0 ? '1' : formatted} | 3s | ${formatted} | ${formatted} | ${formatted} | ${formatted} | ${formatted} | ${count === 0 ? '-' : '33.3%'} |`
+    );
+  });
+
+  it.each([false, true])(
+    'uses summed token counts for cache rates within models and totals, allTime=%s',
+    async (allTime) => {
+      const request = vi.fn<Request>(async (_method, path) =>
+        path.startsWith('/experimental/session')
+          ? [session('session-1', '/repo', 10)]
+          : [
+              assistant('cached', NOW.getTime(), {
+                tokens: { input: 0, output: 1, cache: { read: 100, write: 0 } },
+              }),
+              assistant('uncached', NOW.getTime(), {
+                tokens: { input: 900, output: 1, cache: { read: 0, write: 0 } },
+              }),
+              assistant('other-model', NOW.getTime(), {
+                modelID: 'model-b',
+                tokens: { input: 0, output: 1, cache: { read: 800, write: 200 } },
+              }),
+            ]
+      );
+      const { service } = createService(request);
+
+      await service.openReport(allTime);
+
+      const titles = ['Today', 'Last 7 rolling days', 'Last 30 rolling days'];
+      if (allTime) titles.push('All time');
+      for (const title of titles) {
+        const section = reportSection(reportContent(), title);
+        expect(section).toContain(
+          '| provider-a | model-a | 2 | 1K | 5s | 900 | 2 | 0 | 100 | 0 | 10.0% |'
+        );
+        expect(section).toContain(
+          '| provider-a | model-b | 1 | 1K | 3s | 0 | 1 | 0 | 800 | 200 | 80.0% |'
+        );
+        expect(section).toContain(
+          '| **Total** |  | 3 | 2K | 8s | 900 | 3 | 0 | 900 | 200 | 45.0% |'
+        );
+      }
+      expect(reportContent()).not.toMatch(/tok\/s|TTFT/i);
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(request.mock.calls[1]?.[3]).toMatchObject({ stripMessageParts: true });
+    }
+  );
+
+  it.each([
+    { input: 0, read: 0, write: 0, expected: '-' },
+    { input: 100, read: 0, write: 0, expected: '0.0%' },
+    { input: 0, read: 100, write: 0, expected: '100.0%' },
+    { input: 0, read: 0, write: 100, expected: '0.0%' },
+    { input: 100, read: 100, write: 200, expected: '25.0%' },
+  ])(
+    'renders cache rate $expected for $input/$read/$write',
+    async ({ input, read, write, expected }) => {
+      const request = vi.fn<Request>(async (_method, path) =>
+        path.startsWith('/experimental/session')
+          ? [session('session-1', '/repo', 10)]
+          : [
+              assistant('reply', NOW.getTime(), {
+                tokens: { input, output: 1, cache: { read, write } },
+              }),
+            ]
+      );
+      const { service } = createService(request);
+
+      await service.openReport();
+
+      const row = reportSection(reportContent(), 'Today')
+        .split('\n')
+        .find((line) => line.startsWith('| provider-a | model-a |'));
+      expect(row?.endsWith(`| ${expected} |`)).toBe(true);
+    }
+  );
+
+  it('keeps large prompt counts exact instead of compacting them', async () => {
+    const request = vi.fn<Request>(async (_method, path) =>
+      path.startsWith('/experimental/session')
+        ? [session('session-1', '/repo', 10)]
+        : Array.from({ length: 1_001 }, (_, index) =>
+            assistant(`reply-${index}`, NOW.getTime(), { tokens: tokenDetails(1) })
+          )
+    );
+    const { service } = createService(request);
+
+    await service.openReport();
+
+    expect(reportSection(reportContent(), 'Today')).toContain(
+      '| provider-a | model-a | 1,001 | 1K |'
     );
   });
 

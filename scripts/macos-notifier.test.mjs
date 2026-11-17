@@ -42,11 +42,13 @@ after(async () => {
 });
 
 const url = 'vscode://file/Users/test/Project%20%231/Project.code-workspace';
+const safeUrl = `${url}?windowId=_blank`;
 for (const scenario of [
   {
-    name: 'opens the encoded project URI before acknowledging the click',
+    name: 'protects other windows when opening an already-delivered encoded project URI',
     action: 'default',
     url,
+    openedUrl: safeUrl,
     result: 'success',
     events: ['open', 'complete'],
     code: 0,
@@ -55,9 +57,27 @@ for (const scenario of [
     name: 'acknowledges an open failure and reports it',
     action: 'default',
     url,
+    openedUrl: safeUrl,
     result: 'failure',
     events: ['open', 'complete'],
     code: 6,
+  },
+  {
+    name: 'opens a window-safe project URI before acknowledging the click',
+    action: 'default',
+    url: safeUrl,
+    result: 'success',
+    events: ['open', 'complete'],
+    code: 0,
+  },
+  {
+    name: 'protects other windows when opening an already-delivered folder URI',
+    action: 'default',
+    url: 'vscode://file/Users/test/project',
+    openedUrl: 'vscode://file/Users/test/project?windowId=_blank',
+    result: 'success',
+    events: ['open', 'complete'],
+    code: 0,
   },
   {
     name: 'does not open a project on dismissal',
@@ -79,6 +99,14 @@ for (const scenario of [
     name: 'supports already-delivered chat links',
     action: 'default',
     url: 'vscode://koltyakov.varro/notification?session%3Dses_test%26windowId%3D42',
+    result: 'success',
+    events: ['open', 'complete'],
+    code: 0,
+  },
+  {
+    name: 'opens the window-routed scratch callback unchanged before acknowledging the click',
+    action: 'default',
+    url: 'vscode://koltyakov.varro/notification?session=ses_test&root=ses_root&directory=%2Fvarro%2Fscratch&windowId=42',
     result: 'success',
     events: ['open', 'complete'],
     code: 0,
@@ -107,6 +135,19 @@ for (const scenario of [
     events: ['complete'],
     code: 0,
   },
+  ...[
+    'windowId=42',
+    'windowId=_self',
+    'windowId=_blank&session=other',
+    'windowId=_blank&windowId=42',
+  ].map((query) => ({
+    name: `rejects unsafe project routing parameters: ${query}`,
+    action: 'default',
+    url: `vscode://file/Users/test/project?${query}`,
+    result: 'success',
+    events: ['complete'],
+    code: 0,
+  })),
 ]) {
   test(scenario.name, { skip: process.platform !== 'darwin' }, async () => {
     // The test process replaces NSWorkspace.openURL, so these checks open no application windows.
@@ -123,7 +164,7 @@ for (const scenario of [
     });
     assert.deepEqual(result, {
       events: scenario.events,
-      url: scenario.events.includes('open') ? scenario.url : '',
+      url: scenario.events.includes('open') ? (scenario.openedUrl ?? scenario.url) : '',
       exitCode: scenario.code,
     });
   });

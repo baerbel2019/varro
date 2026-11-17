@@ -1,5 +1,6 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- Tests feed server events into the real provider-owned state manager without starting a server. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MacOSNotificationHelper } from './macos-notification-helper';
 import type { SessionStateManager } from './session-state-manager';
 import type { TrayProject, TraySession } from './macos-tray';
 import type { WebviewSession } from './webview-session';
@@ -17,7 +18,7 @@ async function createHarness(enabled = true) {
   const show = vi.spyOn(NativeNotifications.prototype, 'show').mockResolvedValue();
   const sound = vi.spyOn(NativeNotifications.prototype, 'playSound').mockResolvedValue();
   const editorVisible = vi
-    .spyOn(NativeNotifications.prototype, 'isEditorVisible')
+    .spyOn(MacOSNotificationHelper.prototype, 'isEditorVisible')
     .mockResolvedValue(false);
   const vscode = getVscodeMock();
   vscode.window.state.focused = false;
@@ -424,17 +425,17 @@ describe('SidebarProvider desktop notifications', () => {
     }
   });
 
-  it('targets the project window through the built-in file route', async () => {
+  it('targets the project window without allowing a closed project to replace another window', async () => {
     const test = await createHarness();
     try {
       const provider = test.provider as unknown as {
-        notificationWindowUrl(): Promise<string>;
+        notificationWindowUrl(sessionID: string): Promise<string>;
       };
-      const url = new URL(await provider.notificationWindowUrl());
+      const url = new URL(await provider.notificationWindowUrl('child'));
       expect(url.protocol).toBe('vscode:');
       expect(url.hostname).toBe('file');
       expect(url.pathname).toBe('/repo');
-      expect(url.search).toBe('');
+      expect(Object.fromEntries(url.searchParams)).toEqual({ windowId: '_blank' });
       expect(test.vscode.env.asExternalUri).not.toHaveBeenCalled();
     } finally {
       await test.provider.dispose();
@@ -448,9 +449,64 @@ describe('SidebarProvider desktop notifications', () => {
         scheme: 'file',
         path: '/work/Projects.code-workspace',
       };
-      const provider = test.provider as unknown as { notificationWindowUrl(): Promise<string> };
-      expect(await provider.notificationWindowUrl()).toBe(
-        'vscode://file/work/Projects.code-workspace'
+      const provider = test.provider as unknown as {
+        notificationWindowUrl(sessionID: string): Promise<string>;
+      };
+      expect(await provider.notificationWindowUrl('child')).toBe(
+        'vscode://file/work/Projects.code-workspace?windowId=_blank'
+      );
+    } finally {
+      await test.provider.dispose();
+    }
+  });
+
+  it('routes a scratch notification to its originating window without opening a folder', async () => {
+    const test = await createHarness();
+    try {
+      const scratch = '/varro/scratch folder';
+      test.vscode.workspace.workspaceFolders = [];
+      test.contextProvider.context.workspacePath = scratch;
+      const provider = test.provider as unknown as {
+        notificationWindowUrl(sessionID: string): Promise<string>;
+      };
+      const url = new URL(await provider.notificationWindowUrl('child'));
+      expect(url.protocol).toBe('vscode:');
+      expect(url.hostname).toBe('koltyakov.varro');
+      expect(url.pathname).toBe('/notification');
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        session: 'child',
+        root: 'root',
+        directory: scratch,
+        windowId: '42',
+      });
+      expect(test.vscode.env.asExternalUri).toHaveBeenCalledOnce();
+      const open = vi.spyOn(test.provider, 'openSessionInSidebar').mockResolvedValue();
+      const handler = test.vscode.window.registerUriHandler.mock.calls.at(-1)?.[0];
+      if (!handler) throw new Error('Missing notification URI handler');
+      test.vscode.commands.executeCommand.mockClear();
+      await handler.handleUri({
+        authority: url.hostname,
+        path: url.pathname,
+        query: url.search.slice(1),
+      } as never);
+      expect(open).toHaveBeenCalledExactlyOnceWith('child', scratch);
+      expect(test.vscode.commands.executeCommand).not.toHaveBeenCalled();
+    } finally {
+      await test.provider.dispose();
+    }
+  });
+
+  it('does not fall back to opening scratch as a folder when window routing fails', async () => {
+    const test = await createHarness();
+    try {
+      test.vscode.workspace.workspaceFolders = [];
+      test.contextProvider.context.workspacePath = '/varro/scratch';
+      test.vscode.env.asExternalUri.mockRejectedValueOnce(new Error('Window routing unavailable'));
+      const provider = test.provider as unknown as {
+        notificationWindowUrl(sessionID: string): Promise<string>;
+      };
+      await expect(provider.notificationWindowUrl('root')).rejects.toThrow(
+        'Window routing unavailable'
       );
     } finally {
       await test.provider.dispose();
@@ -496,35 +552,93 @@ describe('SidebarProvider desktop notifications', () => {
       notify: true,
     },
     { windowFocused: true, chatFocused: true, visible: false, editorVisible: false, notify: false },
-    { windowFocused: false, chatFocused: false, visible: true, editorVisible: true, notify: false },
+    { windowFocused: false, chatFocused: false, visible: true, editorVisible: true, notify: true },
     {
       windowFocused: false,
       chatFocused: false,
       visible: false,
       editorVisible: true,
-      notify: false,
+      notify: true,
     },
-  ])('uses editor visibility independently of chat focus: %o', async (scenario) => {
-    const test = await createHarness();
-    try {
-      test.vscode.window.state.focused = scenario.windowFocused;
-      test.editorVisible.mockResolvedValue(scenario.editorVisible);
-      test.view.visible = scenario.visible;
-      await test.provider.handleMessage({
-        type: 'webview/focus',
-        payload: { focused: scenario.chatFocused },
-      });
-      test.state.handleServerEvent({
-        type: 'question.asked',
-        properties: { id: 'question', sessionID: 'child', questions: [] },
-      });
-      await vi.advanceTimersByTimeAsync(300);
-      expect(test.show).toHaveBeenCalledTimes(Number(scenario.notify));
-      expect(test.sound).toHaveBeenCalledTimes(Number(scenario.notify));
-    } finally {
-      await test.provider.dispose();
+  ])(
+    'uses originating window focus independently of chat focus and visibility: %o',
+    async (scenario) => {
+      const test = await createHarness();
+      try {
+        test.vscode.window.state.focused = scenario.windowFocused;
+        test.editorVisible.mockResolvedValue(scenario.editorVisible);
+        test.view.visible = scenario.visible;
+        await test.provider.handleMessage({
+          type: 'webview/focus',
+          payload: { focused: scenario.chatFocused },
+        });
+        test.state.handleServerEvent({
+          type: 'question.asked',
+          properties: { id: 'question', sessionID: 'child', questions: [] },
+        });
+        await vi.advanceTimersByTimeAsync(300);
+        expect(test.show).toHaveBeenCalledTimes(Number(scenario.notify));
+        expect(test.sound).toHaveBeenCalledTimes(Number(scenario.notify));
+        expect(test.editorVisible).not.toHaveBeenCalled();
+      } finally {
+        await test.provider.dispose();
+      }
     }
-  });
+  );
+
+  describe.each(['permission', 'question', 'completed', 'plan-ready'] as const)(
+    '%s in an unfocused window while another VS Code window is active',
+    (kind) => {
+      it.each([
+        { native: true, sound: true },
+        { native: true, sound: false },
+        { native: false, sound: true },
+        { native: false, sound: false },
+      ])('honors notification settings: %o', async ({ native, sound }) => {
+        const test = await createHarness();
+        try {
+          const config = test.vscode.workspace.getConfiguration('varro.notifications');
+          await config.update('native', native);
+          await config.update('sound', {
+            permission: sound,
+            question: sound,
+            completed: sound,
+            planReady: sound,
+          });
+          // Another visible editor window must not override this window's focus state.
+          test.editorVisible.mockResolvedValue(true);
+          test.vscode.window.state.focused = false;
+          test.view.visible = true;
+          await test.provider.handleMessage({ type: 'webview/focus', payload: { focused: true } });
+          if (kind === 'permission') {
+            test.state.handleServerEvent({
+              type: 'permission.asked',
+              properties: { id: 'permission', sessionID: 'child', permission: 'bash' },
+            });
+            test.state.revealPermission('permission');
+          } else if (kind === 'question') {
+            test.state.handleServerEvent({
+              type: 'question.asked',
+              properties: { id: 'question', sessionID: 'child', questions: [] },
+            });
+          } else {
+            if (kind === 'plan-ready') test.state.setSessionAgent('root', 'plan');
+            test.state.markSessionBusy('root');
+            test.state.handleServerEvent({
+              type: 'session.idle',
+              properties: { sessionID: 'root' },
+            });
+          }
+          await vi.advanceTimersByTimeAsync(300);
+          expect(test.show).toHaveBeenCalledTimes(Number(native));
+          expect(test.sound).toHaveBeenCalledTimes(Number(sound));
+          expect(test.editorVisible).not.toHaveBeenCalled();
+        } finally {
+          await test.provider.dispose();
+        }
+      });
+    }
+  );
 
   it('keeps other sessions quiet while the VS Code window is focused', async () => {
     const test = await createHarness();

@@ -18,6 +18,7 @@ import type {
 import type { Provider } from '../types';
 import { postMessage } from '../lib/bridge';
 import { client } from '../lib/client';
+import { codexLoginWarningDismissal } from '../lib/codex-login-warning';
 import { trapModalFocus } from '../lib/modal-focus';
 import { resolveProviderAuthFailure } from '../lib/provider-connection-state';
 import { openProviderSetup } from '../lib/provider-setup';
@@ -31,6 +32,7 @@ export function ProviderConnectionDialog(props: {
   providerLoadError: string;
   isLoadingProviders: boolean;
   initialProviderID?: string | null;
+  initialMethodID?: string;
   lockProvider?: boolean;
   reauthentication?: boolean;
   onClose: () => void;
@@ -46,11 +48,22 @@ export function ProviderConnectionDialog(props: {
   const [authorizationCode, setAuthorizationCode] = createSignal('');
   const [authorization, setAuthorization] = createSignal<ProviderAuthAuthorization | null>(null);
   const [isSubmitting, setIsSubmitting] = createSignal(false);
+  const [isSubmittingRedirect, setIsSubmittingRedirect] = createSignal(false);
   const [errorMessage, setErrorMessage] = createSignal('');
   let authController: AbortController | undefined;
+  let redirectController: AbortController | undefined;
   let initialProviderApplied = false;
 
-  onCleanup(() => authController?.abort(new Error('Provider authorization cancelled')));
+  function cancelAuthorization() {
+    authController?.abort(new Error('Provider authorization cancelled'));
+    redirectController?.abort(new Error('Provider authorization cancelled'));
+    authController = undefined;
+    redirectController = undefined;
+    setIsSubmitting(false);
+    setIsSubmittingRedirect(false);
+  }
+
+  onCleanup(cancelAuthorization);
 
   const providers = createMemo(() => {
     if (props.isLoadingProviders) return [];
@@ -60,7 +73,9 @@ export function ProviderConnectionDialog(props: {
         {
           id: provider.id,
           name: provider.name,
-          methods: state.providerAuthMethods[provider.id] ?? [GENERIC_API_METHOD],
+          methods: state.providerAuthMethods[provider.id] ?? [
+            provider.id === 'claude-agent' ? CLAUDE_AGENT_AUTH_METHOD : GENERIC_API_METHOD,
+          ],
         },
       ])
     );
@@ -83,13 +98,25 @@ export function ProviderConnectionDialog(props: {
     const index = methodIndex();
     return index === null ? undefined : selectedProvider()?.methods[index];
   });
+  const displayedMethods = createMemo(() =>
+    (selectedProvider()?.methods ?? [])
+      .map((method, index) => ({
+        method,
+        // Display order must not change the server's authorization method index.
+        index,
+        ...authMethodPresentation(providerID(), method),
+      }))
+      .toSorted((a, b) => a.order - b.order)
+  );
+  const usesClaudeCodeLogin = () =>
+    providerID() === 'claude-agent' && selectedMethod()?.type === 'external';
   const visiblePrompts = createMemo(() => {
     const prompts = selectedMethod()?.prompts ?? [];
     return prompts.filter((prompt) => !prompt.hidden && promptIsVisible(prompt, inputs(), prompts));
   });
 
   function close() {
-    authController?.abort(new Error('Provider authorization cancelled'));
+    cancelAuthorization();
     props.onClose();
   }
 
@@ -119,7 +146,20 @@ export function ProviderConnectionDialog(props: {
     if (initialProviderApplied || props.isLoadingProviders) return;
     initialProviderApplied = true;
     const id = props.initialProviderID?.trim();
-    if (id && providers().some((provider) => provider.id === id)) chooseProvider(id);
+    if (id && providers().some((provider) => provider.id === id)) {
+      chooseProvider(id);
+      const initialMethodID = props.initialMethodID;
+      if (initialMethodID) {
+        const index = selectedProvider()?.methods.findIndex(
+          (method) =>
+            method.id === initialMethodID ||
+            (!method.id &&
+              initialMethodID === 'chatgpt-browser' &&
+              authMethodPresentation(id, method).label === 'ChatGPT via Codex')
+        );
+        if (index !== undefined && index >= 0) chooseMethod(index);
+      }
+    }
   });
 
   function handleProviderSearchKeyDown(event: KeyboardEvent) {
@@ -142,7 +182,7 @@ export function ProviderConnectionDialog(props: {
   }
 
   function chooseMethod(index: number) {
-    authController?.abort(new Error('Provider authorization cancelled'));
+    cancelAuthorization();
     setMethodIndex(index);
     setInputs(
       Object.fromEntries(
@@ -158,8 +198,7 @@ export function ProviderConnectionDialog(props: {
   }
 
   function returnToMethods() {
-    authController?.abort(new Error('Provider authorization cancelled'));
-    setIsSubmitting(false);
+    cancelAuthorization();
     setAuthorization(null);
     setAuthorizationCode('');
     setInputs({});
@@ -285,9 +324,58 @@ export function ProviderConnectionDialog(props: {
     }
   }
 
+  const canPasteRedirect = () =>
+    authorization()?.method === 'auto' && authorization()?.paste === true;
+
+  async function submitRedirect() {
+    const id = providerID();
+    const index = methodIndex();
+    const active = authController;
+    const code = authorizationCode().trim();
+    if (
+      !canPasteRedirect() ||
+      !active ||
+      active.signal.aborted ||
+      isSubmittingRedirect() ||
+      !code ||
+      !id ||
+      index === null
+    )
+      return;
+    const controller = new AbortController();
+    redirectController = controller;
+    setIsSubmittingRedirect(true);
+    setErrorMessage('');
+    try {
+      const accepted = await client.config.completeProviderAuth(
+        {
+          providerID: id,
+          method: index,
+          attemptID: authorization()?.attemptID,
+          code,
+          submitOnly: true,
+        },
+        { signal: controller.signal }
+      );
+      if (controller.signal.aborted || authController !== active) return;
+      if (accepted !== true) throw new Error('Redirect URL was not accepted. Try again.');
+      setAuthorizationCode('');
+    } catch (error) {
+      if (!controller.signal.aborted && authController === active)
+        setErrorMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (redirectController === controller) {
+        redirectController = undefined;
+        setIsSubmittingRedirect(false);
+      }
+    }
+  }
+
   function finish() {
+    cancelAuthorization();
     const id = providerID();
     if (id) resolveProviderAuthFailure(id);
+    if (id === 'openai') codexLoginWarningDismissal.reset();
     setApiKey('');
     setAuthorizationCode('');
     setInputs({});
@@ -296,7 +384,12 @@ export function ProviderConnectionDialog(props: {
   }
 
   function useTerminal() {
-    authController?.abort(new Error('Provider authorization cancelled'));
+    cancelAuthorization();
+    const id = providerID();
+    if (id === 'claude-agent') {
+      openProviderSetup(id);
+      return;
+    }
     openProviderSetup();
     props.onClose();
   }
@@ -398,18 +491,36 @@ export function ProviderConnectionDialog(props: {
                         </button>
                       </Show>
                       <div class="provider-connect-intro">Choose how you want to authenticate.</div>
-                      <For each={selectedProvider()?.methods ?? []}>
-                        {(method, index) => (
+                      <For each={displayedMethods()}>
+                        {(entry) => (
                           <button
                             type="button"
                             class="provider-connect-method"
-                            onClick={() => chooseMethod(index())}
+                            classList={{ 'has-description': Boolean(entry.description) }}
+                            onClick={() => chooseMethod(entry.index)}
                           >
-                            <span>{method.label}</span>
+                            <span class="provider-connect-method-copy">
+                              <span class="provider-connect-method-heading">
+                                <span>{entry.label}</span>
+                                <Show when={entry.recommended}>
+                                  <span class="provider-connect-method-recommendation">
+                                    Recommended
+                                  </span>
+                                </Show>
+                              </span>
+                              <Show when={entry.description}>
+                                <span
+                                  class="provider-connect-method-description"
+                                  title={entry.description}
+                                >
+                                  {entry.description}
+                                </span>
+                              </Show>
+                            </span>
                             <span class="provider-connect-method-type">
-                              {method.type === 'api'
+                              {entry.method.type === 'api'
                                 ? 'API key'
-                                : method.type === 'external'
+                                : entry.method.type === 'external'
                                   ? 'External credentials'
                                   : 'OAuth'}
                             </span>
@@ -430,7 +541,11 @@ export function ProviderConnectionDialog(props: {
                       class="provider-connect-form"
                       onSubmit={(event) => {
                         event.preventDefault();
-                        void (authorization()?.method === 'code' ? submitCode() : connect());
+                        void (authorization()?.method === 'code'
+                          ? submitCode()
+                          : canPasteRedirect()
+                            ? submitRedirect()
+                            : connect());
                       }}
                     >
                       <button type="button" class="provider-connect-back" onClick={returnToMethods}>
@@ -438,6 +553,22 @@ export function ProviderConnectionDialog(props: {
                         Back to methods
                       </button>
                       <Show when={!authorization()}>
+                        <Show when={usesClaudeCodeLogin()}>
+                          <div class="provider-connect-authorization">
+                            <div class="provider-connect-instructions">
+                              Claude Code manages this login. Run <code>claude auth login</code> in
+                              the terminal, then return here to confirm you've signed in.
+                            </div>
+                            <button
+                              type="button"
+                              class="provider-connect-secondary"
+                              disabled={isSubmitting()}
+                              onClick={() => openProviderSetup('claude-agent')}
+                            >
+                              Run claude auth login
+                            </button>
+                          </div>
+                        </Show>
                         <Show when={method().type === 'oauth' && visiblePrompts().length === 0}>
                           <div class="provider-connect-oauth-handoff">
                             <div class="provider-connect-oauth-icon" aria-hidden="true">
@@ -536,9 +667,26 @@ export function ProviderConnectionDialog(props: {
                                 Open authorization page
                               </button>
                             </Show>
-                            <Show when={auth().method === 'code'}>
+                            <Show when={canPasteRedirect()}>
+                              <div
+                                id="provider-connect-redirect-help"
+                                class="provider-connect-intro"
+                              >
+                                If your browser cannot reach this machine, paste the full URL it
+                                redirected to.
+                                <Show when={isSubmitting()}>
+                                  {' '}
+                                  Automatic sign-in is still active.
+                                </Show>
+                              </div>
+                            </Show>
+                            <Show when={auth().method === 'code' || canPasteRedirect()}>
                               <label class="provider-connect-field">
-                                <span>Authorization code</span>
+                                <span>
+                                  {canPasteRedirect()
+                                    ? 'Browser redirect URL'
+                                    : 'Authorization code'}
+                                </span>
                                 <input
                                   class="provider-connect-input"
                                   type="text"
@@ -546,8 +694,20 @@ export function ProviderConnectionDialog(props: {
                                   onInput={(event) =>
                                     setAuthorizationCode(event.currentTarget.value)
                                   }
-                                  disabled={isSubmitting()}
-                                  required
+                                  disabled={
+                                    canPasteRedirect() ? isSubmittingRedirect() : isSubmitting()
+                                  }
+                                  placeholder={
+                                    canPasteRedirect() ? 'Paste the full redirect URL' : undefined
+                                  }
+                                  aria-describedby={
+                                    canPasteRedirect()
+                                      ? 'provider-connect-redirect-help'
+                                      : undefined
+                                  }
+                                  autocomplete="off"
+                                  spellcheck={false}
+                                  required={!canPasteRedirect()}
                                 />
                               </label>
                             </Show>
@@ -573,19 +733,29 @@ export function ProviderConnectionDialog(props: {
                           type="submit"
                           class="provider-connect-primary"
                           disabled={
-                            !canConnect() ||
-                            Boolean(authorization() && authorization()?.method !== 'code')
+                            canPasteRedirect()
+                              ? !isSubmitting() ||
+                                isSubmittingRedirect() ||
+                                !authorizationCode().trim()
+                              : !canConnect() ||
+                                Boolean(authorization() && authorization()?.method !== 'code')
                           }
                         >
-                          {isSubmitting()
-                            ? authorization()?.method === 'auto'
-                              ? 'Waiting for authorization...'
-                              : 'Connecting...'
-                            : authorization()?.method === 'code'
-                              ? 'Complete connection'
-                              : method().type === 'oauth'
-                                ? 'Continue'
-                                : 'Connect'}
+                          {canPasteRedirect()
+                            ? isSubmittingRedirect()
+                              ? 'Submitting redirect URL...'
+                              : 'Submit redirect URL'
+                            : isSubmitting()
+                              ? authorization()?.method === 'auto'
+                                ? 'Waiting for authorization...'
+                                : 'Connecting...'
+                              : authorization()?.method === 'code'
+                                ? 'Complete connection'
+                                : usesClaudeCodeLogin()
+                                  ? "I've signed in"
+                                  : method().type === 'oauth'
+                                    ? 'Continue'
+                                    : 'Connect'}
                         </button>
                       </div>
                     </form>
@@ -608,6 +778,62 @@ export function ProviderConnectionDialog(props: {
 }
 
 const GENERIC_API_METHOD: ProviderAuthMethod = { type: 'api', label: 'API key' };
+const CLAUDE_AGENT_AUTH_METHOD: ProviderAuthMethod = {
+  type: 'external',
+  label: 'Claude Code login (claude auth login)',
+};
+
+type AuthMethodPresentation = {
+  label: string;
+  description?: string;
+  order: number;
+  recommended?: boolean;
+};
+
+function authMethodPresentation(
+  providerID: string | null,
+  method: ProviderAuthMethod
+): AuthMethodPresentation {
+  if (providerID === 'openai') {
+    if (method.type === 'api' && method.label === 'API key') {
+      return {
+        label: 'OpenAI API key',
+        description: 'Uses separate API billing.',
+        order: 3,
+      };
+    }
+    if (method.type === 'oauth') {
+      // V1 does not supply method IDs. Match only known labels in that case.
+      switch (method.id ?? method.label) {
+        case 'chatgpt-browser':
+        case 'Codex browser':
+        case 'Codex browser (legacy)':
+          return {
+            label: 'ChatGPT via Codex',
+            description: 'Usage limits and reset credits when available.',
+            order: 0,
+            recommended: true,
+          };
+        case 'chatgpt-headless':
+        case 'Codex device code':
+        case 'Codex device code (legacy)':
+          return {
+            label: 'ChatGPT via Codex device code',
+            description: 'Sign in using a device code.',
+            order: 1,
+          };
+        case 'chatgpt-token-sharing':
+        case 'Sign in with ChatGPT':
+          return {
+            label: 'ChatGPT token sharing',
+            description: 'View usage limits in ChatGPT settings.',
+            order: 2,
+          };
+      }
+    }
+  }
+  return { label: method.label, order: 3 };
+}
 
 function BackArrowIcon() {
   return <UiIcon source={arrowLeftIcon} width={11} height={11} aria-hidden="true" />;

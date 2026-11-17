@@ -4,11 +4,17 @@ import { createSignal } from 'solid-js';
 import { reconcile } from 'solid-js/store';
 import { render } from 'solid-js/web';
 import { client } from '../../lib/client';
-import { replaceMessages, setState } from '../../lib/state';
+import type { FollowupSuggestionSet } from '../../../shared/followups';
+import { checkIcon, xmarkIcon } from '../../lib/ui-icons';
+import { error, replaceMessages, setError, setState, state } from '../../lib/state';
+import * as clipboard from '../../lib/write-clipboard';
 import { assistantMessage, session, textPart, userMessage } from '../MessageList.test-utils';
 import { FollowupSuggestions } from './FollowupSuggestions';
 
 const mocks = vi.hoisted(() => ({
+  fork: vi.fn<(id: string) => Promise<string | null>>(),
+  rename: vi.fn<(id: string, title: string) => Promise<boolean>>(),
+  select: vi.fn(async () => true),
   send: vi.fn<
     (
       prompt: string,
@@ -16,7 +22,12 @@ const mocks = vi.hoisted(() => ({
     ) => Promise<boolean>
   >(),
 }));
-vi.mock('../../hooks/useOpenCode', () => ({ sendMessage: mocks.send }));
+vi.mock('../../hooks/useOpenCode', () => ({
+  sendMessage: mocks.send,
+  forkSession: mocks.fork,
+  renameSession: mocks.rename,
+  selectSession: mocks.select,
+}));
 
 const actions = [
   { title: 'Inspect parser failures', prompt: 'Investigate only the reported parser failures.' },
@@ -44,6 +55,10 @@ beforeEach(() => {
   setState('messagesLoading', false);
   setState('followupOpening', null);
   setState('sessions', [session('session-1')]);
+  setState('queuedMessages', []);
+  setState('sessionStatus', reconcile({}));
+  setState('failedSessionIds', []);
+  setError(null);
   replaceMessages([
     { info: userMessage('user'), parts: [textPart('u', 'Fix the parser')] },
     {
@@ -57,10 +72,18 @@ beforeEach(() => {
     },
   ]);
   mocks.send.mockReset().mockResolvedValue(true);
+  mocks.select.mockClear();
+  mocks.rename.mockReset().mockResolvedValue(true);
+  mocks.fork.mockReset().mockImplementation(async () => {
+    setState('sessions', [session('session-1'), session('fork-1')]);
+    return 'fork-1';
+  });
   vi.spyOn(client.varro, 'followups').mockImplementation(async (_id, _source, options) =>
     options.allowGenerate ? suggestions : { summary: '', actions: [] }
   );
   vi.spyOn(client.varro, 'dismissFollowups').mockResolvedValue(true);
+  vi.spyOn(client.varro, 'linkFollowupSession').mockResolvedValue(true);
+  vi.spyOn(clipboard, 'writeClipboard').mockResolvedValue(true);
 });
 afterEach(() => {
   dispose?.();
@@ -71,13 +94,22 @@ afterEach(() => {
   setState('selectedModel', null);
   setState('sessionSelectedModels', reconcile({}));
   setState('messages', []);
+  setState('queuedMessages', []);
+  setState('sessionStatus', reconcile({}));
+  setState('failedSessionIds', []);
+  setError(null);
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 async function flush() {
   for (let i = 0; i < 8; i++) await Promise.resolve();
 }
-function mount(initialWorking = true, agent = 'build') {
+function mount(
+  initialWorking = true,
+  agent = 'build',
+  onRestoreStart?: () => (() => void) | undefined
+) {
   const complete = () =>
     setState(
       'messages',
@@ -100,6 +132,7 @@ function mount(initialWorking = true, agent = 'build') {
         turnId="user"
         working={working()}
         blocked={blocked()}
+        onRestoreStart={onRestoreStart}
       />
     ),
     container
@@ -113,7 +146,536 @@ function mount(initialWorking = true, agent = 'build') {
   };
 }
 
+async function openActionMenu(index = 0) {
+  const button = container.querySelectorAll<HTMLButtonElement>(
+    '.followup-suggestions-actions button'
+  )[index]!;
+  button.focus();
+  button.dispatchEvent(
+    new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 20, clientY: 30 })
+  );
+  await flush();
+  return button;
+}
+
+function menuItem(text: string) {
+  const item = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')).find(
+    (button) => button.textContent?.trim() === text
+  );
+  if (!item) throw new Error(`Missing follow-up menu item: ${text}`);
+  return item;
+}
+
 describe('FollowupSuggestions', () => {
+  it('runs the selected action in a background fork and replaces only that action with a session link', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    mocks.send.mockImplementationOnce(async (_prompt, options) => {
+      expect(await options?.validateBeforeSend?.()).toBe(true);
+      return true;
+    });
+    await openActionMenu(1);
+    const item = menuItem('Run in new session');
+    item.click();
+    item.click();
+    await flush();
+    expect(mocks.fork).toHaveBeenCalledExactlyOnceWith('session-1', undefined, { select: false });
+    expect(mocks.send).toHaveBeenCalledExactlyOnceWith(actions[1]!.prompt, {
+      targetSessionId: 'fork-1',
+      agent: 'build',
+      preserveComposer: true,
+      omitContext: true,
+      followupTitle: actions[1]!.title,
+      validateBeforeSend: expect.any(Function),
+    });
+    expect(client.varro.linkFollowupSession).toHaveBeenCalledExactlyOnceWith(
+      'session-1',
+      expect.objectContaining({ assistantMessageId: 'answer', userMessageId: 'user' }),
+      { ...actions[1]!, sessionId: 'fork-1' },
+      '/workspace'
+    );
+    expect(mocks.rename).toHaveBeenCalledExactlyOnceWith(
+      'fork-1',
+      `${actions[1]!.title} (session-1)`
+    );
+    expect(state.activeSessionId).toBe('session-1');
+    expect(mocks.select).not.toHaveBeenCalled();
+    expect(state.messages.map((entry) => entry.info.id)).toEqual(['user', 'answer']);
+    const link = container.querySelector<HTMLAnchorElement>('.followup-session-link');
+    expect(link?.textContent).toBe(actions[1]!.title);
+    expect(link?.getAttribute('href')).toBe('#session/fork-1');
+    expect(container.querySelectorAll('.followup-suggestions-actions button')).toHaveLength(2);
+    link!.click();
+    expect(mocks.select).toHaveBeenCalledExactlyOnceWith('fork-1', { directory: '/workspace' });
+    expect(mocks.send).toHaveBeenCalledOnce();
+    expect(state.queuedMessages).toHaveLength(0);
+    expect(client.varro.dismissFollowups).not.toHaveBeenCalled();
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it.each([
+    ['Parser review', 'Inspect parser failures (Parser review)'],
+    ['  Parser review  ', 'Inspect parser failures (Parser review)'],
+    ['', 'Inspect parser failures'],
+    ['   ', 'Inspect parser failures'],
+  ])('names the follow-up session using the original title %j', async (originalTitle, title) => {
+    setState('sessions', 0, 'title', originalTitle);
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(mocks.rename).toHaveBeenCalledExactlyOnceWith('fork-1', title);
+    expect(container.querySelector('.followup-session-link')?.textContent).toBe(actions[0]!.title);
+  });
+
+  it('updates the linked session spinner from live busy, retry, and idle status', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    setState('sessionStatus', 'fork-1', { type: 'busy' });
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    const link = container.querySelector<HTMLAnchorElement>('.followup-session-link')!;
+    expect(link.querySelector('.session-status-indicator.is-running')).not.toBeNull();
+    expect(link.getAttribute('aria-label')).toContain('Running');
+    setState('sessionStatus', 'fork-1', {
+      type: 'retry',
+      attempt: 1,
+      message: 'Retrying',
+      next: 10,
+    });
+    expect(link.querySelector('.session-status-indicator.is-running')).not.toBeNull();
+    setState('sessionStatus', 'fork-1', { type: 'idle' });
+    expect(link.querySelector('.session-status-indicator.is-running')).toBeNull();
+    expect(link.getAttribute('aria-label')).toContain('Completed');
+    expect(
+      link.querySelector<HTMLElement>('.ui-icon')?.style.getPropertyValue('--ui-icon-mask')
+    ).toContain(checkIcon);
+    setState('failedSessionIds', ['fork-1']);
+    expect(link.getAttribute('aria-label')).toContain('Failed');
+    expect(
+      link.querySelector<HTMLElement>('.ui-icon')?.style.getPropertyValue('--ui-icon-mask')
+    ).toContain(xmarkIcon);
+    expect(mocks.send).toHaveBeenCalledOnce();
+    expect(mocks.select).not.toHaveBeenCalled();
+  });
+
+  it.each(['busy', 'idle'] as const)(
+    'restores the linked action after a webview reload, status=%s',
+    async (type) => {
+      const { setWorking } = mount();
+      setWorking(false);
+      await flush();
+      let stored: FollowupSuggestionSet = suggestions;
+      vi.mocked(client.varro.followups).mockImplementation(async () => stored);
+      vi.mocked(client.varro.linkFollowupSession).mockImplementationOnce(
+        async (_id, _source, action) => {
+          stored = {
+            ...suggestions,
+            actions: suggestions.actions.map((item) =>
+              item.title === action.title ? action : item
+            ),
+          };
+          return true;
+        }
+      );
+      await openActionMenu();
+      menuItem('Run in new session').click();
+      await flush();
+      dispose?.();
+      dispose = undefined;
+      setState('sessionStatus', 'fork-1', { type });
+      mount(false);
+      await flush();
+      const link = container.querySelector<HTMLAnchorElement>('.followup-session-link')!;
+      expect(link.getAttribute('href')).toBe('#session/fork-1');
+      expect(link.textContent).toBe(actions[0]!.title);
+      expect(link.getAttribute('aria-label')).toContain(type === 'busy' ? 'Running' : 'Completed');
+      expect(!!link.querySelector('.session-status-indicator.is-running')).toBe(type === 'busy');
+      expect(mocks.fork).toHaveBeenCalledOnce();
+      expect(mocks.send).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('restores a session linked in another window instead of forking it again', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue({
+      ...suggestions,
+      actions: [{ ...actions[0]!, sessionId: 'other-fork' }, ...actions.slice(1)],
+    });
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(mocks.fork).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(container.querySelector('.followup-session-link')?.getAttribute('href')).toBe(
+      '#session/other-fork'
+    );
+  });
+
+  it('clears the linked action on a new prompt even while its persistence is pending', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    let finish!: (saved: boolean) => void;
+    vi.mocked(client.varro.linkFollowupSession).mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve))
+    );
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(container.querySelector('.followup-session-link')).not.toBeNull();
+    setWorking(true);
+    finish(false);
+    await flush();
+    expect(container.querySelector('.followup-suggestions')).toBeNull();
+  });
+
+  it('keeps the live link and reports a save failure without rerunning the action', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    vi.mocked(client.varro.linkFollowupSession).mockRejectedValueOnce(
+      new Error('Storage unavailable')
+    );
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(container.querySelector('.followup-session-link')).not.toBeNull();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      'session link could not be saved'
+    );
+    expect(mocks.send).toHaveBeenCalledOnce();
+  });
+
+  it('keeps other suggestions runnable after a background fork', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    await openActionMenu();
+    menuItem('Add to queue (paused)').click();
+    await flush();
+    expect(state.queuedMessages).toMatchObject([{ text: actions[1]!.prompt, paused: true }]);
+    expect(container.querySelector('.followup-session-link')?.textContent).toBe(actions[0]!.title);
+    expect(mocks.fork).toHaveBeenCalledOnce();
+  });
+
+  it.each(['rejected', 'error'])(
+    'keeps the running session link when renaming is %s',
+    async (failure) => {
+      const { setWorking } = mount();
+      setWorking(false);
+      await flush();
+      vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+      if (failure === 'error') mocks.rename.mockRejectedValueOnce(new Error('Unavailable'));
+      else mocks.rename.mockResolvedValueOnce(false);
+      await openActionMenu();
+      menuItem('Run in new session').click();
+      await flush();
+      expect(mocks.rename).toHaveBeenCalledExactlyOnceWith(
+        'fork-1',
+        `${actions[0]!.title} (session-1)`
+      );
+      expect(container.querySelector('.followup-session-link')?.getAttribute('href')).toBe(
+        '#session/fork-1'
+      );
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+        'session could not be renamed'
+      );
+      expect(mocks.send).toHaveBeenCalledOnce();
+      expect(client.varro.linkFollowupSession).toHaveBeenCalledOnce();
+      expect(state.activeSessionId).toBe('session-1');
+    }
+  );
+
+  it('does not show a rename failure in a different session', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    let finish!: (renamed: boolean) => void;
+    mocks.rename.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(mocks.rename).toHaveBeenCalledOnce();
+    setState('activeSessionId', 'session-2');
+    finish(false);
+    await flush();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(state.activeSessionId).toBe('session-2');
+  });
+
+  it('does not fork an action dismissed in another window', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(mocks.fork).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it('ignores fork validation after switching sessions', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    let finish!: (value: typeof suggestions) => void;
+    vi.mocked(client.varro.followups).mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve))
+    );
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    setState('activeSessionId', 'session-2');
+    finish(suggestions);
+    await flush();
+    expect(mocks.fork).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it('does not send when navigation supersedes a pending fork', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    let finish!: (id: string) => void;
+    mocks.fork.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    setState('activeSessionId', 'session-2');
+    finish('fork-1');
+    await flush();
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(state.activeSessionId).toBe('session-2');
+    expect(error()).toBeNull();
+  });
+
+  it.each(['dismissed', 'navigation'])(
+    'revalidates the action before fork send admission after %s',
+    async (change) => {
+      const { setWorking } = mount();
+      setWorking(false);
+      await flush();
+      vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+      mocks.send.mockImplementationOnce(async (_prompt, options) => {
+        if (change === 'dismissed')
+          vi.mocked(client.varro.followups).mockResolvedValue({ summary: '', actions: [] });
+        else setState('activeSessionId', 'session-2');
+        expect(await options?.validateBeforeSend?.()).toBe(false);
+        return false;
+      });
+      await openActionMenu();
+      menuItem('Run in new session').click();
+      await flush();
+      expect(client.varro.dismissFollowups).not.toHaveBeenCalled();
+      if (change === 'navigation') expect(error()).toBeNull();
+    }
+  );
+
+  it('keeps suggestions available for retry when forking fails', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    mocks.fork.mockResolvedValueOnce(null);
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('Could not run');
+    expect(container.querySelectorAll('button:disabled')).toHaveLength(0);
+    await openActionMenu();
+    menuItem('Run in new session').click();
+    await flush();
+    expect(mocks.send).toHaveBeenCalledOnce();
+  });
+
+  it.each(['rejected', 'error'])(
+    'reports a %s background send without replacing the action',
+    async (failure) => {
+      const { setWorking } = mount();
+      setWorking(false);
+      await flush();
+      vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+      if (failure === 'error') mocks.send.mockRejectedValueOnce(new Error('Unavailable'));
+      else mocks.send.mockResolvedValueOnce(false);
+      await openActionMenu();
+      menuItem('Run in new session').click();
+      await flush();
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain('Could not run');
+      expect(container.querySelector('.followup-session-link')).toBeNull();
+      expect(container.querySelectorAll('.followup-suggestions-actions button')).toHaveLength(3);
+      expect(state.activeSessionId).toBe('session-1');
+      expect(client.varro.dismissFollowups).not.toHaveBeenCalled();
+      expect(mocks.rename).not.toHaveBeenCalled();
+    }
+  );
+
+  it('copies the full action description from the context menu without sending or dismissing', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    const button = await openActionMenu();
+    menuItem('Copy description').click();
+    expect(clipboard.writeClipboard).toHaveBeenCalledExactlyOnceWith(actions[0]!.prompt);
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    expect(document.activeElement).toBe(button);
+    expect(container.querySelector('.followup-suggestions')).not.toBeNull();
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(client.varro.dismissFollowups).not.toHaveBeenCalled();
+  });
+
+  it('queues multiple actions paused while keeping the remaining suggestions available', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    for (const index of [0, 1]) {
+      await openActionMenu(index);
+      menuItem('Add to queue (paused)').click();
+      await flush();
+    }
+    expect(state.queuedMessages).toEqual(
+      actions.slice(0, 2).map((action) => ({
+        id: expect.any(String),
+        sessionId: 'session-1',
+        text: action.prompt,
+        followupTitle: action.title,
+        agent: 'build',
+        paused: true,
+      }))
+    );
+    expect(new Set(state.queuedMessages.map((item) => item.id)).size).toBe(2);
+    expect(JSON.parse(localStorage.getItem('varro.queuedMessages') ?? '[]')).toMatchObject([
+      { text: actions[0]!.prompt, followupTitle: actions[0]!.title, paused: true },
+      { text: actions[1]!.prompt, followupTitle: actions[1]!.title, paused: true },
+    ]);
+    expect(container.querySelectorAll('.followup-suggestions-actions button')).toHaveLength(3);
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(client.varro.dismissFollowups).not.toHaveBeenCalled();
+  });
+
+  it('keeps queue pointer input inside the menu until the click activates it', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
+    const button = await openActionMenu();
+    const item = menuItem('Add to queue (paused)');
+    const outsidePointerDown = vi.fn();
+    const outsideClick = vi.fn();
+    window.addEventListener('pointerdown', outsidePointerDown);
+    window.addEventListener('click', outsideClick);
+    try {
+      item.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+      item.focus();
+      expect(document.querySelector('[role="menu"]')).not.toBeNull();
+      expect(document.activeElement).toBe(item);
+      expect(state.queuedMessages).toHaveLength(0);
+      item.click();
+      await flush();
+      expect(document.querySelector('[role="menu"]')).toBeNull();
+      expect(document.activeElement).toBe(button);
+      expect(state.queuedMessages).toMatchObject([{ text: actions[0]!.prompt, paused: true }]);
+      expect(outsidePointerDown).not.toHaveBeenCalled();
+      expect(outsideClick).not.toHaveBeenCalled();
+      expect(mocks.send).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener('pointerdown', outsidePointerDown);
+      window.removeEventListener('click', outsideClick);
+    }
+  });
+
+  it('does not queue an action dismissed in another window', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    await openActionMenu();
+    menuItem('Add to queue (paused)').click();
+    await flush();
+    expect(state.queuedMessages).toHaveLength(0);
+    expect(container.querySelector('.followup-suggestions')).toBeNull();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it('ignores a queue validation result after switching sessions', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    let finish!: (value: typeof suggestions) => void;
+    vi.mocked(client.varro.followups).mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve))
+    );
+    await openActionMenu();
+    menuItem('Add to queue (paused)').click();
+    setState('activeSessionId', 'session-2');
+    finish(suggestions);
+    await flush();
+    expect(state.queuedMessages).toHaveLength(0);
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it('supports menu keyboard navigation, Escape, and outside dismissal', async () => {
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    const button = await openActionMenu();
+    expect(document.activeElement).toBe(menuItem('Copy description'));
+    menuItem('Copy description').dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })
+    );
+    expect(document.activeElement).toBe(menuItem('Add to queue (paused)'));
+    menuItem('Add to queue (paused)').dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })
+    );
+    expect(document.activeElement).toBe(menuItem('Run in new session'));
+    menuItem('Run in new session').dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+    );
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    expect(document.activeElement).toBe(button);
+    await openActionMenu();
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    await openActionMenu();
+    setWorking(true);
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it('renders backticked text in the summary and actions as inline code', async () => {
+    vi.mocked(client.varro.followups).mockResolvedValue({
+      summary: 'The `parseToken` helper still fails.',
+      actions: [{ title: 'Fix `parseToken`', prompt: 'Fix the `parseToken` helper.' }],
+    });
+    const { setWorking } = mount();
+    setWorking(false);
+    await flush();
+    const summaryCode = container.querySelector('.followup-suggestions-summary code');
+    const actionCode = container.querySelector('.followup-suggestions-actions button code');
+    expect(summaryCode?.textContent).toBe('parseToken');
+    expect(actionCode?.textContent).toBe('parseToken');
+    expect(container.querySelector('.followup-suggestions-actions button')?.textContent).toBe(
+      'Fix parseToken'
+    );
+  });
+
   it('does not send an action dismissed in another window', async () => {
     const { setWorking } = mount();
     setWorking(false);
@@ -148,10 +710,13 @@ describe('FollowupSuggestions', () => {
   it.each([0, 2, 3])(
     'admits an unread opening only when the answer completed after the prior seen marker %s',
     async (seenAt) => {
+      const onRestoreStart = vi.fn<() => (() => void) | undefined>();
+      vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
       setState('followupOpening', { sessionId: 'session-1', seenAt });
-      mount(false);
+      mount(false, 'build', onRestoreStart);
       await flush();
       expect(vi.mocked(client.varro.followups).mock.calls[0]?.[2].allowGenerate).toBe(seenAt < 2);
+      expect(onRestoreStart).toHaveBeenCalledOnce();
     }
   );
 
@@ -170,11 +735,114 @@ describe('FollowupSuggestions', () => {
   });
 
   it('restores a cached card on a read-history visit without allowing inference', async () => {
+    const finishRestore = vi.fn(() => {
+      expect(container.querySelector('.followup-suggestions')).not.toBeNull();
+    });
+    const onRestoreStart = vi.fn(() => {
+      expect(container.querySelector('.followup-suggestions')).toBeNull();
+      return finishRestore;
+    });
     vi.mocked(client.varro.followups).mockResolvedValue(suggestions);
-    mount(false);
+    mount(false, 'build', onRestoreStart);
     await flush();
+    expect(onRestoreStart).toHaveBeenCalledOnce();
+    expect(finishRestore).toHaveBeenCalledOnce();
+    expect(client.varro.followups).toHaveBeenCalledOnce();
     expect(container.querySelector('.followup-suggestions')).not.toBeNull();
     expect(vi.mocked(client.varro.followups).mock.calls[0]?.[2].allowGenerate).toBe(false);
+    expect(vi.mocked(client.varro.followups).mock.calls[0]?.[2].cacheOnly).toBe(true);
+  });
+
+  it('does not hold or cache-probe fresh live-turn suggestions', async () => {
+    const onRestoreStart = vi.fn<() => (() => void) | undefined>();
+    const { setWorking } = mount(true, 'build', onRestoreStart);
+    setWorking(false);
+    await flush();
+    expect(container.querySelector('.followup-suggestions')).not.toBeNull();
+    expect(onRestoreStart).not.toHaveBeenCalled();
+    expect(client.varro.followups).toHaveBeenCalledOnce();
+    expect(vi.mocked(client.varro.followups).mock.calls[0]?.[2].cacheOnly).toBeUndefined();
+  });
+
+  it('holds initial reveal until a delayed cached card has mounted', async () => {
+    let finish!: (value: typeof suggestions) => void;
+    vi.mocked(client.varro.followups).mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve))
+    );
+    const finishRestore = vi.fn();
+    mount(false, 'build', () => finishRestore);
+    await flush();
+    expect(finishRestore).not.toHaveBeenCalled();
+    expect(container.querySelector('.followup-suggestions')).toBeNull();
+    finish(suggestions);
+    await flush();
+    expect(container.querySelector('.followup-suggestions')).not.toBeNull();
+    expect(finishRestore).toHaveBeenCalledOnce();
+  });
+
+  it.each(['miss', 'error'])(
+    'releases initial reveal after a cache %s without waiting for generation',
+    async (result) => {
+      if (result === 'miss')
+        vi.mocked(client.varro.followups).mockResolvedValueOnce({ summary: '', actions: [] });
+      else vi.mocked(client.varro.followups).mockRejectedValueOnce(new Error('Cache unavailable'));
+      let finish!: (value: typeof suggestions) => void;
+      vi.mocked(client.varro.followups).mockImplementationOnce(
+        () => new Promise((resolve) => (finish = resolve))
+      );
+      const finishRestore = vi.fn();
+      setState('followupOpening', { sessionId: 'session-1', seenAt: 0 });
+      mount(false, 'build', () => finishRestore);
+      await flush();
+      expect(finishRestore).toHaveBeenCalledOnce();
+      expect(container.querySelector('.followup-suggestions')).toBeNull();
+      expect(
+        vi.mocked(client.varro.followups).mock.calls.map(([, , options]) => ({
+          cacheOnly: options.cacheOnly === true,
+          allowGenerate: options.allowGenerate,
+        }))
+      ).toEqual([
+        { cacheOnly: true, allowGenerate: false },
+        { cacheOnly: false, allowGenerate: true },
+      ]);
+      finish(suggestions);
+      await flush();
+      expect(container.querySelector('.followup-suggestions')).not.toBeNull();
+    }
+  );
+
+  it('bounds the initial cache hold and ignores a cache result arriving after its deadline', async () => {
+    vi.useFakeTimers();
+    let finish!: (value: typeof suggestions) => void;
+    vi.mocked(client.varro.followups).mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve))
+    );
+    const finishRestore = vi.fn();
+    mount(false, 'build', () => finishRestore);
+    const signal = vi.mocked(client.varro.followups).mock.calls[0]![2].signal;
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(signal.aborted).toBe(true);
+    expect(finishRestore).toHaveBeenCalledOnce();
+    finish(suggestions);
+    await flush();
+    expect(container.querySelector('.followup-suggestions')).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('releases an obsolete cache hold on session replacement and ignores its late result', async () => {
+    let finish!: (value: typeof suggestions) => void;
+    vi.mocked(client.varro.followups).mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve))
+    );
+    const finishRestore = vi.fn();
+    mount(false, 'build', () => finishRestore);
+    const signal = vi.mocked(client.varro.followups).mock.calls[0]![2].signal;
+    setState('activeSessionId', 'session-2');
+    expect(signal.aborted).toBe(true);
+    expect(finishRestore).toHaveBeenCalledOnce();
+    finish(suggestions);
+    await flush();
+    expect(container.querySelector('.followup-suggestions')).toBeNull();
   });
 
   it('persists explicit dismissal without sending a prompt', async () => {

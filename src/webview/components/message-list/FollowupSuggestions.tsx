@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, untrack } from 'solid-js';
+import { Portal } from 'solid-js/web';
 import type {
   FollowupAction,
   FollowupSource,
@@ -12,13 +13,22 @@ import {
 import { client } from '../../lib/client';
 import type { ChatModelSelection } from '../../../shared/protocol';
 import { logWarn } from '../../lib/log';
-import { getSelectedModelForSession, state } from '../../lib/state';
+import {
+  enqueueMessage,
+  getSelectedModelForSession,
+  isSessionStatusWorking,
+  state,
+} from '../../lib/state';
 import { deriveSelectedModelFromSession } from '../../hooks/routing-state';
 import { prepareForMessageBlockRemoval } from '../../lib/message-list-layout';
-import { sendMessage } from '../../hooks/useOpenCode';
-import { xmarkIcon } from '../../lib/ui-icons';
+import { writeClipboard } from '../../lib/write-clipboard';
+import { rememberDirectSessionReturn } from '../../lib/session-navigation';
+import { forkSession, renameSession, selectSession, sendMessage } from '../../hooks/useOpenCode';
+import { checkIcon, xmarkIcon } from '../../lib/ui-icons';
+import { InlineCodeText } from '../InlineCodeText';
 import { UiIcon } from '../UiIcon';
 import { Tooltip } from '../Tooltip';
+import { FollowupActionsMenu } from './FollowupActionsMenu';
 
 type ReadyFollowups = FollowupSuggestionSet & {
   key: string;
@@ -27,16 +37,24 @@ type ReadyFollowups = FollowupSuggestionSet & {
   directory?: string;
 };
 
+const INITIAL_CACHE_LOOKUP_TIMEOUT_MS = 2_000;
+
 /** One observer for the latest live turn, outside virtualized message rows. */
 export function FollowupSuggestions(props: {
   finalMessageId: string | null;
   turnId: string | null;
   working: boolean;
   blocked: boolean;
+  onRestoreStart?: () => (() => void) | undefined;
 }) {
   const [ready, setReady] = createSignal<ReadyFollowups | null>(null);
   const [sending, setSending] = createSignal(false);
   const [error, setError] = createSignal('');
+  const [menu, setMenu] = createSignal<{
+    action: FollowupAction;
+    x: number;
+    y: number;
+  } | null>(null);
   // oxlint-disable-next-line no-unassigned-vars -- Assigned by Solid's ref binding.
   let element: HTMLDivElement | undefined;
   let previousScope = '';
@@ -118,6 +136,7 @@ export function FollowupSuggestions(props: {
   function clear() {
     if (element?.isConnected) prepareForMessageBlockRemoval(element);
     setError('');
+    setMenu(null);
     setReady(null);
   }
 
@@ -133,38 +152,120 @@ export function FollowupSuggestions(props: {
     clear();
   }
 
-  async function send(action: FollowupAction) {
+  async function send(
+    action: FollowupAction,
+    destination: 'current' | 'queue' | 'new-session' = 'current'
+  ) {
     const value = current();
-    if (sendPending || !value || !value.actions.includes(action)) return;
+    if (sendPending || !value || !value.actions.includes(action) || action.sessionId) return;
     sendPending = true;
+    setMenu(null);
     setSending(true);
     setError('');
     const sendScope = scope();
+    const model = untrack(sessionModel);
     let optimisticPublished = false;
     const showSendError = () => {
       if (scope() !== sendScope || sourceKey() !== value.key) return;
       if (optimisticPublished && !ready()) setReady(value);
       if (ready() === value)
-        setError('Could not send this follow-up. Your main draft has not changed.');
+        setError(
+          `Could not ${destination === 'queue' ? 'queue' : destination === 'new-session' ? 'run' : 'send'} this follow-up. Your main draft has not changed.`
+        );
     };
     const validateBeforeSend = async () => {
       const latest = await client.varro.followups(value.sessionId, value.source, {
         signal: AbortSignal.timeout(5_000),
         directory: value.directory,
         allowGenerate: false,
-        model: untrack(sessionModel),
+        model,
       });
-      if (
-        current() !== value ||
-        !latest.actions.some((item) => item.title === action.title && item.prompt === action.prompt)
-      ) {
+      const latestAction = latest.actions.find(
+        (item) => item.title === action.title && item.prompt === action.prompt
+      );
+      if (current() !== value || !latestAction) {
         if (ready() === value) clear();
+        return false;
+      }
+      if (latestAction.sessionId) {
+        setReady({ ...value, ...latest });
         return false;
       }
       return true;
     };
     try {
       if (!(await validateBeforeSend())) return;
+      if (destination === 'queue') {
+        enqueueMessage({
+          id: crypto.randomUUID(),
+          sessionId: value.sessionId,
+          text: action.prompt,
+          followupTitle: action.title,
+          agent: 'build',
+          paused: true,
+        });
+        return;
+      }
+      if (destination === 'new-session') {
+        const originalTitle = state.sessions
+          .find((session) => session.id === value.sessionId)
+          ?.title.trim();
+        const title = originalTitle ? `${action.title} (${originalTitle})` : action.title;
+        const forkedSessionId = await forkSession(value.sessionId, undefined, { select: false });
+        if (!forkedSessionId) {
+          showSendError();
+          return;
+        }
+        if (scope() !== sendScope || current() !== value) return;
+        const accepted = await sendMessage(action.prompt, {
+          targetSessionId: forkedSessionId,
+          agent: 'build',
+          preserveComposer: true,
+          omitContext: true,
+          followupTitle: action.title,
+          validateBeforeSend,
+        });
+        if (accepted === false) showSendError();
+        else {
+          const linkedAction = { ...action, sessionId: forkedSessionId };
+          if (ready() === value)
+            setReady({
+              ...value,
+              actions: value.actions.map((item) => (item === action ? linkedAction : item)),
+            });
+          try {
+            if (
+              !(await client.varro.linkFollowupSession(
+                value.sessionId,
+                value.source,
+                linkedAction,
+                value.directory
+              ))
+            )
+              throw new Error('Follow-up session link was not saved');
+          } catch {
+            if (scope() === sendScope && sourceKey() === value.key)
+              setError(
+                'Follow-up started, but its session link could not be saved. Reloading may remove the link.'
+              );
+          }
+          try {
+            if (!(await renameSession(forkedSessionId, title)))
+              throw new Error('Follow-up session title was not saved');
+          } catch {
+            if (scope() === sendScope && sourceKey() === value.key)
+              setError((previous) =>
+                [
+                  previous,
+                  'Follow-up started, but its session could not be renamed to match the task.',
+                ]
+                  .filter(Boolean)
+                  .join(' ')
+              );
+          }
+        }
+        return;
+      }
       const accepted = await sendMessage(action.prompt, {
         targetSessionId: value.sessionId,
         preserveComposer: true,
@@ -186,7 +287,8 @@ export function FollowupSuggestions(props: {
     } finally {
       sendPending = false;
       setSending(false);
-      if (ready() === value && !current()) clear();
+      if (ready()?.key === value.key && ready()?.sessionId === value.sessionId && !current())
+        clear();
     }
   }
 
@@ -252,11 +354,11 @@ export function FollowupSuggestions(props: {
     });
     const unreadOpening =
       opening?.sessionId === sessionId && !!completedAt && completedAt > opening.seenAt;
-    const allowGenerate =
+    const liveTurn =
       !!source &&
-      ((source.userMessageId === armedTurn &&
-        !historicalAssistantIds.has(source.assistantMessageId)) ||
-        unreadOpening);
+      source.userMessageId === armedTurn &&
+      !historicalAssistantIds.has(source.assistantMessageId);
+    const allowGenerate = liveTurn || unreadOpening;
     const attemptKey = `${currentScope}:${source?.userMessageId ?? ''}:${allowGenerate}`;
     if (!source || !sessionId || attempted.has(attemptKey)) return;
     attempted.add(attemptKey);
@@ -266,24 +368,66 @@ export function FollowupSuggestions(props: {
     const directory = untrack(
       () => state.sessions.find((session) => session.id === sessionId)?.directory
     );
-    void client.varro
-      .followups(sessionId, source, {
+    const model = untrack(sessionModel);
+    let finishRestore = !liveTurn ? untrack(() => props.onRestoreStart?.()) : undefined;
+    const releaseRestore = () => {
+      const finish = finishRestore;
+      finishRestore = undefined;
+      finish?.();
+    };
+    const publish = (suggestions: FollowupSuggestionSet) => {
+      if (controller.signal.aborted || scope() !== currentScope || sourceKey() !== key)
+        return false;
+      // Treat bridge output as inert plain text and enforce the same bounds as the host.
+      const validated = parseFollowupSuggestions(JSON.stringify(suggestions), {
+        allowSessionId: true,
+      });
+      if (!validated.actions.length) return false;
+      setReady({ key, source, sessionId, directory, ...validated });
+      return true;
+    };
+    const load = async () => {
+      if (finishRestore) {
+        const cacheController = new AbortController();
+        const timer = setTimeout(() => {
+          cacheController.abort();
+          releaseRestore();
+        }, INITIAL_CACHE_LOOKUP_TIMEOUT_MS);
+        onCleanup(() => {
+          clearTimeout(timer);
+          cacheController.abort();
+          releaseRestore();
+        });
+        try {
+          const cached = await client.varro.followups(sessionId, source, {
+            signal: AbortSignal.any([controller.signal, cacheController.signal]),
+            directory,
+            allowGenerate: false,
+            cacheOnly: true,
+            model,
+          });
+          if (!cacheController.signal.aborted && publish(cached)) return;
+        } catch {
+          // A failed or slow cache probe falls back to normal suggestions without holding reveal.
+        } finally {
+          clearTimeout(timer);
+          releaseRestore();
+        }
+      }
+      if (controller.signal.aborted) return;
+      const suggestions = await client.varro.followups(sessionId, source, {
         signal: controller.signal,
         directory,
         allowGenerate,
-        model: untrack(sessionModel),
-      })
-      .then((suggestions) => {
-        if (controller.signal.aborted || scope() !== currentScope || sourceKey() !== key) return;
-        // Treat bridge output as inert plain text and enforce the same bounds as the host.
-        const validated = parseFollowupSuggestions(JSON.stringify(suggestions));
-        if (validated.actions.length) setReady({ key, source, sessionId, directory, ...validated });
-      })
-      .catch(() => {
-        // Optional inference must not change chat completion or log conversation text.
-        if (!controller.signal.aborted)
-          logWarn('Follow-ups request failed; check Varro output for generation diagnostics');
+        model,
       });
+      publish(suggestions);
+    };
+    void load().catch(() => {
+      // Optional inference must not change chat completion or log conversation text.
+      if (!controller.signal.aborted)
+        logWarn('Follow-ups request failed; check Varro output for generation diagnostics');
+    });
   });
 
   const current = () => {
@@ -318,19 +462,45 @@ export function FollowupSuggestions(props: {
                 <UiIcon source={xmarkIcon} width={12} height={12} aria-hidden="true" />
               </button>
             </Tooltip>
-            <p class="followup-suggestions-summary">{value().summary}</p>
+            <p class="followup-suggestions-summary">
+              <InlineCodeText text={value().summary} />
+            </p>
             <div class="followup-suggestions-actions">
               <For each={value().actions}>
                 {(action) => (
-                  <Tooltip content={action.prompt}>
-                    <button
-                      type="button"
-                      disabled={sending() || !current()}
-                      onClick={() => void send(action)}
-                    >
-                      {action.title}
-                    </button>
-                  </Tooltip>
+                  <Show
+                    when={action.sessionId}
+                    fallback={
+                      <Tooltip content={action.prompt}>
+                        <button
+                          type="button"
+                          disabled={sending() || !current()}
+                          onClick={() => void send(action)}
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            if (sending() || !current()) return;
+                            const rect = event.currentTarget.getBoundingClientRect();
+                            setMenu({
+                              action,
+                              x: event.clientX || rect.left,
+                              y: event.clientY || rect.bottom,
+                            });
+                          }}
+                        >
+                          <InlineCodeText text={action.title} />
+                        </button>
+                      </Tooltip>
+                    }
+                  >
+                    {(sessionId) => (
+                      <FollowupSessionLink
+                        sessionId={sessionId()}
+                        title={action.title}
+                        directory={value().directory}
+                      />
+                    )}
+                  </Show>
                 )}
               </For>
             </div>
@@ -342,6 +512,66 @@ export function FollowupSuggestions(props: {
           </div>
         )}
       </Show>
+      <Show when={menu()} keyed>
+        {(value) => (
+          <Portal>
+            <FollowupActionsMenu
+              x={value.x}
+              y={value.y}
+              onClose={() => setMenu(null)}
+              onCopy={() => {
+                void writeClipboard(value.action.prompt);
+                setMenu(null);
+              }}
+              onQueue={() => {
+                setMenu(null);
+                void send(value.action, 'queue');
+              }}
+              onRunInNewSession={() => {
+                setMenu(null);
+                void send(value.action, 'new-session');
+              }}
+            />
+          </Portal>
+        )}
+      </Show>
     </>
+  );
+}
+
+function FollowupSessionLink(props: { sessionId: string; title: string; directory?: string }) {
+  const working = createMemo(() => isSessionStatusWorking(state.sessionStatus[props.sessionId]));
+  const failed = () => state.failedSessionIds.includes(props.sessionId);
+  const status = () => (working() ? 'Running' : failed() ? 'Failed' : 'Completed');
+  return (
+    <Tooltip content={`Open session: ${props.title} · ${status()}`}>
+      <a
+        class="followup-session-link"
+        href={`#session/${encodeURIComponent(props.sessionId)}`}
+        data-session-id={props.sessionId}
+        aria-label={`${props.title} · ${status()}`}
+        onClick={(event) => {
+          event.preventDefault();
+          if (state.activeSessionId)
+            rememberDirectSessionReturn(props.sessionId, state.activeSessionId);
+          void selectSession(props.sessionId, { directory: props.directory });
+        }}
+      >
+        <Show
+          when={working()}
+          fallback={
+            <UiIcon
+              source={failed() ? xmarkIcon : checkIcon}
+              width={12}
+              height={12}
+              aria-hidden="true"
+            />
+          }
+        >
+          <span class="session-status-indicator is-running" aria-hidden="true" />
+        </Show>
+        <InlineCodeText text={props.title} />
+      </a>
+    </Tooltip>
   );
 }
