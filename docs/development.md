@@ -215,6 +215,43 @@ npm run preview:webview
 
 This serves the existing `preview.html`, which proxies to your local OpenCode server and hot-reloads the webview source via Vite.
 
+## Update A Long-Lived Work Branch
+
+This repository keeps a long-lived local `work` branch for ongoing extension development.
+To bring it up to date with canonical `main`, merge; do not rebase, because the branch
+history uses merge commits (`Merge branch 'main' into work`) and a rebase would rewrite it.
+Only rebase if you explicitly want rewritten history.
+
+1. Fetch the remote that carries canonical `main`, then merge it into the current work branch.
+   In this checkout that remote is `upstream` (`https://github.com/koltyakov/varro.git`),
+   while the local `work` branch tracks the fork `origin`; use whichever remote layout applies:
+
+   ```sh
+   git fetch upstream
+   git merge upstream/main
+   ```
+
+   When `main` is already local and current, the equivalent is merging `main` into `work`.
+
+2. If the merge changed `package.json` or `package-lock.json`, run `npm install`.
+
+3. Install the current branch into local VS Code:
+
+   ```sh
+   npm run vscode:install
+   ```
+
+   The helper packages a VSIX from the current tree and force-installs it into `code`; see
+   [Load The Extension](#load-the-extension) for its targets and options. Pass the exact
+   generated VSIX path when installing manually; do not use a wildcard path. After a large
+   merge, this is the install path for the work branch itself, not the Marketplace build.
+
+4. Reload the editor with Command Palette -> **Developer: Reload Window**. An install does not
+   replace a running extension host until the window is reloaded.
+
+Local editor color customizations in `.vscode/settings.json` are machine-local and should
+stay uncommitted.
+
 ## Runtime Overview
 
 Varro has three layers:
