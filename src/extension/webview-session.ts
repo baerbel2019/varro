@@ -8,6 +8,7 @@ import type {
   SessionStateManager,
 } from './session-state-manager';
 import type { ContextProvider } from './context-provider';
+import type { CommandHistoryState } from './message-router';
 import type { HiddenSessionManager } from './hidden-session-manager';
 import type { SidebarProviderBridge } from './sidebar-provider-bridge';
 import type { SidebarProviderContextFiles } from './sidebar-provider-context-files';
@@ -31,6 +32,10 @@ import { isSameWorkspacePath } from '../shared/workspace-path';
 export type WebviewHost = vscode.WebviewView | vscode.WebviewPanel;
 const RELIABLE_DELIVERY_TIMEOUT_MS = 5_000;
 const ENCODED_API_RESPONSE_MIN_LENGTH = 64 * 1024;
+const NO_COMMAND_HISTORY: CommandHistoryState = {
+  canNavigateBack: false,
+  canNavigateForward: false,
+};
 
 type ApiResponsePayload = Extract<ExtensionMessage, { type: 'api/response' }>['payload'];
 
@@ -54,31 +59,40 @@ function encodeLargeApiResponse(payload: ApiResponsePayload): ApiResponsePayload
   return encoded;
 }
 
+type QueuedCommand = Extract<
+  ExtensionMessage,
+  {
+    type:
+      | 'command/new-session'
+      | 'command/attach-problems'
+      | 'command/abort'
+      | 'command/open-skill-settings'
+      | 'command/open-mcp-settings'
+      | 'command/switch-session'
+      | 'command/navigate-history'
+      | 'command/open-session'
+      | 'command/highlight-session';
+  }
+>;
+
 export class WebviewSession {
   public interruptedSessionsForWebview: InterruptedSessionSnapshot[] = [];
   public blockingRequestsForWebview: BlockingRequestSnapshot[] = [];
+  private embeddedBlockingRequests: BlockingRequestSnapshot[] = [];
+  private embeddedWorkspacePath: string | null = null;
+  /** Embedded requests that only catalog visibility (worktrees, moved conversations) admitted. */
+  private embeddedThroughCatalog = new Set<string>();
 
   private webviewReady = false;
   private pendingInputFocus = false;
   private pendingSearchSessions = false;
   private pendingOpenAttentionSessions = false;
   private pendingOpenCompletedSessions = false;
-  private pendingCommands: Array<
-    Extract<
-      ExtensionMessage,
-      {
-        type:
-          | 'command/new-session'
-          | 'command/attach-problems'
-          | 'command/abort'
-          | 'command/switch-session'
-          | 'command/open-session'
-          | 'command/highlight-session';
-      }
-    >
-  > = [];
+  private pendingCommands: QueuedCommand[] = [];
   private commandStateReady = false;
-  private commandState: { canAbort: boolean; canSwitchSessions: boolean } | undefined;
+  private commandState:
+    | { canAbort: boolean; canSwitchSessions: boolean; history: CommandHistoryState }
+    | undefined;
   private webviewLoadGeneration = 0;
   private webviewRenderGeneration = 0;
   private readyGeneration: number | null = null;
@@ -96,6 +110,7 @@ export class WebviewSession {
       | 'consumeRecoverySnapshot'
       | 'isSessionInWorkspace'
       | 'isSessionVisibleInWorkspace'
+      | 'isSessionAttentionVisibleInWorkspace'
       | 'replayBlockingRequests'
     >,
     private readonly sessionTrash: Pick<
@@ -131,6 +146,7 @@ export class WebviewSession {
       sessionPlanState(): InitialWebviewState['sessionPlanState'];
       sessionReadState(): InitialWebviewState['sessionReadState'];
       sessionPlanAgents(): Record<string, string>;
+      todoSessionIds(): string[];
       sessionModelMigrationPending(): boolean;
       modelPreferences(): InitialWebviewState['modelPreferences'];
       modelPreferencesMigrationPending(): boolean;
@@ -193,6 +209,10 @@ export class WebviewSession {
     return this.webviewLoadGeneration;
   }
 
+  get isReady() {
+    return this.webviewReady;
+  }
+
   setInitialRoute(route: WebviewInstanceContext['initialRoute']) {
     if (this.webviewContext?.surface === 'editor') this.webviewContext.initialRoute = route;
   }
@@ -226,20 +246,7 @@ export class WebviewSession {
     this.flushPendingOpenCompletedSessions();
   }
 
-  queueCommand(
-    message: Extract<
-      ExtensionMessage,
-      {
-        type:
-          | 'command/new-session'
-          | 'command/attach-problems'
-          | 'command/abort'
-          | 'command/switch-session'
-          | 'command/open-session'
-          | 'command/highlight-session';
-      }
-    >
-  ) {
+  queueCommand(message: QueuedCommand) {
     this.pendingCommands.push(message);
     this.flushPendingCommands();
   }
@@ -248,19 +255,39 @@ export class WebviewSession {
     return this.commandState?.canAbort === true;
   }
 
-  updateCommandState(canAbort: boolean, canSwitchSessions: boolean) {
+  updateCommandState(
+    canAbort: boolean,
+    canSwitchSessions: boolean,
+    history: CommandHistoryState = NO_COMMAND_HISTORY
+  ) {
     this.commandStateReady = true;
-    const changed =
-      this.commandState?.canAbort !== canAbort ||
-      this.commandState.canSwitchSessions !== canSwitchSessions;
-    this.commandState = { canAbort, canSwitchSessions };
-    if (this.manageCommandContext && changed) {
-      void vscode.commands.executeCommand('setContext', 'varro:canAbortSession', canAbort);
-      void vscode.commands.executeCommand(
-        'setContext',
-        'varro:canSwitchSessions',
-        canSwitchSessions
-      );
+    const previous = this.commandState;
+    this.commandState = { canAbort, canSwitchSessions, history };
+    if (this.manageCommandContext) {
+      if (previous?.canAbort !== canAbort) {
+        void vscode.commands.executeCommand('setContext', 'varro:canAbortSession', canAbort);
+      }
+      if (previous?.canSwitchSessions !== canSwitchSessions) {
+        void vscode.commands.executeCommand(
+          'setContext',
+          'varro:canSwitchSessions',
+          canSwitchSessions
+        );
+      }
+      if (previous?.history.canNavigateBack !== history.canNavigateBack) {
+        void vscode.commands.executeCommand(
+          'setContext',
+          'varro:canNavigateBack',
+          history.canNavigateBack
+        );
+      }
+      if (previous?.history.canNavigateForward !== history.canNavigateForward) {
+        void vscode.commands.executeCommand(
+          'setContext',
+          'varro:canNavigateForward',
+          history.canNavigateForward
+        );
+      }
     }
     this.flushPendingCommands();
   }
@@ -518,12 +545,31 @@ export class WebviewSession {
       isSameWorkspacePath(folder.path, editorContext.workspaceDirectory)
     );
     const isSessionInWorkspace = (sessionID: string) =>
-      this.sessionState.isSessionVisibleInWorkspace(
+      this.sessionState.isSessionAttentionVisibleInWorkspace(
         sessionID,
         editorContext.workspacePath,
         editorContext.workspaceDirectory,
         workspaceDirectoryIsOpenRoot
       );
+    // Boot replay clears only prompts this HTML actually embedded. A pending request that was
+    // filtered out here is not resolved, and a synthetic reply would tombstone it in the view.
+    this.embeddedBlockingRequests = this.blockingRequestsForWebview.filter(
+      (item) => !this.isHiddenSession(item.sessionID) && isSessionInWorkspace(item.sessionID)
+    );
+    this.embeddedWorkspacePath = editorContext.workspacePath ?? null;
+    this.embeddedThroughCatalog = new Set(
+      this.embeddedBlockingRequests
+        .filter(
+          (item) =>
+            !this.sessionState.isSessionVisibleInWorkspace(
+              item.sessionID,
+              editorContext.workspacePath,
+              editorContext.workspaceDirectory,
+              workspaceDirectoryIsOpenRoot
+            )
+        )
+        .map((item) => item.id)
+    );
     return {
       webviewContext: this.webviewContext,
       // VS Code recreates hidden editors from the same HTML, even after requests are invalidated.
@@ -550,6 +596,7 @@ export class WebviewSession {
       followupModel: config.followupModel,
       debugShowQuotaWarning: config.debugShowQuotaWarning,
       debugResetWarningDays: config.debugResetWarningDays,
+      promptCacheWarningTokens: config.promptCacheWarningTokens,
       autoAttachProblems: config.autoAttachProblems,
       autoAttachActiveFile: config.autoAttachActiveFile,
       desktopSessionPaneSide: config.desktopSessionPaneSide,
@@ -570,17 +617,14 @@ export class WebviewSession {
       openEditorSessionIds: this.deps.openEditorSessionIds(),
       permissionAutomation: this.deps.permissionAutomation(),
       interruptedSessionIds: [],
-      pendingPermissions: this.blockingRequestsForWebview
+      pendingPermissions: this.embeddedBlockingRequests
         .filter((item) => item.kind === 'permission')
-        .filter((item) => !this.isHiddenSession(item.sessionID))
-        .filter((item) => isSessionInWorkspace(item.sessionID))
         .map((item) => item.props),
-      pendingQuestions: this.blockingRequestsForWebview
+      pendingQuestions: this.embeddedBlockingRequests
         .filter((item) => item.kind === 'question')
-        .filter((item) => !this.isHiddenSession(item.sessionID))
-        .filter((item) => isSessionInWorkspace(item.sessionID))
         .map((item) => item.props),
       pinnedSessionIds: this.pinnedSessions.list(),
+      todoSessionIds: this.deps.todoSessionIds(),
       queuedMessages: this.deps.queuedMessages(),
     };
   }
@@ -660,14 +704,24 @@ export class WebviewSession {
       type: 'permission-automation/update',
       payload: this.deps.permissionAutomation(),
     });
+    // In the same workspace, a catalog-admitted prompt that briefly lost catalog visibility, as
+    // during transfer re-verification, is not resolved while the host still has it pending; a
+    // synthetic reply would tombstone it. Another workspace's stale prompts still clear.
+    const sameWorkspace = isSameWorkspacePath(
+      this.embeddedWorkspacePath,
+      editorContext.workspacePath
+    );
     const replayOptions: BlockingRequestReplayOptions = {
-      previousRequests: this.blockingRequestsForWebview,
+      previousRequests: this.embeddedBlockingRequests,
       clearResolvedEmbedded: options?.clearResolvedEmbedded,
       workspacePath: editorContext.workspacePath,
     };
     if (editorContext.workspaceDirectory) {
       replayOptions.workspaceDirectory = editorContext.workspaceDirectory;
       replayOptions.workspaceDirectoryIsOpenRoot = workspaceDirectoryIsOpenRoot;
+    }
+    if (sameWorkspace && this.embeddedThroughCatalog.size > 0) {
+      replayOptions.keepPendingRequestIds = this.embeddedThroughCatalog;
     }
     this.sessionState.replayBlockingRequests(
       this.bridge.post.bind(this.bridge),
@@ -729,6 +783,8 @@ export class WebviewSession {
     if (!this.manageCommandContext) return;
     void vscode.commands.executeCommand('setContext', 'varro:canAbortSession', false);
     void vscode.commands.executeCommand('setContext', 'varro:canSwitchSessions', false);
+    void vscode.commands.executeCommand('setContext', 'varro:canNavigateBack', false);
+    void vscode.commands.executeCommand('setContext', 'varro:canNavigateForward', false);
   }
 
   private registerMessageListener(webviewView: WebviewHost, generation: number) {

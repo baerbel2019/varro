@@ -23,6 +23,7 @@ import type {
   ChatModelSelection,
   DesktopSessionPaneSide,
   PermissionMode,
+  PromptCacheHistorySample,
   WebviewMessage,
 } from '../../shared/protocol';
 import type {
@@ -67,9 +68,14 @@ const MAX_SEARCH_QUERY_LENGTH = 200;
 /** Full tool output opened in an editor tab; generous but bounded so a runaway
  *  tool cannot push an unbounded string through the bridge. */
 const MAX_OPEN_TEXT_LENGTH = 2_000_000;
+/** Titles are display-only and derived from tool input such as a full shell
+ *  command, so longer ones are truncated rather than rejected. */
 const MAX_OPEN_TEXT_TITLE_LENGTH = 200;
-const OPEN_TEXT_LANGUAGES = new Set(['plaintext', 'json', 'markdown', 'shellscript', 'xml']);
+/** Shape of a VS Code language ID; the provider still checks it is registered. */
+const OPEN_TEXT_LANGUAGE_ID = /^[A-Za-z0-9][\w.+#-]{0,39}$/;
 const MAX_DROPPED_PATHS = 100;
+/** A session history contributes at most this many idle-gap samples per message. */
+export const MAX_PROMPT_CACHE_SAMPLES = 500;
 const MAX_DROPPED_CONTENT_NAME_LENGTH = 512;
 const MAX_DROPPED_CONTENT_BASE64_LENGTH = Math.ceil(MAX_DROPPED_CONTENT_FILE_BYTES / 3) * 4;
 const MAX_NATIVE_PDF_BASE64_LENGTH = Math.ceil(MAX_NATIVE_PDF_TOTAL_BYTES / 3) * 4;
@@ -149,6 +155,7 @@ export const WEBVIEW_MESSAGE_TYPES = {
   'editor/route-changed': true,
   'session/export': true,
   'usage/report': true,
+  'usage/session-report': true,
   'webview/reload': true,
   'vscode/open-folder': true,
   'vscode/open-settings': true,
@@ -185,6 +192,9 @@ export const WEBVIEW_MESSAGE_TYPES = {
   'ralph/resume': true,
   'ralph/update-model': true,
   'ralph/sync': true,
+  'warming/sync': true,
+  'warming/set': true,
+  'warming/samples': true,
   log: true,
   'server/restart': true,
   'server/restart/check': true,
@@ -224,6 +234,7 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
     case 'vscode/show-output':
     case 'chat/new-editor':
     case 'chat/new-window':
+    case 'warming/sync':
       return { type };
 
     case 'vscode/open-folder': {
@@ -417,23 +428,9 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       const acknowledgement = selectionId ? { selectionId } : {};
       if (payload?.model === null)
         return { type, payload: { sessionId, model: null, ...acknowledgement } };
-      const model = asRecord(payload?.model);
-      const providerID = getBoundedString(model?.providerID, MAX_RALPH_ID_LENGTH);
-      const modelID = getBoundedString(model?.modelID, MAX_RALPH_ID_LENGTH);
-      if (!providerID || !modelID) return null;
-      const variant =
-        model?.variant === undefined
-          ? undefined
-          : getBoundedString(model.variant, MAX_RALPH_ID_LENGTH);
-      if (model?.variant !== undefined && !variant) return null;
-      return {
-        type,
-        payload: {
-          sessionId,
-          model: variant ? { providerID, modelID, variant } : { providerID, modelID },
-          ...acknowledgement,
-        },
-      };
+      const model = parseChatModelSelection(payload?.model);
+      if (!model) return null;
+      return { type, payload: { sessionId, model, ...acknowledgement } };
     }
 
     case 'session-models/migrate': {
@@ -513,6 +510,40 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
         type,
         payload: { images },
       };
+    }
+
+    case 'warming/set': {
+      const payload = asRecord(message?.payload);
+      const sessionId = getBoundedString(payload?.sessionId, 512);
+      if (!sessionId || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
+      if (typeof payload?.enabled !== 'boolean') return null;
+      return { type, payload: { sessionId, enabled: payload.enabled } };
+    }
+
+    case 'warming/samples': {
+      const payload = asRecord(message?.payload);
+      const sessionId = getBoundedString(payload?.sessionId, 512);
+      if (!sessionId || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
+      if (!Array.isArray(payload?.samples) || payload.samples.length > MAX_PROMPT_CACHE_SAMPLES)
+        return null;
+      const samples: PromptCacheHistorySample[] = [];
+      for (const entry of payload.samples) {
+        const sample = asRecord(entry);
+        const providerID = getBoundedString(sample?.providerID, 256);
+        const modelID = getBoundedString(sample?.modelID, 256);
+        const { at, gapMs, hit } = sample ?? {};
+        if (
+          !providerID ||
+          !modelID ||
+          !Number.isFinite(at) ||
+          !Number.isFinite(gapMs) ||
+          Number(gapMs) <= 0 ||
+          typeof hit !== 'boolean'
+        )
+          return null;
+        samples.push({ providerID, modelID, at: Number(at), gapMs: Number(gapMs), hit });
+      }
+      return { type, payload: { sessionId, samples } };
     }
 
     case 'server/restart/check': {
@@ -601,15 +632,17 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       return { type, payload: { route: parsedRoute } };
     }
 
-    case 'session/export': {
+    case 'session/export':
+    case 'usage/session-report': {
       const payload = asRecord(message?.payload);
       const sessionId = getBoundedString(payload?.sessionId, 512);
       const directory = getBoundedString(payload?.directory, MAX_PATH_LENGTH);
       if (payload?.directory !== undefined && !directory) return null;
       if (!sessionId) return null;
-      const parsedPayload: Extract<WebviewMessage, { type: 'session/export' }>['payload'] = {
-        sessionId,
-      };
+      const parsedPayload: Extract<
+        WebviewMessage,
+        { type: 'session/export' | 'usage/session-report' }
+      >['payload'] = { sessionId };
       if (directory) parsedPayload.directory = directory;
       return { type, payload: parsedPayload };
     }
@@ -626,6 +659,9 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       if (
         typeof payload?.canAbort !== 'boolean' ||
         typeof payload.canSwitchSessions !== 'boolean' ||
+        (payload.canNavigateBack !== undefined && typeof payload.canNavigateBack !== 'boolean') ||
+        (payload.canNavigateForward !== undefined &&
+          typeof payload.canNavigateForward !== 'boolean') ||
         (payload.modelVisible !== undefined && typeof payload.modelVisible !== 'boolean')
       ) {
         return null;
@@ -640,21 +676,16 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
         };
         if (sessionId.value !== undefined) commandState.sessionId = sessionId.value;
         if (payload.modelVisible !== undefined) commandState.modelVisible = payload.modelVisible;
+        if (payload.canNavigateBack !== undefined) {
+          commandState.canNavigateBack = payload.canNavigateBack;
+        }
+        if (payload.canNavigateForward !== undefined) {
+          commandState.canNavigateForward = payload.canNavigateForward;
+        }
         return { type, payload: commandState };
       }
-      const model = asRecord(payload.model);
-      const providerID = getBoundedString(model?.providerID, MAX_RALPH_ID_LENGTH);
-      const modelID = getBoundedString(model?.modelID, MAX_RALPH_ID_LENGTH);
-      if (!providerID || !modelID) return null;
-      const variant =
-        model?.variant === undefined
-          ? undefined
-          : getBoundedString(model.variant, MAX_RALPH_ID_LENGTH);
-      if (model?.variant !== undefined && !variant) return null;
-      const selectedModel: NonNullable<
-        Extract<WebviewMessage, { type: 'commands/state' }>['payload']['model']
-      > = { providerID, modelID };
-      if (variant) selectedModel.variant = variant;
+      const selectedModel = parseChatModelSelection(payload.model);
+      if (!selectedModel) return null;
       const sessionId = parseOptionalSessionId(payload.sessionId);
       if (!sessionId.valid) return null;
       const commandState: Extract<WebviewMessage, { type: 'commands/state' }>['payload'] = {
@@ -664,6 +695,12 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
       };
       if (sessionId.value !== undefined) commandState.sessionId = sessionId.value;
       if (payload.modelVisible !== undefined) commandState.modelVisible = payload.modelVisible;
+      if (payload.canNavigateBack !== undefined) {
+        commandState.canNavigateBack = payload.canNavigateBack;
+      }
+      if (payload.canNavigateForward !== undefined) {
+        commandState.canNavigateForward = payload.canNavigateForward;
+      }
       return { type, payload: commandState };
     }
 
@@ -906,11 +943,17 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | null {
     case 'vscode/open-text': {
       const payload = asRecord(message?.payload);
       const content = getBoundedString(payload?.content, MAX_OPEN_TEXT_LENGTH, true);
-      const title = getBoundedString(payload?.title, MAX_OPEN_TEXT_TITLE_LENGTH);
-      const language = getOptionalBoundedString(payload?.language, 40);
+      const title = getString(payload?.title)?.slice(0, MAX_OPEN_TEXT_TITLE_LENGTH);
+      const rawLanguage = payload?.language;
+      // A bad hint costs highlighting, not the click that asked to open the text.
+      const language =
+        rawLanguage === undefined || rawLanguage === null
+          ? undefined
+          : typeof rawLanguage === 'string' && OPEN_TEXT_LANGUAGE_ID.test(rawLanguage)
+            ? rawLanguage
+            : 'plaintext';
       const view = getOptionalBoundedString(payload?.view, 40);
       if (content === null || !title) return null;
-      if (language !== undefined && !OPEN_TEXT_LANGUAGES.has(language)) return null;
       if (view !== undefined && view !== 'markdown-preview') return null;
       const openTextPayload: Extract<WebviewMessage, { type: 'vscode/open-text' }>['payload'] = {
         content,
@@ -1786,6 +1829,7 @@ const SESSION_ACTIONS = new Set([
   'fork',
   'prompt_async',
   'revert',
+  'revert-commit',
   'summarize',
   'unrevert',
   'init',
@@ -1882,6 +1926,7 @@ const API_ROUTES: ApiRoute[] = [
   route('/provider/auth', methodsNoQuery('GET')),
   route('/auth/:id', methodsNoQuery('PUT', 'DELETE')),
   route('/command', methodsNoQuery('GET')),
+  route('/skill', methodsNoQuery('GET')),
   route('/mcp', methodsNoQuery('GET')),
   route(VARRO_API_ENDPOINTS.mcpDefaults, methodsNoQuery('GET', 'POST')),
   route(VARRO_API_ENDPOINTS.mcpConfig, methodsNoQuery('POST')),
@@ -1929,6 +1974,7 @@ const API_ROUTES: ApiRoute[] = [
   route(VARRO_API_ENDPOINTS.workspaceFilePick, methodsNoQuery('GET')),
   route(VARRO_API_ENDPOINTS.copiedSelectionMatch, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.remoteImage, methodsNoQuery('POST')),
+  route(VARRO_API_ENDPOINTS.localImage, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.citationPaths, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.citationSymbols, methodsNoQuery('POST')),
   route(VARRO_API_ENDPOINTS.workspaceProblems, methodsNoQuery('GET')),
@@ -1986,7 +2032,15 @@ const API_ROUTES: ApiRoute[] = [
     `${VARRO_API_ENDPOINTS.session}/:id/diff-summary`,
     ({ method, url }) => method === 'GET' && queryWithOptionalDirectory(url, 'revision')
   ),
+  route(
+    `${VARRO_API_ENDPOINTS.session}/:id/followup-usage`,
+    ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)
+  ),
   route(`${VARRO_API_ENDPOINTS.session}/:id/activate`, methodsNoQuery('POST')),
+  route(
+    `${VARRO_API_ENDPOINTS.session}/:id/reference`,
+    ({ method, url }) => (method === 'GET' || method === 'POST') && noQuery(url)
+  ),
   route(
     `${VARRO_API_ENDPOINTS.session}/:id/location`,
     ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)
@@ -2005,6 +2059,10 @@ const API_ROUTES: ApiRoute[] = [
   ),
   route(
     `${VARRO_API_ENDPOINTS.session}/:id/pin`,
+    ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
+  ),
+  route(
+    `${VARRO_API_ENDPOINTS.session}/:id/todo`,
     ({ method, url }) => method === 'POST' && optionalDirectoryQuery(url)
   ),
   route(
@@ -2078,6 +2136,7 @@ const API_ROUTES: ApiRoute[] = [
     ({ method, url }) => method === 'DELETE' && optionalDirectoryQuery(url)
   ),
   route('/session/:id/todo', ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)),
+  route('/session/:id/goal', ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)),
   route(
     '/session/:id/child-task-controls',
     ({ method, url }) => method === 'GET' && optionalDirectoryQuery(url)

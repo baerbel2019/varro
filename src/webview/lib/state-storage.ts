@@ -4,11 +4,13 @@ export const STORAGE_KEYS = {
   selectedAgent: 'varro.selectedAgent',
   sessionSelectedAgents: 'varro.sessionSelectedAgents',
   skippedPlanSessions: 'varro.skippedPlanSessions',
+  planHandoffs: 'varro.planHandoffs',
   selectedModel: 'varro.selectedModel',
   lastSelectedModel: 'varro.lastSelectedModel',
   sessionSelectedModels: 'varro.sessionSelectedModels',
   modelVariantSelections: 'varro.modelVariantSelections',
   providerOrder: 'varro.providerOrder',
+  providersConnected: 'varro.providersConnected',
   providerLimitPins: 'varro.providerLimitPins',
   quotaWarningDismissals: 'varro.quotaWarningDismissals',
   resetWarningDismissals: 'varro.resetWarningDismissals',
@@ -44,6 +46,7 @@ export const STORAGE_KEYS = {
   manualWorkspaceSelection: 'varro.manualWorkspaceSelection',
   showThinking: 'varro.showThinking',
   todoListCollapsed: 'varro.todoListCollapsed',
+  skillSettingsHideDisabled: 'varro.skillSettingsHideDisabled',
   starterHintsDismissed: 'varro.starterHintsDismissed',
 } as const;
 

@@ -1,4 +1,3 @@
-import { batch } from 'solid-js';
 import { BACKGROUND_COMMAND_SUMMARY_CHARS } from '../../../shared/background-process';
 import {
   isAbortedAssistantError,
@@ -11,7 +10,6 @@ import { serverEvents } from '../../lib/client';
 import {
   hasUnsettledToolPart,
   isAssistantMessage,
-  isContinuationAssistantFinish,
   latestAssistantFinishedBeforeLoading,
 } from '../../lib/message-metrics';
 import { isRunningSessionStatus } from '../../lib/session-event-reducer';
@@ -131,7 +129,7 @@ function isSessionNotFoundError<T>(error: T) {
 type EventHandlerDependencies = {
   getActiveSessionId(): string | null;
   getSessionStatus(sessionId: string): SessionStatus | null | undefined;
-  isSessionTreeStatusWorking(sessionId: string): boolean;
+  isSessionTreeStatusWorking?(sessionId: string): boolean;
   isSessionInActiveTree?(sessionId: string): boolean;
   getMessages(): MessageEntry[];
   userMessageUpdated?(message: Message): void;
@@ -174,6 +172,7 @@ type EventHandlerDependencies = {
   judgePermission?(permission: Permission): Promise<void | boolean | object>;
   permissionReplied?(permissionId: string): void;
   permissionVisible?(permissionId: string): void;
+  fullAccessReplyFailed?(permission: Permission, cause: unknown): void;
   syncPendingPermissions?(): Promise<void | boolean | object>;
   reconcileServerState?(): Promise<void | boolean | object>;
   invalidateMessageSync?(sessionId: string): void;
@@ -185,7 +184,7 @@ type EventHandlerDependencies = {
   ): Promise<void | boolean | object>;
   respondAutomaticPermission?: EventHandlerDependencies['respondPermission'];
   setDiffs(diffs: FileDiff[]): void;
-  abortRemoteSession(sessionId: string): Promise<void | boolean | object>;
+  abortRemoteSession(sessionId: string, directory?: string): Promise<void | boolean | object>;
   continueInterruptedSession?(
     sessionId: string,
     options?: { messageID: string }
@@ -224,6 +223,7 @@ type EventHandlerOperationDependencies = {
     | 'judgePermission'
     | 'permissionReplied'
     | 'permissionVisible'
+    | 'fullAccessReplyFailed'
     | 'isPermissionSessionKnown'
     | 'syncPermissionSession'
   > & {
@@ -246,7 +246,6 @@ export class SessionEventHandlerOperations {
     return registerSessionEventHandlers({
       getActiveSessionId: () => appStore.state.activeSessionId,
       getSessionStatus: (sessionId) => appStore.state.sessionStatus[sessionId],
-      isSessionTreeStatusWorking,
       isSessionInActiveTree: (sessionId) => {
         const activeSessionId = appStore.state.activeSessionId;
         if (!activeSessionId) return false;
@@ -304,6 +303,7 @@ export class SessionEventHandlerOperations {
       judgePermission: this.deps.sessionApprovalOperations.judgePermission,
       permissionReplied: this.deps.sessionApprovalOperations.permissionReplied,
       permissionVisible: this.deps.sessionApprovalOperations.permissionVisible,
+      fullAccessReplyFailed: this.deps.sessionApprovalOperations.fullAccessReplyFailed,
       syncPendingPermissions: this.deps.syncPendingPermissions,
       reconcileServerState: this.deps.reconcileServerState,
       invalidateMessageSync: this.deps.invalidateMessageSync,
@@ -443,22 +443,21 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
   };
   const isActiveTreeWorking = () => {
     const activeSessionId = deps.getActiveSessionId();
-    return activeSessionId ? deps.isSessionTreeStatusWorking(activeSessionId) : false;
+    if (!activeSessionId) return false;
+    if (deps.isSessionTreeStatusWorking) return deps.isSessionTreeStatusWorking(activeSessionId);
+    // The status event and loading indicator publish together. The committed store
+    // still has the previous status here, including for other events in this batch.
+    let working = false;
+    appStore.setState((draft) => {
+      working = isSessionTreeStatusWorking(activeSessionId, draft.sessionStatus);
+    });
+    return working;
   };
   const messagesForSession = (sessionId: string) =>
     deps.getMessages().filter((entry) => entry.info.sessionID === sessionId);
   const isStaleProgressAfterFinishedAssistant = (sessionId: string) =>
     isSessionInActiveTree(sessionId) &&
     latestAssistantFinishedBeforeLoading(messagesForSession(sessionId), uiStore.loadingStartedAt());
-  const latestAssistantHasExplicitTerminalFinish = (sessionId: string) => {
-    const latest = messagesForSession(sessionId).at(-1)?.info;
-    return (
-      latest?.role === 'assistant' &&
-      !!latest.time.completed &&
-      !!latest.finish &&
-      !isContinuationAssistantFinish(latest.finish)
-    );
-  };
   const scheduleMessageSync = (sessionId: string, ensureLatest = false) => {
     if (disposed) return;
     if (messageSyncs.has(sessionId)) {
@@ -475,7 +474,7 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
         if (completedAt === undefined) return;
         pendingTerminalStepSettles.delete(sessionId);
         if (!settleLatestAssistantOnIdle(sessionId, completedAt)) return;
-        handleSessionIdle(sessionId, deps.hasPendingAbort(sessionId));
+        reconcileCompletedAssistantStep(sessionId);
       })
       .catch((err) => {
         if (!disposed) deps.logError('syncSessionMessages', err);
@@ -713,19 +712,17 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
     }
     settledIdleSessions.add(sessionId);
     const hadActiveAssistantReply = hasActiveAssistantReply(deps.getMessages());
-    batch(() => {
-      if (!alreadySettled) settleLatestAssistantOnIdle(sessionId, Date.now());
-      deps.clearPendingAbort(sessionId);
-      sessionStore.setSessionCompacting(sessionId, false);
-      deps.setSessionStatusEntry(sessionId, status);
-      if (!abortedRetry) deps.updateUsageLimitState(sessionId, status);
-      if (sessionId === deps.getActiveSessionId()) {
-        if (isActiveTreeWorking()) uiStore.startLoading();
-        else uiStore.stopLoading();
-      } else if (isSessionInActiveTree(sessionId) && !isActiveTreeWorking()) {
-        uiStore.stopLoading();
-      }
-    });
+    if (!alreadySettled) settleLatestAssistantOnIdle(sessionId, Date.now());
+    deps.clearPendingAbort(sessionId);
+    sessionStore.setSessionCompacting(sessionId, false);
+    deps.setSessionStatusEntry(sessionId, status);
+    if (!abortedRetry) deps.updateUsageLimitState(sessionId, status);
+    if (sessionId === deps.getActiveSessionId()) {
+      if (isActiveTreeWorking()) uiStore.startLoading();
+      else uiStore.stopLoading();
+    } else if (isSessionInActiveTree(sessionId) && !isActiveTreeWorking()) {
+      uiStore.stopLoading();
+    }
     if (alreadySettled) return;
     deps
       .syncSession(sessionId)
@@ -758,6 +755,16 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
     } else if (isSessionInActiveTree(sessionId) && deps.shouldResyncSessionAfterIdle(sessionId)) {
       deps.syncSessionMessages(sessionId).catch((err) => deps.logError('syncSessionMessages', err));
     }
+  };
+  const reconcileCompletedAssistantStep = (sessionId: string) => {
+    // Legacy step events can recover a missing idle signal, but a provider
+    // response must never override execution that the server still reports running.
+    if (!isRunningSessionStatus(deps.getSessionStatus(sessionId))) {
+      handleSessionIdle(sessionId, deps.hasPendingAbort(sessionId));
+    }
+    void deps
+      .recheckSessionStatus?.(sessionId)
+      .catch((err) => deps.logError('recheckSessionStatus after assistant step', err));
   };
   const recordToolExecutionTime = (eventName: string, props: UnknownRecord) => {
     const sessionId = isString(props.sessionID) ? props.sessionID : null;
@@ -997,7 +1004,7 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
     deps.setSessionStatusEntry(info.id, { type: 'idle' });
     if (alreadyPending) return;
 
-    void deps.abortRemoteSession(info.id).catch((err) => {
+    void deps.abortRemoteSession(info.id, info.directory).catch((err) => {
       deps.clearPendingAbort(info.id);
       deps.logError('abortSession', err);
     });
@@ -1401,27 +1408,9 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
         handleSessionIdle(sessionID, abortedRetry, status);
         return;
       }
-      // opencode emits `busy` immediately after both continuation and terminal
-      // assistant messages. A terminal finish is already authoritative; allowing
-      // that trailing status to restart loading flashes Thinking before idle arrives.
-      if (
-        status.type === 'busy' &&
-        !status.background &&
-        isSessionInActiveTree(sessionID) &&
-        latestAssistantFinishedBeforeLoading(
-          messagesForSession(sessionID),
-          uiStore.loadingStartedAt()
-        ) &&
-        (!isRunningSessionStatus(deps.getSessionStatus(sessionID)) ||
-          latestAssistantHasExplicitTerminalFinish(sessionID))
-      ) {
-        const idleStatus: Extract<SessionStatus, { type: 'idle' }> = { type: 'idle' };
-        if (status.backgroundServices !== undefined)
-          idleStatus.backgroundServices = status.backgroundServices;
-        deps.setSessionStatusEntry(sessionID, idleStatus);
-        if (!isActiveTreeWorking()) uiStore.stopLoading();
-        return;
-      }
+      // Message completion only closes a provider response. Execution can
+      // continue or resume before another assistant message reaches this view.
+      // Keep the server's busy/retry status until an execution boundary settles it.
       if (status.type === 'busy' || status.type === 'retry')
         cancelTransientConnectionRetry(sessionID);
       settledIdleSessions.delete(sessionID);
@@ -1546,51 +1535,51 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
       }
 
       if (isSessionInActiveTree(sessionID)) {
-        batch(() => {
-          if (!assistantFinished) markSessionProgress(sessionID);
-          uiStore.markLoadingActivity();
-          if (message) {
-            recordSessionMessageSnapshotMutation(sessionID);
-            if (
-              !deps
-                .getMessages()
-                .some(
-                  (entry) =>
-                    entry.info.id === message.id && entry.info.sessionID === message.sessionID
-                )
-            ) {
-              invalidateMessageLoads(sessionID);
-            }
-            sessionStore.upsertMessageInfo(message);
+        if (!assistantFinished) markSessionProgress(sessionID);
+        uiStore.markLoadingActivity();
+        if (message) {
+          recordSessionMessageSnapshotMutation(sessionID);
+          if (
+            !deps
+              .getMessages()
+              .some(
+                (entry) =>
+                  entry.info.id === message.id && entry.info.sessionID === message.sessionID
+              )
+          ) {
+            invalidateMessageLoads(sessionID);
+          }
+          sessionStore.upsertMessageInfo(message);
+        } else {
+          scheduleMessageSync(sessionID);
+        }
+        if (assistantFinished) {
+          if (assistantMessage) {
+            sessionStore.finishMessageStreaming(assistantMessage.id);
+            syncMessagePartsIfMissing(assistantMessage);
+            if (assistantCompleted) scheduleMessageSync(sessionID);
+            deps.handoffTodosToMessages();
+            refreshSettledTodos(sessionID);
           } else {
-            scheduleMessageSync(sessionID);
+            const settledMessageId = settlePartialAssistantUpdate(
+              sessionID,
+              partialMessage,
+              assistantMessage
+            );
+            if (settledMessageId) recordSessionMessageSnapshotMutation(sessionID);
           }
-          if (assistantFinished) {
-            if (assistantMessage) {
-              sessionStore.finishMessageStreaming(assistantMessage.id);
-              syncMessagePartsIfMissing(assistantMessage);
-              if (assistantCompleted) scheduleMessageSync(sessionID);
-              deps.handoffTodosToMessages();
-              refreshSettledTodos(sessionID);
-            } else {
-              const settledMessageId = settlePartialAssistantUpdate(
-                sessionID,
-                partialMessage,
-                assistantMessage
-              );
-              if (settledMessageId) recordSessionMessageSnapshotMutation(sessionID);
-            }
-          }
-        });
+        }
       }
       if (partialMessage?.role === 'assistant') {
         sessionStore.setSessionFailed(
           sessionID,
           !!partialMessage.error && !isAbortedAssistantError(partialMessage.error)
         );
-        const notice = parseUsageLimitNotice(
-          partialMessage.error?.data?.message || partialMessage.error?.name
-        );
+        const notice = isAbortedAssistantError(partialMessage.error)
+          ? null
+          : parseUsageLimitNotice(
+              partialMessage.error?.data?.message || partialMessage.error?.name
+            );
         if (notice) {
           deps.applyUsageLimitNotice(sessionID, {
             ...notice,
@@ -1636,7 +1625,7 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
         sessionStore.upsertPart(part);
         if (part.type === 'tool') deps.syncTodosFromMessages();
         if (settleAssistantStepFinishPart(part, getEventTimestamp(data.properties || {}))) {
-          handleSessionIdle(part.sessionID, deps.hasPendingAbort(part.sessionID));
+          reconcileCompletedAssistantStep(part.sessionID);
           return;
         }
         if (!staleCompletedMessage) {
@@ -1735,7 +1724,7 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
         const activeTreeEvent = isSessionInActiveTree(sessionID);
         if (eventName === 'session.next.step.ended' && settleAssistantStepEnd(sessionID, p)) {
           if (activeTreeEvent) recordSessionMessageSnapshotMutation(sessionID);
-          handleSessionIdle(sessionID, deps.hasPendingAbort(sessionID));
+          reconcileCompletedAssistantStep(sessionID);
           return;
         }
         const compactionEnded = eventName === 'session.next.compaction.ended';
@@ -1846,9 +1835,34 @@ export function registerSessionEventHandlers(deps: EventHandlerDependencies) {
       const sessionId = data.properties?.sessionID as string | undefined;
       if (!sessionId) return;
       invalidateMessageLoads(sessionId, true);
-      if (isSessionInActiveTree(sessionId)) scheduleMessageSync(sessionId, true);
+      if (!isSessionInActiveTree(sessionId)) return;
+      scheduleMessageSync(sessionId, true);
+      deps
+        .syncSession(sessionId)
+        .catch((err) => logWarn('session-event syncSession after revert commit', err));
     })
   );
+
+  // A staged rewind only marks the boundary on the session; OpenCode keeps the messages until
+  // it is committed or cleared. Refresh the session so the transcript hides or restores them.
+  for (const type of ['session.next.revert.staged', 'session.next.revert.cleared'] as const) {
+    cleanups.push(
+      serverEvents.on(type, (data) => {
+        const properties = data.properties;
+        if (!properties) return;
+        const sessionId = properties.sessionID;
+        if (!isString(sessionId) || !isSessionInActiveTree(sessionId)) return;
+        // Varro's own V2 message deletion stages and commits immediately while edit flows defer
+        // those removals; do not hide the rows they still own.
+        const revert = 'revert' in properties ? asRecord(properties.revert) : undefined;
+        const boundary = revert ? getEventString(revert, 'messageID') : undefined;
+        if (boundary && deps.isMessageRemovalDeferred?.(sessionId, boundary)) return;
+        deps
+          .syncSession(sessionId)
+          .catch((err) => logWarn(`session-event syncSession after ${type}`, err));
+      })
+    );
+  }
 
   cleanups.push(
     ...registerReasoningEventHandlers({
@@ -1918,6 +1932,10 @@ function parseSessionStatus<T>(value: T): SessionStatus | null {
         0,
         BACKGROUND_COMMAND_SUMMARY_CHARS
       );
+    if (status.backgroundKind === 'subagent' || status.backgroundKind === 'task')
+      pending.backgroundKind = status.backgroundKind;
+    if (pending.backgroundKind === 'subagent' && isString(status.backgroundSessionID))
+      pending.backgroundSessionID = status.backgroundSessionID;
     return pending;
   }
   if (

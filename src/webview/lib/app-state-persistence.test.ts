@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAppState } from './app-state';
-import { flushInputDraft, readInputDraft } from './input-draft-persistence';
+import { flushInputDraft, inputDraftKey, readInputDraft } from './input-draft-persistence';
 import { STORAGE_KEYS } from './state-storage';
 import type { UnknownRecord } from '../../shared/type-utils';
 
@@ -34,6 +34,209 @@ describe('empty-state histogram configuration', () => {
 });
 
 describe('composer draft persistence', () => {
+  it('keeps a migrated legacy draft visible when opening history and the session picker', () => {
+    window.localStorage.setItem(STORAGE_KEYS.inputDraft, JSON.stringify('unassigned draft'));
+    const app = createAppState();
+    expect(app.inputText()).toBe('unassigned draft');
+    app.setState((d) => {
+      d.activeSessionId = 'root';
+    });
+    expect(app.inputText()).toBe('unassigned draft');
+    app.setShowSessionPicker(true);
+    expect(app.inputText()).toBe('unassigned draft');
+  });
+
+  it('adopts an existing session draft into the shared input on selection', () => {
+    const legacyKey = inputDraftKey(null, 'root');
+    window.localStorage.setItem(legacyKey, JSON.stringify('Previously parked text'));
+    const app = createAppState();
+    app.setState((draft) => {
+      draft.activeSessionId = 'root';
+    });
+    expect(app.inputText()).toBe('Previously parked text');
+    expect(readInputDraft(legacyKey)).toBeNull();
+    expect(createAppState().inputText()).toBe('Previously parked text');
+  });
+
+  it('recovers an interrupted legacy migration into an empty shared draft', () => {
+    const legacyKey = `${inputDraftKey(null, null)}:legacy`;
+    window.localStorage.setItem(legacyKey, JSON.stringify('Interrupted migration text'));
+    expect(createAppState().inputText()).toBe('Interrupted migration text');
+    expect(readInputDraft(legacyKey)).toBeNull();
+  });
+
+  it.each(['Current unsent text', 'Previously parked text'])(
+    'preserves shared input %j when opening a session with an old draft',
+    (currentText) => {
+      const legacyKey = inputDraftKey(null, 'root');
+      window.localStorage.setItem(legacyKey, JSON.stringify('Previously parked text'));
+      const app = createAppState();
+      app.setInputText(currentText);
+      app.setState((draft) => {
+        draft.activeSessionId = 'root';
+      });
+      expect(app.inputText()).toBe(currentText);
+      expect(readInputDraft(legacyKey)).toBe(
+        currentText === 'Previously parked text' ? null : 'Previously parked text'
+      );
+      if (currentText !== 'Previously parked text') {
+        app.setInputText('');
+        app.setShowSessionPicker(true);
+        app.setShowSessionPicker(false);
+        expect(app.inputText()).toBe('Previously parked text');
+        expect(readInputDraft(legacyKey)).toBeNull();
+      }
+    }
+  );
+
+  it('restores the native initial route before selection and isolates editor view IDs', () => {
+    let saved: UnknownRecord = { [STORAGE_KEYS.inputDraft]: 'old editor text' };
+    Object.assign(window, {
+      __vscodeWebviewState: {
+        getState: () => saved,
+        setState: (v: UnknownRecord) => {
+          saved = v;
+        },
+      },
+    });
+    const view = (id: string) =>
+      Object.assign(window, {
+        __initialWebviewState: {
+          webviewContext: {
+            viewId: id,
+            surface: 'editor',
+            initialRoute: { type: 'session', sessionId: 'root' },
+          },
+        },
+      });
+    view('editor-1');
+    const app = createAppState();
+    expect(app.state.activeSessionId).toBeNull();
+    expect(app.inputText()).toBe('old editor text');
+    app.setState((d) => {
+      d.activeSessionId = 'root';
+    });
+    app.setInputText('root checkpoint');
+    app.setState((d) => {
+      d.activeSessionId = 'child';
+    });
+    app.setInputText('child checkpoint');
+    view('editor-2');
+    expect(createAppState().inputText()).toBe('');
+    view('editor-1');
+    const reload = createAppState();
+    expect(reload.inputText()).toBe('child checkpoint');
+    reload.setState((d) => {
+      d.activeSessionId = 'child';
+    });
+    expect(reload.inputText()).toBe('child checkpoint');
+  });
+
+  it('does not bind a parked workspace marker to a namesake file or image in the shared tray', () => {
+    const app = createAppState();
+    app.setState((d) => {
+      d.activeSessionId = 'root';
+      d.editorContext.workspacePath = '/a';
+      d.droppedFiles = [{ path: '/a/main.ts', type: 'file', relativePath: 'main.ts' }];
+      d.clipboardImages = [
+        { id: 'first', url: 'blob:first', filename: 'Image 1', size: 1, mime: 'image/png' },
+      ];
+    });
+    app.setInputText('Look at @main.ts and [Image 1]');
+    app.setState((d) => {
+      d.activeSessionId = 'child';
+      d.editorContext.workspacePath = '/b';
+    });
+    app.setState((d) => {
+      d.droppedFiles = [{ path: '/b/main.ts', type: 'file', relativePath: 'main.ts' }];
+      d.clipboardImages = [
+        { id: 'second', url: 'blob:second', filename: 'Image 1', size: 1, mime: 'image/png' },
+      ];
+    });
+    app.setInputText('child text');
+    app.setState((d) => {
+      d.activeSessionId = 'root';
+      d.editorContext.workspacePath = '/a';
+    });
+    expect(app.inputText()).toBe('Look at /a/main.ts and _____');
+  });
+  it('shares unsent text across root, child and picker routes while isolating workspaces', () => {
+    const app = createAppState();
+    const select = (id: string) =>
+      app.setState((draft) => {
+        draft.activeSessionId = id;
+      });
+    const folder = (path: string) =>
+      app.setState((draft) => {
+        draft.editorContext.workspacePath = path;
+      });
+    folder('/repo-a');
+    select('root');
+    app.setInputText('unfinished root');
+    select('child');
+    expect(app.inputText()).toBe('unfinished root');
+    app.setInputText('unfinished child');
+    app.setShowSessionPicker(true);
+    expect(app.inputText()).toBe('unfinished child');
+    app.setInputText('new chat');
+    app.setShowSessionPicker(false);
+    expect(app.inputText()).toBe('new chat');
+    select('root');
+    expect(app.inputText()).toBe('new chat');
+    folder('/repo-b');
+    expect(app.inputText()).toBe('');
+    folder('/repo-a');
+    expect(app.inputText()).toBe('new chat');
+    app.setShowSessionPicker(true);
+    expect(app.inputText()).toBe('new chat');
+  });
+
+  it('does not resurrect a sent or cleared draft when returning to another session', () => {
+    const app = createAppState();
+    app.setState((draft) => {
+      draft.activeSessionId = 'root';
+    });
+    app.setInputText('Send from the child instead');
+    app.setState((draft) => {
+      draft.activeSessionId = 'child';
+    });
+    expect(app.inputText()).toBe('Send from the child instead');
+    app.setInputText('');
+    app.setState((draft) => {
+      draft.activeSessionId = 'root';
+    });
+    expect(app.inputText()).toBe('');
+    expect(app.readLatestDraftText()).toBe('');
+    app.setShowSessionPicker(true);
+    expect(app.inputText()).toBe('');
+  });
+
+  it('ends route-owned edits before carrying the unsent input to another session', () => {
+    const app = createAppState();
+    app.setState((draft) => {
+      draft.activeSessionId = 'root';
+    });
+    const source = app.currentDraftKey();
+    app.setInputText('Temporary edit text');
+    const stop = app.onBeforeDraftSwitch(() =>
+      app.writeOwnedDraft(source, 'Original unsent input')
+    );
+    app.setState((draft) => {
+      draft.activeSessionId = 'child';
+    });
+    stop();
+    expect(app.currentDraftKey()).toBe(source);
+    expect(app.draftSessionId()).toBe('child');
+    expect(app.inputText()).toBe('Original unsent input');
+    expect(app.readLatestDraftText()).toBe('Original unsent input');
+
+    app.setState((draft) => {
+      draft.editorContext.workspacePath = '/another-workspace';
+    });
+    app.setInputText('Other workspace input');
+    app.writeOwnedDraft(source, 'Late failed send');
+    expect(app.readLatestDraftText()).toBe('Other workspace input');
+  });
   it('uses host session models instead of stale editor-local variants', () => {
     window.localStorage.setItem(
       STORAGE_KEYS.sessionSelectedModels,
@@ -139,7 +342,7 @@ describe('composer draft persistence', () => {
 
     expect(restored.inputText()).toBe('Keep this draft');
     flushInputDraft();
-    expect(window.localStorage.getItem(STORAGE_KEYS.inputDraft)).toBe(
+    expect(window.localStorage.getItem(inputDraftKey(null, null))).toBe(
       JSON.stringify('Keep this draft')
     );
   });
@@ -161,6 +364,37 @@ describe('composer draft persistence', () => {
     expect(restored.state.queuedMessageEdit).toEqual({ id: 'queue-1', sessionId: 'session-1' });
   });
 
+  it('keeps a sidebar queued edit when only the host default New Chat route is available', () => {
+    const queued = { id: 'queue-1', sessionId: 'session-1', text: 'Unfinished queued edit' };
+    let saved: UnknownRecord = {
+      [STORAGE_KEYS.inputDraft]: queued.text,
+      [STORAGE_KEYS.queuedMessageEdit]: { id: queued.id, sessionId: queued.sessionId },
+    };
+    Object.assign(window, {
+      __vscodeWebviewState: {
+        getState: () => saved,
+        setState: (value: UnknownRecord) => {
+          saved = value;
+        },
+      },
+      __initialWebviewState: {
+        webviewContext: {
+          viewId: 'sidebar',
+          surface: 'sidebar',
+          initialRoute: { type: 'new-session' },
+        },
+        queuedMessages: [queued],
+      },
+    });
+    const restored = createAppState();
+    expect(restored.inputText()).toBe(queued.text);
+    expect(restored.draftSessionId()).toBe(queued.sessionId);
+    expect(restored.state.queuedMessageEdit).toEqual({
+      id: queued.id,
+      sessionId: queued.sessionId,
+    });
+  });
+
   it('discards a queued edit draft missing from the authoritative host queue', () => {
     window.localStorage.setItem(STORAGE_KEYS.inputDraft, JSON.stringify('Stale queued draft'));
     window.localStorage.setItem(
@@ -177,8 +411,42 @@ describe('composer draft persistence', () => {
     expect(restored.inputText()).toBe('');
     expect(restored.state.queuedMessages).toEqual([]);
     expect(restored.state.queuedMessageEdit).toBeNull();
-    expect(window.localStorage.getItem(STORAGE_KEYS.inputDraft)).toBeNull();
+    expect(window.localStorage.getItem(inputDraftKey(null, null))).toBeNull();
     expect(window.localStorage.getItem(STORAGE_KEYS.queuedMessageEdit)).toBeNull();
+  });
+
+  it('discards a restored queued edit when the native route opens a different session', () => {
+    const queued = { id: 'queue-1', sessionId: 'session-1', text: 'Queued edit text' };
+    let saved: UnknownRecord = {
+      [STORAGE_KEYS.inputDraft]: queued.text,
+      [STORAGE_KEYS.queuedMessageEdit]: { id: queued.id, sessionId: queued.sessionId },
+    };
+    Object.assign(window, {
+      __vscodeWebviewState: {
+        getState: () => saved,
+        setState: (value: UnknownRecord) => {
+          saved = value;
+        },
+      },
+      __initialWebviewState: {
+        webviewContext: {
+          viewId: 'editor',
+          surface: 'editor',
+          initialRoute: { type: 'session', sessionId: 'session-2' },
+        },
+        queuedMessages: [queued],
+      },
+    });
+    saved[inputDraftKey(null, null)] = queued.text;
+    saved[inputDraftKey(null, queued.sessionId)] = queued.text;
+
+    const restored = createAppState();
+
+    expect(restored.inputText()).toBe('');
+    expect(restored.state.queuedMessageEdit).toBeNull();
+    expect(restored.state.queuedMessages).toMatchObject([queued]);
+    expect(saved[STORAGE_KEYS.queuedMessageEdit]).toBeUndefined();
+    expect(readInputDraft(inputDraftKey(null, queued.sessionId))).toBeNull();
   });
 
   it('restores draft text from VS Code webview state', () => {
@@ -213,7 +481,7 @@ describe('composer draft persistence', () => {
     const restored = createAppState();
 
     expect(restored.inputText()).toBe('Keep this VS Code draft');
-    expect(vscodeState[STORAGE_KEYS.inputDraft]).toBe('Keep this VS Code draft');
+    expect(vscodeState[inputDraftKey(null, null)]).toBe('Keep this VS Code draft');
   });
 
   it.each(['sidebar', 'editor'] as const)(
@@ -242,22 +510,22 @@ describe('composer draft persistence', () => {
       appState.setInputText('Newest visible draft');
 
       // VS Code can snapshot state before pagehide or the draft debounce fires.
-      expect(vscodeState[STORAGE_KEYS.inputDraft]).toBe('Newest visible draft');
+      expect(vscodeState[inputDraftKey(null, null)]).toBe('Newest visible draft');
       expect(vscodeState.unrelated).toBe('Preserve other webview state');
       expect(setState).toHaveBeenCalledOnce();
-      expect(window.localStorage.getItem(STORAGE_KEYS.inputDraft)).toBeNull();
+      expect(window.localStorage.getItem(inputDraftKey(null, null))).toBeNull();
 
       appState.setInputText('Newest visible draft');
       vi.runAllTimers();
       window.dispatchEvent(new Event('pagehide'));
       expect(setState).toHaveBeenCalledOnce();
-      expect(readInputDraft()).toBe('Newest visible draft');
+      expect(readInputDraft(inputDraftKey(null, null))).toBe('Newest visible draft');
 
       appState.setInputText('');
-      expect(vscodeState[STORAGE_KEYS.inputDraft]).toBeUndefined();
+      expect(vscodeState[inputDraftKey(null, null)]).toBeUndefined();
       expect(createAppState().inputText()).toBe('');
       vi.runAllTimers();
-      expect(readInputDraft()).toBeNull();
+      expect(readInputDraft(inputDraftKey(null, null))).toBeNull();
     }
   );
 
@@ -271,7 +539,7 @@ describe('composer draft persistence', () => {
     appState.setInputText('ab');
     appState.setInputText('abc');
 
-    expect(readInputDraft()).toBe('abc');
+    expect(readInputDraft(inputDraftKey(null, null))).toBe('abc');
     expect(setState).not.toHaveBeenCalled();
     expect(createAppState().inputText()).toBe('abc');
     expect(setState).not.toHaveBeenCalled();
@@ -281,13 +549,13 @@ describe('composer draft persistence', () => {
     expect(setState).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(setState).toHaveBeenCalledOnce();
-    expect(window.localStorage.getItem(STORAGE_KEYS.inputDraft)).toBe(JSON.stringify('abc'));
+    expect(window.localStorage.getItem(inputDraftKey(null, null))).toBe(JSON.stringify('abc'));
 
     appState.setInputText('flush before unload');
     window.dispatchEvent(new Event('pagehide'));
 
     expect(setState).toHaveBeenCalledTimes(2);
-    expect(window.localStorage.getItem(STORAGE_KEYS.inputDraft)).toBe(
+    expect(window.localStorage.getItem(inputDraftKey(null, null))).toBe(
       JSON.stringify('flush before unload')
     );
     setState.mockRestore();
@@ -303,8 +571,8 @@ describe('composer draft persistence', () => {
     appState.setInputText('');
     vi.runAllTimers();
 
-    expect(readInputDraft()).toBeNull();
-    expect(window.localStorage.getItem(STORAGE_KEYS.inputDraft)).toBeNull();
+    expect(readInputDraft(inputDraftKey(null, null))).toBeNull();
+    expect(window.localStorage.getItem(inputDraftKey(null, null))).toBeNull();
     expect(setState).not.toHaveBeenCalled();
     setState.mockRestore();
   });
@@ -398,7 +666,7 @@ describe('composer draft persistence', () => {
 
     appState.setInputText('');
 
-    expect(window.localStorage.getItem(STORAGE_KEYS.inputDraft)).toBeNull();
+    expect(window.localStorage.getItem(inputDraftKey(null, null))).toBeNull();
     expect(createAppState().inputText()).toBe('');
   });
 

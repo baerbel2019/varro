@@ -1,6 +1,6 @@
-import { batch, createSignal } from 'solid-js';
+import { flush as flushSolid, createSignal } from 'solid-js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { emptyPageIcon, folderIcon, messageTextIcon } from '../../lib/ui-icons';
 import { toCssUrl } from '../UiIcon';
 import { dismissComposerOverlays } from './composer-overlay-dismiss';
@@ -29,10 +29,13 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup?.();
+  flushSolid();
   cleanup = undefined;
   container?.remove();
+  flushSolid();
   container = null;
   document.querySelector('.chat-attachment-image-preview')?.remove();
+  flushSolid();
   vi.unstubAllGlobals();
 });
 
@@ -63,6 +66,9 @@ function expectChipUiIcon(element: Element | null | undefined, source: string) {
 
 function renderComposer(props: {
   value: string;
+  slashCommandNames?: ReadonlySet<string>;
+  commandArgumentHint?: string;
+  promptSuggestion?: string;
   cursorOffset: number;
   chips: RichComposerChip[];
   centerCaret?: boolean;
@@ -82,6 +88,15 @@ function renderComposer(props: {
         centerCaret: props.centerCaret,
         get value() {
           return props.value;
+        },
+        get slashCommandNames() {
+          return props.slashCommandNames;
+        },
+        get commandArgumentHint() {
+          return props.commandArgumentHint;
+        },
+        get promptSuggestion() {
+          return props.promptSuggestion;
         },
         get cursorOffset() {
           return props.cursorOffset;
@@ -109,9 +124,204 @@ function renderComposer(props: {
       }),
     container!
   );
+  flushSolid();
+}
+
+// Renders a composer whose value and cursor follow its own onInput reports.
+function renderControlledComposer(
+  value: string,
+  cursorOffset = value.length,
+  chips: RichComposerChip[] = []
+) {
+  const [currentValue, setValue] = createSignal(value);
+  const [currentCursorOffset, setCursorOffset] = createSignal(cursorOffset);
+  renderComposer({
+    get value() {
+      return currentValue();
+    },
+    get cursorOffset() {
+      return currentCursorOffset();
+    },
+    chips,
+    onInput: (text, nextOffset) => {
+      setValue(text);
+      setCursorOffset(nextOffset);
+    },
+  });
+}
+
+function authSessionChip(marker: string): RichComposerChip {
+  return {
+    id: marker,
+    type: 'mention-session',
+    label: 'Authentication work',
+    icon: 'session',
+    textMarker: marker,
+  };
+}
+
+function pressKey(target: EventTarget, init: KeyboardEventInit) {
+  const event = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function dispatchBeforeInput(target: EventTarget, init: InputEventInit) {
+  const event = new InputEvent('beforeinput', { ...init, bubbles: true, cancelable: true });
+  target.dispatchEvent(event);
+  return event;
 }
 
 describe('RichComposerArea', () => {
+  it('keeps argument hints outside editor text and clipboard and hides them during composition', () => {
+    const [hint, setHint] = createSignal(' [question]');
+    renderComposer({
+      value: '/btw',
+      cursorOffset: 4,
+      chips: [],
+      get commandArgumentHint() {
+        return hint();
+      },
+      promptSuggestion: ' unrelated suggestion',
+    });
+    const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
+    const originalText = editor.firstChild!;
+    setCollapsedSelection(originalText, 2);
+    setHint(' [updated question]');
+    flushSolid();
+    expect(editor.firstChild).toBe(originalText);
+    expect(window.getSelection()?.anchorNode).toBe(originalText);
+    expect(window.getSelection()?.anchorOffset).toBe(2);
+    expect(editor.dataset.commandArgumentHint).toBe(' [updated question]');
+    expect(editor.dataset.promptSuggestion).toBeUndefined();
+    expect(editor.getAttribute('aria-autocomplete')).toBe('none');
+    expect(extractText(editor)).toBe('/btw');
+
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    const setData = vi.fn();
+    const event = new Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: { setData } });
+    editor.dispatchEvent(event);
+    expect(setData).toHaveBeenCalledWith('text/plain', '/btw');
+    editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    flushSolid();
+    expect(editor.dataset.commandArgumentHint).toBeUndefined();
+  });
+
+  it('does not read reactive highlight inputs in effect callbacks when the CSS API is absent', () => {
+    vi.stubGlobal('CSS', undefined);
+    const warn = vi.spyOn(console, 'warn');
+    const [value] = createSignal('/audit details');
+    const [names] = createSignal<ReadonlySet<string>>(new Set(['audit']));
+    try {
+      renderComposer({
+        get value() {
+          return value();
+        },
+        get slashCommandNames() {
+          return names();
+        },
+        cursorOffset: 14,
+        chips: [],
+      });
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('[STRICT_READ_UNTRACKED]'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('updates command highlights for catalog changes without replacing the editor DOM or selection', () => {
+    const highlights = new Map<string, Set<Range>>();
+    vi.stubGlobal('CSS', { highlights });
+    vi.stubGlobal(
+      'Highlight',
+      class extends Set<Range> {
+        constructor(...ranges: Range[]) {
+          super(ranges);
+        }
+      }
+    );
+    const [value, setValue] = createSignal('  /audit details');
+    const [names, setNames] = createSignal<ReadonlySet<string>>(new Set());
+    renderComposer({
+      get value() {
+        return value();
+      },
+      get slashCommandNames() {
+        return names();
+      },
+      cursorOffset: 16,
+      chips: [],
+    });
+    const editor = container!.querySelector<HTMLElement>('[contenteditable="true"]')!;
+    const originalText = editor.firstChild!;
+    setCollapsedSelection(originalText, 5);
+    expect(highlights.size).toBe(0);
+    setNames(new Set(['audit']));
+    flushSolid();
+    expect([...highlights.get('composer-slash-command')!].map((range) => range.toString())).toEqual(
+      ['/audit']
+    );
+    expect(editor.firstChild).toBe(originalText);
+    expect(window.getSelection()?.anchorNode).toBe(originalText);
+    expect(window.getSelection()?.anchorOffset).toBe(5);
+    setNames(new Set<string>());
+    flushSolid();
+    expect(highlights.size).toBe(0);
+    setNames(new Set(['audit']));
+    setValue('/AUDIT updated');
+    flushSolid();
+    expect([...highlights.get('composer-slash-command')!].map((range) => range.toString())).toEqual(
+      ['/AUDIT']
+    );
+    setValue('/unknown');
+    flushSolid();
+    expect(highlights.size).toBe(0);
+    editor.textContent = '/audit native';
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    flushSolid();
+    expect([...highlights.get('composer-slash-command')!].map((range) => range.toString())).toEqual(
+      ['/audit']
+    );
+    cleanup?.();
+    cleanup = undefined;
+    expect(highlights.size).toBe(0);
+  });
+
+  it('preserves a native selection on unrelated updates but applies a changed controlled cursor', () => {
+    const [chips, setChips] = createSignal<RichComposerChip[]>([]);
+    const [cursor, setCursor] = createSignal(12);
+    renderComposer({
+      value: 'replace this',
+      get cursorOffset() {
+        return cursor();
+      },
+      get chips() {
+        return chips();
+      },
+    });
+    const editor = container!.querySelector<HTMLElement>('[contenteditable="true"]')!;
+    editor.focus();
+    const selection = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    // A fresh chip definition array reruns synchronization without changing its content.
+    setChips([]);
+    flushSolid();
+    expect(selection.toString()).toBe('replace this');
+
+    setCursor(3);
+    flushSolid();
+    expect(selection.isCollapsed).toBe(true);
+    expect(selection.anchorOffset).toBe(3);
+  });
+
   it('shows an annotation comment preview with a custom tooltip instead of a native title', async () => {
     vi.useFakeTimers();
     try {
@@ -132,6 +342,7 @@ describe('RichComposerArea', () => {
         },
       });
       await flushAsyncWork();
+      flushSolid();
       const element = container!.querySelector<HTMLElement>('.inline-chip')!;
       expect(element.textContent).toBe(chip.label);
       expectChipUiIcon(element.querySelector('.inline-chip-icon'), messageTextIcon);
@@ -139,7 +350,9 @@ describe('RichComposerArea', () => {
       expect(element.hasAttribute('title')).toBe(false);
       expect(element.getAttribute('aria-describedby')).toBeTruthy();
       element.dispatchEvent(new MouseEvent('mouseenter'));
+      flushSolid();
       await vi.advanceTimersByTimeAsync(400);
+      flushSolid();
       const tooltip = document.querySelector('[role="tooltip"]');
       expect(tooltip?.querySelector('.chat-annotation-tooltip-note')?.textContent).toBe(
         chip.annotation!.note
@@ -148,8 +361,10 @@ describe('RichComposerArea', () => {
         chip.annotation!.selectedText
       );
       setChips([{ ...chip, annotation: { ...chip.annotation! } }]);
+      flushSolid();
       expect(container!.querySelector('.inline-chip')).toBe(element);
       setChips([]);
+      flushSolid();
       expect(document.querySelector('[role="tooltip"]')).toBeNull();
       expect(element.hasAttribute('aria-describedby')).toBe(false);
     } finally {
@@ -189,7 +404,9 @@ describe('RichComposerArea', () => {
         const typed = document.createTextNode('x');
         editor.append(typed);
         setCollapsedSelection(typed, 1);
+        flushSolid();
         editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        flushSolid();
       }
       expect(container?.querySelector('[data-chip-id="img:1"]')).toBe(original);
       expect(stringify.mock.results.every((result) => !String(result.value).includes(url))).toBe(
@@ -223,8 +440,10 @@ describe('RichComposerArea', () => {
     const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
     const textNode = editor.firstChild!;
     editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    flushSolid();
     textNode.textContent = 'café';
     setCollapsedSelection(textNode, 4);
+    flushSolid();
     editor.dispatchEvent(
       new InputEvent('input', {
         bubbles: true,
@@ -232,11 +451,13 @@ describe('RichComposerArea', () => {
         isComposing: true,
       })
     );
-    batch(() => {
+    flushSolid();
+    (() => {
       setCursor(0);
       setChips([{ id: 'file', type: 'mention-file', label: 'file.ts', textMarker: '@file.ts' }]);
-    });
+    })();
     await flushAsyncWork();
+    flushSolid();
 
     expect(onInput).not.toHaveBeenCalled();
     expect(editor.firstChild).toBe(textNode);
@@ -245,13 +466,17 @@ describe('RichComposerArea', () => {
     expect(window.getSelection()?.focusOffset).toBe(4);
 
     editor.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'é' }));
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
     expect(onInput).toHaveBeenCalledWith('café', 4);
     expect(value()).toBe('café');
     expect(editor.textContent).toBe('café');
 
     setValue('controlled replacement');
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
     expect(editor.textContent).toBe('controlled replacement');
   });
 
@@ -260,14 +485,19 @@ describe('RichComposerArea', () => {
     renderComposer({ value: '', cursorOffset: 0, chips: [], onInput });
     const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
     editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    flushSolid();
     editor.textContent = 'é';
     setCollapsedSelection(editor.firstChild!, 1);
+    flushSolid();
     editor.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: false }));
+    flushSolid();
     expect(onInput).toHaveBeenLastCalledWith('é', 1);
 
     editor.textContent = 'éx';
     setCollapsedSelection(editor.firstChild!, 2);
+    flushSolid();
     editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    flushSolid();
     expect(onInput).toHaveBeenLastCalledWith('éx', 2);
   });
 
@@ -277,9 +507,12 @@ describe('RichComposerArea', () => {
     renderComposer({ value: '', cursorOffset: 0, chips: [], onInput, onKeyDown });
     const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
     editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    flushSolid();
     editor.textContent = 'é';
     setCollapsedSelection(editor.firstChild!, 1);
+    flushSolid();
     editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    flushSolid();
     expect(onKeyDown).toHaveBeenCalledOnce();
     expect(onKeyDown).toHaveReturnedWith(['é', 1]);
   });
@@ -289,14 +522,19 @@ describe('RichComposerArea', () => {
     renderComposer({ value: '', cursorOffset: 0, chips: [], onInput });
     const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
     editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    flushSolid();
     editor.textContent = 'ü';
     setCollapsedSelection(editor.firstChild!, 1);
+    flushSolid();
     editor.dispatchEvent(new FocusEvent(type));
+    flushSolid();
     expect(onInput).toHaveBeenLastCalledWith('ü', 1);
 
     editor.textContent = 'über';
     setCollapsedSelection(editor.firstChild!, 4);
+    flushSolid();
     editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    flushSolid();
     expect(onInput).toHaveBeenLastCalledWith('über', 4);
   });
 
@@ -308,10 +546,12 @@ describe('RichComposerArea', () => {
       renderComposer({ value: 'caf', cursorOffset: 3, chips: [], onInput, onKeyDown });
       const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
       editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+      flushSolid();
       editor.firstChild!.textContent = 'café';
       setCollapsedSelection(editor.firstChild!, 4);
-      const event = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true });
-      editor.dispatchEvent(event);
+      flushSolid();
+      const event = pressKey(editor, init);
+      flushSolid();
       expect(event.defaultPrevented).toBe(false);
       expect(onInput).not.toHaveBeenCalled();
       expect(onKeyDown).not.toHaveBeenCalled();
@@ -330,15 +570,15 @@ describe('RichComposerArea', () => {
     const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
     const label = editor.querySelector('.inline-chip-label')!;
     setCollapsedSelection(label.firstChild!, 1);
+    flushSolid();
     editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
-    const event = new InputEvent('beforeinput', {
-      bubbles: true,
-      cancelable: true,
+    flushSolid();
+    const event = dispatchBeforeInput(editor, {
       inputType: 'insertCompositionText',
       data: 'é',
       isComposing: true,
     });
-    editor.dispatchEvent(event);
+    flushSolid();
     expect(event.defaultPrevented).toBe(false);
     expect(onInput).not.toHaveBeenCalled();
   });
@@ -368,10 +608,12 @@ describe('RichComposerArea', () => {
     expect(indicator.title).toContain('3.0 MB');
     expect(chip.classList.contains('image-size-warning')).toBe(true);
     indicator.click();
+    flushSolid();
     expect(onCompressImage).not.toHaveBeenCalled();
     expect(onChipClick).toHaveBeenCalledWith('img:one');
     const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
     chip.dispatchEvent(event);
+    flushSolid();
     expect(event.defaultPrevented).toBe(true);
     expect(onCompressImage).toHaveBeenCalledTimes(1);
     expect(onCompressImage).toHaveBeenCalledWith('img:one', expect.any(MouseEvent));
@@ -390,15 +632,7 @@ describe('RichComposerArea', () => {
     renderComposer({
       value: 'session:ses_auth',
       cursorOffset: 'session:ses_auth'.length,
-      chips: [
-        {
-          id: 'session:ses_auth',
-          type: 'mention-session',
-          label: 'Authentication work',
-          icon: 'session',
-          textMarker: 'session:ses_auth',
-        },
-      ],
+      chips: [authSessionChip('session:ses_auth')],
       onChipClick,
     });
 
@@ -409,6 +643,7 @@ describe('RichComposerArea', () => {
     expect(reference?.getAttribute('contenteditable')).toBeNull();
 
     reference?.click();
+    flushSolid();
     expect(onChipClick).not.toHaveBeenCalled();
   });
 
@@ -418,15 +653,7 @@ describe('RichComposerArea', () => {
     renderComposer({
       value: `before ${marker} after`,
       cursorOffset: `before ${marker}`.length,
-      chips: [
-        {
-          id: marker,
-          type: 'mention-session',
-          label: 'Authentication work',
-          icon: 'session',
-          textMarker: marker,
-        },
-      ],
+      chips: [authSessionChip(marker)],
       onInput,
     });
 
@@ -436,14 +663,10 @@ describe('RichComposerArea', () => {
     );
     if (!editor || !label?.firstChild) throw new Error('Expected session reference label');
     setCollapsedSelection(label.firstChild, 7);
+    flushSolid();
 
-    const event = new InputEvent('beforeinput', {
-      bubbles: true,
-      cancelable: true,
-      inputType: 'insertText',
-      data: 'X',
-    });
-    editor.dispatchEvent(event);
+    const event = dispatchBeforeInput(editor, { inputType: 'insertText', data: 'X' });
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(onInput).toHaveBeenCalledWith('before X after', 'before X'.length);
@@ -456,16 +679,12 @@ describe('RichComposerArea', () => {
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor?.firstChild) throw new Error('Expected composer text');
     setCollapsedSelection(editor.firstChild, 5);
+    flushSolid();
     const cloneContents = vi.spyOn(Range.prototype, 'cloneContents');
 
     try {
-      const event = new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        inputType: 'insertText',
-        data: 'X',
-      });
-      editor.dispatchEvent(event);
+      const event = dispatchBeforeInput(editor, { inputType: 'insertText', data: 'X' });
+      flushSolid();
 
       expect(event.defaultPrevented).toBe(false);
       expect(onInput).not.toHaveBeenCalled();
@@ -481,19 +700,14 @@ describe('RichComposerArea', () => {
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor?.firstChild) throw new Error('Expected composer text');
     setCollapsedSelection(editor.firstChild, 7);
+    flushSolid();
     const cloneContents = vi.spyOn(Range.prototype, 'cloneContents');
 
     try {
-      editor.dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true, cancelable: true })
-      );
-      editor.dispatchEvent(
-        new InputEvent('beforeinput', {
-          bubbles: true,
-          cancelable: true,
-          inputType: 'deleteContentBackward',
-        })
-      );
+      pressKey(editor, { key: 'Backspace' });
+      flushSolid();
+      dispatchBeforeInput(editor, { inputType: 'deleteContentBackward' });
+      flushSolid();
 
       expect(cloneContents).not.toHaveBeenCalled();
     } finally {
@@ -507,15 +721,7 @@ describe('RichComposerArea', () => {
     renderComposer({
       value: `before ${marker} after`,
       cursorOffset: `before ${marker}`.length,
-      chips: [
-        {
-          id: marker,
-          type: 'mention-session',
-          label: 'Authentication work',
-          icon: 'session',
-          textMarker: marker,
-        },
-      ],
+      chips: [authSessionChip(marker)],
       onInput,
     });
 
@@ -528,14 +734,11 @@ describe('RichComposerArea', () => {
     range.selectNodeContents(label);
     const selection = window.getSelection();
     selection?.removeAllRanges();
+    flushSolid();
     selection?.addRange(range);
-    editor.dispatchEvent(
-      new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        inputType: 'deleteContentBackward',
-      })
-    );
+    flushSolid();
+    dispatchBeforeInput(editor, { inputType: 'deleteContentBackward' });
+    flushSolid();
 
     expect(onInput).toHaveBeenCalledWith('before  after', 'before '.length);
   });
@@ -548,15 +751,7 @@ describe('RichComposerArea', () => {
       renderComposer({
         value: `before ${marker} after`,
         cursorOffset: `before ${marker}`.length,
-        chips: [
-          {
-            id: marker,
-            type: 'mention-session',
-            label: 'Authentication work',
-            icon: 'session',
-            textMarker: marker,
-          },
-        ],
+        chips: [authSessionChip(marker)],
         onInput,
       });
 
@@ -566,7 +761,9 @@ describe('RichComposerArea', () => {
       );
       if (!editor || !label?.firstChild) throw new Error('Expected session reference label');
       setCollapsedSelection(label.firstChild, 7);
-      editor.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+      flushSolid();
+      pressKey(editor, { key });
+      flushSolid();
 
       expect(onInput).toHaveBeenCalledWith('before  after', 'before '.length);
     }
@@ -606,7 +803,9 @@ describe('RichComposerArea', () => {
       throw new Error('Expected external link text');
     linkText.textContent = 'ttps://iconoir.dev';
     setCollapsedSelection(linkText, 'ttps://iconoir.dev'.length);
+    flushSolid();
     editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    flushSolid();
 
     expect(onInput).toHaveBeenCalledWith(
       'See https://iconoir.dev',
@@ -655,12 +854,16 @@ describe('RichComposerArea', () => {
         }),
       container!
     );
+    flushSolid();
     const editor = container?.querySelector<HTMLElement>('.rich-composer');
     editor?.focus();
+    flushSolid();
     expect(editor?.querySelector('.composer-external-link')).not.toBeNull();
 
     setValue('plain replacement text that can wrap');
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     expect(editor?.querySelector('.composer-external-link')).toBeNull();
     expect(editor?.textContent).toBe('plain replacement text that can wrap');
@@ -709,13 +912,19 @@ describe('RichComposerArea', () => {
     }
 
     editor.focus();
+    flushSolid();
     const range = document.createRange();
     range.setStart(startNode, 0);
+    flushSolid();
     range.setEnd(endNode, endNode.textContent?.length ?? 0);
+    flushSolid();
     const selection = window.getSelection();
     selection?.removeAllRanges();
+    flushSolid();
     selection?.addRange(range);
+    flushSolid();
     document.dispatchEvent(new Event('selectionchange'));
+    flushSolid();
 
     expect(reference.querySelector('.inline-chip-icon-wrap')?.classList).toContain(
       'selection-crossed'
@@ -747,9 +956,12 @@ describe('RichComposerArea', () => {
       throw new Error('Expected editable external link');
     }
     editor.focus();
+    flushSolid();
     linkText.textContent = "ttps://iconoir.com what's this";
     setCollapsedSelection(linkText, "ttps://iconoir.com what's this".length);
+    flushSolid();
     editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    flushSolid();
 
     expect(reference.textContent).toBe('https://iconoir.com');
     expect(reference.nextSibling?.textContent).toBe(" what's this");
@@ -768,10 +980,10 @@ describe('RichComposerArea', () => {
       const [value, setValue] = createSignal(href);
       const [cursor, setCursor] = createSignal(0);
       const onInput = vi.fn((text: string, offset: number) => {
-        batch(() => {
+        (() => {
           setValue(text);
           setCursor(offset);
-        });
+        })();
       });
       renderComposer({
         get value() {
@@ -797,10 +1009,13 @@ describe('RichComposerArea', () => {
         if (entry === 'plain text') reference.before(inserted);
         inserted.textContent = `${prefix}${inserted.textContent}`;
         setCollapsedSelection(inserted, prefix.length);
+        flushSolid();
         editor.dispatchEvent(
           new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ' ' })
         );
+        flushSolid();
       }
+      flushSolid();
       const text = editor.firstChild!;
 
       expect(onInput).toHaveBeenLastCalledWith(`${prefix}${href}`, prefix.length);
@@ -816,9 +1031,11 @@ describe('RichComposerArea', () => {
       if (!(text instanceof Text)) throw new Error('Expected plain text before URL');
       text.insertData(prefix.length, 'more ');
       setCollapsedSelection(text, prefix.length + 5);
+      flushSolid();
       editor.dispatchEvent(
         new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ' ' })
       );
+      flushSolid();
       expect(onInput).toHaveBeenLastCalledWith(`${prefix}more ${href}`, prefix.length + 5);
       expect(text.data).toBe(`${prefix}more \u200B`);
       expect(editor.querySelector('.composer-external-link')?.textContent).toBe(href);
@@ -849,14 +1066,11 @@ describe('RichComposerArea', () => {
       throw new Error('Expected editable external link');
     }
     editor.focus();
+    flushSolid();
     setCollapsedSelection(linkText, 'ttps://iconoir.com'.length);
-    const event = new InputEvent('beforeinput', {
-      bubbles: true,
-      cancelable: true,
-      inputType: 'insertText',
-      data: ' ',
-    });
-    editor.dispatchEvent(event);
+    flushSolid();
+    const event = dispatchBeforeInput(editor, { inputType: 'insertText', data: ' ' });
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(onInput).toHaveBeenCalledWith('https://iconoir.com ', 'https://iconoir.com '.length);
@@ -873,15 +1087,7 @@ describe('RichComposerArea', () => {
     renderComposer({
       value,
       cursorOffset: cursor,
-      chips: [
-        {
-          id: 'session:ses_auth',
-          type: 'mention-session',
-          label: 'Authentication work',
-          icon: 'session',
-          textMarker: 'session:ses_auth',
-        },
-      ],
+      chips: [authSessionChip('session:ses_auth')],
       onInput,
       onRemoveChip,
     });
@@ -891,7 +1097,9 @@ describe('RichComposerArea', () => {
     const target = findNodeAtOffset(editor, cursor);
     if (!target) throw new Error('Expected cursor target');
     setCollapsedSelection(target.node, target.offset);
-    editor.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    flushSolid();
+    pressKey(editor, { key });
+    flushSolid();
 
     expect(onInput).toHaveBeenCalledWith('before  after', 'before '.length);
     expect(onRemoveChip).toHaveBeenCalledWith('session:ses_auth');
@@ -950,7 +1158,9 @@ describe('RichComposerArea', () => {
 
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     editor?.focus();
+    flushSolid();
     if (editor) setCollapsedSelection(editor, 0);
+    flushSolid();
 
     const event = new Event('paste', { bubbles: true, cancelable: true });
     Object.defineProperty(event, 'clipboardData', {
@@ -958,6 +1168,7 @@ describe('RichComposerArea', () => {
     });
 
     editor?.dispatchEvent(event);
+    flushSolid();
 
     expect(onInput).toHaveBeenCalledWith('pasted text', 11);
     expect(onPasteInsertion).toHaveBeenCalledWith(event, {
@@ -975,14 +1186,10 @@ describe('RichComposerArea', () => {
       renderComposer({ value: 'before after', cursorOffset: 7, chips: [], onInput });
       const editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
       setCollapsedSelection(editor.firstChild!, 7);
+      flushSolid();
       const text = 'first\nsecond\n\nlast';
-      const event = new InputEvent('beforeinput', {
-        inputType,
-        data: text,
-        bubbles: true,
-        cancelable: true,
-      });
-      editor.dispatchEvent(event);
+      const event = dispatchBeforeInput(editor, { inputType, data: text });
+      flushSolid();
 
       expect(event.defaultPrevented).toBe(true);
       expect(onInput).toHaveBeenCalledWith(`before ${text}after`, 7 + text.length);
@@ -997,13 +1204,9 @@ describe('RichComposerArea', () => {
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor?.firstChild) throw new Error('Expected populated composer editor');
     setCollapsedSelection(editor.firstChild, value.length);
-    const event = new KeyboardEvent('keydown', {
-      key: 'Enter',
-      shiftKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(event);
+    flushSolid();
+    const event = pressKey(editor, { key: 'Enter', shiftKey: true });
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(onInput).toHaveBeenCalledWith('something\n', 'something\n'.length);
@@ -1029,22 +1232,30 @@ describe('RichComposerArea', () => {
       editor = container!.querySelector<HTMLDivElement>('.rich-composer')!;
       editor.getBoundingClientRect = () => new DOMRect(0, 100, 200, 48);
       editor.focus();
+      flushSolid();
       setCollapsedSelection(editor.firstChild!, 5);
+      flushSolid();
       editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowUp', bubbles: true }));
+      flushSolid();
       editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowUp', bubbles: true }));
+      flushSolid();
       expect(frame).toHaveBeenCalledTimes(1);
       frame.mock.calls[0]![0](0);
       expect(editor.scrollTop).toBe(56);
       caretTop = 126;
       editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowUp', bubbles: true }));
+      flushSolid();
       frame.mock.calls[1]![0](0);
       expect(editor.scrollTop).toBe(12);
       editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowDown', bubbles: true }));
+      flushSolid();
       cleanup?.();
+      flushSolid();
       cleanup = undefined;
       expect(cancelFrame).toHaveBeenCalledWith(42);
     } finally {
       cleanup?.();
+      flushSolid();
       cleanup = undefined;
       frame.mockRestore();
       cancelFrame.mockRestore();
@@ -1055,7 +1266,9 @@ describe('RichComposerArea', () => {
         });
       } else {
         Reflect.deleteProperty(Range.prototype, 'getBoundingClientRect');
+        flushSolid();
       }
+      flushSolid();
     }
   });
 
@@ -1067,55 +1280,21 @@ describe('RichComposerArea', () => {
     });
 
     try {
-      cleanup = render(() => {
-        const [value, setValue] = createSignal('last visible line');
-        const [cursorOffset, setCursorOffset] = createSignal(value().length);
-
-        return RichComposerArea({
-          editorRef: () => {},
-          placeholder: 'Compose',
-          get value() {
-            return value();
-          },
-          get cursorOffset() {
-            return cursorOffset();
-          },
-          chips: [],
-          isFocused: true,
-          showCompletionMenu: false,
-          completionItems: [],
-          completionSelectedIndex: 0,
-          onInput: (text, nextOffset) => {
-            setValue(text);
-            setCursorOffset(nextOffset);
-          },
-          onKeyDown: () => {},
-          onPaste: () => {},
-          onFocus: () => {},
-          onBlur: () => {},
-          onClick: () => {},
-          onKeyUp: () => {},
-          onSelect: () => {},
-          onSelectCompletion: () => {},
-        });
-      }, container!);
+      renderControlledComposer('last visible line');
 
       const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
       if (!editor?.firstChild) throw new Error('Expected populated composer editor');
       editor.focus();
+      flushSolid();
       editor.scrollTop = 40;
       editor.getBoundingClientRect = () => new DOMRect(0, 20, 0, 180);
       setCollapsedSelection(editor.firstChild, 'last visible line'.length);
+      flushSolid();
 
-      editor.dispatchEvent(
-        new KeyboardEvent('keydown', {
-          key: 'Enter',
-          shiftKey: true,
-          bubbles: true,
-          cancelable: true,
-        })
-      );
+      pressKey(editor, { key: 'Enter', shiftKey: true });
+      flushSolid();
       await flushAsyncWork();
+      flushSolid();
 
       expect(editor.scrollTop).toBe(80);
     } finally {
@@ -1126,7 +1305,9 @@ describe('RichComposerArea', () => {
         });
       } else {
         Reflect.deleteProperty(Range.prototype, 'getBoundingClientRect');
+        flushSolid();
       }
+      flushSolid();
     }
   });
 
@@ -1142,7 +1323,7 @@ describe('RichComposerArea', () => {
       writable: true,
       value: function (this: HTMLElement) {
         if (this.dataset.caretMeasure) {
-          const editor = this.parentElement!;
+          const editor = this.closest<HTMLElement>('.rich-composer')!;
           const top = 180 + editor.querySelectorAll('br').length * 20 - editor.scrollTop;
           return new DOMRect(0, top, 0, 20);
         }
@@ -1151,55 +1332,21 @@ describe('RichComposerArea', () => {
     });
 
     try {
-      cleanup = render(() => {
-        const [value, setValue] = createSignal('last visible line');
-        const [cursorOffset, setCursorOffset] = createSignal(value().length);
-
-        return RichComposerArea({
-          editorRef: () => {},
-          placeholder: 'Compose',
-          get value() {
-            return value();
-          },
-          get cursorOffset() {
-            return cursorOffset();
-          },
-          chips: [],
-          isFocused: true,
-          showCompletionMenu: false,
-          completionItems: [],
-          completionSelectedIndex: 0,
-          onInput: (text, nextOffset) => {
-            setValue(text);
-            setCursorOffset(nextOffset);
-          },
-          onKeyDown: () => {},
-          onPaste: () => {},
-          onFocus: () => {},
-          onBlur: () => {},
-          onClick: () => {},
-          onKeyUp: () => {},
-          onSelect: () => {},
-          onSelectCompletion: () => {},
-        });
-      }, container!);
+      renderControlledComposer('last visible line');
 
       const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
       if (!editor?.firstChild) throw new Error('Expected populated composer editor');
       editor.focus();
+      flushSolid();
       editor.getBoundingClientRect = () => new DOMRect(0, 20, 0, 180);
       setCollapsedSelection(editor.firstChild, 'last visible line'.length);
+      flushSolid();
 
       for (let index = 0; index < 4; index++) {
-        editor.dispatchEvent(
-          new KeyboardEvent('keydown', {
-            key: 'Enter',
-            shiftKey: true,
-            bubbles: true,
-            cancelable: true,
-          })
-        );
+        pressKey(editor, { key: 'Enter', shiftKey: true });
+        flushSolid();
         await flushAsyncWork();
+        flushSolid();
       }
 
       expect(extractText(editor)).toBe('last visible line\n\n\n\n');
@@ -1207,14 +1354,10 @@ describe('RichComposerArea', () => {
       expect(editor.querySelector('[data-caret-measure]')).toBeNull();
 
       for (let index = 0; index < 3; index++) {
-        editor.dispatchEvent(
-          new KeyboardEvent('keydown', {
-            key: 'Backspace',
-            bubbles: true,
-            cancelable: true,
-          })
-        );
+        pressKey(editor, { key: 'Backspace' });
+        flushSolid();
         await flushAsyncWork();
+        flushSolid();
       }
 
       const placeholder = editor.querySelector<HTMLElement>('[data-caret-placeholder]');
@@ -1229,7 +1372,9 @@ describe('RichComposerArea', () => {
         });
       } else {
         Reflect.deleteProperty(Range.prototype, 'getBoundingClientRect');
+        flushSolid();
       }
+      flushSolid();
       Object.defineProperty(HTMLElement.prototype, 'getBoundingClientRect', {
         configurable: true,
         writable: true,
@@ -1244,61 +1389,28 @@ describe('RichComposerArea', () => {
     const secondBlock =
       'From: GPT-5.6 Sol Default\nTo: GPT-5.6 Luna Default\nNormal: GPT-5.6 Sol Default -> GPT-5.6 Luna Default';
 
-    cleanup = render(() => {
-      const [value, setValue] = createSignal(`${firstBlock}\n\n${secondBlock}`);
-      const [cursorOffset, setCursorOffset] = createSignal(firstBlock.length);
-
-      return RichComposerArea({
-        editorRef: () => {},
-        placeholder: 'Compose',
-        get value() {
-          return value();
-        },
-        get cursorOffset() {
-          return cursorOffset();
-        },
-        chips: [],
-        isFocused: true,
-        showCompletionMenu: false,
-        completionItems: [],
-        completionSelectedIndex: 0,
-        onInput: (text, nextOffset) => {
-          setValue(text);
-          setCursorOffset(nextOffset);
-        },
-        onKeyDown: () => {},
-        onPaste: () => {},
-        onFocus: () => {},
-        onBlur: () => {},
-        onClick: () => {},
-        onKeyUp: () => {},
-        onSelect: () => {},
-        onSelectCompletion: () => {},
-      });
-    }, container!);
+    renderControlledComposer(`${firstBlock}\n\n${secondBlock}`, firstBlock.length);
 
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor) throw new Error('Expected composer editor');
     editor.focus();
+    flushSolid();
     const target = findNodeAtOffset(editor, firstBlock.length);
     if (!target) throw new Error('Expected cursor target');
     setCollapsedSelection(target.node, target.offset);
+    flushSolid();
 
-    editor.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        shiftKey: true,
-        bubbles: true,
-        cancelable: true,
-      })
-    );
+    pressKey(editor, { key: 'Enter', shiftKey: true });
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     const selection = window.getSelection();
     if (!selection?.rangeCount) throw new Error('Expected composer selection');
     const prefixRange = document.createRange();
     prefixRange.selectNodeContents(editor);
     prefixRange.setEnd(selection.focusNode!, selection.focusOffset);
+    flushSolid();
     const prefix = document.createElement('div');
     prefix.appendChild(prefixRange.cloneContents());
 
@@ -1316,54 +1428,21 @@ describe('RichComposerArea', () => {
       textMarker: marker,
     };
 
-    cleanup = render(() => {
-      const [value, setValue] = createSignal(marker);
-      const [cursorOffset, setCursorOffset] = createSignal(marker.length);
-
-      return RichComposerArea({
-        editorRef: () => {},
-        placeholder: 'Compose',
-        get value() {
-          return value();
-        },
-        get cursorOffset() {
-          return cursorOffset();
-        },
-        chips: [chip],
-        isFocused: true,
-        showCompletionMenu: false,
-        completionItems: [],
-        completionSelectedIndex: 0,
-        onInput: (text, nextOffset) => {
-          setValue(text);
-          setCursorOffset(nextOffset);
-        },
-        onKeyDown: () => {},
-        onPaste: () => {},
-        onFocus: () => {},
-        onBlur: () => {},
-        onClick: () => {},
-        onKeyUp: () => {},
-        onSelect: () => {},
-        onSelectCompletion: () => {},
-      });
-    }, container!);
+    renderControlledComposer(marker, marker.length, [chip]);
 
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor) throw new Error('Expected composer editor');
     await flushAsyncWork();
+    flushSolid();
     const target = findNodeAtOffset(editor, marker.length);
     if (!target) throw new Error('Expected cursor target');
     setCollapsedSelection(target.node, target.offset);
+    flushSolid();
 
-    const event = new KeyboardEvent('keydown', {
-      key: 'Enter',
-      shiftKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(event);
+    const event = pressKey(editor, { key: 'Enter', shiftKey: true });
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(extractText(editor)).toBe(`${marker}\n`);
@@ -1382,13 +1461,9 @@ describe('RichComposerArea', () => {
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor?.firstChild) throw new Error('Expected populated composer editor');
     setCollapsedSelection(editor.firstChild, value.length);
-    const event = new KeyboardEvent('keydown', {
-      key: 'Enter',
-      shiftKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(event);
+    flushSolid();
+    const event = pressKey(editor, { key: 'Enter', shiftKey: true });
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(onInput).toHaveBeenCalledWith('- Bullet item 1\n- ', '- Bullet item 1\n- '.length);
@@ -1404,13 +1479,9 @@ describe('RichComposerArea', () => {
     const target = findNodeAtOffset(editor, value.length);
     if (!target) throw new Error('Expected cursor target');
     setCollapsedSelection(target.node, target.offset);
-    const event = new KeyboardEvent('keydown', {
-      key: 'Enter',
-      shiftKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(event);
+    flushSolid();
+    const event = pressKey(editor, { key: 'Enter', shiftKey: true });
+    flushSolid();
 
     const expected = '- Bullet item 1\n- Bullet item 2\n';
     expect(event.defaultPrevented).toBe(true);
@@ -1492,12 +1563,9 @@ describe('RichComposerArea', () => {
     const target = findNodeAtOffset(editor, 'Tests\n'.length);
     if (!target) throw new Error('Expected cursor target');
     setCollapsedSelection(target.node, target.offset);
-    const event = new KeyboardEvent('keydown', {
-      key: 'Backspace',
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(event);
+    flushSolid();
+    const event = pressKey(editor, { key: 'Backspace' });
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(onInput).toHaveBeenCalledWith(`Tests${marker}`, 'Tests'.length);
@@ -1529,12 +1597,9 @@ describe('RichComposerArea', () => {
     const target = findNodeAtOffset(editor, value.length);
     if (!target) throw new Error('Expected cursor target');
     setCollapsedSelection(target.node, target.offset);
-    const event = new KeyboardEvent('keydown', {
-      key: 'Backspace',
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(event);
+    flushSolid();
+    const event = pressKey(editor, { key: 'Backspace' });
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(onInput).toHaveBeenCalledWith('sdsds ', 'sdsds '.length);
@@ -1568,6 +1633,7 @@ describe('RichComposerArea', () => {
     const target = findNodeAtOffset(editor, value.length);
     if (!target) throw new Error('Expected cursor target');
     setCollapsedSelection(target.node, target.offset);
+    flushSolid();
 
     const getPrefix = () => {
       const selection = window.getSelection();
@@ -1580,21 +1646,13 @@ describe('RichComposerArea', () => {
       return extractText(fragment);
     };
 
-    const left = new KeyboardEvent('keydown', {
-      key: 'ArrowLeft',
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(left);
+    const left = pressKey(editor, { key: 'ArrowLeft' });
+    flushSolid();
     expect(left.defaultPrevented).toBe(true);
     expect(getPrefix()).toBe(prefix);
 
-    const right = new KeyboardEvent('keydown', {
-      key: 'ArrowRight',
-      bubbles: true,
-      cancelable: true,
-    });
-    editor.dispatchEvent(right);
+    const right = pressKey(editor, { key: 'ArrowRight' });
+    flushSolid();
     expect(right.defaultPrevented).toBe(true);
     expect(getPrefix()).toBe(value);
     const selection = window.getSelection();
@@ -1616,15 +1674,7 @@ describe('RichComposerArea', () => {
     renderComposer({
       value: `before ${marker} after`,
       cursorOffset: `before ${marker} after`.length,
-      chips: [
-        {
-          id: marker,
-          type: 'mention-session',
-          label: 'Authentication work',
-          icon: 'session',
-          textMarker: marker,
-        },
-      ],
+      chips: [authSessionChip(marker)],
       onInput,
     });
 
@@ -1637,13 +1687,16 @@ describe('RichComposerArea', () => {
     range.selectNodeContents(label.firstChild);
     const selection = window.getSelection();
     selection?.removeAllRanges();
+    flushSolid();
     selection?.addRange(range);
+    flushSolid();
 
     const event = new Event('paste', { bubbles: true, cancelable: true });
     Object.defineProperty(event, 'clipboardData', {
       value: { getData: (type: string) => (type === 'text/plain' ? 'replacement' : '') },
     });
     editor.dispatchEvent(event);
+    flushSolid();
 
     expect(onInput).toHaveBeenCalledWith('before replacement after', 'before replacement'.length);
   });
@@ -1664,12 +1717,14 @@ describe('RichComposerArea', () => {
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor?.firstChild) throw new Error('Expected populated composer editor');
     setCollapsedSelection(editor.firstChild, 0);
+    flushSolid();
     const event = new Event('paste', { bubbles: true, cancelable: true });
     Object.defineProperty(event, 'clipboardData', {
       value: { getData: (type: string) => (type === 'text/plain' ? '@README.md' : '') },
     });
 
     editor?.dispatchEvent(event);
+    flushSolid();
 
     expect(onInput).not.toHaveBeenCalled();
     expect(onPasteInsertion).toHaveBeenCalledWith(event, {
@@ -1690,8 +1745,11 @@ describe('RichComposerArea', () => {
 
     editor.textContent = 'updated draft';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(editor.firstChild || editor, 13);
+    flushSolid();
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSolid();
 
     expect(onInput).toHaveBeenCalledWith('updated draft', 13);
   });
@@ -1706,6 +1764,7 @@ describe('RichComposerArea', () => {
     editor.dispatchEvent(
       new InputEvent('input', { bubbles: true, inputType: 'historyUndo', data: null })
     );
+    flushSolid();
 
     expect(editor.textContent).toBe('123');
     expect(onInput).not.toHaveBeenCalled();
@@ -1727,7 +1786,9 @@ describe('RichComposerArea', () => {
     const range = document.createRange();
     range.selectNodeContents(editor!);
     selection?.removeAllRanges();
+    flushSolid();
     selection?.addRange(range);
+    flushSolid();
 
     const setData = vi.fn();
     const event = new Event('copy', { bubbles: true, cancelable: true });
@@ -1736,6 +1797,7 @@ describe('RichComposerArea', () => {
     });
 
     editor?.dispatchEvent(event);
+    flushSolid();
 
     expect(setData).toHaveBeenCalledWith('text/plain', 'Review @README.md please');
   });
@@ -1763,10 +1825,14 @@ describe('RichComposerArea', () => {
     if (!editor) throw new Error('Expected composer editor');
 
     await flushAsyncWork();
+    flushSolid();
     editor.textContent = '';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(editor, 0);
+    flushSolid();
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSolid();
 
     expect(onInput).toHaveBeenCalledWith('', 0);
     expect(onRemoveChip).toHaveBeenCalledWith('file:/workspace/README.md');
@@ -1779,18 +1845,25 @@ describe('RichComposerArea', () => {
     if (!editor) throw new Error('Expected composer editor');
 
     await flushAsyncWork();
+    flushSolid();
     expect(editor.dataset.empty).toBe('true');
 
     editor.textContent = 'hello';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(editor.firstChild || editor, 5);
+    flushSolid();
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSolid();
     expect(editor.dataset.empty).toBe('false');
 
     editor.textContent = '';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(editor, 0);
+    flushSolid();
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSolid();
     expect(extractText(editor)).toBe('');
     expect(editor.dataset.empty).toBe('true');
   });
@@ -1802,10 +1875,15 @@ describe('RichComposerArea', () => {
     if (!editor) throw new Error('Expected composer editor');
 
     await flushAsyncWork();
+    flushSolid();
     editor.replaceChildren(document.createElement('br'));
+    flushSolid();
     editor.focus();
+    flushSolid();
     setCollapsedSelection(editor, 0);
+    flushSolid();
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSolid();
 
     expect(extractText(editor)).toBe('');
     expect(editor.dataset.empty).toBe('true');
@@ -1848,11 +1926,13 @@ describe('RichComposerArea', () => {
         onSelectCompletion: () => {},
       });
     }, container!);
+    flushSolid();
 
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor) throw new Error('Expected composer editor');
 
     await flushAsyncWork();
+    flushSolid();
     const trailingText = editor.childNodes[1];
     if (!trailingText || trailingText.nodeType !== Node.TEXT_NODE) {
       throw new Error('Expected spacer text node after chip');
@@ -1860,15 +1940,23 @@ describe('RichComposerArea', () => {
 
     trailingText.textContent = '\u200Ba';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(trailingText, 2);
+    flushSolid();
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     trailingText.textContent = '\u200Bab';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(trailingText, 3);
+    flushSolid();
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     expect(extractText(editor)).toBe('[Image]ab');
   });
@@ -1893,10 +1981,10 @@ describe('RichComposerArea', () => {
         completionItems: [],
         completionSelectedIndex: 0,
         onInput: (text, nextOffset) => {
-          batch(() => {
+          (() => {
             setValue(text);
             setCursorOffset(nextOffset);
-          });
+          })();
         },
         onKeyDown: () => {},
         onPaste: () => {},
@@ -1908,12 +1996,15 @@ describe('RichComposerArea', () => {
         onSelectCompletion: () => {},
       });
     }, container!);
+    flushSolid();
 
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor?.firstChild) throw new Error('Expected composer text');
     editor.firstChild.textContent = 'ab';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(editor.firstChild, 2);
+    flushSolid();
     const childNodes = vi.spyOn(editor, 'childNodes', 'get');
     const cloneContents = vi.spyOn(Range.prototype, 'cloneContents');
 
@@ -1921,7 +2012,9 @@ describe('RichComposerArea', () => {
       editor.dispatchEvent(
         new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'b' })
       );
+      flushSolid();
       await flushAsyncWork();
+      flushSolid();
 
       expect(childNodes).toHaveBeenCalledTimes(1);
       expect(cloneContents).toHaveBeenCalledTimes(1);
@@ -1953,10 +2046,10 @@ describe('RichComposerArea', () => {
         completionItems: [],
         completionSelectedIndex: 0,
         onInput: (text) => {
-          batch(() => {
+          (() => {
             setValue(text);
             setCursorOffset(0);
-          });
+          })();
         },
         onKeyDown: () => {},
         onPaste: () => {},
@@ -1968,16 +2061,21 @@ describe('RichComposerArea', () => {
         onSelectCompletion: () => {},
       });
     }, container!);
+    flushSolid();
 
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     if (!editor?.firstChild) throw new Error('Expected composer text');
     editor.firstChild.textContent = 'ab';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(editor.firstChild, 2);
+    flushSolid();
     editor.dispatchEvent(
       new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'b' })
     );
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     expect(window.getSelection()?.focusNode).toBe(editor.firstChild);
     expect(window.getSelection()?.focusOffset).toBe(0);
@@ -2020,6 +2118,7 @@ describe('RichComposerArea', () => {
         onSelectCompletion: () => {},
       });
     }, container!);
+    flushSolid();
 
     const editor = container?.querySelector<HTMLDivElement>('.rich-composer');
     const textNode = editor?.lastChild;
@@ -2029,13 +2128,17 @@ describe('RichComposerArea', () => {
 
     textNode.textContent = 'Take the Xbest parts';
     editor.focus();
+    flushSolid();
     setCollapsedSelection(textNode, 'Take the X'.length);
+    flushSolid();
     const selection = window.getSelection();
     if (!selection) throw new Error('Expected browser selection');
     const removeAllRanges = vi.spyOn(selection, 'removeAllRanges');
 
     editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     expect(extractText(editor)).toBe(`${chip.textMarker}\nTake the Xbest parts`);
     expect(selection.anchorNode).toBe(textNode);
@@ -2061,6 +2164,7 @@ describe('RichComposerArea', () => {
     renderComposer({ value: '[Image 1]', cursorOffset: 0, chips: [chip] });
     container = originalContainer;
     await flushAsyncWork();
+    flushSolid();
 
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     originalContainer!.getBoundingClientRect = () =>
@@ -2071,6 +2175,7 @@ describe('RichComposerArea', () => {
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     inlineChip.getBoundingClientRect = () => ({ left: 30, right: 100, width: 70 }) as DOMRect;
     inlineChip.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    flushSolid();
 
     const preview = document.querySelector<HTMLElement>('.chat-attachment-image-preview');
     expect(preview?.querySelector('img')?.getAttribute('src')).toBe('blob:image-1');
@@ -2116,14 +2221,19 @@ describe('RichComposerArea', () => {
         }),
       container!
     );
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     const inlineChip = container?.querySelector<HTMLElement>('.inline-chip');
     inlineChip?.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    flushSolid();
     expect(document.querySelector('.chat-attachment-image-preview')).not.toBeNull();
 
     setValue('');
+    flushSolid();
     await flushAsyncWork();
+    flushSolid();
 
     expect(document.querySelector('.chat-attachment-image-preview')).toBeNull();
   });
@@ -2143,13 +2253,16 @@ describe('RichComposerArea', () => {
       chips: [chip],
     });
     await flushAsyncWork();
+    flushSolid();
 
     const inlineChip = container?.querySelector<HTMLElement>('.inline-chip');
     inlineChip?.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    flushSolid();
     expect(document.querySelector('.chat-attachment-image-preview')).not.toBeNull();
 
     dismissComposerOverlays();
     await flushAsyncWork();
+    flushSolid();
 
     expect(document.querySelector('.chat-attachment-image-preview')).toBeNull();
   });
@@ -2172,6 +2285,7 @@ describe('RichComposerArea', () => {
     });
 
     await flushAsyncWork();
+    flushSolid();
 
     const inlineChip = container?.querySelector<HTMLElement>('.inline-chip');
     expect(inlineChip?.getAttribute('title')).toBe(
@@ -2196,6 +2310,7 @@ describe('RichComposerArea', () => {
     });
 
     await flushAsyncWork();
+    flushSolid();
 
     const chipElement = container?.querySelector<HTMLElement>('.inline-chip');
     expectChipUiIcon(chipElement?.querySelector('.inline-chip-icon'), folderIcon);
@@ -2213,6 +2328,7 @@ describe('RichComposerArea', () => {
 
     renderComposer({ value: '@Notes', cursorOffset: 0, chips: [chip] });
     await flushAsyncWork();
+    flushSolid();
 
     const chipElement = container?.querySelector<HTMLElement>('.inline-chip');
     expectChipUiIcon(chipElement?.querySelector('.inline-chip-icon'), emptyPageIcon);
@@ -2243,6 +2359,7 @@ describe('RichComposerArea', () => {
     });
 
     await flushAsyncWork();
+    flushSolid();
 
     const agentIcon = container?.querySelector('[data-chip-type="mention-agent"] img');
     const imageIcon = container?.querySelector('[data-chip-type="image"] img');
@@ -2271,9 +2388,11 @@ describe('RichComposerArea', () => {
     });
 
     await flushAsyncWork();
+    flushSolid();
 
     const label = container?.querySelector<HTMLElement>('.inline-chip .inline-chip-label');
     label?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    flushSolid();
 
     expect(onChipClick).toHaveBeenCalledWith('file:/workspace/src/app.ts');
   });
@@ -2289,9 +2408,11 @@ describe('RichComposerArea', () => {
     });
 
     await flushAsyncWork();
+    flushSolid();
 
     const editor = container?.querySelector<HTMLElement>('[contenteditable]');
     editor?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    flushSolid();
 
     expect(onChipClick).not.toHaveBeenCalled();
   });

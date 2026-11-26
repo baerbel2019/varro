@@ -98,6 +98,7 @@ function createActionFixture() {
   };
   const usageReportService = {
     openReport: vi.fn(() => Promise.resolve()),
+    openSessionReport: vi.fn(() => Promise.resolve()),
   };
   const restProxy = {
     handleRequest: vi.fn(() => Promise.resolve()),
@@ -179,6 +180,7 @@ function createActionFixture() {
     openNewWindow: vi.fn(),
     editorRouteChanged: vi.fn(),
     handleRalphMessage: vi.fn<SidebarProviderActionDeps['handleRalphMessage']>(),
+    handleWarmingMessage: vi.fn<SidebarProviderActionDeps['handleWarmingMessage']>(),
     updateQueuedMessages: vi.fn<SidebarProviderActionDeps['updateQueuedMessages']>(() =>
       Promise.resolve()
     ),
@@ -283,6 +285,17 @@ const nestedSessionActionCases: Array<{
     invoke: ({ actions }) => actions.exportSession('nested-session', NESTED_SESSION_DIRECTORY),
     verify: ({ sessionExportService }) => {
       expect(sessionExportService.exportSession).toHaveBeenCalledWith(
+        'nested-session',
+        NESTED_SESSION_DIRECTORY
+      );
+    },
+  },
+  {
+    name: 'session usage report',
+    invoke: ({ actions }) =>
+      actions.generateSessionUsageReport('nested-session', NESTED_SESSION_DIRECTORY),
+    verify: ({ usageReportService }) => {
+      expect(usageReportService.openSessionReport).toHaveBeenCalledWith(
         'nested-session',
         NESTED_SESSION_DIRECTORY
       );
@@ -561,10 +574,12 @@ describe('createSidebarProviderActions', () => {
 
     actions.updateCommandState(true, false, model);
 
-    expect(webviewSession.updateCommandState).toHaveBeenCalledWith(true, false);
+    expect(webviewSession.updateCommandState).toHaveBeenCalledWith(true, false, undefined);
     expect(deps.setActiveChatModel).toHaveBeenCalledWith(model, true);
-    actions.updateCommandState(true, false, model, undefined, false);
+    const history = { canNavigateBack: true, canNavigateForward: false };
+    actions.updateCommandState(true, false, model, undefined, false, history);
     expect(deps.setActiveChatModel).toHaveBeenLastCalledWith(model, false);
+    expect(webviewSession.updateCommandState).toHaveBeenLastCalledWith(true, false, history);
   });
 
   it('forwards session read acknowledgements', () => {
@@ -685,6 +700,16 @@ describe('createSidebarProviderActions', () => {
     await actions.exportSession('session-1', '/dedicated');
 
     expect(sessionExportService.exportSession).toHaveBeenCalledWith('session-1', '/dedicated');
+  });
+
+  it('refuses a session usage report for a folder that is not open', async () => {
+    const { actions, contextProvider, usageReportService } = createActionFixture();
+    contextProvider.getOpenWorkspaceRoot.mockReturnValue(null);
+
+    await expect(actions.generateSessionUsageReport('session-1', '/elsewhere')).rejects.toThrow(
+      'Session workspace folder is not open'
+    );
+    expect(usageReportService.openSessionReport).not.toHaveBeenCalled();
   });
 
   it('opens settings with explicit and default extension queries', async () => {

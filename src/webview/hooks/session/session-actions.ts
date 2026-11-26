@@ -1,8 +1,10 @@
 import type { Message, MessageEntry, Part } from '../../types';
 import type { QueuedAttachmentSnapshot } from './session-send';
-import type { SessionWorkspaceTarget } from '../../../shared/protocol';
+import type { ChatModelSelection, SessionWorkspaceTarget } from '../../../shared/protocol';
 
 type PlanImplementationSendOptions = {
+  agent: string;
+  selectedModel?: ChatModelSelection;
   queuedAttachments: QueuedAttachmentSnapshot;
   preserveComposer: true;
 };
@@ -31,6 +33,8 @@ export async function implementPlanWithDependencies(
     setError(message: string): void;
     clearSkippedPlanSession(sessionId: string): void;
     applySelectedAgent(agent: string, sessionId: string): void;
+    /** The model picking this agent would select, or null to keep the current one. */
+    resolveAgentModel?(agent: string, sessionId: string): ChatModelSelection | null;
     sendMessage(
       prompt: string,
       options?: PlanImplementationSendOptions
@@ -48,8 +52,11 @@ export async function implementPlanWithDependencies(
   }
 
   deps.clearSkippedPlanSession(sessionId);
+  // Resolve before the agent changes so the planning model is remembered for Plan.
+  const selectedModel = deps.resolveAgentModel?.(buildAgent, sessionId) ?? null;
   deps.applySelectedAgent(buildAgent, sessionId);
-  await deps.sendMessage(prompt, {
+  const options: PlanImplementationSendOptions = {
+    agent: buildAgent,
     queuedAttachments: {
       droppedFiles: [],
       clipboardImages: [],
@@ -58,7 +65,9 @@ export async function implementPlanWithDependencies(
       attachedDiagnostics: null,
     },
     preserveComposer: true,
-  });
+  };
+  if (selectedModel) options.selectedModel = selectedModel;
+  await deps.sendMessage(prompt, options);
 }
 
 export async function openPlanWithDependencies(
@@ -192,6 +201,7 @@ type SessionActionDependencies = {
   setError(message: string | null): void;
   clearSkippedPlanSession(sessionId: string): void;
   applySelectedAgent(agent: string, sessionId: string): void;
+  resolveAgentModel?(agent: string, sessionId: string): ChatModelSelection | null;
   sendMessage(
     prompt: string,
     options?: PlanImplementationSendOptions | InitSendOptions
@@ -217,40 +227,15 @@ export class SessionActionOperations {
   constructor(private readonly deps: SessionActionDependencies) {}
 
   readonly implementPlan = async (prompt: string, sessionId: string | null) => {
-    await implementPlanWithDependencies(
-      {
-        getActiveSessionId: this.deps.getActiveSessionId,
-        getBuildAgent: this.deps.getBuildAgent,
-        setError: this.deps.setError,
-        clearSkippedPlanSession: this.deps.clearSkippedPlanSession,
-        applySelectedAgent: this.deps.applySelectedAgent,
-        sendMessage: this.deps.sendMessage,
-      },
-      prompt,
-      sessionId
-    );
+    await implementPlanWithDependencies(this.deps, prompt, sessionId);
   };
 
   readonly openPlan = async (markdown: string, sessionId: string | null) => {
-    await openPlanWithDependencies(
-      {
-        getActiveSessionId: this.deps.getActiveSessionId,
-        setError: this.deps.setError,
-        openPlan: this.deps.openPlan,
-      },
-      markdown,
-      sessionId
-    );
+    await openPlanWithDependencies(this.deps, markdown, sessionId);
   };
 
   readonly initSession = async () => {
-    await initSessionWithDependencies({
-      getActiveSessionId: this.deps.getActiveSessionId,
-      createSession: this.deps.createSession,
-      getMessageCount: this.deps.getMessageCount,
-      setError: this.deps.setError,
-      sendMessage: this.deps.sendMessage,
-    });
+    await initSessionWithDependencies(this.deps);
   };
 
   readonly runSlashCommandByName = async (
@@ -258,27 +243,6 @@ export class SessionActionOperations {
     args: string,
     options?: SessionCommandOptions
   ) => {
-    return runSlashCommandWithDependencies(
-      {
-        hasCommand: this.deps.hasCommand,
-        getCommandRouting: this.deps.getCommandRouting,
-        getActiveSessionId: this.deps.getActiveSessionId,
-        createSession: this.deps.createSession,
-        startLoading: this.deps.startLoading,
-        runSessionCommand: this.deps.runSessionCommand,
-        shouldApplyToActiveSession: this.deps.shouldApplyToActiveSession,
-        upsertMessageInfo: this.deps.upsertMessageInfo,
-        upsertPart: this.deps.upsertPart,
-        syncTodosFromMessages: this.deps.syncTodosFromMessages,
-        requestMessageListScrollToBottom: this.deps.requestMessageListScrollToBottom,
-        syncSession: this.deps.syncSession,
-        recheckSessionStatus: this.deps.recheckSessionStatus,
-        stopLoading: this.deps.stopLoading,
-        setError: this.deps.setError,
-      },
-      name,
-      args,
-      options
-    );
+    return runSlashCommandWithDependencies(this.deps, name, args, options);
   };
 }

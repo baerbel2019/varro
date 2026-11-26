@@ -1,5 +1,5 @@
-import { createSignal } from 'solid-js';
-import { render } from 'solid-js/web';
+import { flush as flushSolid, createSignal } from 'solid-js';
+import { render } from '@solidjs/web';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProviderLimitStatus, ProviderLimitWindow } from '../../../shared/protocol';
 import { STORAGE_KEYS, writeStored } from '../../lib/state-storage';
@@ -35,6 +35,7 @@ const sendToExtension = vi.fn();
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
+  flushSolid();
   writeStored(STORAGE_KEYS.quotaWarningDismissals, null);
   quotaWarningDismissals.reload();
   writeStored(STORAGE_KEYS.resetWarningDismissals, null);
@@ -43,16 +44,20 @@ beforeEach(() => {
   document.body.append(container);
   sendToExtension.mockClear();
   Reflect.set(window, '__sendToExtension', sendToExtension);
+  flushSolid();
 });
 
 afterEach(() => {
   dispose?.();
+  flushSolid();
   dispose = undefined;
   container.remove();
+  flushSolid();
   writeStored(STORAGE_KEYS.quotaWarningDismissals, null);
   vi.useRealTimers();
   writeStored(STORAGE_KEYS.resetWarningDismissals, null);
   Reflect.deleteProperty(window, '__sendToExtension');
+  flushSolid();
 });
 
 function mount(initial: ProviderLimitStatus, modelID = 'gpt-6') {
@@ -97,6 +102,7 @@ function banner() {
 
 function dismiss() {
   container.querySelector<HTMLButtonElement>('.chat-quota-warning-close')!.click();
+  flushSolid();
 }
 
 describe('ProviderQuotaWarning', () => {
@@ -109,6 +115,7 @@ describe('ProviderQuotaWarning', () => {
       note: 'Token sharing cannot read quotas',
       codexLoginRequired: { connectionID: 'integration-test-connection' },
     });
+    flushSolid();
     expect(banner()?.textContent).toContain('Sign in via Codex to see usage limits');
     expect(container.querySelectorAll('.chat-quota-warning')).toHaveLength(1);
   });
@@ -126,54 +133,73 @@ describe('ProviderQuotaWarning', () => {
   it('warns within five days, shows only the nearest expiration and removes expired resets', () => {
     const expiresAt = NOW + 5 * 24 * HOUR;
     const { setLimit } = mount(withResets([expiresAt + 1_000, null, NOW]));
+    flushSolid();
     expect(banner()).toBeNull();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()?.textContent).toContain('Reset expires in 5d');
     setLimit(withResets([expiresAt, expiresAt - HOUR, expiresAt, null, NOW]));
+    flushSolid();
     expect(container.querySelectorAll('.chat-quota-warning-row')).toHaveLength(1);
     expect(banner()?.textContent).toContain('Reset expires in 4d 23h');
     vi.setSystemTime(expiresAt);
+    flushSolid();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()).toBeNull();
   });
 
   it('updates the reset expiration window from the debug setting', () => {
     const { setResetWarningDays } = mount(withResets([NOW + 10 * 24 * HOUR]));
+    flushSolid();
     expect(banner()).toBeNull();
     setResetWarningDays(14);
+    flushSolid();
     expect(banner()?.textContent).toContain('Reset expires in 10d');
     setResetWarningDays(5);
+    flushSolid();
     expect(banner()).toBeNull();
   });
 
   it('turns reset warnings red at 24 hours and removes them at expiration', () => {
     const expiresAt = NOW + 24 * HOUR + 1_000;
     mount(withResets([expiresAt]));
+    flushSolid();
     expect(banner()?.classList.contains('error')).toBe(false);
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()?.classList.contains('error')).toBe(true);
     vi.setSystemTime(expiresAt - 2_000);
+    flushSolid();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()?.classList.contains('error')).toBe(true);
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()).toBeNull();
   });
 
   it('persists reset snoozes per provider and expiration across polling and remounts', () => {
     const expiresAt = NOW + 4 * 24 * HOUR;
     const { setLimit, setModel, remount } = mount(withResets([expiresAt]));
+    flushSolid();
     dismiss();
     resetWarningDismissals.reload();
     setLimit(withResets([expiresAt]));
+    flushSolid();
     setModel('gpt-6-sol');
+    flushSolid();
     remount();
     expect(banner()).toBeNull();
     setLimit(withResets([expiresAt], 'anthropic'));
+    flushSolid();
     expect(banner()).not.toBeNull();
     setLimit(withResets([expiresAt, expiresAt + HOUR]));
+    flushSolid();
     expect(container.querySelectorAll('.chat-quota-warning-row')).toHaveLength(1);
     expect(banner()?.textContent).toContain('Reset expires in 4d 1h');
     setLimit({ ...withResets([expiresAt]), windows: [quota('weekly', 8)] });
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly: 8% left');
     expect(banner()?.textContent).not.toContain('Reset expires');
   });
@@ -181,45 +207,58 @@ describe('ProviderQuotaWarning', () => {
   it('reminds again at closer milestones after each close, including across remounts', () => {
     const expiresAt = NOW + 5 * 24 * HOUR;
     const { setLimit, remount } = mount(withResets([expiresAt]));
+    flushSolid();
     dismiss();
 
     for (const hours of [72, 24, 6, 1]) {
       vi.setSystemTime(expiresAt - hours * HOUR - 2_000);
+      flushSolid();
       vi.advanceTimersByTime(1_000);
+      flushSolid();
       setLimit(withResets([expiresAt]));
+      flushSolid();
       resetWarningDismissals.reload();
       remount();
       expect(banner()).toBeNull();
 
       vi.advanceTimersByTime(1_000);
+      flushSolid();
       expect(banner()?.textContent).toContain('Reset expires in');
       expect(banner()?.classList.contains('error')).toBe(hours <= 24);
       dismiss();
       expect(banner()).toBeNull();
       vi.advanceTimersByTime(1_000);
+      flushSolid();
       remount();
       expect(banner()).toBeNull();
     }
 
     vi.setSystemTime(expiresAt - 2_000);
+    flushSolid();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()).toBeNull();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()).toBeNull();
   });
 
   it('reminds after reopening past a milestone and snoozes until the next one', () => {
     const expiresAt = NOW + 4 * 24 * HOUR;
     const { remount } = mount(withResets([expiresAt]));
+    flushSolid();
     dismiss();
     vi.setSystemTime(expiresAt - 5 * HOUR);
+    flushSolid();
     remount();
     expect(banner()?.textContent).toContain('Reset expires in 5h');
     dismiss();
     remount();
     expect(banner()).toBeNull();
     vi.setSystemTime(expiresAt - HOUR - 1_000);
+    flushSolid();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()?.textContent).toContain('Reset expires in 1h');
   });
 
@@ -227,39 +266,54 @@ describe('ProviderQuotaWarning', () => {
     const expiresAt = NOW + 2 * 24 * HOUR;
     writeStored(STORAGE_KEYS.resetWarningDismissals, [{ providerID: 'openai', expiresAt }]);
     mount(withResets([expiresAt]));
+    flushSolid();
     expect(banner()).toBeNull();
     vi.setSystemTime(expiresAt - 24 * HOUR - 1_000);
+    flushSolid();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()?.textContent).toContain('Reset expires in');
     dismiss();
     expect(banner()).toBeNull();
     vi.setSystemTime(expiresAt - 6 * HOUR - 1_000);
+    flushSolid();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()?.textContent).toContain('Reset expires in 6h');
   });
 
   it('rotates quota and reset warnings in one panel', () => {
     mount({
       ...withResets([NOW + 4 * 24 * HOUR]),
-      windows: [quota('weekly', 0)],
+      windows: [quota('weekly', 0), quota('five_hour', 20)],
     });
+    flushSolid();
     expect(container.querySelectorAll('.chat-quota-warning')).toHaveLength(1);
     expect(banner()?.textContent).toContain('weekly: 0% left');
     expect(banner()?.textContent).not.toContain('Reset expires');
     vi.advanceTimersByTime(5_000);
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly: 0% left');
     vi.advanceTimersByTime(10_000);
-    expect(banner()?.textContent).toContain('Reset expires in');
+    flushSolid();
+    expect(banner()?.textContent).toContain('five_hour: 20% left');
     expect(banner()?.textContent).not.toContain('weekly:');
     expect(banner()?.classList.contains('error')).toBe(false);
     vi.advanceTimersByTime(15_000);
+    flushSolid();
+    expect(banner()?.textContent).toContain('Reset expires in');
+    expect(banner()?.textContent).not.toContain('five_hour:');
+    expect(banner()?.classList.contains('error')).toBe(false);
+    vi.advanceTimersByTime(15_000);
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly: 0% left');
     expect(banner()?.classList.contains('error')).toBe(true);
   });
 
   it.each([
     { phase: 'quota', elapsed: 0, text: 'weekly: 0% left' },
-    { phase: 'reset expiration', elapsed: 15_000, text: 'Reset expires in' },
+    { phase: 'second quota', elapsed: 15_000, text: 'five_hour: 20% left' },
+    { phase: 'reset expiration', elapsed: 30_000, text: 'Reset expires in' },
   ])('dismisses both warnings from the $phase phase without rotating back', ({ elapsed, text }) => {
     const expiresAt = NOW + 4 * 24 * HOUR;
     const limit = {
@@ -267,7 +321,9 @@ describe('ProviderQuotaWarning', () => {
       windows: [quota('weekly', 0), quota('five_hour', 20)],
     };
     const { setLimit, remount } = mount(limit);
+    flushSolid();
     vi.advanceTimersByTime(elapsed);
+    flushSolid();
     expect(banner()?.textContent).toContain(text);
     dismiss();
     expect(banner()).toBeNull();
@@ -280,33 +336,42 @@ describe('ProviderQuotaWarning', () => {
       expiresAt + HOUR,
     ]);
     vi.advanceTimersByTime(30_000);
+    flushSolid();
     expect(banner()).toBeNull();
     quotaWarningDismissals.reload();
     resetWarningDismissals.reload();
     setLimit({ ...limit, checkedAt: Date.now() });
+    flushSolid();
     remount();
     expect(banner()).toBeNull();
     vi.advanceTimersByTime(15_000);
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(withResets([NOW + HOUR]));
+    flushSolid();
     expect(banner()?.textContent).toContain('Reset expires in');
   });
 
   it('syncs reset dismissals through storage and keeps debug closes temporary', () => {
     const expiresAt = NOW + HOUR;
     const { setForceShow } = mount(withResets([expiresAt]));
+    flushSolid();
     setForceShow(true);
+    flushSolid();
     dismiss();
     expect(resetWarningDismissals.read()).toEqual([]);
     setForceShow(false);
+    flushSolid();
     expect(banner()).not.toBeNull();
     resetWarningDismissals.dismiss('openai', [expiresAt], NOW);
+    flushSolid();
     expect(banner()).toBeNull();
     writeStored(STORAGE_KEYS.resetWarningDismissals, [
       null,
       { providerID: 'openai', expiresAt: 'bad' },
     ]);
     window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEYS.resetWarningDismissals }));
+    flushSolid();
     expect(banner()).not.toBeNull();
   });
 
@@ -315,19 +380,27 @@ describe('ProviderQuotaWarning', () => {
     quotaWarningDismissals.dismiss('openai', windows, NOW);
     const saved = quotaWarningDismissals.read();
     const { setForceShow } = mount(snapshot(windows));
+    flushSolid();
     expect(banner()).toBeNull();
 
     setForceShow(true);
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly: 80% left');
+    expect(banner()?.textContent).not.toContain('five_hour:');
+    vi.advanceTimersByTime(15_000);
+    flushSolid();
     expect(banner()?.textContent).toContain('five_hour: 100% left');
     dismiss();
     expect(banner()).toBeNull();
     expect(quotaWarningDismissals.read()).toEqual(saved);
 
     setForceShow(false);
+    flushSolid();
     setForceShow(true);
+    flushSolid();
     expect(banner()).not.toBeNull();
     setForceShow(false);
+    flushSolid();
     expect(banner()).toBeNull();
   });
 
@@ -359,29 +432,38 @@ describe('ProviderQuotaWarning', () => {
     { windows: [quota('weekly', 25.01), quota('five_hour', 100)], labels: [], critical: false },
   ])('selects low windows and severity for $windows', ({ windows, labels, critical }) => {
     mount(snapshot(windows));
-    expect(
-      Array.from(
-        container.querySelectorAll('.chat-quota-warning-row > span:first-child'),
-        (row) => row.textContent
-      )
-    ).toEqual(labels);
+    flushSolid();
     expect(banner()?.classList.contains('error') ?? false).toBe(critical);
     expect(banner() !== null).toBe(labels.length > 0);
+    for (const label of labels) {
+      const rows = container.querySelectorAll('.chat-quota-warning-row > span:first-child');
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.textContent).toBe(label);
+      vi.advanceTimersByTime(15_000);
+      flushSolid();
+    }
   });
 
-  it('orders the most depleted window first and associates each reset with its own label', () => {
-    mount(
-      snapshot([
-        { ...quota('five_hour', 15, NOW + 32 * 60_000), label: '5-hour limit' },
-        { ...quota('weekly', 8, NOW + 76 * HOUR), label: 'Weekly limit' },
-      ])
-    );
-    expect(
-      Array.from(container.querySelectorAll('.chat-quota-warning-row'), (row) => row.textContent)
-    ).toEqual([
-      'Weekly limit: 8% left · resets in 3d 4h',
-      '5-hour limit: 15% left · resets in 32m',
-    ]);
+  it('rotates one row starting with the most depleted quota even after polling', () => {
+    const windows = [
+      { ...quota('five_hour', 22, NOW + 31 * 60_000), label: '5-Hour Limit' },
+      { ...quota('weekly', 16, NOW + 281 * 60_000), label: 'Weekly All-Model' },
+    ];
+    const { setLimit } = mount(snapshot(windows));
+    flushSolid();
+    const rows = () =>
+      Array.from(container.querySelectorAll('.chat-quota-warning-row'), (row) => row.textContent);
+    expect(rows()).toEqual(['Weekly All-Model: 16% left · resets in 4h 41m']);
+    vi.advanceTimersByTime(10_000);
+    setLimit(snapshot(windows.map((window) => ({ ...window }))));
+    flushSolid();
+    expect(rows()).toEqual(['Weekly All-Model: 16% left · resets in 4h 41m']);
+    vi.advanceTimersByTime(5_000);
+    flushSolid();
+    expect(rows()).toEqual(['5-Hour Limit: 22% left · resets in 31m']);
+    vi.advanceTimersByTime(15_000);
+    flushSolid();
+    expect(rows()).toEqual(['Weekly All-Model: 16% left · resets in 4h 41m']);
   });
 
   it('uses reported percentages with missing bounds and does not guess unknown usage', () => {
@@ -391,6 +473,7 @@ describe('ProviderQuotaWarning', () => {
         { ...quota('unknown', 1), limit: null },
       ])
     );
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly: 6% left');
     expect(banner()?.textContent).not.toContain('unknown');
   });
@@ -410,15 +493,30 @@ describe('ProviderQuotaWarning', () => {
       'anthropic'
     );
     const { setModel } = mount(limit, 'claude-opus-4-6');
-    expect(
-      Array.from(
-        container.querySelectorAll('.chat-quota-warning-row > span:first-child'),
-        (row) => row.textContent
-      )
-    ).toEqual(['seven_day_opus: 3% left', 'extra_usage: 4% left', 'seven_day: 12% left']);
+    flushSolid();
+    for (const label of [
+      'seven_day_opus: 3% left',
+      'extra_usage: 4% left',
+      'seven_day: 12% left',
+    ]) {
+      expect(container.querySelector('.chat-quota-warning-row > span')?.textContent).toBe(label);
+      vi.advanceTimersByTime(15_000);
+      flushSolid();
+    }
     setModel('claude-sonnet-4-6');
+    flushSolid();
     expect(banner()?.textContent).toContain('seven_day_sonnet: 2% left');
     expect(banner()?.textContent).not.toContain('seven_day_opus');
+  });
+
+  it('warns about the weekly Fable limit only for Fable models', () => {
+    const windows = [quota('five_hour', 50), quota('seven_day_fable', 3)];
+    expect(
+      getLowQuotaWindows(snapshot(windows), 'claude-fable-5-2', 'Fable 5.2').map(
+        (window) => window.id
+      )
+    ).toEqual(['seven_day_fable']);
+    expect(getLowQuotaWindows(snapshot(windows), 'claude-opus-5-5', 'Opus 5.5')).toEqual([]);
   });
 
   it('uses Spark windows only for Spark models', () => {
@@ -433,15 +531,20 @@ describe('ProviderQuotaWarning', () => {
   it('keeps provider dismissals through polling, model switches and remounts without hiding a newly low window', () => {
     const weekly = quota('weekly', 8, NOW + 76 * HOUR);
     const { setLimit, setModel, remount } = mount(snapshot([quota('five_hour', 90), weekly]));
+    flushSolid();
     dismiss();
     expect(banner()).toBeNull();
     setLimit(snapshot([quota('five_hour', 90), { ...weekly, remaining: 1 }]));
+    flushSolid();
     setModel('gpt-6-sol');
+    flushSolid();
     remount();
     expect(banner()).toBeNull();
     setLimit(snapshot([weekly], 'anthropic'));
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly');
     setLimit(snapshot([quota('five_hour', 8), weekly]));
+    flushSolid();
     expect(banner()?.textContent).toContain('five_hour');
     expect(banner()?.textContent).not.toContain('weekly');
   });
@@ -449,6 +552,7 @@ describe('ProviderQuotaWarning', () => {
   it('restores a dismissed yellow warning at the red threshold, then keeps red dismissed until renewal', () => {
     const weekly = quota('weekly', 20, NOW + 76 * HOUR);
     const { setLimit, remount } = mount(snapshot([weekly]));
+    flushSolid();
     expect(banner()?.classList.contains('error')).toBe(false);
     expect(container.querySelector('.chat-quota-warning-close')?.getAttribute('title')).toContain(
       'until quota becomes critical'
@@ -457,8 +561,10 @@ describe('ProviderQuotaWarning', () => {
     remount();
     expect(banner()).toBeNull();
     setLimit(snapshot([{ ...weekly, remaining: 10.01 }]));
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(snapshot([{ ...weekly, remaining: 10 }]));
+    flushSolid();
     expect(banner()?.classList.contains('error')).toBe(true);
     expect(banner()?.textContent).toContain('weekly: 10% left');
     expect(container.querySelector('.chat-quota-warning-close')?.getAttribute('title')).toContain(
@@ -468,10 +574,13 @@ describe('ProviderQuotaWarning', () => {
     remount();
     expect(banner()).toBeNull();
     setLimit(snapshot([{ ...weekly, remaining: 0 }]));
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(snapshot([{ ...weekly, remaining: 20 }]));
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(snapshot([{ ...weekly, resetAt: NOW + 168 * HOUR }]));
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly: 20% left');
   });
 
@@ -479,6 +588,7 @@ describe('ProviderQuotaWarning', () => {
     const fiveHour = quota('five_hour', 8);
     const weekly = quota('weekly', 20, NOW + 76 * HOUR);
     const { setLimit, remount } = mount(snapshot([fiveHour, weekly]));
+    flushSolid();
     dismiss();
     remount();
     expect(banner()).toBeNull();
@@ -488,6 +598,7 @@ describe('ProviderQuotaWarning', () => {
         { ...weekly, remaining: 10 },
       ])
     );
+    flushSolid();
     expect(banner()?.textContent).toContain('weekly: 10% left');
     expect(banner()?.textContent).not.toContain('five_hour');
     dismiss();
@@ -501,8 +612,10 @@ describe('ProviderQuotaWarning', () => {
     ]);
     quotaWarningDismissals.reload();
     const { setLimit, remount } = mount(snapshot([quota('weekly', 20)]));
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(snapshot([quota('weekly', 10)]));
+    flushSolid();
     expect(banner()?.classList.contains('error')).toBe(true);
     dismiss();
     remount();
@@ -513,38 +626,50 @@ describe('ProviderQuotaWarning', () => {
     const fiveHour = quota('five_hour', 8, NOW + 2_000);
     const weekly = quota('weekly', 15, NOW + 76 * HOUR);
     const { setLimit, onRefresh } = mount(snapshot([fiveHour, weekly]));
+    flushSolid();
     dismiss();
     vi.advanceTimersByTime(2_000);
+    flushSolid();
     expect(banner()).toBeNull();
     expect(onRefresh).toHaveBeenCalledOnce();
     vi.advanceTimersByTime(10_000);
+    flushSolid();
     setLimit(snapshot([fiveHour, weekly]));
+    flushSolid();
     expect(banner()).toBeNull();
     expect(onRefresh).toHaveBeenCalledOnce();
     setLimit(snapshot([quota('five_hour', 100, Date.now() + HOUR), weekly]));
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(snapshot([quota('five_hour', 20, Date.now() + HOUR), weekly]));
+    flushSolid();
     expect(banner()?.textContent).toContain('five_hour: 20% left');
     expect(banner()?.textContent).not.toContain('weekly');
   });
 
   it('recognizes an early provider reset as a new quota cycle', () => {
     const { setLimit } = mount(snapshot([quota('weekly', 8, NOW + 76 * HOUR)]));
+    flushSolid();
     dismiss();
     setLimit(snapshot([quota('weekly', 100, NOW + 168 * HOUR)]));
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(snapshot([quota('weekly', 8, NOW + 168 * HOUR)]));
+    flushSolid();
     expect(banner()).not.toBeNull();
   });
 
   it('uses a one-hour fallback when reset time is unknown without extending it on reload', () => {
     const { remount } = mount(snapshot([quota('weekly', 8, null)]));
+    flushSolid();
     expect(banner()?.textContent).not.toContain('resets');
     dismiss();
     vi.advanceTimersByTime(HOUR - 1_000);
+    flushSolid();
     remount();
     expect(banner()).toBeNull();
     vi.advanceTimersByTime(1_000);
+    flushSolid();
     expect(banner()).not.toBeNull();
   });
 
@@ -555,15 +680,19 @@ describe('ProviderQuotaWarning', () => {
     ]);
     quotaWarningDismissals.reload();
     mount(snapshot([quota('weekly', 8)]));
+    flushSolid();
     expect(banner()).not.toBeNull();
   });
 
   it('shares dismissal changes with another mounted composer and storage events', () => {
     mount(snapshot([quota('weekly', 8)]));
+    flushSolid();
     quotaWarningDismissals.dismiss('openai', [quota('weekly', 8)], NOW);
+    flushSolid();
     expect(banner()).toBeNull();
     writeStored(STORAGE_KEYS.quotaWarningDismissals, []);
     window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEYS.quotaWarningDismissals }));
+    flushSolid();
     expect(banner()).not.toBeNull();
   });
 
@@ -580,8 +709,10 @@ describe('ProviderQuotaWarning', () => {
         credits: [{ title: 'Full reset', expiresAt }],
       },
     });
+    flushSolid();
     const button = container.querySelector<HTMLButtonElement>('.chat-quota-warning-usage')!;
     button.click();
+    flushSolid();
     expect(sendToExtension).not.toHaveBeenCalled();
     expect(button.getAttribute('aria-expanded')).toBe('true');
     const popup = container.querySelector('.provider-limit-popup')!;
@@ -593,32 +724,40 @@ describe('ProviderQuotaWarning', () => {
     const link = popup.querySelector<HTMLAnchorElement>('.provider-limit-reset-link')!;
     expect(link.href).toBe(url);
     link.click();
+    flushSolid();
     expect(sendToExtension).toHaveBeenCalledWith({
       type: 'vscode/open-external',
       payload: { url },
     });
     expect(sendToExtension).toHaveBeenCalledTimes(1);
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    flushSolid();
     expect(container.querySelector('.provider-limit-popup')).toBeNull();
     expect(document.activeElement).toBe(button);
     button.click();
+    flushSolid();
     expect(container.querySelector('.provider-limit-popup')).not.toBeNull();
     document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    flushSolid();
     expect(container.querySelector('.provider-limit-popup')).toBeNull();
     button.click();
+    flushSolid();
     button.click();
+    flushSolid();
     expect(button.getAttribute('aria-expanded')).toBe('false');
     expect(container.querySelector('.provider-limit-popup')).toBeNull();
   });
 
   it('updates available resets and hides missing or zero counts', () => {
     const { setLimit } = mount(snapshot([quota('weekly', 8)]));
+    flushSolid();
     expect(container.querySelector('.chat-quota-warning-usage')).toBeNull();
     for (const count of [1, 3, 0]) {
       setLimit({
         ...snapshot([quota('weekly', 8)]),
         usageLimitResets: { availableCount: count, credits: null },
       });
+      flushSolid();
       const link = container.querySelector('.chat-quota-warning-usage');
       if (count === 0) expect(link).toBeNull();
       else expect(link?.textContent).toBe(`${count} ${count === 1 ? 'reset' : 'resets'} available`);
@@ -627,8 +766,10 @@ describe('ProviderQuotaWarning', () => {
       ...snapshot([quota('weekly', 8)], 'custom-provider'),
       usageLimitResets: { availableCount: 2, credits: null },
     });
+    flushSolid();
     expect(banner()?.textContent).toContain('2 resets available');
     container.querySelector<HTMLButtonElement>('.chat-quota-warning-usage')!.click();
+    flushSolid();
     expect(container.querySelector('.provider-limit-popup')?.textContent).toContain(
       'Expiration details unavailable for 2 resets.'
     );
@@ -638,9 +779,12 @@ describe('ProviderQuotaWarning', () => {
 
   it('removes warnings when quota recovers or becomes unavailable', () => {
     const { setLimit } = mount(snapshot([quota('weekly', 8)]));
+    flushSolid();
     setLimit(snapshot([quota('weekly', 80)]));
+    flushSolid();
     expect(banner()).toBeNull();
     setLimit(snapshot([quota('weekly', 8)]));
+    flushSolid();
     expect(banner()).not.toBeNull();
     setLimit({
       providerID: 'openai',
@@ -649,6 +793,7 @@ describe('ProviderQuotaWarning', () => {
       checkedAt: NOW,
       note: 'Unavailable',
     });
+    flushSolid();
     expect(banner()).toBeNull();
   });
 });

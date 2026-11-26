@@ -4,6 +4,7 @@ import {
   selectSessionWithDependencies,
   syncSessionMessagesWithDependencies,
 } from './session/session-selection';
+import { deferred } from '../test-fixtures';
 
 function assistantMessage(id: string): Extract<Message, { role: 'assistant' }> {
   return {
@@ -49,16 +50,6 @@ function loadedSession(id: string) {
     } satisfies Session,
     messages: [],
   };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: Error) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 function createSelectionDependencies(
@@ -151,13 +142,16 @@ describe('selection outcomes', () => {
 
   it('refreshes a transferred session without clearing its transcript, draft state, or scroll anchor', async () => {
     const pending = deferred<Awaited<ReturnType<SelectionDependencies['loadSession']>>>();
+    const loadSession = vi.fn(() => pending.promise);
     const deps = createSelectionDependencies({
       getActiveSessionId: () => 'session-1',
-      loadSession: () => pending.promise,
+      loadSession,
     });
     const selection = selectSessionWithDependencies(deps, { next: () => 1 }, 'session-1', {
       preserveTranscript: true,
+      directory: '/repo',
     });
+    expect(loadSession).toHaveBeenCalledWith('session-1', expect.any(Function), '/repo');
     expect(deps.clearMessages).not.toHaveBeenCalled();
     expect(deps.clearDraftCurrentDocumentState).not.toHaveBeenCalled();
     expect(deps.resetToolCallExpansionState).not.toHaveBeenCalled();
@@ -167,7 +161,7 @@ describe('selection outcomes', () => {
     expect(deps.requestMessageListScrollToBottom).not.toHaveBeenCalled();
   });
   it('reports a missed transfer without removing the session as unavailable', async () => {
-    const message = 'Conversation moved to /outside. Open its folder to continue.';
+    const message = 'Conversation moved to /outside. Try again.';
     const deps = createSelectionDependencies({
       getActiveSessionId: () => 'session-1',
       loadSession: async () => {
@@ -348,49 +342,31 @@ describe('session-selection helpers', () => {
     };
 
     await selectSessionWithDependencies(
-      {
+      createSelectionDependencies({
         getActiveSessionId: () => activeSession.value,
         setActiveSessionId: (id) => {
           activeSession.value = id;
         },
-        clearPendingAbort: vi.fn(),
         persistActiveSessionId,
         markSessionSeen,
-        clearDraftCurrentDocumentState: vi.fn(),
-        resetToolCallExpansionState: vi.fn(),
-        resolvePersistedAgent: () => ({ persistedAgent: null, fallbackAgent: 'build' }),
-        applySelectedAgent: vi.fn(),
         getSession: () => externalSession,
-        resolveSessionModel: selectedModelFromSession,
         resolvePersistedModel,
         resolveFallbackModel,
         applySelectedModel,
         getConnectedMcpNames: () => ['docs'],
-        hasSelectedMcps: () => false,
-        setSelectedMcpsForSession: vi.fn(),
         syncSessionMcps,
-        resetTodoSync: vi.fn(),
         clearMessages,
         loadSession: vi.fn(async () => ({
           session: externalSession,
           messages: [{ info: assistantMessage('assistant-1'), parts: [] }],
         })),
-        isCurrentSelectionGeneration: () => true,
-        upsertSession: vi.fn(),
-        setMessagesIncremental: vi.fn(),
-        syncFailedSessionsFromMessages: vi.fn(),
-        requestMessageListScrollToBottom: vi.fn(),
         deriveSelectedAgentFromMessages: () => 'build',
         deriveSelectedModelFromMessages,
-        syncTodosForSession: vi.fn(async () => {}),
-        loadQuestions: vi.fn(async () => {}),
         loadSessionStatuses: vi.fn(async () => ({ 'session-1': { type: 'busy' as const } })),
         mergeSessionStatuses: vi.fn((statuses) => statuses),
-        updateUsageLimitState: vi.fn(),
         startLoading,
         stopLoading,
-        setError: vi.fn(),
-      },
+      }),
       { next: () => 1 },
       'session-1'
     );
@@ -510,45 +486,15 @@ describe('session-selection helpers', () => {
     const requestMessageListScrollToBottom = vi.fn();
 
     const selection = selectSessionWithDependencies(
-      {
+      createSelectionDependencies({
         getActiveSessionId: () => 'session-1',
-        setActiveSessionId: vi.fn(),
-        clearPendingAbort: vi.fn(),
-        persistActiveSessionId: vi.fn(),
-        markSessionSeen: vi.fn(),
-        clearDraftCurrentDocumentState: vi.fn(),
-        resetToolCallExpansionState: vi.fn(),
-        resolvePersistedAgent: () => ({ persistedAgent: null, fallbackAgent: 'build' }),
-        applySelectedAgent: vi.fn(),
-        getSession: () => undefined,
-        resolveSessionModel: selectedModelFromSession,
-        resolvePersistedModel: () => null,
-        resolveFallbackModel: () => null,
-        applySelectedModel: vi.fn(),
-        getConnectedMcpNames: () => [],
-        hasSelectedMcps: () => false,
-        setSelectedMcpsForSession: vi.fn(),
-        syncSessionMcps: vi.fn(async () => {}),
-        resetTodoSync: vi.fn(),
-        clearMessages: vi.fn(),
         setMessagesLoading,
         loadSession: vi.fn(() => loadPromise),
-        isCurrentSelectionGeneration: () => true,
-        upsertSession: vi.fn(),
         setMessagesIncremental,
-        syncFailedSessionsFromMessages: vi.fn(),
         requestMessageListScrollToBottom,
-        deriveSelectedAgentFromMessages: () => null,
-        deriveSelectedModelFromMessages: () => null,
         syncTodosForSession: vi.fn(() => todos.promise),
-        loadQuestions: vi.fn(async () => {}),
-        loadSessionStatuses: vi.fn(async () => ({})),
         mergeSessionStatuses: vi.fn((statuses) => statuses),
-        updateUsageLimitState: vi.fn(),
-        startLoading: vi.fn(),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       { next: () => 1 },
       'session-1'
     );
@@ -590,52 +536,50 @@ describe('session-selection helpers', () => {
     expect(initialScrollCallOrder).toBeGreaterThan(loadingCompleteCallOrder);
   });
 
+  it('starts the native todo read after reset and before the transcript load settles', async () => {
+    const calls: string[] = [];
+    const load = deferred<ReturnType<typeof loadedSession>>();
+    const deps = createSelectionDependencies({
+      getActiveSessionId: () => 'session-1',
+      resetTodoSync: () => {
+        calls.push('reset');
+      },
+      prefetchTodosForSession: (id, directory) => {
+        calls.push(`prefetch:${id}:${directory}`);
+      },
+      loadSession: () => {
+        calls.push('load');
+        return load.promise;
+      },
+      syncTodosForSession: async () => {
+        calls.push('sync');
+      },
+    });
+
+    const selection = selectSessionWithDependencies(deps, { next: () => 1 }, 'session-1', {
+      directory: '/repo',
+    });
+    expect(calls).toEqual(['reset', 'prefetch:session-1:/repo', 'load']);
+
+    load.resolve(loadedSession('session-1'));
+    await selection;
+    expect(calls).toEqual(['reset', 'prefetch:session-1:/repo', 'load', 'sync']);
+  });
+
   it('clears the loading flag and reports an error when the session load fails', async () => {
     const setMessagesLoading = vi.fn();
     const setError = vi.fn();
 
     await selectSessionWithDependencies(
-      {
+      createSelectionDependencies({
         getActiveSessionId: () => 'session-1',
-        setActiveSessionId: vi.fn(),
-        clearPendingAbort: vi.fn(),
-        persistActiveSessionId: vi.fn(),
-        markSessionSeen: vi.fn(),
-        clearDraftCurrentDocumentState: vi.fn(),
-        resetToolCallExpansionState: vi.fn(),
-        resolvePersistedAgent: () => ({ persistedAgent: null, fallbackAgent: 'build' }),
-        applySelectedAgent: vi.fn(),
-        getSession: () => undefined,
-        resolveSessionModel: selectedModelFromSession,
-        resolvePersistedModel: () => null,
-        resolveFallbackModel: () => null,
-        applySelectedModel: vi.fn(),
-        getConnectedMcpNames: () => [],
-        hasSelectedMcps: () => false,
-        setSelectedMcpsForSession: vi.fn(),
-        syncSessionMcps: vi.fn(async () => {}),
-        resetTodoSync: vi.fn(),
-        clearMessages: vi.fn(),
         setMessagesLoading,
         loadSession: vi.fn(async () => {
           throw new Error('load failed');
         }),
-        isCurrentSelectionGeneration: () => true,
-        upsertSession: vi.fn(),
-        setMessagesIncremental: vi.fn(),
-        syncFailedSessionsFromMessages: vi.fn(),
-        requestMessageListScrollToBottom: vi.fn(),
-        deriveSelectedAgentFromMessages: () => null,
-        deriveSelectedModelFromMessages: () => null,
-        syncTodosForSession: vi.fn(async () => {}),
-        loadQuestions: vi.fn(async () => {}),
-        loadSessionStatuses: vi.fn(async () => ({})),
         mergeSessionStatuses: vi.fn((statuses) => statuses),
-        updateUsageLimitState: vi.fn(),
-        startLoading: vi.fn(),
-        stopLoading: vi.fn(),
         setError,
-      },
+      }),
       { next: () => 1 },
       'session-1'
     );
@@ -651,46 +595,19 @@ describe('session-selection helpers', () => {
     const setError = vi.fn();
 
     await selectSessionWithDependencies(
-      {
+      createSelectionDependencies({
         getActiveSessionId: () => 'session-2',
-        setActiveSessionId: vi.fn(),
-        clearPendingAbort: vi.fn(),
         persistActiveSessionId,
         markSessionSeen,
-        clearDraftCurrentDocumentState: vi.fn(),
-        resetToolCallExpansionState: vi.fn(),
-        resolvePersistedAgent: () => ({ persistedAgent: null, fallbackAgent: 'build' }),
-        applySelectedAgent: vi.fn(),
-        getSession: () => undefined,
-        resolveSessionModel: selectedModelFromSession,
-        resolvePersistedModel: () => null,
         resolveFallbackModel: () => ({ providerID: 'openai', modelID: 'gpt-4o' }),
-        applySelectedModel: vi.fn(),
         getConnectedMcpNames: () => ['docs'],
-        hasSelectedMcps: () => false,
-        setSelectedMcpsForSession: vi.fn(),
-        syncSessionMcps: vi.fn(async () => {}),
-        resetTodoSync: vi.fn(),
-        clearMessages: vi.fn(),
         loadSession: vi.fn(async () => {
           throw new Error('offline');
         }),
         isCurrentSelectionGeneration: () => false,
-        upsertSession: vi.fn(),
-        setMessagesIncremental: vi.fn(),
-        syncFailedSessionsFromMessages: vi.fn(),
-        requestMessageListScrollToBottom: vi.fn(),
-        deriveSelectedAgentFromMessages: () => null,
-        deriveSelectedModelFromMessages: () => null,
-        syncTodosForSession: vi.fn(async () => {}),
-        loadQuestions: vi.fn(async () => {}),
-        loadSessionStatuses: vi.fn(async () => ({})),
         mergeSessionStatuses: vi.fn((statuses) => statuses),
-        updateUsageLimitState: vi.fn(),
-        startLoading: vi.fn(),
-        stopLoading: vi.fn(),
         setError,
-      },
+      }),
       { next: () => 1 },
       'session-1'
     );
@@ -792,27 +709,9 @@ describe('session-selection helpers', () => {
     const setMessagesIncremental = vi.fn();
     const syncTodosForSession = vi.fn(async () => {});
     const selection = selectSessionWithDependencies(
-      {
+      createSelectionDependencies({
         getActiveSessionId: () => 'session-1',
-        setActiveSessionId: vi.fn(),
-        clearPendingAbort: vi.fn(),
-        persistActiveSessionId: vi.fn(),
-        markSessionSeen: vi.fn(),
-        clearDraftCurrentDocumentState: vi.fn(),
-        resetToolCallExpansionState: vi.fn(),
-        resolvePersistedAgent: () => ({ persistedAgent: null, fallbackAgent: 'build' }),
-        applySelectedAgent: vi.fn(),
-        getSession: () => undefined,
-        resolveSessionModel: selectedModelFromSession,
-        resolvePersistedModel: () => null,
-        resolveFallbackModel: () => null,
-        applySelectedModel: vi.fn(),
-        getConnectedMcpNames: () => [],
-        hasSelectedMcps: () => false,
-        setSelectedMcpsForSession: vi.fn(),
         syncSessionMcps: vi.fn(() => mcpSync),
-        resetTodoSync: vi.fn(),
-        clearMessages: vi.fn(),
         loadSession: vi.fn(async () => ({
           session: {
             id: 'session-1',
@@ -824,22 +723,10 @@ describe('session-selection helpers', () => {
           },
           messages: [{ info: assistantMessage('assistant-1'), parts: [] }],
         })),
-        isCurrentSelectionGeneration: () => true,
-        upsertSession: vi.fn(),
         setMessagesIncremental,
-        syncFailedSessionsFromMessages: vi.fn(),
-        requestMessageListScrollToBottom: vi.fn(),
-        deriveSelectedAgentFromMessages: () => null,
-        deriveSelectedModelFromMessages: () => null,
         syncTodosForSession,
-        loadQuestions: vi.fn(async () => {}),
-        loadSessionStatuses: vi.fn(async () => ({})),
         mergeSessionStatuses: vi.fn((statuses) => statuses),
-        updateUsageLimitState: vi.fn(),
-        startLoading: vi.fn(),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       { next: () => 1 },
       'session-1'
     );
@@ -936,29 +823,12 @@ describe('session-selection helpers', () => {
     const messages = [{ info: assistantMessage('assistant-1'), parts: [] }];
 
     await selectSessionWithDependencies(
-      {
+      createSelectionDependencies({
         getActiveSessionId: () => activeSession.value,
         setActiveSessionId: (id) => {
           activeSession.value = id;
         },
-        clearPendingAbort: vi.fn(),
-        persistActiveSessionId: vi.fn(),
-        markSessionSeen: vi.fn(),
-        clearDraftCurrentDocumentState: vi.fn(),
-        resetToolCallExpansionState: vi.fn(),
-        resolvePersistedAgent: () => ({ persistedAgent: null, fallbackAgent: 'build' }),
-        applySelectedAgent: vi.fn(),
-        getSession: () => undefined,
-        resolveSessionModel: selectedModelFromSession,
-        resolvePersistedModel: () => null,
         resolveFallbackModel: () => ({ providerID: 'openai', modelID: 'gpt-4o' }),
-        applySelectedModel: vi.fn(),
-        getConnectedMcpNames: () => [],
-        hasSelectedMcps: () => false,
-        setSelectedMcpsForSession: vi.fn(),
-        syncSessionMcps: vi.fn(async () => {}),
-        resetTodoSync: vi.fn(),
-        clearMessages: vi.fn(),
         loadSession: vi.fn(async () => ({
           session: {
             id: 'session-1',
@@ -970,13 +840,7 @@ describe('session-selection helpers', () => {
           },
           messages,
         })),
-        isCurrentSelectionGeneration: () => true,
-        upsertSession: vi.fn(),
         setMessagesIncremental,
-        syncFailedSessionsFromMessages: vi.fn(),
-        requestMessageListScrollToBottom: vi.fn(),
-        deriveSelectedAgentFromMessages: () => null,
-        deriveSelectedModelFromMessages: () => null,
         syncTodosForSession: vi.fn(async () => {
           throw new Error('todos unavailable');
         }),
@@ -987,11 +851,8 @@ describe('session-selection helpers', () => {
           throw new Error('statuses unavailable');
         }),
         mergeSessionStatuses: vi.fn((statuses) => statuses),
-        updateUsageLimitState: vi.fn(),
-        startLoading: vi.fn(),
-        stopLoading: vi.fn(),
         setError,
-      },
+      }),
       { next: () => 1 },
       'session-1'
     );
@@ -1112,29 +973,12 @@ describe('session-selection helpers', () => {
     failed.error = { name: 'ProviderError', data: { message: '429 usage limit reached' } };
 
     await selectSessionWithDependencies(
-      {
+      createSelectionDependencies({
         getActiveSessionId: () => activeSession.value,
         setActiveSessionId: (id) => {
           activeSession.value = id;
         },
-        clearPendingAbort: vi.fn(),
-        persistActiveSessionId: vi.fn(),
-        markSessionSeen: vi.fn(),
-        clearDraftCurrentDocumentState: vi.fn(),
-        resetToolCallExpansionState: vi.fn(),
-        resolvePersistedAgent: () => ({ persistedAgent: null, fallbackAgent: 'build' }),
-        applySelectedAgent: vi.fn(),
-        getSession: () => undefined,
-        resolveSessionModel: selectedModelFromSession,
-        resolvePersistedModel: () => null,
         resolveFallbackModel: () => ({ providerID: 'openai', modelID: 'gpt-4o' }),
-        applySelectedModel: vi.fn(),
-        getConnectedMcpNames: () => [],
-        hasSelectedMcps: () => false,
-        setSelectedMcpsForSession: vi.fn(),
-        syncSessionMcps: vi.fn(async () => {}),
-        resetTodoSync: vi.fn(),
-        clearMessages: vi.fn(),
         loadSession: vi.fn(async () => ({
           session: {
             id: 'session-1',
@@ -1146,15 +990,6 @@ describe('session-selection helpers', () => {
           },
           messages: [{ info: failed, parts: [] }],
         })),
-        isCurrentSelectionGeneration: () => true,
-        upsertSession: vi.fn(),
-        setMessagesIncremental: vi.fn(),
-        syncFailedSessionsFromMessages: vi.fn(),
-        requestMessageListScrollToBottom: vi.fn(),
-        deriveSelectedAgentFromMessages: () => null,
-        deriveSelectedModelFromMessages: () => null,
-        syncTodosForSession: vi.fn(async () => {}),
-        loadQuestions: vi.fn(async () => {}),
         loadSessionStatuses: vi.fn(async () => ({
           'session-1': {
             type: 'retry' as const,
@@ -1164,11 +999,9 @@ describe('session-selection helpers', () => {
           },
         })),
         mergeSessionStatuses: vi.fn((statuses) => statuses),
-        updateUsageLimitState: vi.fn(),
         startLoading,
         stopLoading,
-        setError: vi.fn(),
-      },
+      }),
       { next: () => 1 },
       'session-1'
     );

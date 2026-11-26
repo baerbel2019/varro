@@ -1,3 +1,4 @@
+import { storePath } from '@solidjs/signals';
 import type { SelectedModel } from '../lib/app-state-types';
 import { client, type SessionListPage } from '../lib/client';
 import { appStore } from '../lib/stores/app-store';
@@ -6,7 +7,11 @@ import { routingStore } from '../lib/stores/routing-store';
 import { captureSessionStatusSnapshotTime, sessionStore } from '../lib/stores/session-store';
 import type { SessionStatusSnapshotOptions } from '../lib/stores/session-store';
 import { clearQueuedMessagesForSession } from '../lib/state-queued-messages';
-import { getEffectiveComposerSessionId } from '../lib/state-view-persistence';
+import { logInfo } from '../lib/log';
+import {
+  getEffectiveComposerSessionId,
+  syncNewChatComposerAgentModel,
+} from '../lib/state-view-persistence';
 import type {
   McpDefaults,
   McpStatus,
@@ -49,6 +54,10 @@ const WORKSPACE_CATALOG_RELOAD_ATTEMPTS = 2;
 const WORKSPACE_CATALOG_LOAD_TIMEOUT_MS = 10_000;
 const STARTUP_CATALOG_TIMEOUT_MS = 60_000;
 const STARTUP_CATALOG_RETRY_MS = 500;
+// A reused server waking from sleep, or shared with a starting window, can briefly
+// report no providers. Confirm an empty catalog when providers were seen before.
+const EMPTY_PROVIDER_CATALOG_READS = 3;
+const EMPTY_PROVIDER_CATALOG_RETRY_MS = 1_500;
 
 function isPluginActivationPending(error: unknown): error is Error {
   return (
@@ -91,6 +100,7 @@ export function createStateBoundDataLoaderOperations(deps: {
     setMcpStatus: routingStore.setMcpStatus,
     getActiveSessionId: () => appStore.state.activeSessionId,
     getComposerSessionId: getEffectiveComposerSessionId,
+    syncNewChatAgentModel: syncNewChatComposerAgentModel,
     getSelectedMcpsForSession: routingStore.getSelectedMcpsForSession,
     setSelectedMcpsForSession: routingStore.setSelectedMcpsForSession,
     listQuestions: () => client.question.list(),
@@ -110,6 +120,8 @@ export function createStateBoundDataLoaderOperations(deps: {
     readStartupDiagnostics: (signal) => client.config.startupDiagnostics(signal),
     setProvidersLoaded: routingStore.setProvidersLoaded,
     setProviders: routingStore.setProviders,
+    hadConnectedProviders: routingStore.hadConnectedProviders,
+    logInfo,
     setProviderDefaults: routingStore.setProviderDefaults,
     getSelectedModel: () => appStore.state.selectedModel,
     getLastSelectedModel: () => appStore.state.lastSelectedModel,
@@ -124,13 +136,15 @@ export function createStateBoundDataLoaderOperations(deps: {
     finishWorkspaceCatalogReload: routingStore.finishWorkspaceCatalogReload,
     listSessions: (limit) => client.session.list({ limit }),
     applySessions: deps.applySessions,
-    setSessionsLoadError: (message) => appStore.setState('sessionsLoadError', message),
-    setSessionsHasMore: (value) => appStore.setState('sessionsHasMore', value),
-    setSessionsLoadingMore: (value) => appStore.setState('sessionsLoadingMore', value),
-    setSessionsPaginationError: (message) => appStore.setState('sessionsPaginationError', message),
+    setSessionsLoadError: (message) => appStore.setState(storePath('sessionsLoadError', message)),
+    setSessionsHasMore: (value) => appStore.setState(storePath('sessionsHasMore', value)),
+    setSessionsLoadingMore: (value) => appStore.setState(storePath('sessionsLoadingMore', value)),
+    setSessionsPaginationError: (message) =>
+      appStore.setState(storePath('sessionsPaginationError', message)),
     listRecycleBin: () => client.varro.recycleBin.list(),
     setRecycleBinEntries: sessionStore.setRecycleBinEntries,
-    setRecycleBinLoadError: (message) => appStore.setState('recycleBinLoadError', message),
+    setRecycleBinLoadError: (message) =>
+      appStore.setState(storePath('recycleBinLoadError', message)),
     loadSessionStatuses: () => client.session.status(),
     setSessionStatuses: sessionStore.setSessionStatuses,
     getSessions: () => appStore.state.sessions,
@@ -147,6 +161,8 @@ export function createDataLoaderOperations(deps: {
   setMcpStatus(status: Record<string, McpStatus>): void;
   getActiveSessionId(): string | null;
   getComposerSessionId(): string | null;
+  /** Lets a new chat follow its agent's configured model once the catalog can resolve it. */
+  syncNewChatAgentModel?(): void;
   getSelectedMcpsForSession(sessionId: string): string[] | null | undefined;
   setSelectedMcpsForSession(sessionId: string, names: string[]): void;
   listQuestions(): Promise<QuestionRequest[]>;
@@ -177,6 +193,10 @@ export function createDataLoaderOperations(deps: {
   }>;
   readStartupDiagnostics?(signal: AbortSignal): Promise<StartupAddonFailure[]>;
   setProvidersLoaded(value: boolean): void;
+  /** Persisted across reloads so a fresh webview also confirms an empty first catalog. */
+  hadConnectedProviders?(): boolean;
+  /** Records provider catalog changes so transient empty catalogs can be traced in the output log. */
+  logInfo?(message: string): void;
   setProviders(
     providers: Provider[],
     defaults?: Record<string, string>,
@@ -246,6 +266,8 @@ export function createDataLoaderOperations(deps: {
   let startupCatalog: StartupCatalogReload | null = null;
   let startupCatalogError: string | null = null;
   let knownProviderIDs: Set<string> | null = null;
+  let hasAppliedProviders = deps.hadConnectedProviders?.() ?? false;
+  let appliedProviderIDs: string | null = null;
   const questionSnapshots = createMutationAwareSnapshotReconciler(deps.getQuestions);
   const sessionSnapshots = createMutationAwareSnapshotReconciler(deps.getSessions);
 
@@ -272,12 +294,7 @@ export function createDataLoaderOperations(deps: {
     const workspace = workspaceGeneration;
     const generation = ++mcpLoadGeneration;
     const request = loadMcpsWithDependencies(
-      {
-        listMcpStatus: deps.listMcpStatus,
-        listMcpDefaults: deps.listMcpDefaults,
-        setMcpDefaults: deps.setMcpDefaults,
-        setMcpStatus: deps.setMcpStatus,
-      },
+      deps,
       deps.logError,
       () => workspace === workspaceGeneration && generation === mcpLoadGeneration
     );
@@ -332,20 +349,10 @@ export function createDataLoaderOperations(deps: {
     const generation = ++agentLoadGeneration;
     const isLatest = () => workspace === workspaceGeneration && generation === agentLoadGeneration;
     const request = inheritSupersededLoad(
-      loadAgentsWithDependencies(
-        {
-          listAgents: deps.listAgents,
-          getActiveSessionId: deps.getActiveSessionId,
-          getSelectedAgent: deps.getSelectedAgent,
-          getSelectedAgentForSession: deps.getSelectedAgentForSession,
-          getPersistedSelectedAgent: deps.getPersistedSelectedAgent,
-          setAllAgents: deps.setAllAgents,
-          setPrimaryAgents: deps.setPrimaryAgents,
-          setSelectedAgent: deps.setSelectedAgent,
-        },
-        deps.logError,
-        isLatest
-      ),
+      loadAgentsWithDependencies(deps, deps.logError, isLatest).then((loaded) => {
+        if (loaded && isLatest()) deps.syncNewChatAgentModel?.();
+        return loaded;
+      }),
       workspace,
       isLatest,
       () => latestAgentLoad
@@ -360,14 +367,7 @@ export function createDataLoaderOperations(deps: {
     const isLatest = () =>
       workspace === workspaceGeneration && generation === commandLoadGeneration;
     const request = inheritSupersededLoad(
-      loadCommandsWithDependencies(
-        {
-          listCommands: deps.listCommands,
-          setCommands: deps.setCommands,
-        },
-        deps.logError,
-        isLatest
-      ),
+      loadCommandsWithDependencies(deps, deps.logError, isLatest),
       workspace,
       isLatest,
       () => latestCommandLoad
@@ -388,9 +388,41 @@ export function createDataLoaderOperations(deps: {
     const request = inheritSupersededLoad(
       loadProvidersWithDependencies(
         {
-          listProviders: () => deps.listProviders(signal),
-          setProvidersLoaded: deps.setProvidersLoaded,
+          ...deps,
+          listProviders: async () => {
+            for (let read = 1; ; read += 1) {
+              const response = await deps.listProviders(signal);
+              if (response.providers.length === 0 && isCurrent()) {
+                deps.logInfo?.(
+                  hasAppliedProviders
+                    ? `Provider catalog returned no providers (read ${read} of ${EMPTY_PROVIDER_CATALOG_READS})`
+                    : 'Provider catalog returned no providers'
+                );
+              }
+              if (
+                response.providers.length > 0 ||
+                !hasAppliedProviders ||
+                read >= EMPTY_PROVIDER_CATALOG_READS ||
+                !isCurrent()
+              ) {
+                return response;
+              }
+              await waitForCatalogRetry(
+                signal ?? controller.signal,
+                EMPTY_PROVIDER_CATALOG_RETRY_MS
+              );
+              if (!isCurrent()) return response;
+            }
+          },
           setProviders: (providers, defaults) => {
+            hasAppliedProviders = providers.length > 0;
+            const providerIDs = providers.map((provider) => provider.id).join(', ') || 'none';
+            if (providerIDs !== appliedProviderIDs) {
+              deps.logInfo?.(
+                `Provider catalog applied: ${providers.length} provider${providers.length === 1 ? '' : 's'} (${providerIDs})`
+              );
+              appliedProviderIDs = providerIDs;
+            }
             const knownProviders = knownProviderIDs;
             const newlyConnectedProviderIDs = knownProviders
               ? providers
@@ -401,12 +433,6 @@ export function createDataLoaderOperations(deps: {
             knownProviderIDs ??= new Set();
             for (const provider of providers) knownProviderIDs.add(provider.id);
           },
-          setProviderDefaults: deps.setProviderDefaults,
-          getSelectedModel: deps.getSelectedModel,
-          getLastSelectedModel: deps.getLastSelectedModel,
-          getSelectedModelForSession: deps.getSelectedModelForSession,
-          getComposerSessionId: deps.getComposerSessionId,
-          setSelectedModel: deps.setSelectedModel,
         },
         (context, error) => {
           if (startup && isCurrent()) {
@@ -432,7 +458,12 @@ export function createDataLoaderOperations(deps: {
           deps.logError(context, error);
         },
         isCurrent
-      ).finally(() => controller.abort()),
+      )
+        .then((loaded) => {
+          if (loaded && isCurrent()) deps.syncNewChatAgentModel?.();
+          return loaded;
+        })
+        .finally(() => controller.abort()),
       workspace,
       isLatest,
       () => latestProviderLoad
@@ -471,7 +502,7 @@ export function createDataLoaderOperations(deps: {
       signal?.throwIfAborted();
       if (agentsLoaded && commandsLoaded && providersLoaded) break;
       if (signal && agentsLoaded && commandsLoaded && startupCatalog?.activationError) {
-        await waitForStartupCatalogRetry(signal);
+        await waitForCatalogRetry(signal, STARTUP_CATALOG_RETRY_MS);
         continue;
       }
       if (attempt + 1 >= WORKSPACE_CATALOG_RELOAD_ATTEMPTS) break;
@@ -540,10 +571,7 @@ export function createDataLoaderOperations(deps: {
   const refreshProviderLimit = async (providerID: string, modelID?: string | null) => {
     const workspace = workspaceGeneration;
     await refreshProviderLimitWithDependencies(
-      {
-        loadProviderLimit: deps.loadProviderLimit,
-        setProviderLimit: deps.setProviderLimit,
-      },
+      deps,
       providerID,
       modelID,
       deps.logError,
@@ -557,22 +585,8 @@ export function createDataLoaderOperations(deps: {
     const isCurrent = () =>
       workspace === workspaceGeneration && generation === compatibilityLoadGeneration;
     await Promise.all([
-      loadProviderAuthMethodsWithDependencies(
-        {
-          listProviderAuthMethods: deps.listProviderAuthMethods,
-          setProviderAuthMethods: deps.setProviderAuthMethods,
-        },
-        deps.logError,
-        isCurrent
-      ),
-      loadWorkspaceStatusesWithDependencies(
-        {
-          listWorkspaceStatuses: deps.listWorkspaceStatuses,
-          setWorkspaceStatuses: deps.setWorkspaceStatuses,
-        },
-        deps.logError,
-        isCurrent
-      ),
+      loadProviderAuthMethodsWithDependencies(deps, deps.logError, isCurrent),
+      loadWorkspaceStatusesWithDependencies(deps, deps.logError, isCurrent),
     ]);
   };
 
@@ -712,10 +726,7 @@ export function createDataLoaderOperations(deps: {
     const workspace = workspaceGeneration;
     const generation = ++recycleBinLoadGeneration;
     const loaded = await loadRecycleBinWithDependencies(
-      {
-        listRecycleBin: deps.listRecycleBin,
-        setRecycleBinEntries: deps.setRecycleBinEntries,
-      },
+      deps,
       deps.logError,
       () => workspace === workspaceGeneration && generation === recycleBinLoadGeneration
     );
@@ -799,7 +810,7 @@ async function runWorkspaceCatalogLoadWithTimeout(load: () => Promise<boolean>) 
   }
 }
 
-function waitForStartupCatalogRetry(signal: AbortSignal): Promise<void> {
+function waitForCatalogRetry(signal: AbortSignal, delayMs: number): Promise<void> {
   signal.throwIfAborted();
   return new Promise((resolve, reject) => {
     const abort = () => {
@@ -810,7 +821,7 @@ function waitForStartupCatalogRetry(signal: AbortSignal): Promise<void> {
     const timer = setTimeout(() => {
       signal.removeEventListener('abort', abort);
       resolve();
-    }, STARTUP_CATALOG_RETRY_MS);
+    }, delayMs);
     signal.addEventListener('abort', abort, { once: true });
   });
 }

@@ -1,6 +1,5 @@
-import { batch } from 'solid-js';
 import { getHostExtension } from '../host/extensions';
-import { unwrap } from 'solid-js/store';
+import { snapshot } from 'solid-js';
 import type { ExtensionMessage, WebviewMessage } from '../../shared/protocol';
 import { parseExtensionMessage } from '../../shared/extension-message';
 import { isString, type UnknownRecord, isObject } from './runtime-values';
@@ -55,18 +54,16 @@ function flushStreamBatch() {
   if (streamBatch.length === 0) return;
   const messages = streamBatch;
   streamBatch = [];
-  batch(() => {
-    for (const message of messages) {
-      try {
-        for (const handler of handlers) handler(message);
-      } catch (error) {
-        // Preserve normal uncaught-error reporting without losing subsequent packets in the batch.
-        queueMicrotask(() => {
-          throw error;
-        });
-      }
+  for (const message of messages) {
+    try {
+      for (const handler of handlers) handler(message);
+    } catch (error) {
+      // Preserve normal uncaught-error reporting without losing subsequent packets in the batch.
+      queueMicrotask(() => {
+        throw error;
+      });
     }
-  });
+  }
 }
 
 const messageListener = (event: Pick<MessageEvent, 'data'>) => {
@@ -83,10 +80,8 @@ const messageListener = (event: Pick<MessageEvent, 'data'>) => {
     return;
   }
   // Permissions, questions, completion, and RPC messages are ordering barriers and remain immediate.
-  batch(() => {
-    flushStreamBatch();
-    for (const handler of handlers) handler(msg);
-  });
+  flushStreamBatch();
+  for (const handler of handlers) handler(msg);
 };
 
 export function cleanupBridge() {
@@ -144,7 +139,7 @@ function sendToExtension(msg: WebviewMessage): SendResult {
   if (!send) return { sent: false };
   try {
     // Solid store proxies cannot cross the host's structured-clone boundary.
-    send(unwrap(msg));
+    send(snapshot(msg));
     return { sent: true };
   } catch (error) {
     return { sent: false, error };
@@ -259,15 +254,7 @@ function sendApiCall<T>(
   method: string,
   path: string,
   body: UnknownRecord[string],
-  options: {
-    timeoutMs: number;
-    signal?: AbortSignal;
-    retries: number;
-    permissionAutomationLease?: number;
-    permissionAutomationSessionID?: string;
-    queuedMessageDispatch?: { itemId: string; lease: number };
-    interruptedRecovery?: true;
-  }
+  options: ApiCallOptions & { timeoutMs: number; retries: number }
 ): Promise<T> {
   if (disposed) return Promise.reject(new Error('Bridge cleaned up'));
   const id = ++reqId;
@@ -426,8 +413,8 @@ function parsePathname(path: string): string {
 }
 
 function notifySlowApiRequestsChanged() {
-  const snapshot = [...slowApiRequests.values()];
-  for (const handler of slowApiRequestHandlers) handler(snapshot);
+  const requests = [...slowApiRequests.values()];
+  for (const handler of slowApiRequestHandlers) handler(requests);
 }
 
 function defaultTimeoutForRequest(method: string, path: string) {

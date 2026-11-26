@@ -3,7 +3,13 @@
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import type * as WebviewState from '../../src/webview/lib/state';
-import { getScrollMetrics, waitForAnimationFrames, waitForHarnessStartup } from './helpers';
+import {
+  getScrollMetrics,
+  postWebviewMessage,
+  scrollToBottom,
+  waitForAnimationFrames,
+  waitForHarnessStartup,
+} from './helpers';
 
 async function delayPromptRequest(page: Page, delayMs: number) {
   await page.evaluate((delay) => {
@@ -112,14 +118,16 @@ test('pastes an absolute path as immediately editable text without command sugge
   await page.evaluate(async () => {
     const path = '/src/webview/lib/state.ts';
     const { setState } = (await import(path)) as typeof WebviewState;
-    setState('commands', [
-      {
-        name: 'inspect-launch-services',
-        description: 'Inspect /usr/libexec/lsd',
-        template: 'Inspect launch services',
-        source: 'skill',
-      },
-    ]);
+    setState((draft) => {
+      draft.commands = [
+        {
+          name: 'inspect-launch-services',
+          description: 'Inspect /usr/libexec/lsd',
+          template: 'Inspect launch services',
+          source: 'skill',
+        },
+      ];
+    });
   });
   const pastedPath = '/usr/libexec/lsd';
   const immediateText = await composer.evaluate((editor, text) => {
@@ -1184,26 +1192,21 @@ test('preserves completed todos against stale native todo update events', async 
     'Patch stale incremental message equivalence and add regression coverage'
   );
 
-  await page.evaluate(() => {
-    window.postMessage(
-      {
-        type: 'server/event',
-        payload: {
-          type: 'todo.updated',
-          properties: {
-            sessionID: 'session-todo-completion',
-            todos: [
-              {
-                content: 'Patch stale incremental message equivalence and add regression coverage',
-                status: 'in_progress',
-                priority: 'high',
-              },
-            ],
+  await postWebviewMessage(page, {
+    type: 'server/event',
+    payload: {
+      type: 'todo.updated',
+      properties: {
+        sessionID: 'session-todo-completion',
+        todos: [
+          {
+            content: 'Patch stale incremental message equivalence and add regression coverage',
+            status: 'in_progress',
+            priority: 'high',
           },
-        },
+        ],
       },
-      '*'
-    );
+    },
   });
 
   await expect(todoButton).toContainText('1/1');
@@ -1211,29 +1214,24 @@ test('preserves completed todos against stale native todo update events', async 
     'Patch stale incremental message equivalence and add regression coverage'
   );
 
-  await page.evaluate(() => {
-    window.postMessage(
-      {
-        type: 'server/event',
-        payload: {
-          type: 'todo.updated',
-          properties: {
-            sessionID: 'session-todo-completion',
-            todos: [
-              {
-                content: 'Patch stale incremental message equivalence and add regression coverage',
-                status: 'completed',
-                priority: 'high',
-              },
-            ],
-            info: {
-              sessionID: 'session-todo-completion',
-            },
+  await postWebviewMessage(page, {
+    type: 'server/event',
+    payload: {
+      type: 'todo.updated',
+      properties: {
+        sessionID: 'session-todo-completion',
+        todos: [
+          {
+            content: 'Patch stale incremental message equivalence and add regression coverage',
+            status: 'completed',
+            priority: 'high',
           },
+        ],
+        info: {
+          sessionID: 'session-todo-completion',
         },
       },
-      '*'
-    );
+    },
   });
 
   await expect(todoButton).toContainText('1/1');
@@ -1384,25 +1382,20 @@ test('keeps the sent card and previous Worked summary stable through Thinking', 
   const composer = page.locator('[role="textbox"][aria-multiline="true"]').first();
   const text = 'Keep this message continuously visible';
   await expect(page.getByRole('button', { name: /Todos/i })).toContainText('1/1');
-  await page.evaluate(() => {
-    window.postMessage(
-      {
-        type: 'server/event',
-        payload: {
-          type: 'message.part.updated',
-          properties: {
-            part: {
-              id: 'message-todo-completion-final-text',
-              sessionID: 'session-todo-completion',
-              messageID: 'message-todo-completion-assistant',
-              type: 'text',
-              text: 'All completed work is verified.',
-            },
-          },
+  await postWebviewMessage(page, {
+    type: 'server/event',
+    payload: {
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'message-todo-completion-final-text',
+          sessionID: 'session-todo-completion',
+          messageID: 'message-todo-completion-assistant',
+          type: 'text',
+          text: 'All completed work is verified.',
         },
       },
-      '*'
-    );
+    },
   });
   await expect(
     page
@@ -1674,10 +1667,7 @@ test('upward scroll disables follow until the list reaches bottom again', async 
     .poll(async () => await list.evaluate((element) => element.scrollTop))
     .toBeLessThan(scrollTopBefore - 20);
 
-  await list.evaluate((element) => {
-    element.scrollTop = element.scrollHeight;
-    element.dispatchEvent(new Event('scroll'));
-  });
+  await scrollToBottom(list);
 
   await expect
     .poll(async () => (await getScrollMetrics(page, '.interactive-list')).distanceFromBottom)

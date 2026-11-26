@@ -1,20 +1,17 @@
+import { storePath } from '@solidjs/signals';
 import { describe, expect, it, vi } from 'vitest';
 import { registerProviderLimitRefreshEffect } from '../hooks/session/session-effects';
 import { getActiveProviderSelection, isProviderWorking } from '../hooks/routing-state';
 import { createAppState } from '../lib/state';
-import type { AssistantMessage, Provider } from '../types';
+import type { Provider } from '../types';
 import type { ProviderLimitStatus } from '../../shared/protocol';
-import { createPerfRoot, expectEffectDependencyIsolation, settlePerfEffects } from './harness';
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: Error) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
+import {
+  createPerfRoot,
+  expectEffectDependencyIsolation,
+  settlePerfEffects,
+  createAssistantMessage,
+} from './harness';
+import { deferred } from '../test-fixtures';
 
 function createProvider(): Provider {
   return {
@@ -32,27 +29,6 @@ function createProvider(): Provider {
   };
 }
 
-function createAssistantMessage(id: string): AssistantMessage {
-  return {
-    id,
-    sessionID: 'session-1',
-    role: 'assistant',
-    time: { created: 1, completed: 2 },
-    parentID: 'parent-1',
-    modelID: 'gpt-4o',
-    providerID: 'openai',
-    mode: 'default',
-    path: { cwd: '/workspace', root: '/workspace' },
-    cost: 0,
-    tokens: {
-      input: 0,
-      output: 0,
-      reasoning: 0,
-      cache: { read: 0, write: 0 },
-    },
-  };
-}
-
 describe('session effects perf guards', () => {
   it('does not rerun provider-limit polling when messages state changes', async () => {
     const appState = createAppState();
@@ -65,16 +41,18 @@ describe('session effects perf guards', () => {
     const loadProviderLimit = vi.fn(async () => null);
     const logError = vi.fn();
 
-    appState.setState('serverStatus', { state: 'running' });
-    appState.setState('providersLoaded', true);
-    appState.setState('providers', [createProvider()]);
-    appState.setState('providerDefaults', { openai: 'gpt-4o' });
-    appState.setState('selectedModel', { providerID: 'openai', modelID: 'gpt-4o' });
-    appState.setState('sessionStatus', 'background', { type: 'busy' });
-    appState.setState('sessionSelectedModels', 'background', {
-      providerID: 'openai',
-      modelID: 'gpt-4o',
-    });
+    appState.setState(storePath('serverStatus', { state: 'running' }));
+    appState.setState(storePath('providersLoaded', true));
+    appState.setState(storePath('providers', [createProvider()]));
+    appState.setState(storePath('providerDefaults', { openai: 'gpt-4o' }));
+    appState.setState(storePath('selectedModel', { providerID: 'openai', modelID: 'gpt-4o' }));
+    appState.setState(storePath('sessionStatus', 'background', { type: 'busy' }));
+    appState.setState(
+      storePath('sessionSelectedModels', 'background', {
+        providerID: 'openai',
+        modelID: 'gpt-4o',
+      })
+    );
 
     const dispose = createPerfRoot(() => {
       registerProviderLimitRefreshEffect({
@@ -98,7 +76,7 @@ describe('session effects perf guards', () => {
           appState.state.providerLimits[`${providerID}:${modelID ?? ''}`] ?? null,
         loadProviderLimit,
         setProviderLimit: (providerID, modelID, limit) => {
-          appState.setState('providerLimits', `${providerID}:${modelID ?? ''}`, limit);
+          appState.setState(storePath('providerLimits', `${providerID}:${modelID ?? ''}`, limit));
         },
         getPollIntervalMs: () => 120_000,
         logError,
@@ -113,7 +91,9 @@ describe('session effects perf guards', () => {
         label: 'provider-limit refresh effect',
         getCount: () => loadProviderLimit.mock.calls.length,
         mutate: () => {
-          appState.setState('messages', [{ info: createAssistantMessage('message-1'), parts: [] }]);
+          appState.setState(
+            storePath('messages', [{ info: createAssistantMessage('message-1'), parts: [] }])
+          );
         },
       });
 
@@ -121,12 +101,14 @@ describe('session effects perf guards', () => {
         label: 'provider-limit busy/retry transitions',
         getCount: () => loadProviderLimit.mock.calls.length,
         mutate: () => {
-          appState.setState('sessionStatus', 'background', {
-            type: 'retry',
-            attempt: 2,
-            message: 'Retrying',
-            next: 1000,
-          });
+          appState.setState(
+            storePath('sessionStatus', 'background', {
+              type: 'retry',
+              attempt: 2,
+              message: 'Retrying',
+              next: 1000,
+            })
+          );
         },
       });
 
@@ -147,11 +129,11 @@ describe('session effects perf guards', () => {
     const loadProviderLimit = vi.fn(() => pendingLimit.promise);
     const logError = vi.fn();
 
-    appState.setState('serverStatus', { state: 'running' });
-    appState.setState('providersLoaded', true);
-    appState.setState('providers', [createProvider()]);
-    appState.setState('providerDefaults', { openai: 'gpt-4o' });
-    appState.setState('selectedModel', { providerID: 'openai', modelID: 'gpt-4o' });
+    appState.setState(storePath('serverStatus', { state: 'running' }));
+    appState.setState(storePath('providersLoaded', true));
+    appState.setState(storePath('providers', [createProvider()]));
+    appState.setState(storePath('providerDefaults', { openai: 'gpt-4o' }));
+    appState.setState(storePath('selectedModel', { providerID: 'openai', modelID: 'gpt-4o' }));
 
     const dispose = createPerfRoot(() => {
       registerProviderLimitRefreshEffect({
@@ -170,7 +152,7 @@ describe('session effects perf guards', () => {
           appState.state.providerLimits[`${providerID}:${modelID ?? ''}`] ?? null,
         loadProviderLimit,
         setProviderLimit: (providerID, modelID, limit) => {
-          appState.setState('providerLimits', `${providerID}:${modelID ?? ''}`, limit);
+          appState.setState(storePath('providerLimits', `${providerID}:${modelID ?? ''}`, limit));
         },
         getPollIntervalMs: () => 10,
         logError,

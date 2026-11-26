@@ -1,14 +1,16 @@
-import { Show, createEffect, createSignal, untrack } from 'solid-js';
+import { createEffect, Show, createSignal, untrack } from 'solid-js';
 import { supportsDetachedEditors } from '../../host/extensions';
 import { HostActions } from '../HostActions';
-import { Portal } from 'solid-js/web';
+import { Portal } from '@solidjs/web';
+import { storePath } from '@solidjs/signals';
 import { normalizeSessionTitle } from '../../../shared/session-title';
 import { isSameWorkspacePath } from '../../../shared/workspace-path';
 import { renameSession } from '../../hooks/useOpenCode';
 import { postMessage } from '../../lib/bridge';
 import { clampPopupToViewport } from '../../lib/popup-position';
 import { unshareSession } from '../../lib/session-sharing';
-import { getSelectedModelForSession, setError, state } from '../../lib/state';
+import { client } from '../../lib/client';
+import { getSelectedModelForSession, setError, setState, state } from '../../lib/state';
 import { openSideQuestion, sideQuestionUnavailableReason } from '../../lib/side-question';
 import { writeClipboard } from '../../lib/write-clipboard';
 import type { Session } from '../../types';
@@ -159,6 +161,19 @@ export function SessionActionsMenu(props: {
     }
     showSessionActionFeedback('Session ID copied');
   };
+  const isTodo = () => state.todoSessionIds.includes(props.session.id);
+  const toggleTodo = async () => {
+    const sessionId = props.session.id;
+    const directory = props.session.directory;
+    const todo = !isTodo();
+    props.state.close();
+    try {
+      const todoSessionIds = await client.varro.session.setTodo(sessionId, todo, { directory });
+      setState(storePath('todoSessionIds', todoSessionIds));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    }
+  };
   const unshare = async () => {
     const session = props.session;
     props.state.close();
@@ -172,13 +187,14 @@ export function SessionActionsMenu(props: {
     });
   };
 
-  createEffect(() => {
-    props.state.position();
-    props.state.renaming();
-    queueMicrotask(() => {
-      if (menuRef) clampPopupToViewport(menuRef);
-    });
-  });
+  createEffect(
+    () => [props.state.position(), props.state.renaming()],
+    () => {
+      queueMicrotask(() => {
+        if (menuRef) clampPopupToViewport(menuRef);
+      });
+    }
+  );
 
   return (
     <Portal>
@@ -258,7 +274,7 @@ export function SessionActionsMenu(props: {
                     openSideQuestion();
                   }}
                 >
-                  Ask a side question…
+                  Ask side-question
                 </button>
               </Show>
               <button
@@ -302,6 +318,16 @@ export function SessionActionsMenu(props: {
                   }}
                 >
                   {props.isPinned ? 'Unpin session' : 'Pin session'}
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  title={
+                    isTodo() ? undefined : 'Mark to come back later; the next prompt clears it'
+                  }
+                  onClick={() => void toggleTodo()}
+                >
+                  {isTodo() ? 'Remove ToDo mark' : 'Mark as ToDo'}
                 </button>
               </Show>
               <Show
@@ -414,6 +440,10 @@ export function SessionActionsMenu(props: {
         >
           <form
             class="session-item-rename-form"
+            onKeyDown={(event) => {
+              // Keep the session list's Enter shortcut from cancelling native form submission.
+              if (event.key === 'Enter') event.stopPropagation();
+            }}
             onSubmit={(event) => {
               event.preventDefault();
               void submitRename();

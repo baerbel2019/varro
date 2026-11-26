@@ -22,8 +22,13 @@ any saving described here.
   `scripts/ai-performance.mjs`. It reports frame-target counters and per-process CPU.
 - Confirm findings in a realistic state. Deltas appended to a completed message in an idle session
   produced trailing-summary churn that a busy stream (`multi-agent-large-streaming`) never shows.
-- A frame gap with no long task, while CDP evaluations keep answering, is a rendering pause in the
-  host, not main-thread work. Replay the same capture before attributing it to Varro.
+- A frame gap with no Long Tasks API entry does not rule out webview main-thread work. A retained
+  post-release trace caught a 97.2 ms V8 major GC that the API missed, while the workbench kept
+  rendering. Pair callback-entry age with renderer tasks, GC, compositor frame delivery, and
+  trace-clock markers before attributing a gap to the host or application. CDP responses outside
+  the gap do not establish responsiveness inside it.
+- Label frame gaps against actual native press/release timestamps, not a phase name that remains
+  active during later playback. A post-release streaming pause is not a held-drag stall.
 - Observer gaps record `heartbeats`, `server/event` `messages`, and `maxHeartbeatSpacingMs` from a
   50 ms timer running between observer start and stop. Spacing near 50 ms bounds any main-thread
   block inside that gap to about that length; it does not name the cause. Counts alone can hide a
@@ -65,12 +70,29 @@ any saving described here.
   `src/webview/components/message-list/history-segments.ts`) or return stable references.
 - Row props derived from global maps fan out to every mounted row. Prefer per-ID lookups behind memos
   with structural equality.
+- Full-record scans use `src/webview/lib/record-snapshots.ts`: keyed per-record memos track nested
+  changes and preserve unchanged snapshot references, while 128-record chunks bound aggregation
+  dependencies. Keep these immutable views in derivations only. Canonical message and part objects
+  still own rows, scroll anchors, editing, and mutations. Restrict snapshots to the same frozen,
+  recent, and trailing ranges so tail updates do not rederive settled history.
+  Within the trailing turn, only completed steps use snapshot scan views. Unfinished steps retain
+  canonical objects and fine-grained fields for presentation and measurement. Stream probes must
+  track their range and lookup accessors before an untracked traversal; a structural version alone
+  does not invalidate a result cached before a derived snapshot settles. Keep the first-send and
+  following-text regressions in `scroll-short-transcript.spec.ts` and `scroll-tool-grouping.spec.ts`.
 - Keep expensive derivations, such as regular expressions over prompt text, in their own memo. A
   compiled element's render effect reruns all of its bindings together.
 - `class={...}` bindings write the attribute on every notification, even when the string is unchanged.
   A `MutationObserver` that counts same-value class writes exposes excess reruns.
 - To find fan-out, instrument Solid's `writeSignal` in a scratch copy of an unminified build and log
   writes that reach many observers. Do not edit `node_modules` or sources for diagnosis.
+- Solid's `HUGE_FAN_IN` diagnostic reports one computation tracking at least 2,000 sources, not
+  2,000 messages or reruns. A passing work-count assertion does not establish that those subscriptions
+  are necessary. Do not suppress it globally or across a test file. Use
+  `src/test/expected-solid-diagnostics.ts` only inside a test that deliberately creates an extreme
+  condition, with an explicit list of expected computation names and a comment explaining why.
+  Restore output after fixture setup if subsequent interactions must remain bounded. Ordinary
+  pagination, the 60-row scroll case, and unknown computation names retain their warnings.
 
 ## Layout and scrolling
 
@@ -135,6 +157,15 @@ any saving described here.
   cap must accommodate a 200-message history page: the old 100-entry cap evicted a large rendered
   response during native scrolling even with most of the byte budget free, adding a parse/sanitize
   pass to its remount. Keep the history-page reuse and shared-byte-budget regressions together.
+- History-cache size accounting runs synchronously on every message sync, including each older-page
+  prepend, and walks the whole retained session. Size the rows actually cached, not the incoming
+  response: reconciliation can materialize queued streaming text and keep optimistic rows or extra
+  parts. Read each store record through its plain `snapshot()` rather than proxy traps, deduplicate
+  input proxies before snapshotting, and avoid per-field pair arrays. On the retained cold-prepend
+  capture this cut the in-task estimate from 4.4/4.1 ms to 1.3/1.6 ms with identical byte totals,
+  while later streaming syncs cost about 0.2 ms more each; evidence is under
+  `artifacts/ai-fuzzy/cold-cache-20261121/`. Keep the walk current: streamed text grows retained
+  records in place, so earlier recorded bytes plus the new page can undercount.
 - Streaming completion can cache its sanitized stable/tail HTML when the append validator proves
   the boundary independent. Never assemble a full-result cache entry across contextual HTML,
   reference definitions, or an unfinished code fence. Core/overscan changes only need a Markdown

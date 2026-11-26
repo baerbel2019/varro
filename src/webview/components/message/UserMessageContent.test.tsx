@@ -1,6 +1,8 @@
+import { flush as flushSolid, createMemo, createRoot, createStore } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installHighlightWorker } from '../../lib/highlight-worker.test-support';
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { messageTextIcon, navArrowLeftIcon, navArrowRightIcon } from '../../lib/ui-icons';
 import { toCssUrl } from '../UiIcon';
 import { StickyUserMessagePreviewCard } from '../message-list/MessageListChrome';
@@ -27,6 +29,9 @@ import { pastedTextDataUrl } from '../../../shared/pasted-text';
 import { createChatAnnotation } from '../../../shared/chat-annotation';
 import { citationPathChecks } from '../../lib/citation-path-checks';
 import { isAssistantActivityPart } from '../../lib/assistant-activity';
+import { client } from '../../lib/client';
+import * as feedback from '../chat/SessionActionFeedback';
+import type { SessionLookup } from '../../../shared/protocol';
 
 const selectSessionMock = vi.hoisted(() => vi.fn());
 const retryMessageMock = vi.hoisted(() => vi.fn());
@@ -92,6 +97,40 @@ function renderUserContent(parts: Part[]) {
   cleanup = render(() => UserMessageContent({ parts }), container!);
 }
 
+describe('shared prompt parsing lifetime', () => {
+  it('keeps a cached parse reactive after its first row owner is disposed', () => {
+    const [store, setStore] = createStore({ parts: [textPart('prompt', 'before')] });
+    const first = createRoot((dispose) => ({
+      dispose,
+      parsed: createMemo(() => parseUserMessageContent(store.parts)),
+    }));
+    flushSolid();
+    const original = first.parsed();
+    expect(original.messageTexts).toEqual(['before']);
+    first.dispose();
+    flushSolid();
+
+    const second = createRoot((dispose) => ({
+      dispose,
+      parsed: createMemo(() => parseUserMessageContent(store.parts)),
+    }));
+    flushSolid();
+    try {
+      expect(second.parsed()).toBe(original);
+      setStore(storePath('parts', 0, 'text', 'after'));
+      flushSolid();
+      expect(second.parsed().messageTexts).toEqual(['after']);
+      expect(second.parsed()).not.toBe(original);
+      setStore(storePath('parts', (parts) => [...parts, textPart('next', 'next prompt')]));
+      flushSolid();
+      expect(second.parsed().messageTexts).toEqual(['after', 'next prompt']);
+    } finally {
+      second.dispose();
+      flushSolid();
+    }
+  });
+});
+
 describe('native subagent results', () => {
   it.each(['completed', 'error', 'cancelled'] as const)(
     'projects a %s result once without changing native identities or exposing an editable prompt',
@@ -131,13 +170,79 @@ describe('native subagent results', () => {
     }
   );
 
-  it('does not treat user-written subagent markup as a native result', () => {
-    const parsed = parseUserMessageContent([
-      textPart('user-text', '<subagent sessionID="fake">Result</subagent>'),
-    ]);
+  it.each([
+    '<subagent sessionID="fake">Result</subagent>',
+    '<background-result kind="subagent" sessionID="fake">\nResult\n</background-result>',
+  ])('does not treat user-written subagent markup as a native result: %s', (text) => {
+    const parsed = parseUserMessageContent([textPart('user-text', text)]);
     expect(parsed.automaticParts).toEqual([]);
     expect(parsed.messageTexts).toHaveLength(1);
   });
+
+  it.each(['completed', 'error', 'cancelled'] as const)(
+    'strips the v2.4 wrapper from a %s native result without trusting its attribution',
+    (resultState) => {
+      const part: TextPart = {
+        ...textPart(
+          'native-result-v2.4',
+          '<background-result kind="subagent" sessionID="wrong-child">\nAudit result\n</background-result>'
+        ),
+        synthetic: true,
+        subagentResult: {
+          sessionID: 'native-child',
+          state: resultState,
+          description: 'Audit auth',
+        },
+      };
+      const parsed = parseUserMessageContent([part]);
+      expect(parsed.messageTexts).toEqual([]);
+      expect(parsed.automaticParts).toHaveLength(1);
+      const action = parsed.automaticParts[0]!;
+      expect(action).toMatchObject({
+        id: part.id,
+        messageID: part.messageID,
+        sessionID: part.sessionID,
+        state: { metadata: { sessionID: 'native-child' } },
+      });
+      if (action.state.status === 'completed') expect(action.state.output).toBe('Audit result');
+      else if (action.state.status === 'error')
+        expect(action.state.error).toBe(
+          resultState === 'cancelled' ? 'Aborted: Audit result' : 'Audit result'
+        );
+      else throw new Error('Expected a settled native result');
+      expect(hasUserMessageEditableContent([part])).toBe(false);
+    }
+  );
+});
+
+it.each([
+  ['completed', 'Background command finished'],
+  ['failed', 'Background command failed'],
+  ['error', 'Background command failed'],
+  ['cancelled', 'Background command cancelled'],
+])('preserves a v2.4 %s background shell notice', (noticeState, title) => {
+  const part = {
+    ...textPart(
+      'native-shell-result',
+      `<background-result kind="shell" id="sh_one" state="${noticeState}" command="npm test > results.txt">\nTest output\n</background-result>`
+    ),
+    synthetic: true,
+  };
+  const parsed = parseUserMessageContent([part]);
+  expect(parsed.messageTexts).toEqual([]);
+  expect(parsed.automaticActions).toEqual([title]);
+  expect(parsed.automaticParts).toHaveLength(1);
+  const action = parsed.automaticParts[0]!;
+  expect(action).toMatchObject({
+    id: part.id,
+    messageID: part.messageID,
+    sessionID: part.sessionID,
+    state: { input: { command: 'npm test > results.txt', state: noticeState } },
+  });
+  if (action.state.status === 'completed') expect(action.state.output).toBe('Test output');
+  else if (action.state.status === 'error') expect(action.state.error).toBe('Test output');
+  else throw new Error('Expected a settled shell notice');
+  expect(hasUserMessageEditableContent([part])).toBe(false);
 });
 
 it('renders independent problem links with file and line labels and restores them for editing', () => {
@@ -169,6 +274,7 @@ it('renders independent problem links with file and line labels and restores the
     ...references.map((reference) => textPart(reference.id, formatInlineProblem(reference))),
   ];
   renderUserContent(parts);
+  flushSolid();
   const chips = container!.querySelectorAll<HTMLButtonElement>(
     '.user-message-text-scroll .inline-chip'
   );
@@ -182,6 +288,7 @@ it('renders independent problem links with file and line labels and restores the
   expect(getUserMessageEditText(parts)).toBe(text);
   expect(getUserMessagePreviewText(parts)).toBe('Explain a.ts L3:7 and b.ts L9');
   chips[0]!.click();
+  flushSolid();
   expect(send).toHaveBeenCalledWith({
     type: 'vscode/open',
     payload: { path: '/repo/a.ts', line: 3, kind: 'file' },
@@ -203,6 +310,7 @@ it('renders an All snapshot as one inline Problems count chip', () => {
     textPart('all', formatInlineProblem(reference)),
   ];
   renderUserContent(parts);
+  flushSolid();
   const chips = container!.querySelectorAll<HTMLButtonElement>(
     '.user-message-text-scroll .inline-chip'
   );
@@ -211,6 +319,7 @@ it('renders an All snapshot as one inline Problems count chip', () => {
   expect(chips[0]?.querySelector('.inline-chip-detail')?.textContent).toBe('2');
   expect(getUserMessageEditContext(parts).inlineProblems).toEqual([reference]);
   chips[0]!.click();
+  flushSolid();
   expect(send).toHaveBeenCalledWith({
     type: 'vscode/open-text',
     payload: {
@@ -224,6 +333,7 @@ it('renders an All snapshot as one inline Problems count chip', () => {
 it.each(['separate', 'combined', 'combined-crlf'])(
   'renders %s problems as a count chip without leaking details into visible or editable prompt text',
   (layout) => {
+    const warn = vi.spyOn(console, 'warn');
     const send = installSendToExtension();
     const details =
       '[VS Code problems for playwright.config.ts: 1 errors, 0 warnings]\nCannot find module @playwright/test';
@@ -238,7 +348,9 @@ it.each(['separate', 'combined', 'combined-crlf'])(
                 .replaceAll('\n', layout === 'combined-crlf' ? '\r\n' : '\n')
             ),
           ];
+    flushSolid();
     renderUserContent(parts);
+    flushSolid();
     const chip = container?.querySelector<HTMLButtonElement>('.message-attachment-chip');
     expect(chip?.querySelector('.chip-label')?.textContent).toBe('Problems');
     expect(chip?.querySelector('.chip-detail')?.textContent).toBe('1');
@@ -249,6 +361,7 @@ it.each(['separate', 'combined', 'combined-crlf'])(
     expect(getUserMessageEditText(parts)).toBe('Explain this problem');
     expect(getUserMessageEditContext(parts).issues).toMatchObject({ count: 1, text: details });
     chip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-text',
       payload: {
@@ -258,6 +371,7 @@ it.each(['separate', 'combined', 'combined-crlf'])(
       },
     });
     expect(getUserMessagePreviewText([textPart('problems-only', details)])).toBe('Problems 1');
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('[STRICT_READ_UNTRACKED]'));
   }
 );
 
@@ -271,6 +385,7 @@ it('keeps context after combined diagnostics as separate attachments', () => {
     ),
   ];
   renderUserContent(parts);
+  flushSolid();
   expect(container!.querySelectorAll('.message-attachment-chip')).toHaveLength(3);
   expect(container!.querySelector('.user-message-text-scroll')?.textContent).toBe('Explain this');
   expect(getUserMessageEditContext(parts).issues).toMatchObject({ count: 2, text: details });
@@ -297,6 +412,7 @@ it.each(['separate', 'combined'])(
         ? [textPart('prompt', 'Explain [Problems] please'), textPart('problems', details)]
         : [textPart('prompt', `Explain [Problems] please\n${details}`)];
     renderUserContent(parts);
+    flushSolid();
     const chip = container?.querySelector('.user-message-text-scroll .inline-chip');
     expect(chip?.querySelector('.inline-chip-label')?.textContent).toBe('Problems');
     expect(chip?.querySelector('.inline-chip-detail')?.textContent).toBe('1');
@@ -330,12 +446,14 @@ it('renders saved table attachments with their table identity and keeps the snap
       })
     ),
   ]);
+  flushSolid();
   const chip = container?.querySelector<HTMLButtonElement>('.message-attachment-chip');
   expect(chip?.textContent).toContain('users');
   expect(chip?.textContent).toContain('2 rows');
   expect(container?.textContent).not.toContain('context.json');
   expect(chip?.querySelector('[data-chip-icon="table"]')).not.toBeNull();
   chip?.click();
+  flushSolid();
   expect(send).toHaveBeenCalledWith({
     type: 'vscode/open',
     payload: { path, line: undefined, kind: 'file' },
@@ -346,6 +464,7 @@ function installSendToExtension() {
   const send = vi.fn();
   // SAFETY: The fixture provides the unknown fields read by this statement.
   fixture<UnknownRecord>(window).__sendToExtension = send;
+  flushSolid();
   return send;
 }
 
@@ -359,23 +478,33 @@ beforeEach(() => {
     disconnect() {}
   };
   resetDefaultAppState();
+  flushSolid();
   clearDirectSessionReturn();
+  flushSolid();
 });
 
 afterEach(() => {
   cleanup?.();
+  flushSolid();
   vi.restoreAllMocks();
+  flushSolid();
   cleanup = undefined;
   container?.remove();
+  flushSolid();
   container = null;
   if (originalResizeObserver) globalThis.ResizeObserver = originalResizeObserver;
   else Reflect.deleteProperty(globalThis, 'ResizeObserver');
+  flushSolid();
   document.body.classList.remove('chat-image-preview-open');
+  flushSolid();
   selectSessionMock.mockReset();
   retryMessageMock.mockReset();
-  setAppState('sessions', []);
-  setAppState('allAgents', []);
+  setAppState(storePath('sessions', []));
+  flushSolid();
+  setAppState(storePath('allAgents', []));
+  flushSolid();
   resetDefaultAppState();
+  flushSolid();
   // SAFETY: The fixture provides the unknown fields read by this statement.
   delete fixture<UnknownRecord>(window).__sendToExtension;
 });
@@ -402,11 +531,13 @@ describe('UserMessageContent', () => {
             ? { selectedText: 'Selected passage', note: 'Please check this assumption' }
             : undefined,
         };
+        flushSolid();
         renderUserContent([
           textPart('prompt', `Review @${file.relativePath}`),
           part,
           { ...part, id: 'duplicate' },
         ]);
+        flushSolid();
         const chips = container!.querySelectorAll<HTMLElement>('.inline-chip');
         expect(chips).toHaveLength(1);
         const chip = chips[0]!;
@@ -416,7 +547,9 @@ describe('UserMessageContent', () => {
           chip.querySelector<HTMLElement>('.ui-icon')?.style.getPropertyValue('--ui-icon-mask')
         ).toBe(toCssUrl(messageTextIcon));
         chip.dispatchEvent(new MouseEvent('mouseenter'));
+        flushSolid();
         await vi.advanceTimersByTimeAsync(400);
+        flushSolid();
         expect(document.querySelector('.chat-annotation-tooltip-note')?.textContent).toBe(
           'Please check this assumption'
         );
@@ -445,6 +578,7 @@ describe('UserMessageContent', () => {
         filename,
         url: pastedTextDataUrl(content),
       };
+      flushSolid();
       const parts: Part[] = [
         textPart('prompt', `${prefix} @${filename}`),
         file,
@@ -452,11 +586,13 @@ describe('UserMessageContent', () => {
         textPart('attachment', `[Attached file: ${filename}]`),
       ];
       renderUserContent(parts);
+      flushSolid();
       const chips = container!.querySelectorAll<HTMLElement>('.inline-chip');
       expect(chips).toHaveLength(1);
       expect(chips[0]!.textContent).toBe(filename);
       expect(container!.querySelector('.message-attachments')).toBeNull();
       chips[0]!.click();
+      flushSolid();
       expect(send).toHaveBeenCalledWith({
         type: 'vscode/open-text',
         payload: { content, title: filename, language: 'plaintext' },
@@ -485,10 +621,14 @@ describe('UserMessageContent', () => {
               ? pastedTextDataUrl('content')
               : 'file:///missing/pasted-text.txt',
       };
+      flushSolid();
       renderUserContent([textPart('prompt', `@${filename}`), file]);
+      flushSolid();
       const onMessageClick = vi.fn();
       container!.addEventListener('click', onMessageClick);
+      flushSolid();
       container!.querySelector<HTMLElement>('.inline-chip')!.click();
+      flushSolid();
 
       expect(onMessageClick).not.toHaveBeenCalled();
       if (available) {
@@ -512,7 +652,9 @@ describe('UserMessageContent', () => {
       filename: 'pasted-text.txt',
       url: pastedTextDataUrl('content'),
     };
+    flushSolid();
     renderUserContent([textPart('prompt', 'Review this'), file, { ...file, id: 'duplicate' }]);
+    flushSolid();
     expect(container!.querySelectorAll('.message-attachment-chip')).toHaveLength(1);
   });
 
@@ -536,7 +678,9 @@ describe('UserMessageContent', () => {
                     )
               ),
             ];
+      flushSolid();
       renderUserContent(parts);
+      flushSolid();
 
       const chip = container?.querySelector<HTMLButtonElement>(
         '.message-attachments-leading .message-attachment-chip'
@@ -546,6 +690,7 @@ describe('UserMessageContent', () => {
       expect(getUserMessageEditText(parts)).toBe(prompt);
       expect(getUserMessageEditContext(parts).files).toMatchObject([{ path, type: 'file' }]);
       chip?.click();
+      flushSolid();
       expect(send).toHaveBeenCalledWith({
         type: 'vscode/open',
         payload: { path, line: undefined, kind: 'file' },
@@ -587,7 +732,9 @@ describe('UserMessageContent', () => {
                   .replaceAll('\n', layout === 'joined-crlf' ? '\r\n' : '\n')
               ),
             ];
+      flushSolid();
       renderUserContent(persistedParts);
+      flushSolid();
       const attachments = container?.querySelector('.message-attachments-leading');
       const text = container?.querySelector('.user-message-text');
       expect(attachments?.textContent).not.toContain('browser-bridge');
@@ -606,11 +753,51 @@ describe('UserMessageContent', () => {
     }
   );
 
+  it.each(['/goal Wait for 1 minute', '/goal **Wait** for 1 minute'])(
+    'renders the leading goal command as a skill chip: %s',
+    (prompt) => {
+      const parts = [textPart('prompt', prompt)];
+      renderUserContent(parts);
+      flushSolid();
+      const chip = container?.querySelector('.inline-chip[data-copy-marker="/goal"]');
+      expect(chip?.querySelector('.inline-chip-label')?.textContent).toBe('goal');
+      expect(chip?.querySelector('[data-chip-icon="skill"]')).not.toBeNull();
+      expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(
+        'goal Wait for 1 minute'
+      );
+      expect(getUserMessageEditText(parts)).toBe(prompt);
+      expect(getUserMessagePreviewText(parts)).toBe(prompt);
+      expect(container?.querySelector('.message-attachments')).toBeNull();
+    }
+  );
+
+  it.each([
+    'Discuss /goal Wait for 1 minute',
+    '/goals Wait for 1 minute',
+    '/goal.md',
+    '`/goal Wait for 1 minute`',
+    '```text\n/goal Wait for 1 minute\n```',
+  ])('does not turn goal-like prose or code into a command chip: %s', (prompt) => {
+    renderUserContent([textPart('prompt', prompt)]);
+    flushSolid();
+    expect(container?.querySelector('[data-copy-marker="/goal"]')).toBeNull();
+  });
+
+  it('keeps goal-like paths in a Markdown objective as text', () => {
+    renderUserContent([textPart('prompt', '/goal **Read** /goals and /goal.md')]);
+    flushSolid();
+    expect(container?.querySelectorAll('.inline-chip[data-copy-marker="/goal"]')).toHaveLength(1);
+    expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(
+      'goal Read /goals and /goal.md'
+    );
+  });
+
   it('shows an inline skill without an attachment row', () => {
     renderUserContent([
       textPart('prompt', 'What machines can you see using $[control]'),
       textPart('skill', formatSkillAttachment('control')),
     ]);
+    flushSolid();
     expect(container?.querySelector('.message-attachments')).toBeNull();
     expect(container?.querySelectorAll('.inline-chip')).toHaveLength(1);
     expect(container?.querySelector('.inline-chip')?.textContent).toBe('control');
@@ -622,6 +809,7 @@ describe('UserMessageContent', () => {
       textPart('inline-skill', formatSkillAttachment('control')),
       textPart('attached-skill', formatSkillAttachment('unslop')),
     ]);
+    flushSolid();
     const attachments = container?.querySelector('.message-attachments-leading');
     expect(attachments?.querySelectorAll('.message-attachment-chip')).toHaveLength(1);
     expect(attachments?.querySelector('.message-attachment-chip .chip-label')?.textContent).toBe(
@@ -646,6 +834,7 @@ describe('UserMessageContent', () => {
           ? parts
           : [textPart('joined', parts.map((part) => part.text).join('\n'))];
       renderUserContent(persistedParts);
+      flushSolid();
       expect(container?.querySelector('.user-message-text-scroll')?.textContent).toBe(
         'What machines can you see'
       );
@@ -668,6 +857,7 @@ describe('UserMessageContent', () => {
       textPart('skill', formatSkillAttachment('control')),
     ];
     renderUserContent(parts);
+    flushSolid();
     expect(container?.querySelector('.user-message-text-scroll')).toBeNull();
     expect(container?.querySelector('.message-attachment-chip .chip-label')?.textContent).toBe(
       'control'
@@ -682,6 +872,7 @@ describe('UserMessageContent', () => {
     '```text\n$[control] What machines can you see\n```',
   ])('preserves unbacked and fenced skill prefixes: %s', (prompt) => {
     renderUserContent([textPart('prompt', prompt)]);
+    flushSolid();
     expect(container?.querySelector('.user-message-text-scroll')?.textContent).toContain(
       '$[control]'
     );
@@ -697,6 +888,7 @@ describe('UserMessageContent', () => {
 
   it('renders each text part as its own paragraph in the scroll container', () => {
     renderUserContent([textPart('text-1', 'Line 1'), textPart('text-2', 'Line 2')]);
+    flushSolid();
 
     const scrollContainer = container?.querySelector('.user-message-text-scroll');
     expect(scrollContainer).toBeInstanceOf(HTMLDivElement);
@@ -713,6 +905,7 @@ describe('UserMessageContent', () => {
 
   it('shows the empty placeholder for prompts without renderable content', () => {
     renderUserContent([textPart('text-1', '[Working directory: /repo]'), textPart('text-2', '')]);
+    flushSolid();
 
     expect(container?.querySelector('.user-message-empty')?.textContent).toBe('(no content)');
     expect(container?.querySelector('.user-message-text-scroll')).toBeNull();
@@ -721,6 +914,7 @@ describe('UserMessageContent', () => {
 
   it('renders fenced code with its language and leaves fenced URLs unlinkified', () => {
     renderUserContent([textPart('text-1', '```text\nhttps://example.test/docs\n```')]);
+    flushSolid();
 
     expect(container?.querySelector('.user-message-code-block .code-block-lang')?.textContent).toBe(
       'text'
@@ -733,10 +927,12 @@ describe('UserMessageContent', () => {
 
   it('upgrades user code in place after the worker responds', async () => {
     renderUserContent([textPart('text-1', '```ts\nconst userValue = 17;\n```')]);
+    flushSolid();
     const block = container?.querySelector('.user-message-code-block');
     const code = block?.querySelector('code');
     expect(code?.textContent).toBe('const userValue = 17;\n');
     await vi.waitFor(() => expect(code?.querySelector('.hljs-keyword')?.textContent).toBe('const'));
+    flushSolid();
     expect(container?.querySelector('.user-message-code-block')).toBe(block);
     expect(code?.textContent).toBe('const userValue = 17;\n');
   });
@@ -757,6 +953,7 @@ describe('UserMessageContent', () => {
         ].join('\n')
       ),
     ]);
+    flushSolid();
 
     expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(
       'Fix the session state.'
@@ -771,6 +968,7 @@ describe('UserMessageContent', () => {
     expect(chip?.textContent).toContain('L1-3; truncated');
 
     chip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-text',
       payload: {
@@ -792,6 +990,7 @@ describe('UserMessageContent', () => {
         `[Unsaved selection from LOADTESTS.md lines 25-41]\n\`\`\`\`markdown\n${content}\n\`\`\`\``
       ),
     ]);
+    flushSolid();
 
     expect(container?.querySelectorAll('.user-message-text')).toHaveLength(1);
     expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(
@@ -805,6 +1004,7 @@ describe('UserMessageContent', () => {
     expect(chip?.textContent).toContain('LOADTESTS.md');
     expect(chip?.textContent).toContain('L25-41');
     chip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-text',
       payload: { content, title: 'LOADTESTS.md unsaved selection', language: 'markdown' },
@@ -826,6 +1026,7 @@ describe('UserMessageContent', () => {
       ),
       textPart('text-2', 'README.md'),
     ]);
+    flushSolid();
 
     const markdown = container?.querySelector('.user-message-markdown');
     expect(markdown?.querySelector('h1')?.textContent).toBe('Review');
@@ -839,6 +1040,7 @@ describe('UserMessageContent', () => {
 
   it('renders task-list checkboxes in user prompts', () => {
     renderUserContent([textPart('text-1', '- [x] Do this\n- [ ] Do that')]);
+    flushSolid();
 
     const markdown = container?.querySelector('.user-message-markdown');
     expect(markdown?.querySelectorAll('.markdown-task-checkbox')).toHaveLength(2);
@@ -853,12 +1055,14 @@ describe('UserMessageContent', () => {
   it('renders Markdown links through the external-link bridge', () => {
     const send = installSendToExtension();
     renderUserContent([textPart('text-1', 'Read the [documentation](https://example.test/docs).')]);
+    flushSolid();
 
     const link = container?.querySelector<HTMLAnchorElement>('a.external-link');
     expect(link?.textContent).toContain('documentation');
     expect(link?.getAttribute('href')).toBe('https://example.test/docs');
 
     link?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-external',
       payload: { url: 'https://example.test/docs' },
@@ -874,6 +1078,7 @@ describe('UserMessageContent', () => {
         )
       ),
     ]);
+    flushSolid();
 
     const scrollContainer = container?.querySelector('.user-message-text-scroll');
     expect(scrollContainer?.querySelectorAll('.interactive-result-code-block')).toHaveLength(2);
@@ -884,6 +1089,7 @@ describe('UserMessageContent', () => {
     const send = installSendToExtension();
     const svg = '<svg viewBox="0 0 10 10">\n  <path d="M0 0h10v10z" />\n</svg>';
     renderUserContent([textPart('text-svg', svg)]);
+    flushSolid();
 
     const chip = container?.querySelector<HTMLButtonElement>('.user-message-format-chip');
     expect(chip?.textContent).toBe('SVG59 B');
@@ -892,6 +1098,7 @@ describe('UserMessageContent', () => {
     expect(container?.querySelector('.user-message-text')?.textContent).not.toContain('<svg');
 
     chip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-text',
       payload: {
@@ -912,6 +1119,7 @@ describe('UserMessageContent', () => {
       '</svg>',
     ].join('\n');
     renderUserContent([textPart('text-prose-svg', prompt)]);
+    flushSolid();
 
     const messageText = container?.querySelectorAll('.user-message-text');
     expect(messageText).toHaveLength(2);
@@ -927,6 +1135,7 @@ describe('UserMessageContent', () => {
   it('leaves malformed markup as plain message text', () => {
     const malformed = '<svg><path></svg>';
     renderUserContent([textPart('text-malformed-svg', malformed)]);
+    flushSolid();
 
     expect(container?.querySelector('.user-message-format-chip')).toBeNull();
     expect(container?.querySelector('.user-message-text')?.textContent).toBe(malformed);
@@ -934,12 +1143,34 @@ describe('UserMessageContent', () => {
 
   it('renders attachment-only prompts as a standalone attachment strip', () => {
     renderUserContent([textPart('text-1', '[Active file: src/shared/extension-message.ts]')]);
+    flushSolid();
 
     const attachments = container?.querySelector('.message-attachments');
     expect(attachments).toBeInstanceOf(HTMLDivElement);
     expect(attachments?.classList.contains('message-attachments-standalone')).toBe(true);
     expect(attachments?.textContent).toContain('extension-message.ts');
     expect(container?.querySelector('.user-message-text-scroll')).toBeNull();
+  });
+
+  it('observes the new attachment rail width when prompt text arrives', () => {
+    const observe = vi.spyOn(ResizeObserver.prototype, 'observe');
+    const unobserve = vi.spyOn(ResizeObserver.prototype, 'unobserve');
+    const [store, setStore] = createStore({
+      parts: [textPart('context', '[Active file: app.ts]')],
+    });
+    cleanup = render(() => <UserMessageContent parts={store.parts} />, container!);
+    flushSolid();
+
+    const rail = container!.querySelector('.message-attachments-standalone')!;
+    const parent = rail.parentElement;
+    expect(observe).toHaveBeenCalledWith(parent);
+
+    setStore(storePath('parts', (parts) => [...parts, textPart('prompt', 'Explain this')]));
+    flushSolid();
+
+    expect(container!.querySelector('.message-attachments-leading')).toBe(rail);
+    expect(unobserve).toHaveBeenCalledWith(parent);
+    expect(observe).toHaveBeenCalledWith(rail);
   });
 
   it('orders attachments above image tiles and keeps tile clicks out of the message card', () => {
@@ -949,6 +1180,7 @@ describe('UserMessageContent', () => {
       textPart('text-2', 'Please review this.'),
       imageFilePart('image-1', 'diagram.png'),
     ]);
+    flushSolid();
 
     const rendered = container?.querySelector('.rendered-markdown');
     expect(rendered?.classList.contains('user-message-content-has-image')).toBe(true);
@@ -976,7 +1208,9 @@ describe('UserMessageContent', () => {
 
     const bubbledClick = vi.fn();
     container?.addEventListener('click', bubbledClick);
+    flushSolid();
     leadingChildren[1]?.querySelector<HTMLButtonElement>('.user-message-image-tile')?.click();
+    flushSolid();
     expect(bubbledClick).not.toHaveBeenCalled();
     expect(
       document.body.querySelector<HTMLImageElement>('.chat-image-preview-img')?.getAttribute('src')
@@ -990,6 +1224,7 @@ describe('UserMessageContent', () => {
       textPart('text-3', 'three.ts'),
       textPart('text-4', 'four.ts'),
     ]);
+    flushSolid();
 
     const trigger = container?.querySelector<HTMLButtonElement>(
       '.message-attachment-overflow-trigger'
@@ -1001,6 +1236,7 @@ describe('UserMessageContent', () => {
     const railChildCount = rail?.childElementCount;
 
     trigger?.click();
+    flushSolid();
 
     expect(trigger?.getAttribute('aria-expanded')).toBe('true');
     expect(container?.querySelector('.message-attachment-overflow-menu')).toBeNull();
@@ -1010,6 +1246,7 @@ describe('UserMessageContent', () => {
     expect(popup?.textContent).toContain('four.ts');
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    flushSolid();
     expect(document.body.querySelector('.message-attachment-overflow-menu')).toBeNull();
   });
 
@@ -1021,6 +1258,7 @@ describe('UserMessageContent', () => {
         '[Selection from terminal zsh]\n```text\nnpm test\nfailed output\n```'
       ),
     ]);
+    flushSolid();
 
     const terminalBlock = container?.querySelector('.user-message-terminal-code-block');
     expect(terminalBlock).toBeInstanceOf(HTMLDivElement);
@@ -1038,12 +1276,15 @@ describe('UserMessageContent', () => {
     expect(preview?.getAttribute('tabindex')).toBe('0');
     const bubbledClick = vi.fn();
     container?.addEventListener('click', bubbledClick);
+    flushSolid();
 
     terminalBlock?.querySelector<HTMLElement>('.code-block-header')?.click();
+    flushSolid();
     expect(send).not.toHaveBeenCalled();
     expect(bubbledClick).toHaveBeenCalledTimes(1);
 
     terminalBlock?.querySelector<HTMLElement>('pre.code-block')?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-text',
       payload: {
@@ -1062,6 +1303,7 @@ describe('UserMessageContent', () => {
         '[Selection from terminal zsh]\n```text\nnpm test\nfailed output\n```'
       ),
     ]);
+    flushSolid();
 
     const attachments = container?.querySelector('.message-attachments');
     expect(attachments?.classList).toContain('message-attachments-leading');
@@ -1081,6 +1323,7 @@ describe('UserMessageContent', () => {
       ),
       imageFilePart('image-1', 'diagram.png'),
     ]);
+    flushSolid();
 
     expect(container?.querySelector('.user-message-terminal-code-block')).toBeNull();
     expect(container?.querySelector('.message-attachment-chip')?.textContent).toContain('zsh');
@@ -1095,6 +1338,7 @@ describe('UserMessageContent', () => {
         'Why does this fail?\n[Selection from terminal zsh]\n```text\nnpm test\nfailed output\n```'
       ),
     ]);
+    flushSolid();
 
     const strip = container?.querySelector('.message-attachments');
     expect(strip?.classList.contains('message-attachments-leading')).toBe(true);
@@ -1110,6 +1354,7 @@ describe('UserMessageContent', () => {
     );
 
     chip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-text',
       payload: {
@@ -1129,6 +1374,7 @@ describe('UserMessageContent', () => {
         '[Selection from terminal zsh]\n```text\nnpm test\nfailed output\n```'
       ),
     ]);
+    flushSolid();
 
     const text = container?.querySelector('.user-message-text');
     const chip = text?.querySelector<HTMLButtonElement>('.inline-chip');
@@ -1138,6 +1384,7 @@ describe('UserMessageContent', () => {
     expect(text?.textContent).not.toContain('[Terminal selection]');
     expect(container?.querySelector('.message-attachment-chip')).toBeNull();
     chip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-text',
       payload: {
@@ -1151,6 +1398,7 @@ describe('UserMessageContent', () => {
   it('renders a terminal selection without text as a non-clickable chip', () => {
     const send = installSendToExtension();
     renderUserContent([textPart('text-1', '[Selection from terminal zsh]')]);
+    flushSolid();
 
     const chip = container?.querySelector('.message-attachment-chip');
     expect(chip).toBeInstanceOf(HTMLSpanElement);
@@ -1160,16 +1408,21 @@ describe('UserMessageContent', () => {
     expect(container?.querySelector('.user-message-terminal-code-block')).toBeNull();
 
     chip?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    flushSolid();
     expect(send).not.toHaveBeenCalled();
   });
 
   it('resolves attachment opens against the workspace with selection lines and directory kind', () => {
     const send = installSendToExtension();
-    setAppState('editorContext', { ...state.editorContext, workspacePath: '/workspace' });
+    setAppState(
+      storePath('editorContext', { ...state.editorContext, workspacePath: '/workspace' })
+    );
+    flushSolid();
     renderUserContent([
       textPart('text-1', 'Review these\n[Selection from src/main.ts lines 2-4]'),
       textPart('text-2', 'assets/'),
     ]);
+    flushSolid();
 
     const chips = container?.querySelectorAll<HTMLButtonElement>(
       '.message-attachment-chip-clickable'
@@ -1183,6 +1436,7 @@ describe('UserMessageContent', () => {
     expect(selectionChip?.querySelector('.file-type-icon')).toBeInstanceOf(HTMLImageElement);
     expect(selectionChip?.querySelector('.chip-detail')?.textContent).toBe('L2-4');
     selectionChip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open',
       payload: { path: '/workspace/src/main.ts', line: 2, kind: 'file' },
@@ -1194,6 +1448,7 @@ describe('UserMessageContent', () => {
     expect(folderChip?.textContent).toContain('assets');
     expect(folderChip?.querySelector('.file-type-icon')).toBeNull();
     folderChip?.click();
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open',
       payload: { path: '/workspace/assets', line: undefined, kind: 'directory' },
@@ -1206,6 +1461,7 @@ describe('UserMessageContent', () => {
       textPart('text-2', 'README.md'),
       textPart('text-3', 'preview.html'),
     ]);
+    flushSolid();
 
     const messageText = container?.querySelector('.user-message-text');
     expect(messageText?.textContent?.trim()).toBe('Test README.md');
@@ -1229,6 +1485,7 @@ describe('UserMessageContent', () => {
       imageFilePart('image-1', 'Image 1'),
       imageFilePart('image-2', 'Image 2'),
     ]);
+    flushSolid();
 
     const messageText = container?.querySelector('.user-message-text');
     expect(messageText?.textContent?.trim()).toBe('Compare Image 1 with Image 2');
@@ -1239,6 +1496,7 @@ describe('UserMessageContent', () => {
     expect(imageChips.every((chip) => !chip.hasAttribute('title'))).toBe(true);
 
     imageChips[1]?.click();
+    flushSolid();
 
     const overlayImage = document.body.querySelector<HTMLImageElement>('.chat-image-preview-img');
     expect(overlayImage?.getAttribute('src')).toBe('https://example.test/image-2.png');
@@ -1250,6 +1508,7 @@ describe('UserMessageContent', () => {
 
   it('maps the legacy [Image] marker to the first image pill', () => {
     renderUserContent([textPart('text-1', 'Review [Image]'), imageFilePart('image-1', 'Image 1')]);
+    flushSolid();
 
     const imageChip = container?.querySelector('.user-message-text .inline-chip');
     expect(imageChip?.textContent?.trim()).toBe('Image 1');
@@ -1258,12 +1517,14 @@ describe('UserMessageContent', () => {
 
   it('renders a single image as a plain figure and closes its preview with Escape', () => {
     renderUserContent([imageFilePart('image-1', 'diagram.png')]);
+    flushSolid();
 
     expect(container?.querySelector('.message-image-carousel')).toBeNull();
     const trigger = container?.querySelector<HTMLButtonElement>('.chat-image-preview-trigger');
     expect(trigger?.getAttribute('aria-label')).toBe('Open image preview: diagram.png');
 
     trigger?.click();
+    flushSolid();
 
     expect(document.body.querySelector('.chat-image-preview-overlay')).toBeInstanceOf(
       HTMLDivElement
@@ -1274,6 +1535,7 @@ describe('UserMessageContent', () => {
     ).toBe('https://example.test/image-1.png');
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    flushSolid();
 
     expect(document.body.querySelector('.chat-image-preview-overlay')).toBeNull();
     expect(document.body.classList.contains('chat-image-preview-open')).toBe(false);
@@ -1281,6 +1543,7 @@ describe('UserMessageContent', () => {
 
   it('steps the image carousel with its navigation controls', () => {
     renderUserContent([imageFilePart('image-1', 'Image 1'), imageFilePart('image-2', 'Image 2')]);
+    flushSolid();
 
     const carousel = container?.querySelector('.message-image-carousel');
     expect(carousel).toBeInstanceOf(HTMLDivElement);
@@ -1298,6 +1561,7 @@ describe('UserMessageContent', () => {
       )
     ).toEqual([toCssUrl(navArrowLeftIcon), toCssUrl(navArrowRightIcon)]);
     navButtons?.[1]?.click();
+    flushSolid();
 
     expect(caption?.textContent).toContain('2 / 2');
     expect(caption?.textContent).toContain('Image 2');
@@ -1307,6 +1571,7 @@ describe('UserMessageContent', () => {
     );
 
     navButtons?.[0]?.click();
+    flushSolid();
 
     expect(caption?.textContent).toContain('1 / 2');
   });
@@ -1317,20 +1582,25 @@ describe('UserMessageContent', () => {
     '.session-reference-link .session-reference-icon',
   ])('selects a known session when clicking %s in a normal user message', (target) => {
     const send = installSendToExtension();
-    setAppState('activeSessionId', 'ses_origin123');
-    setAppState('sessions', [
-      {
-        id: 'ses_found123',
-        projectID: 'project-1',
-        directory: '/repo',
-        title: 'Permission request states',
-        version: '1',
-        time: { created: 0, updated: 0 },
-      },
-    ]);
+    setAppState(storePath('activeSessionId', 'ses_origin123'));
+    flushSolid();
+    setAppState(
+      storePath('sessions', [
+        {
+          id: 'ses_found123',
+          projectID: 'project-1',
+          directory: '/repo',
+          title: 'Permission request states',
+          version: '1',
+          time: { created: 0, updated: 0 },
+        },
+      ])
+    );
+    flushSolid();
     renderUserContent([
       textPart('text-1', 'Session session:ses_found123 and session:ses_missing456'),
     ]);
+    flushSolid();
 
     const link = container?.querySelector<HTMLAnchorElement>('a.session-reference-link');
     expect(link?.textContent).toBe('Permission request states');
@@ -1349,6 +1619,7 @@ describe('UserMessageContent', () => {
     const element = container!.querySelector(target);
     expect(element).not.toBeNull();
     element!.dispatchEvent(click);
+    flushSolid();
     expect(click.defaultPrevented).toBe(true);
     expect(selectSessionMock).toHaveBeenCalledExactlyOnceWith('ses_found123', {
       directory: '/repo',
@@ -1362,17 +1633,21 @@ describe('UserMessageContent', () => {
     (loading) => {
       const send = installSendToExtension();
       const onClick = vi.fn();
-      setAppState('activeSessionId', 'ses_origin123');
-      setAppState('sessions', [
-        {
-          id: 'ses_found123',
-          projectID: 'project-1',
-          directory: '/repo',
-          title: 'Permission request states',
-          version: '1',
-          time: { created: 0, updated: 0 },
-        },
-      ]);
+      setAppState(storePath('activeSessionId', 'ses_origin123'));
+      flushSolid();
+      setAppState(
+        storePath('sessions', [
+          {
+            id: 'ses_found123',
+            projectID: 'project-1',
+            directory: '/repo',
+            title: 'Permission request states',
+            version: '1',
+            time: { created: 0, updated: 0 },
+          },
+        ])
+      );
+      flushSolid();
       const preview = {
         id: 'msg-1',
         index: 3,
@@ -1391,6 +1666,7 @@ describe('UserMessageContent', () => {
         ),
         container!
       );
+      flushSolid();
 
       for (const selector of ['.link-leading-label', '.session-reference-icon']) {
         onClick.mockClear();
@@ -1398,6 +1674,7 @@ describe('UserMessageContent', () => {
         expect(target).not.toBeNull();
         const click = new MouseEvent('click', { bubbles: true, cancelable: true });
         target!.dispatchEvent(click);
+        flushSolid();
         expect(click.defaultPrevented).toBe(true);
         if (loading) expect(onClick).not.toHaveBeenCalled();
         else expect(onClick).toHaveBeenCalledExactlyOnceWith(preview);
@@ -1408,11 +1685,207 @@ describe('UserMessageContent', () => {
     }
   );
 
+  describe('cross-project session references in plain user messages', () => {
+    const external: SessionLookup = {
+      id: 'ses_external123',
+      title: 'Review release',
+      directory: '/projects/other',
+      external: true,
+    };
+    let lookupScope = 0;
+
+    function installSessionLookups() {
+      const lookup = vi
+        .spyOn(client.varro.session, 'reference')
+        .mockImplementation(async (id: string) => {
+          if (id === external.id) return external;
+          throw new Error(`Unknown session ${id}`);
+        });
+      const open = vi.spyOn(client.varro.session, 'openReference').mockResolvedValue();
+      const warn = vi.spyOn(feedback, 'showSessionActionFeedback').mockImplementation(() => {});
+      // A unique server URL gives each test a fresh lookup cache scope.
+      lookupScope += 1;
+      setAppState(
+        storePath('serverStatus', {
+          state: 'running',
+          url: `http://localhost/user-message-references-${lookupScope}`,
+        })
+      );
+      setAppState(storePath('activeSessionId', 'ses_origin123'));
+      return { lookup, open, warn };
+    }
+
+    async function waitForExternalLink(): Promise<HTMLAnchorElement> {
+      await vi.waitFor(() =>
+        expect(container?.querySelector('a.session-reference-link')?.textContent).toBe(
+          'Review release · other'
+        )
+      );
+      return container!.querySelector<HTMLAnchorElement>('a.session-reference-link')!;
+    }
+
+    it.each([
+      ['bare', 'Check ses_external123 too', 'ses_external123'],
+      ['prefixed', 'Check session:ses_external123 too', 'session:ses_external123'],
+    ])(
+      'resolves a %s ID without assistant rendering and labels its project',
+      async (_kind, text, marker) => {
+        const send = installSendToExtension();
+        const { lookup, open } = installSessionLookups();
+        flushSolid();
+        renderUserContent([textPart('text-1', text)]);
+        flushSolid();
+
+        // Plain prose path, not the Markdown renderer used by assistant messages.
+        expect(container?.querySelector('.user-message-markdown')).toBeNull();
+        const link = await waitForExternalLink();
+        flushSolid();
+        expect(lookup).toHaveBeenCalledExactlyOnceWith('ses_external123');
+        expect(link.closest('p.user-message-text')).not.toBeNull();
+        flushSolid();
+        expect(link.getAttribute('href')).toBe('#session/ses_external123');
+        expect(link.getAttribute('data-copy-marker')).toBe(marker);
+        expect(link.dataset.sessionId).toBe('ses_external123');
+        expect(link.dataset.sessionDirectory).toBe('/projects/other');
+        expect(link.dataset.sessionExternal).toBe('true');
+        expect(link.getAttribute('title')).toBe('Open project folder /projects/other');
+        expect(link.querySelector('.session-reference-folder')?.textContent).toBe(' · other');
+        expect(JSON.parse(link.getAttribute('data-vscode-context') ?? '{}')).toMatchObject({
+          varroLinkText: 'Review release · other',
+        });
+        expect(container?.querySelector('.user-message-text')?.textContent).toBe(
+          'Check Review release · other too'
+        );
+        expect(open).not.toHaveBeenCalled();
+        expect(send).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each([
+      'a.session-reference-link',
+      '.session-reference-link .link-leading-label',
+      '.session-reference-link .session-reference-icon',
+      '.session-reference-link .session-reference-folder',
+    ])('opens the project window when clicking %s', async (target) => {
+      const send = installSendToExtension();
+      const { open, warn } = installSessionLookups();
+      flushSolid();
+      renderUserContent([textPart('text-1', 'Check session:ses_external123 too')]);
+      flushSolid();
+      await waitForExternalLink();
+      flushSolid();
+
+      const element = container!.querySelector(target);
+      expect(element).not.toBeNull();
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+      element!.dispatchEvent(click);
+      flushSolid();
+
+      expect(click.defaultPrevented).toBe(true);
+      expect(open).toHaveBeenCalledExactlyOnceWith('ses_external123');
+      expect(selectSessionMock).not.toHaveBeenCalled();
+      expect(getDirectSessionReturnId('ses_external123')).toBeNull();
+      expect(state.activeSessionId).toBe('ses_origin123');
+      expect(send).not.toHaveBeenCalled();
+      await Promise.resolve();
+      flushSolid();
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('updates mounted links when the referenced project joins or leaves the workspace', async () => {
+      const { lookup, open } = installSessionLookups();
+      flushSolid();
+      lookup
+        .mockResolvedValueOnce(external)
+        .mockResolvedValueOnce({ ...external, external: false });
+      setAppState(storePath('editorContext', 'workspacePath', '/repo'));
+      flushSolid();
+      const currentFolder = { name: 'repo', path: '/repo' };
+      setAppState(storePath('editorContext', 'workspaceFolders', [currentFolder]));
+      flushSolid();
+      renderUserContent([textPart('text-1', 'Check ses_external123 too')]);
+      flushSolid();
+      await waitForExternalLink();
+      flushSolid();
+
+      setAppState(
+        storePath('editorContext', 'workspaceFolders', [
+          currentFolder,
+          { name: 'other project', path: external.directory },
+        ])
+      );
+      flushSolid();
+      const link = () => container?.querySelector<HTMLAnchorElement>('a.session-reference-link');
+      await vi.waitFor(() => expect(link()?.title).toBe(`Open session ${external.id}`));
+      flushSolid();
+      link()?.click();
+      flushSolid();
+      expect(selectSessionMock).toHaveBeenCalledExactlyOnceWith(external.id, {
+        directory: external.directory,
+      });
+      expect(open).not.toHaveBeenCalled();
+
+      setAppState(storePath('editorContext', 'workspaceFolders', [currentFolder]));
+      flushSolid();
+      await waitForExternalLink();
+      flushSolid();
+      link()?.click();
+      flushSolid();
+      expect(open).toHaveBeenCalledExactlyOnceWith(external.id);
+      expect(lookup).toHaveBeenCalledTimes(3);
+    });
+
+    it('keeps unknown IDs as plain text beside a resolved reference', async () => {
+      const { lookup } = installSessionLookups();
+      flushSolid();
+      renderUserContent([
+        textPart('text-1', 'Open ses_external123 first'),
+        textPart('text-2', 'Skip session:ses_missing456 later'),
+      ]);
+      flushSolid();
+      await waitForExternalLink();
+      flushSolid();
+      await vi.waitFor(() => expect(lookup).toHaveBeenCalledWith('ses_missing456'));
+      flushSolid();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSolid();
+
+      expect(container?.querySelectorAll('a.session-reference-link')).toHaveLength(1);
+      expect(container?.querySelectorAll('.user-message-text')[1]?.textContent).toBe(
+        'Skip session:ses_missing456 later'
+      );
+      expect(container?.querySelector('[data-session-id="ses_missing456"]')).toBeNull();
+    });
+
+    it('warns without falling back to local selection when the project window cannot open', async () => {
+      const { open, warn } = installSessionLookups();
+      flushSolid();
+      open.mockRejectedValue(new Error('No project window'));
+      renderUserContent([textPart('text-1', 'Check ses_external123 too')]);
+      flushSolid();
+      const link = await waitForExternalLink();
+      flushSolid();
+
+      link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      flushSolid();
+
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledExactlyOnceWith('Could not open the project window', 'warning')
+      );
+      flushSolid();
+      expect(open).toHaveBeenCalledExactlyOnceWith('ses_external123');
+      expect(selectSessionMock).not.toHaveBeenCalled();
+      expect(getDirectSessionReturnId('ses_external123')).toBeNull();
+      expect(state.activeSessionId).toBe('ses_origin123');
+    });
+  });
+
   it.each(['https://example.test/docs', 'http://localhost:3000', 'http://app.above-all.test/x'])(
     'renders %s as an external link and opens it through the bridge',
     (url) => {
       const send = installSendToExtension();
       renderUserContent([textPart('text-1', `See ${url}.`)]);
+      flushSolid();
 
       const links = container?.querySelectorAll<HTMLAnchorElement>('a.external-link');
       expect(links).toHaveLength(1);
@@ -1429,6 +1902,7 @@ describe('UserMessageContent', () => {
       expect(container?.querySelector('.user-message-text')?.textContent).toContain(`See ${url}.`);
 
       link?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      flushSolid();
       expect(send).toHaveBeenCalledWith({
         type: 'vscode/open-external',
         payload: { url },
@@ -1440,13 +1914,17 @@ describe('UserMessageContent', () => {
     'offers complete label Copy and Copy path for a user-message folder link to %s',
     (href) => {
       vi.spyOn(citationPathChecks, 'peek').mockReturnValue('/repo/src');
-      setAppState('editorContext', {
-        workspacePath: '/repo',
-        activeFile: null,
-        selection: null,
-        diagnostics: [],
-      });
+      setAppState(
+        storePath('editorContext', {
+          workspacePath: '/repo',
+          activeFile: null,
+          selection: null,
+          diagnostics: [],
+        })
+      );
+      flushSolid();
       renderUserContent([textPart('text-1', `[Project folder](${href})`)]);
+      flushSolid();
       const link = container!.querySelector('a.file-path-link');
       expect(link?.textContent).toBe('Project folder');
       expect(JSON.parse(link?.getAttribute('data-vscode-context') ?? '{}')).toEqual({
@@ -1460,6 +1938,7 @@ describe('UserMessageContent', () => {
 
   it('keeps one-line prose ending in a URL as message text', () => {
     renderUserContent([textPart('text-1', 'Test message https://iconoir.com')]);
+    flushSolid();
 
     expect(container?.querySelector('.message-attachments')).toBeNull();
     expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(
@@ -1475,13 +1954,16 @@ describe('UserMessageContent', () => {
     (url) => {
       const send = installSendToExtension();
       renderUserContent([textPart('text-1', `See ${url}.`)]);
+      flushSolid();
       const hostLinkHandler = vi.fn();
       window.addEventListener('click', hostLinkHandler);
+      flushSolid();
       try {
         const linkLabel = container!.querySelector('.external-link .link-leading-label');
         expect(linkLabel).not.toBeNull();
         const event = new MouseEvent('click', { bubbles: true, cancelable: true });
         linkLabel!.dispatchEvent(event);
+        flushSolid();
 
         expect(event.defaultPrevented).toBe(true);
         expect(send).toHaveBeenCalledExactlyOnceWith({
@@ -1491,6 +1973,7 @@ describe('UserMessageContent', () => {
         expect(hostLinkHandler).not.toHaveBeenCalled();
       } finally {
         window.removeEventListener('click', hostLinkHandler);
+        flushSolid();
       }
     }
   );
@@ -1500,6 +1983,7 @@ describe('UserMessageContent', () => {
     const prompt =
       'All JS should be strongly typed similar as in git@github.com:koltyakov/browser-bridge.git';
     renderUserContent([textPart('text-1', prompt)]);
+    flushSolid();
 
     expect(container?.querySelector('.message-attachments')).toBeNull();
     expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(prompt);
@@ -1508,6 +1992,7 @@ describe('UserMessageContent', () => {
     expect(link?.querySelector('.material-chip-icon')).toBeInstanceOf(HTMLImageElement);
 
     link?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    flushSolid();
     expect(send).toHaveBeenCalledWith({
       type: 'vscode/open-external',
       payload: { url: 'https://github.com/koltyakov/browser-bridge' },
@@ -1539,6 +2024,7 @@ describe('UserMessageContent', () => {
       ),
       image,
     ]);
+    flushSolid();
 
     expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(
       "What's on this image? Image 1 Vision"
@@ -1555,6 +2041,7 @@ describe('UserMessageContent', () => {
 
   it('renders agent parts as leading chips when not mentioned in the text', () => {
     renderUserContent([textPart('text-1', 'Run the review'), agentPart('agent-1', 'vision')]);
+    flushSolid();
 
     const strip = container?.querySelector('.message-attachments');
     expect(strip?.classList.contains('message-attachments-leading')).toBe(true);
@@ -1578,6 +2065,7 @@ describe('UserMessageContent', () => {
       const image = imageFilePart('image-1', 'Image 1');
       const parts = [textPart('joined', `${prompt}${separator}${context}`), image];
       renderUserContent(parts);
+      flushSolid();
 
       expect(container?.querySelector('.user-message-text')?.textContent?.trim()).toBe(prompt);
       expect(getUserMessageEditText(parts)).toBe(prompt);
@@ -1632,14 +2120,18 @@ describe('UserMessageContent', () => {
   );
 
   it('renders textual agent mentions from known agents as inline chips', () => {
-    setAppState('allAgents', [
-      {
-        name: 'vision',
-        mode: 'subagent',
-        permission: [],
-      },
-    ]);
+    setAppState(
+      storePath('allAgents', [
+        {
+          name: 'vision',
+          mode: 'subagent',
+          permission: [],
+        },
+      ])
+    );
+    flushSolid();
     renderUserContent([textPart('text-1', "What's on the image? @vision")]);
+    flushSolid();
 
     const chip = container?.querySelector('.user-message-text .inline-chip');
     expect(chip?.textContent).toBe('Vision');
@@ -1649,6 +2141,7 @@ describe('UserMessageContent', () => {
 
   it('toggles the overflow fade as the prompt text scrolls', () => {
     renderUserContent([textPart('text-1', 'A long prompt')]);
+    flushSolid();
 
     const scrollContainer = container?.querySelector<HTMLElement>('.user-message-text-scroll');
     expect(scrollContainer).not.toBeNull();
@@ -1659,10 +2152,12 @@ describe('UserMessageContent', () => {
 
     scrollContainer!.scrollTop = 0;
     scrollContainer!.dispatchEvent(new Event('scroll'));
+    flushSolid();
     expect(scrollContainer?.classList.contains('has-more-below')).toBe(true);
 
     scrollContainer!.scrollTop = 140;
     scrollContainer!.dispatchEvent(new Event('scroll'));
+    flushSolid();
     expect(scrollContainer?.classList.contains('has-more-below')).toBe(false);
   });
 
@@ -1672,13 +2167,16 @@ describe('UserMessageContent', () => {
       textPart('text-2', 'handlers.js'),
       textPart('text-3', 'README.md'),
     ]);
+    flushSolid();
 
     const messageCard = container?.querySelector<HTMLElement>('.rendered-markdown');
     const selection = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(messageCard!);
     selection?.removeAllRanges();
+    flushSolid();
     selection?.addRange(range);
+    flushSolid();
 
     const setData = vi.fn();
     const event = new Event('copy', { bubbles: true, cancelable: true });
@@ -1687,12 +2185,47 @@ describe('UserMessageContent', () => {
     });
 
     messageCard?.dispatchEvent(event);
+    flushSolid();
 
     expect(setData).toHaveBeenCalledWith('text/plain', 'Check @handlers.js and @README.md today');
+  });
+
+  it('copies a goal skill chip as the original slash command', () => {
+    renderUserContent([textPart('prompt', '/goal Wait for 1 minute')]);
+    flushSolid();
+    const message = container?.querySelector<HTMLElement>('.rendered-markdown');
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(message!);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    const setData = vi.fn();
+    const event = new Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: { setData } });
+    message?.dispatchEvent(event);
+    flushSolid();
+    expect(setData).toHaveBeenCalledWith('text/plain', '/goal Wait for 1 minute');
   });
 });
 
 describe('UserMessagePreviewContent', () => {
+  it('formats the goal command as a skill chip in the sticky preview', () => {
+    cleanup = render(
+      () => (
+        <UserMessagePreviewContent
+          parts={[textPart('prompt', '/goal Wait for 1 minute')]}
+          fallback="Fallback"
+        />
+      ),
+      container!
+    );
+    flushSolid();
+    const chip = container?.querySelector('.inline-chip[data-copy-marker="/goal"]');
+    expect(chip?.textContent).toBe('goal');
+    expect(chip?.querySelector('[data-chip-icon="skill"]')).not.toBeNull();
+    expect(container?.textContent).toBe('goal Wait for 1 minute');
+  });
+
   it('renders the first meaningful text with inline chips', () => {
     cleanup = render(
       () =>
@@ -1706,6 +2239,7 @@ describe('UserMessagePreviewContent', () => {
         }),
       container!
     );
+    flushSolid();
 
     const messageText = container?.querySelector('.user-message-text');
     expect(messageText?.textContent?.trim()).toBe('Check README.md');
@@ -1723,6 +2257,7 @@ describe('UserMessagePreviewContent', () => {
         }),
       container!
     );
+    flushSolid();
 
     const messageText = container?.querySelector('.user-message-text');
     expect(messageText).toBeInstanceOf(HTMLParagraphElement);
@@ -1739,6 +2274,7 @@ describe('UserMessagePreviewContent', () => {
         }),
       container!
     );
+    flushSolid();
 
     expect(container?.textContent).toBe('Attachments only');
     expect(container?.querySelector('.user-message-text')).toBeNull();
@@ -1759,6 +2295,7 @@ describe('getUserMessageMarkupSuffix', () => {
     const suffix = getUserMessageMarkupSuffix(prompt);
     expect(suffix?.prefix).toBe('In input, change the agent chip icon to');
     expect(suffix?.content.startsWith('<?xml')).toBe(true);
+    flushSolid();
     expect(suffix?.format).toEqual({ kind: 'svg', byteSize: 143 });
   });
 

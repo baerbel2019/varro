@@ -1,6 +1,7 @@
+import { flush as flushSolid, reconcile } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render } from 'solid-js/web';
-import { reconcile } from 'solid-js/store';
+import { render } from '@solidjs/web';
 import type { ProviderAuthMethod } from '../../shared/opencode-types';
 import type { Provider } from '../types';
 import { codexLoginWarningDismissal } from '../lib/codex-login-warning';
@@ -57,6 +58,11 @@ let cleanup: (() => void) | undefined;
 let originalResizeObserver: typeof globalThis.ResizeObserver | undefined;
 let originalClipboardDescriptor: PropertyDescriptor | undefined;
 
+function applyState(setter: Parameters<typeof setState>[0]) {
+  setState(setter);
+  flushSolid();
+}
+
 function catalogProvider(id: string, name = id): Provider {
   return { id, name, source: 'api', models: {} };
 }
@@ -82,6 +88,7 @@ function renderDialog(overrides: Partial<DialogProps> = {}) {
     ...overrides,
   };
   cleanup = render(() => ProviderConnectionDialog(props), container!);
+  flushSolid();
   return onClose;
 }
 
@@ -128,6 +135,12 @@ function alertText() {
 function type(input: HTMLInputElement, value: string) {
   input.value = value;
   input.dispatchEvent(new Event('input', { bubbles: true }));
+  flushSolid();
+}
+
+function click(target: HTMLElement) {
+  target.click();
+  flushSolid();
 }
 
 function pressKey(element: HTMLElement, key: string) {
@@ -143,13 +156,13 @@ async function flush(count = 6) {
 }
 
 function chooseProvider(name: string) {
-  optionByName(name).click();
+  click(optionByName(name));
 }
 
 function chooseMethod(label: string) {
   const button = methodButton(label);
   if (!button) throw new Error(`No auth method labelled ${label}`);
-  button.click();
+  click(button);
 }
 
 async function startApiFlow() {
@@ -161,7 +174,9 @@ async function startApiFlow() {
 }
 
 it('finishes an external credential connection without a key, browser handoff, or OAuth callback', async () => {
-  setState('providerAuthMethods', 'openai', [{ type: 'external', label: 'CLI credentials' }]);
+  applyState(
+    storePath('providerAuthMethods', 'openai', [{ type: 'external', label: 'CLI credentials' }])
+  );
   clientMocks.authorizeProvider.mockResolvedValue({
     url: '',
     method: 'complete',
@@ -171,8 +186,9 @@ it('finishes an external credential connection without a key, browser handoff, o
   chooseProvider('OpenAI');
   chooseMethod('CLI credentials');
   expect(dialog()!.querySelector('input[type="password"]')).toBeNull();
-  primaryButton().click();
+  click(primaryButton());
   await flush();
+  flushSolid();
   expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
     { providerID: 'openai', method: 0, inputs: {} },
     { signal: expect.any(AbortSignal) }
@@ -189,14 +205,18 @@ it.each([false, true])(
   'uses Claude Code login and waits for confirmation before reconnecting (auth methods loaded: %s)',
   async (methodsLoaded) => {
     if (methodsLoaded) {
-      setState('providerAuthMethods', 'claude-agent', [
-        {
-          type: 'external',
-          label: 'Claude Code login (claude auth login)',
-        },
-      ]);
+      applyState(
+        storePath('providerAuthMethods', 'claude-agent', [
+          {
+            type: 'external',
+            label: 'Claude Code login (claude auth login)',
+          },
+        ])
+      );
     }
+    flushSolid();
     markProviderAuthFailure('claude-agent', 'message-1');
+    flushSolid();
     clientMocks.authorizeProvider.mockResolvedValue({
       url: '',
       method: 'complete',
@@ -213,14 +233,15 @@ it.each([false, true])(
     expect(dialog()?.querySelector('input[type="password"]')).toBeNull();
     expect(primaryButton().textContent).toBe("I've signed in");
 
-    findButton('Run claude auth login')!.click();
+    click(findButton('Run claude auth login')!);
     expect(openProviderSetupMock).toHaveBeenCalledWith('claude-agent');
     expect(clientMocks.authorizeProvider).not.toHaveBeenCalled();
     expect(providerRequiresReconnection('claude-agent')).toBe(true);
     expect(onClose).not.toHaveBeenCalled();
 
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
       { providerID: 'claude-agent', method: 0, inputs: {} },
       { signal: expect.any(AbortSignal) }
@@ -238,13 +259,14 @@ it.each([false, true])(
 
 it('routes Claude Agent terminal fallback to Claude Code without prematurely completing reauthentication', () => {
   markProviderAuthFailure('claude-agent', 'message-1');
+  flushSolid();
   const onClose = renderDialog({
     catalogProviders: [catalogProvider('claude-agent', 'Claude Agent')],
     initialProviderID: 'claude-agent',
     lockProvider: true,
     reauthentication: true,
   });
-  findButton('Use terminal setup')!.click();
+  click(findButton('Use terminal setup')!);
   expect(openProviderSetupMock).toHaveBeenCalledWith('claude-agent');
   expect(providerRequiresReconnection('claude-agent')).toBe(true);
   expect(onClose).not.toHaveBeenCalled();
@@ -255,7 +277,9 @@ beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   resetDefaultAppState();
+  flushSolid();
   resetProviderConnectionState();
+  flushSolid();
   originalResizeObserver = globalThis.ResizeObserver;
   originalClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
   // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
@@ -277,25 +301,35 @@ beforeEach(() => {
   clientMocks.completeProviderAuth.mockResolvedValue(true);
   clientMocks.connectApiProvider.mockResolvedValue(true);
   codexLoginWarningDismissal.reset();
-  setState('providerAuthMethods', {
-    anthropic: [{ type: 'oauth', label: 'Claude subscription' }],
-    openai: [{ type: 'api', label: 'API key' }],
-  });
+  flushSolid();
+  applyState(
+    storePath('providerAuthMethods', {
+      anthropic: [{ type: 'oauth', label: 'Claude subscription' }],
+      openai: [{ type: 'api', label: 'API key' }],
+    })
+  );
 });
 
 afterEach(() => {
   cleanup?.();
+  flushSolid();
   cleanup = undefined;
   container?.remove();
+  flushSolid();
   container = null;
   resetDefaultAppState();
+  flushSolid();
   resetProviderConnectionState();
+  flushSolid();
   if (originalResizeObserver) globalThis.ResizeObserver = originalResizeObserver;
   else Reflect.deleteProperty(globalThis, 'ResizeObserver');
+  flushSolid();
   if (originalClipboardDescriptor)
     Object.defineProperty(navigator, 'clipboard', originalClipboardDescriptor);
   else Reflect.deleteProperty(navigator, 'clipboard');
+  flushSolid();
   vi.restoreAllMocks();
+  flushSolid();
 });
 
 describe('ProviderConnectionDialog provider list', () => {
@@ -315,14 +349,17 @@ describe('ProviderConnectionDialog provider list', () => {
   });
 
   it('includes auth-plugin-only providers named from configured state or a formatted id', () => {
-    setState(
-      'providerAuthMethods',
-      reconcile({
+    applyState((draft) => {
+      const current = draft['providerAuthMethods'];
+      const incoming = {
         'auth-only': [{ type: 'oauth', label: 'Auth only login' }],
         'zendesk-chat': [{ type: 'oauth', label: 'Zendesk login' }],
-      })
-    );
-    setState('providers', [catalogProvider('zendesk-chat', 'Zendesk Support')]);
+      } satisfies typeof current;
+      if (incoming === null || incoming === undefined || current === null || current === undefined)
+        draft['providerAuthMethods'] = incoming;
+      else reconcile(incoming)(current);
+    });
+    applyState(storePath('providers', [catalogProvider('zendesk-chat', 'Zendesk Support')]));
 
     renderDialog({ catalogProviders: [] });
 
@@ -350,6 +387,20 @@ describe('ProviderConnectionDialog provider list', () => {
     expect(alertText()).toContain('Could not load the full provider catalog');
     expect(alertText()).toContain('Catalog request failed (503)');
     expect(optionByName('Openai')).toBeInstanceOf(HTMLButtonElement);
+  });
+
+  it('does not describe an unfiltered empty list as a search miss', () => {
+    // Replace rather than merge, so no auth-plugin fallback providers remain.
+    applyState((draft) => {
+      draft.providerAuthMethods = {};
+    });
+    applyState(storePath('providers', []));
+
+    renderDialog({ catalogProviders: [] });
+
+    expect(optionElements()).toHaveLength(0);
+    expect(dialog()?.textContent).toContain('No providers available.');
+    expect(dialog()?.textContent).not.toContain('No matching providers.');
   });
 
   it('filters providers by name or id and reports empty results', () => {
@@ -381,13 +432,17 @@ describe('ProviderConnectionDialog provider list', () => {
     expect(search.getAttribute('aria-activedescendant')).toBe('provider-connect-option-0');
 
     pressKey(search, 'ArrowDown');
+    flushSolid();
     expect(search.getAttribute('aria-activedescendant')).toBe('provider-connect-option-1');
 
     pressKey(search, 'ArrowUp');
+    flushSolid();
     expect(search.getAttribute('aria-activedescendant')).toBe('provider-connect-option-0');
 
     pressKey(search, 'ArrowDown');
+    flushSolid();
     const enter = pressKey(search, 'Enter');
+    flushSolid();
 
     expect(enter.defaultPrevented).toBe(true);
     expect(searchInput()).toBeNull();
@@ -406,10 +461,12 @@ describe('ProviderConnectionDialog method selection', () => {
   it.each([true, false])(
     'preselects Codex browser from a warning without starting OAuth (IDs: %s)',
     async (withIDs) => {
-      setState(
-        'providerAuthMethods',
-        'openai',
-        openaiMethods.map(({ id, ...method }) => (withIDs ? { id, ...method } : method))
+      applyState(
+        storePath(
+          'providerAuthMethods',
+          'openai',
+          openaiMethods.map(({ id, ...method }) => (withIDs ? { id, ...method } : method))
+        )
       );
       renderDialog({
         initialProviderID: 'openai',
@@ -418,8 +475,9 @@ describe('ProviderConnectionDialog method selection', () => {
       });
       expect(dialog()!.querySelector('.provider-connect-form')).not.toBeNull();
       expect(clientMocks.authorizeProvider).not.toHaveBeenCalled();
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
       expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
         { providerID: 'openai', method: 3, inputs: {} },
         { signal: expect.any(AbortSignal) }
@@ -428,7 +486,7 @@ describe('ProviderConnectionDialog method selection', () => {
   );
 
   it('leaves method selection open if Codex browser is unavailable', () => {
-    setState('providerAuthMethods', 'openai', [openaiMethods[1]!]);
+    applyState(storePath('providerAuthMethods', 'openai', [openaiMethods[1]!]));
     renderDialog({
       initialProviderID: 'openai',
       initialMethodID: 'chatgpt-browser',
@@ -445,25 +503,27 @@ describe('ProviderConnectionDialog method selection', () => {
     const input = dialog()!.querySelector<HTMLInputElement>('input[type="password"]')!;
     type(input, 'test-key');
     expect(codexLoginWarningDismissal.read()?.dismissed).toBe(true);
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     expect(codexLoginWarningDismissal.read()).toBeNull();
   });
 
   it('retains the saved notice dismissal when authentication fails or is cancelled', async () => {
     codexLoginWarningDismissal.dismiss('connection');
     clientMocks.authorizeProvider.mockRejectedValue(new Error('Authentication failed'));
-    setState('providerAuthMethods', 'openai', openaiMethods);
+    applyState(storePath('providerAuthMethods', 'openai', openaiMethods));
     renderDialog({
       initialProviderID: 'openai',
       initialMethodID: 'chatgpt-browser',
       lockProvider: true,
     });
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     expect(codexLoginWarningDismissal.read()?.dismissed).toBe(true);
-    findButton('Back to methods')!.click();
-    dialog()!.querySelector<HTMLButtonElement>('[aria-label="Close"]')!.click();
+    click(findButton('Back to methods')!);
+    click(dialog()!.querySelector<HTMLButtonElement>('[aria-label="Close"]')!);
     expect(codexLoginWarningDismissal.read()?.dismissed).toBe(true);
   });
 
@@ -473,7 +533,7 @@ describe('ProviderConnectionDialog method selection', () => {
       const methods = openaiMethods.map(({ id, ...method }) =>
         withIDs ? { id, ...method } : method
       );
-      setState('providerAuthMethods', 'openai', methods);
+      applyState(storePath('providerAuthMethods', 'openai', methods));
       renderDialog({ initialProviderID: 'openai' });
 
       const buttons = Array.from(dialog()!.querySelectorAll('.provider-connect-method'));
@@ -511,11 +571,12 @@ describe('ProviderConnectionDialog method selection', () => {
     ['ChatGPT via Codex device code', 2],
     ['ChatGPT token sharing', 1],
   ] as const)('keeps the original auth index for %s after reordering', async (label, index) => {
-    setState('providerAuthMethods', 'openai', openaiMethods);
+    applyState(storePath('providerAuthMethods', 'openai', openaiMethods));
     renderDialog({ initialProviderID: 'openai', lockProvider: true, reauthentication: true });
     chooseMethod(label);
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
       { providerID: 'openai', method: index, inputs: {} },
@@ -529,10 +590,12 @@ describe('ProviderConnectionDialog method selection', () => {
   });
 
   it('uses stable OpenAI IDs even if upstream changes the labels', () => {
-    setState('providerAuthMethods', 'openai', [
-      { id: 'chatgpt-token-sharing', type: 'oauth', label: 'New sharing label' },
-      { id: 'chatgpt-browser', type: 'oauth', label: 'New browser label' },
-    ]);
+    applyState(
+      storePath('providerAuthMethods', 'openai', [
+        { id: 'chatgpt-token-sharing', type: 'oauth', label: 'New sharing label' },
+        { id: 'chatgpt-browser', type: 'oauth', label: 'New browser label' },
+      ])
+    );
     renderDialog({ initialProviderID: 'openai' });
 
     expect(methodButton('ChatGPT via Codex')?.textContent).toContain('Recommended');
@@ -540,10 +603,12 @@ describe('ProviderConnectionDialog method selection', () => {
   });
 
   it('leaves unknown OpenAI OAuth methods unchanged and does not recommend a missing browser method', () => {
-    setState('providerAuthMethods', 'openai', [
-      { id: 'custom-login', type: 'oauth', label: 'Codex browser (legacy)' },
-      openaiMethods[1]!,
-    ]);
+    applyState(
+      storePath('providerAuthMethods', 'openai', [
+        { id: 'custom-login', type: 'oauth', label: 'Codex browser (legacy)' },
+        openaiMethods[1]!,
+      ])
+    );
     renderDialog({ initialProviderID: 'openai' });
 
     expect(methodButton('Codex browser (legacy)')).toBeInstanceOf(HTMLButtonElement);
@@ -551,7 +616,7 @@ describe('ProviderConnectionDialog method selection', () => {
   });
 
   it('does not relabel or reorder other providers', () => {
-    setState('providerAuthMethods', 'anthropic', openaiMethods);
+    applyState(storePath('providerAuthMethods', 'anthropic', openaiMethods));
     renderDialog({ initialProviderID: 'anthropic' });
 
     expect(
@@ -590,12 +655,14 @@ describe('ProviderConnectionDialog method selection', () => {
   });
 
   it('lists each auth method with its label and type, then opens the OAuth handoff', () => {
-    setState('providerAuthMethods', {
-      openai: [
-        { type: 'oauth', label: 'ChatGPT subscription' },
-        { type: 'api', label: 'API key' },
-      ],
-    });
+    applyState(
+      storePath('providerAuthMethods', {
+        openai: [
+          { type: 'oauth', label: 'ChatGPT subscription' },
+          { type: 'api', label: 'API key' },
+        ],
+      })
+    );
     renderDialog();
 
     chooseProvider('OpenAI');
@@ -625,7 +692,7 @@ describe('ProviderConnectionDialog method selection', () => {
   });
 
   it('directs providers without embedded methods to terminal setup', () => {
-    setState('providerAuthMethods', { 'legacy-idp': [] });
+    applyState(storePath('providerAuthMethods', { 'legacy-idp': [] }));
     renderDialog({ catalogProviders: [catalogProvider('legacy-idp', 'Legacy')] });
 
     chooseProvider('Legacy');
@@ -641,7 +708,7 @@ describe('ProviderConnectionDialog method selection', () => {
 
     chooseProvider('OpenAI');
     expect(findButton('Back to providers')).toBeInstanceOf(HTMLButtonElement);
-    findButton('Back to providers')!.click();
+    click(findButton('Back to providers')!);
 
     expect(searchInput()).toBeInstanceOf(HTMLInputElement);
     expect(dialog()?.querySelector('.provider-connect-method')).toBeNull();
@@ -652,6 +719,7 @@ describe('ProviderConnectionDialog API key flow', () => {
   it('keeps Connect disabled until a non-blank API key is entered', async () => {
     renderDialog();
     const keyInput = await startApiFlow();
+    flushSolid();
 
     expect(primaryButton().textContent).toBe('Connect');
     expect(primaryButton().disabled).toBe(true);
@@ -667,13 +735,16 @@ describe('ProviderConnectionDialog API key flow', () => {
 
   it('connects with the trimmed key, reports the auth change, and clears failure notices', async () => {
     markProviderAuthFailure('openai', 'message-1');
+    flushSolid();
     expect(providerRequiresReconnection('openai')).toBe(true);
     const onClose = renderDialog();
     const keyInput = await startApiFlow();
+    flushSolid();
 
     type(keyInput, '  sk-test  ');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(clientMocks.connectApiProvider).toHaveBeenCalledWith(
       { providerID: 'openai', key: 'sk-test', metadata: {} },
@@ -694,8 +765,9 @@ describe('ProviderConnectionDialog API key flow', () => {
     const keyInput = dialog()!.querySelector<HTMLInputElement>('input[type="password"]')!;
 
     type(keyInput, 'sk-again');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(postMessageMock).toHaveBeenCalledWith({ type: 'providers/auth-changed' });
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -705,10 +777,12 @@ describe('ProviderConnectionDialog API key flow', () => {
     clientMocks.connectApiProvider.mockRejectedValue(new Error('Invalid API key'));
     const onClose = renderDialog();
     const keyInput = await startApiFlow();
+    flushSolid();
 
     type(keyInput, 'sk-bad');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(alertText()).toContain('Invalid API key');
     expect(onClose).not.toHaveBeenCalled();
@@ -718,13 +792,16 @@ describe('ProviderConnectionDialog API key flow', () => {
 
   it('keeps auth failures visible when saving credentials returns false', async () => {
     markProviderAuthFailure('openai', 'message-1');
+    flushSolid();
     clientMocks.connectApiProvider.mockResolvedValue(false);
     const onClose = renderDialog();
     const keyInput = await startApiFlow();
+    flushSolid();
 
     type(keyInput, 'sk-test');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(alertText()).toContain('Provider credentials were not saved');
     expect(providerRequiresReconnection('openai')).toBe(true);
@@ -734,17 +811,22 @@ describe('ProviderConnectionDialog API key flow', () => {
 
   it('ignores a successful credential save after the dialog is cancelled', async () => {
     markProviderAuthFailure('openai', 'message-1');
+    flushSolid();
     const completion = deferred<boolean>();
     clientMocks.connectApiProvider.mockImplementation(() => completion.promise);
     const onClose = renderDialog();
     const keyInput = await startApiFlow();
+    flushSolid();
 
     type(keyInput, 'sk-test');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
-    dialog()!.querySelector<HTMLButtonElement>('[aria-label="Close"]')!.click();
+    flushSolid();
+    click(dialog()!.querySelector<HTMLButtonElement>('[aria-label="Close"]')!);
     completion.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
 
     expect(providerRequiresReconnection('openai')).toBe(true);
     expect(postMessageMock).not.toHaveBeenCalledWith({ type: 'providers/auth-changed' });
@@ -759,22 +841,26 @@ describe('ProviderConnectionDialog API key flow', () => {
       .mockReturnValueOnce(second.promise);
     const onClose = renderDialog();
     type(await startApiFlow(), 'first-key');
-    primaryButton().click();
-    findButton('Back to methods')!.click();
+    click(primaryButton());
+    click(findButton('Back to methods')!);
     chooseMethod('API key');
     const keyInput = dialog()!.querySelector<HTMLInputElement>('input[type="password"]')!;
     type(keyInput, 'second-key');
-    primaryButton().click();
+    click(primaryButton());
 
     first.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(primaryButton().disabled).toBe(true);
     expect(keyInput.disabled).toBe(true);
     expect(primaryButton().textContent).toBe('Connecting...');
     expect(onClose).not.toHaveBeenCalled();
 
     second.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -783,13 +869,16 @@ describe('ProviderConnectionDialog API key flow', () => {
     clientMocks.connectApiProvider.mockReturnValue(completion.promise);
     renderDialog();
     type(await startApiFlow(), 'test-key');
-    primaryButton().click();
+    click(primaryButton());
     dialog()!
       .querySelector('form')!
       .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    flushSolid();
     expect(clientMocks.connectApiProvider).toHaveBeenCalledTimes(1);
     completion.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
   });
 
   it('cancels credential saving on unmount and ignores its late result', async () => {
@@ -803,12 +892,14 @@ describe('ProviderConnectionDialog API key flow', () => {
     );
     const onClose = renderDialog();
     type(await startApiFlow(), 'test-key');
-    primaryButton().click();
+    click(primaryButton());
     cleanup!();
     cleanup = undefined;
     expect(signal?.aborted).toBe(true);
     completion.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(onClose).not.toHaveBeenCalled();
     expect(postMessageMock).not.toHaveBeenCalledWith({ type: 'providers/auth-changed' });
   });
@@ -818,10 +909,12 @@ describe('ProviderConnectionDialog API key flow', () => {
     clientMocks.connectApiProvider.mockImplementation(() => completion.promise);
     const onClose = renderDialog();
     const keyInput = await startApiFlow();
+    flushSolid();
 
     type(keyInput, 'sk-slow');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(primaryButton().textContent).toBe('Connecting...');
     expect(primaryButton().disabled).toBe(true);
@@ -829,23 +922,32 @@ describe('ProviderConnectionDialog API key flow', () => {
     expect(onClose).not.toHaveBeenCalled();
 
     completion.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
 
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it('sends visible text prompt inputs as trimmed metadata', async () => {
-    setState('providerAuthMethods', {
-      openai: [
-        {
-          type: 'api',
-          label: 'Azure OpenAI',
-          prompts: [
-            { type: 'text', key: 'resourceName', message: 'Resource name', placeholder: 'my-org' },
-          ],
-        },
-      ],
-    });
+    applyState(
+      storePath('providerAuthMethods', {
+        openai: [
+          {
+            type: 'api',
+            label: 'Azure OpenAI',
+            prompts: [
+              {
+                type: 'text',
+                key: 'resourceName',
+                message: 'Resource name',
+                placeholder: 'my-org',
+              },
+            ],
+          },
+        ],
+      })
+    );
     renderDialog();
     chooseProvider('OpenAI');
     chooseMethod('Azure OpenAI');
@@ -860,8 +962,9 @@ describe('ProviderConnectionDialog API key flow', () => {
     type(promptInput, ' my-org ');
     expect(primaryButton().disabled).toBe(false);
 
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(clientMocks.connectApiProvider).toHaveBeenCalledWith(
       {
@@ -874,33 +977,35 @@ describe('ProviderConnectionDialog API key flow', () => {
   });
 
   it('initializes prompt defaults, reveals dependent fields, and preserves edits', async () => {
-    setState('providerAuthMethods', {
-      openai: [
-        {
-          type: 'api',
-          label: 'Configured key',
-          prompts: [
-            {
-              type: 'select',
-              key: 'enabled',
-              message: 'Enabled',
-              default: 'false',
-              options: [
-                { value: 'true', label: 'Yes' },
-                { value: 'false', label: 'No' },
-              ],
-            },
-            {
-              type: 'text',
-              key: 'count',
-              message: 'Count',
-              default: '0',
-              when: { key: 'enabled', op: 'eq', value: 'false' },
-            },
-          ],
-        },
-      ],
-    });
+    applyState(
+      storePath('providerAuthMethods', {
+        openai: [
+          {
+            type: 'api',
+            label: 'Configured key',
+            prompts: [
+              {
+                type: 'select',
+                key: 'enabled',
+                message: 'Enabled',
+                default: 'false',
+                options: [
+                  { value: 'true', label: 'Yes' },
+                  { value: 'false', label: 'No' },
+                ],
+              },
+              {
+                type: 'text',
+                key: 'count',
+                message: 'Count',
+                default: '0',
+                when: { key: 'enabled', op: 'eq', value: 'false' },
+              },
+            ],
+          },
+        ],
+      })
+    );
     renderDialog();
     chooseProvider('OpenAI');
     chooseMethod('Configured key');
@@ -912,8 +1017,9 @@ describe('ProviderConnectionDialog API key flow', () => {
     type(count, '2');
     type(dialog()!.querySelector<HTMLInputElement>('input[type="password"]')!, 'key');
     expect(primaryButton().disabled).toBe(false);
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     expect(clientMocks.connectApiProvider).toHaveBeenCalledWith(
       {
         providerID: 'openai',
@@ -925,32 +1031,34 @@ describe('ProviderConnectionDialog API key flow', () => {
   });
 
   it('renders select prompts as a listbox and reveals conditional prompts', async () => {
-    setState('providerAuthMethods', {
-      gitlab: [
-        {
-          type: 'api',
-          label: 'Self-hosted GitLab',
-          prompts: [
-            {
-              type: 'select',
-              key: 'deployment',
-              message: 'Select GitLab deployment type',
-              options: [
-                { label: 'GitLab.com', value: 'cloud', hint: 'Hosted by GitLab' },
-                { label: 'Self-managed', value: 'self-managed' },
-              ],
-            },
-            {
-              type: 'text',
-              key: 'baseUrl',
-              message: 'GitLab URL',
-              placeholder: 'https://git.example.com',
-              when: { key: 'deployment', op: 'eq', value: 'self-managed' },
-            },
-          ],
-        },
-      ],
-    });
+    applyState(
+      storePath('providerAuthMethods', {
+        gitlab: [
+          {
+            type: 'api',
+            label: 'Self-hosted GitLab',
+            prompts: [
+              {
+                type: 'select',
+                key: 'deployment',
+                message: 'Select GitLab deployment type',
+                options: [
+                  { label: 'GitLab.com', value: 'cloud', hint: 'Hosted by GitLab' },
+                  { label: 'Self-managed', value: 'self-managed' },
+                ],
+              },
+              {
+                type: 'text',
+                key: 'baseUrl',
+                message: 'GitLab URL',
+                placeholder: 'https://git.example.com',
+                when: { key: 'deployment', op: 'eq', value: 'self-managed' },
+              },
+            ],
+          },
+        ],
+      })
+    );
     renderDialog({ catalogProviders: [catalogProvider('gitlab', 'GitLab')] });
     chooseProvider('GitLab');
     chooseMethod('Self-hosted GitLab');
@@ -960,7 +1068,7 @@ describe('ProviderConnectionDialog API key flow', () => {
     expect(trigger.textContent).toContain('Select an option');
     expect(dialog()?.textContent).not.toContain('GitLab URL');
 
-    trigger.click();
+    click(trigger);
 
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
     expect(dialog()?.querySelector('.provider-connect-body')?.classList).toContain(
@@ -971,7 +1079,7 @@ describe('ProviderConnectionDialog API key flow', () => {
     const selfManaged = Array.from(
       dialog()!.querySelectorAll<HTMLButtonElement>('.provider-connect-select-option')
     ).find((option) => option.textContent?.trim() === 'Self-managed')!;
-    selfManaged.click();
+    click(selfManaged);
 
     expect(trigger.textContent).toContain('Self-managed');
     expect(dialog()?.querySelector('.provider-connect-body')?.classList).not.toContain(
@@ -986,8 +1094,9 @@ describe('ProviderConnectionDialog API key flow', () => {
     type(baseUrlInput!, 'https://git.example.com');
     const keyInput = dialog()!.querySelector<HTMLInputElement>('input[type="password"]')!;
     type(keyInput, 'glpat-token');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(clientMocks.connectApiProvider).toHaveBeenCalledWith(
       {
@@ -1002,41 +1111,43 @@ describe('ProviderConnectionDialog API key flow', () => {
   it.each(['api', 'oauth'] as const)(
     'uses active hidden defaults to reveal required %s fields without rendering hidden controls',
     async (authType) => {
-      setState('providerAuthMethods', {
-        openai: [
-          {
-            type: authType,
-            label: 'Enterprise',
-            prompts: [
-              {
-                key: 'deployment',
-                type: 'select',
-                message: 'Deployment',
-                default: 'enterprise',
-                options: [
-                  { value: 'enterprise', label: 'Enterprise' },
-                  { value: 'public', label: 'Public' },
-                ],
-              },
-              {
-                key: 'enterprise',
-                type: 'text',
-                message: 'Hidden flag',
-                hidden: true,
-                default: 'true',
-                when: { key: 'deployment', op: 'eq', value: 'enterprise' },
-              },
-              {
-                key: 'organization',
-                type: 'text',
-                message: 'Organization',
-                required: true,
-                when: { key: 'enterprise', op: 'eq', value: 'true' },
-              },
-            ],
-          },
-        ],
-      });
+      applyState(
+        storePath('providerAuthMethods', {
+          openai: [
+            {
+              type: authType,
+              label: 'Enterprise',
+              prompts: [
+                {
+                  key: 'deployment',
+                  type: 'select',
+                  message: 'Deployment',
+                  default: 'enterprise',
+                  options: [
+                    { value: 'enterprise', label: 'Enterprise' },
+                    { value: 'public', label: 'Public' },
+                  ],
+                },
+                {
+                  key: 'enterprise',
+                  type: 'text',
+                  message: 'Hidden flag',
+                  hidden: true,
+                  default: 'true',
+                  when: { key: 'deployment', op: 'eq', value: 'enterprise' },
+                },
+                {
+                  key: 'organization',
+                  type: 'text',
+                  message: 'Organization',
+                  required: true,
+                  when: { key: 'enterprise', op: 'eq', value: 'true' },
+                },
+              ],
+            },
+          ],
+        })
+      );
       renderDialog();
       chooseProvider('OpenAI');
       chooseMethod('Enterprise');
@@ -1046,16 +1157,17 @@ describe('ProviderConnectionDialog API key flow', () => {
       const select = dialog()!.querySelector<HTMLButtonElement>(
         '.provider-connect-select-trigger'
       )!;
-      select.click();
-      findButton('Public')!.click();
+      click(select);
+      click(findButton('Public')!);
       expect(dialog()?.textContent).not.toContain('Organization');
-      select.click();
-      findButton('Enterprise')!.click();
+      click(select);
+      click(findButton('Enterprise')!);
       type(dialog()!.querySelector<HTMLInputElement>('input[type="text"]')!, 'acme');
       if (authType === 'api')
         type(dialog()!.querySelector<HTMLInputElement>('input[type="password"]')!, 'key');
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
       const answers = { deployment: 'enterprise', organization: 'acme' };
       expect(
         authType === 'api' ? clientMocks.connectApiProvider : clientMocks.authorizeProvider
@@ -1096,6 +1208,7 @@ describe('ProviderConnectionDialog OAuth flow', () => {
   it('offers an editable redirect URL while automatic authorization remains active', async () => {
     const automatic = deferred<boolean>();
     const onClose = await startPasteFlow(automatic.promise);
+    flushSolid();
     const input = redirectInput();
     expect(input.labels?.[0]?.textContent).toContain('Browser redirect URL');
     expect(input.disabled).toBe(false);
@@ -1107,10 +1220,14 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     dialog()!
       .querySelector('form')!
       .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    flushSolid();
     await flush();
+    flushSolid();
     expect(clientMocks.completeProviderAuth).toHaveBeenCalledTimes(1);
     automatic.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -1118,13 +1235,17 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     const automatic = deferred<boolean>();
     const submitted = deferred<boolean>();
     const onClose = await startPasteFlow(automatic.promise);
+    flushSolid();
     clientMocks.completeProviderAuth.mockReturnValueOnce(submitted.promise);
     const redirect = 'http://127.0.0.1:1455/callback?code=a%2Bb&state=opaque%2Fstate';
     type(redirectInput(), `  ${redirect}  `);
     const form = dialog()!.querySelector('form')!;
     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    flushSolid();
     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    flushSolid();
     await flush();
+    flushSolid();
     expect(clientMocks.completeProviderAuth).toHaveBeenCalledTimes(2);
     expect(clientMocks.completeProviderAuth).toHaveBeenLastCalledWith(
       {
@@ -1141,13 +1262,17 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     expect(redirectInput().disabled).toBe(true);
     expect(primaryButton().textContent).toBe('Submitting redirect URL...');
     submitted.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(redirectInput().value).toBe('');
     expect(redirectInput().disabled).toBe(false);
     expect(onClose).not.toHaveBeenCalled();
     expect(postMessageMock).not.toHaveBeenCalledWith({ type: 'providers/auth-changed' });
     automatic.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -1156,12 +1281,14 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     async (failure) => {
       const automatic = deferred<boolean>();
       const onClose = await startPasteFlow(automatic.promise);
+      flushSolid();
       if (failure === 'rejected')
         clientMocks.completeProviderAuth.mockRejectedValueOnce(new Error('Invalid redirect URL'));
       else clientMocks.completeProviderAuth.mockResolvedValueOnce(false);
       type(redirectInput(), 'http://localhost/callback?code=wrong');
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
       expect(alertText()).toContain(
         failure === 'rejected' ? 'Invalid redirect URL' : 'Redirect URL was not accepted'
       );
@@ -1171,12 +1298,15 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       expect(options.signal.aborted).toBe(false);
       clientMocks.completeProviderAuth.mockResolvedValueOnce(true);
       type(redirectInput(), 'http://localhost/callback?code=correct');
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
       expect(alertText()).toBe('');
       expect(onClose).not.toHaveBeenCalled();
       automatic.resolve(true);
+      flushSolid();
       await flush();
+      flushSolid();
       expect(onClose).toHaveBeenCalledOnce();
     }
   );
@@ -1185,16 +1315,22 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     const automatic = deferred<boolean>();
     const submitted = deferred<boolean>();
     const onClose = await startPasteFlow(automatic.promise);
+    flushSolid();
     clientMocks.completeProviderAuth.mockReturnValueOnce(submitted.promise);
     type(redirectInput(), 'http://localhost/callback?code=fixture');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     const options: { signal: AbortSignal } = clientMocks.completeProviderAuth.mock.calls[1]![1];
     automatic.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(options.signal.aborted).toBe(true);
     submitted.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(onClose).toHaveBeenCalledOnce();
     expect(
       postMessageMock.mock.calls.filter(([message]) => message.type === 'providers/auth-changed')
@@ -1207,10 +1343,12 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       const automatic = deferred<boolean>();
       const submitted = deferred<boolean>();
       const onClose = await startPasteFlow(automatic.promise);
+      flushSolid();
       clientMocks.completeProviderAuth.mockReturnValueOnce(submitted.promise);
       type(redirectInput(), 'http://localhost/callback?code=fixture');
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
       const options: { signal: AbortSignal }[] = clientMocks.completeProviderAuth.mock.calls.map(
         ([, requestOptions]) => requestOptions
       );
@@ -1221,10 +1359,14 @@ describe('ProviderConnectionDialog OAuth flow', () => {
         cleanup!();
         cleanup = undefined;
       }
+      flushSolid();
       expect(options.every((option) => option.signal.aborted)).toBe(true);
       automatic.resolve(true);
+      flushSolid();
       submitted.resolve(true);
+      flushSolid();
       await flush();
+      flushSolid();
       expect(onClose).toHaveBeenCalledTimes(action === 'close' ? 1 : 0);
       expect(postMessageMock).not.toHaveBeenCalledWith({ type: 'providers/auth-changed' });
     }
@@ -1234,31 +1376,41 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     const oldAutomatic = deferred<boolean>();
     const oldSubmission = deferred<boolean>();
     const onClose = await startPasteFlow(oldAutomatic.promise);
+    flushSolid();
     clientMocks.completeProviderAuth.mockReturnValueOnce(oldSubmission.promise);
     type(redirectInput(), 'http://localhost/callback?code=old');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
-    findButton('Back to methods')!.click();
+    flushSolid();
+    click(findButton('Back to methods')!);
     const currentAutomatic = deferred<boolean>();
     const currentSubmission = deferred<boolean>();
     clientMocks.completeProviderAuth
       .mockReturnValueOnce(currentAutomatic.promise)
       .mockReturnValueOnce(currentSubmission.promise);
     chooseMethod('Claude subscription');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     type(redirectInput(), 'http://localhost/callback?code=current');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     oldAutomatic.resolve(true);
+    flushSolid();
     oldSubmission.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(primaryButton().disabled).toBe(true);
     expect(primaryButton().textContent).toBe('Submitting redirect URL...');
     expect(onClose).not.toHaveBeenCalled();
     currentSubmission.resolve(true);
+    flushSolid();
     currentAutomatic.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -1283,8 +1435,9 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       chooseProvider('Anthropic');
       chooseMethod('Claude subscription');
       expect(dialog()?.querySelector('[aria-label^="Copy authorization URL:"]')).toBeNull();
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
 
       const urlInput = dialog()!.querySelector<HTMLInputElement>(
         '#provider-connect-authorization-url'
@@ -1293,6 +1446,7 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       expect(urlInput.readOnly).toBe(true);
       expect(urlInput.disabled).toBe(false);
       urlInput.focus();
+      flushSolid();
       expect(urlInput.selectionStart).toBe(0);
       expect(urlInput.selectionEnd).toBe(url.length);
 
@@ -1300,8 +1454,9 @@ describe('ProviderConnectionDialog OAuth flow', () => {
         '[aria-label^="Copy authorization URL:"]'
       )!;
       expect(copyButton.disabled).toBe(false);
-      copyButton.click();
+      click(copyButton);
       await flush();
+      flushSolid();
 
       expect(writeText).toHaveBeenCalledExactlyOnceWith(url);
       expect(copyButton.getAttribute('aria-label')).toBe('Copied');
@@ -1313,11 +1468,13 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       }
       expect(onClose).not.toHaveBeenCalled();
 
-      findButton('Back to methods')!.click();
+      click(findButton('Back to methods')!);
       expect(dialog()?.querySelector('#provider-connect-authorization-url')).toBeNull();
       expect(dialog()?.querySelector('[aria-label="Copied"]')).toBeNull();
       completion.resolve(true);
+      flushSolid();
       await flush();
+      flushSolid();
       expect(onClose).not.toHaveBeenCalled();
     }
   );
@@ -1334,16 +1491,19 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       renderDialog();
       chooseProvider('Anthropic');
       chooseMethod('Claude subscription');
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
       if (method === 'code') {
         type(
           dialog()!.querySelector<HTMLInputElement>('.provider-connect-authorization input')!,
           'code'
         );
-        primaryButton().click();
+        click(primaryButton());
         await flush();
+        flushSolid();
       }
+      flushSolid();
       expect(clientMocks.completeProviderAuth).toHaveBeenCalledWith(
         {
           providerID: 'anthropic',
@@ -1356,28 +1516,30 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     }
   );
   it('does not require a conditional enterprise field for GitHub.com re-authentication', async () => {
-    setState('providerAuthMethods', {
-      'github-copilot': [
-        {
-          type: 'oauth',
-          label: 'Login with GitHub Copilot',
-          prompts: [
-            {
-              type: 'select',
-              key: 'deploymentType',
-              message: 'Select GitHub deployment type',
-              options: [{ value: 'github.com', label: 'GitHub.com' }],
-            },
-            {
-              type: 'text',
-              key: 'enterpriseUrl',
-              message: 'GitHub Enterprise URL',
-              when: [{ key: 'deploymentType', op: 'eq', value: 'enterprise' }],
-            },
-          ],
-        },
-      ],
-    });
+    applyState(
+      storePath('providerAuthMethods', {
+        'github-copilot': [
+          {
+            type: 'oauth',
+            label: 'Login with GitHub Copilot',
+            prompts: [
+              {
+                type: 'select',
+                key: 'deploymentType',
+                message: 'Select GitHub deployment type',
+                options: [{ value: 'github.com', label: 'GitHub.com' }],
+              },
+              {
+                type: 'text',
+                key: 'enterpriseUrl',
+                message: 'GitHub Enterprise URL',
+                when: [{ key: 'deploymentType', op: 'eq', value: 'enterprise' }],
+              },
+            ],
+          },
+        ],
+      })
+    );
     renderDialog({
       catalogProviders: [catalogProvider('github-copilot', 'GitHub Copilot')],
       initialProviderID: 'github-copilot',
@@ -1388,12 +1550,13 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     chooseMethod('Login with GitHub Copilot');
     expect(dialog()?.textContent).not.toContain('GitHub Enterprise URL');
     const select = dialog()!.querySelector<HTMLButtonElement>('.provider-connect-select-trigger')!;
-    select.click();
-    findButton('GitHub.com')!.click();
+    click(select);
+    click(findButton('GitHub.com')!);
 
     expect(primaryButton().disabled).toBe(false);
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
       {
         providerID: 'github-copilot',
@@ -1408,6 +1571,7 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     'keeps auth failures visible when the %s exchange returns false',
     async (method) => {
       markProviderAuthFailure('anthropic', 'message-1');
+      flushSolid();
       clientMocks.authorizeProvider.mockResolvedValue({
         url: 'https://auth.example.com/oauth',
         method,
@@ -1417,17 +1581,20 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       const onClose = renderDialog();
       chooseProvider('Anthropic');
       chooseMethod('Claude subscription');
-      primaryButton().click();
+      click(primaryButton());
       await flush();
+      flushSolid();
 
       if (method === 'code') {
         const codeInput = dialog()!.querySelector<HTMLInputElement>(
           '.provider-connect-authorization .provider-connect-input'
         )!;
         type(codeInput, 'test-code');
-        primaryButton().click();
+        click(primaryButton());
         await flush();
+        flushSolid();
       }
+      flushSolid();
 
       expect(alertText()).toContain('Provider authorization did not complete');
       expect(providerRequiresReconnection('anthropic')).toBe(true);
@@ -1443,8 +1610,9 @@ describe('ProviderConnectionDialog OAuth flow', () => {
 
     chooseProvider('Anthropic');
     chooseMethod('Claude subscription');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(clientMocks.authorizeProvider).toHaveBeenCalledWith(
       { providerID: 'anthropic', method: 0, inputs: {} },
@@ -1464,7 +1632,9 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     expect(onClose).not.toHaveBeenCalled();
 
     completion.resolve(true);
+    flushSolid();
     await flush();
+    flushSolid();
 
     expect(postMessageMock).toHaveBeenCalledWith({ type: 'providers/auth-changed' });
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -1482,8 +1652,9 @@ describe('ProviderConnectionDialog OAuth flow', () => {
 
     chooseProvider('Anthropic');
     chooseMethod('Claude subscription');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(capturedSignal?.aborted).toBe(false);
 
@@ -1493,6 +1664,7 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       cleanup!();
       cleanup = undefined;
     }
+    flushSolid();
 
     expect(capturedSignal?.aborted).toBe(true);
     expect(onClose).toHaveBeenCalledTimes(action === 'close' ? 1 : 0);
@@ -1504,15 +1676,18 @@ describe('ProviderConnectionDialog OAuth flow', () => {
       method: 'auto',
       instructions: 'Sign in with `az login` before continuing.',
     });
-    setState('providerAuthMethods', {
-      azure: [{ type: 'oauth', label: 'Microsoft Entra ID (Azure CLI)' }],
-    });
+    applyState(
+      storePath('providerAuthMethods', {
+        azure: [{ type: 'oauth', label: 'Microsoft Entra ID (Azure CLI)' }],
+      })
+    );
     const onClose = renderDialog({ catalogProviders: [catalogProvider('azure', 'Azure')] });
 
     chooseProvider('Azure');
     chooseMethod('Microsoft Entra ID (Azure CLI)');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(postMessageMock).not.toHaveBeenCalledWith({
       type: 'vscode/open-external',
@@ -1538,15 +1713,16 @@ describe('ProviderConnectionDialog OAuth flow', () => {
 
     chooseProvider('Anthropic');
     chooseMethod('Claude subscription');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(dialog()?.textContent).toContain('Enter code ABCD-1234 in your browser');
     expect(
       dialog()!.querySelector('[aria-label="Copy authorization code: ABCD-1234"]')
     ).toBeInstanceOf(HTMLButtonElement);
 
-    findButton('Open authorization page')!.click();
+    click(findButton('Open authorization page')!);
     expect(postMessageMock).toHaveBeenLastCalledWith({
       type: 'vscode/open-external',
       payload: { url: 'https://auth.example.com/device' },
@@ -1557,14 +1733,16 @@ describe('ProviderConnectionDialog OAuth flow', () => {
     )!;
     expect(primaryButton().textContent).toBe('Complete connection');
 
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
     expect(clientMocks.completeProviderAuth).not.toHaveBeenCalled();
 
     type(codeInput, 'GHIJ-7890');
     expect(primaryButton().disabled).toBe(false);
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(clientMocks.completeProviderAuth).toHaveBeenCalledWith(
       { providerID: 'anthropic', method: 0, code: 'GHIJ-7890' },
@@ -1580,8 +1758,9 @@ describe('ProviderConnectionDialog OAuth flow', () => {
 
     chooseProvider('Anthropic');
     chooseMethod('Claude subscription');
-    primaryButton().click();
+    click(primaryButton());
     await flush();
+    flushSolid();
 
     expect(alertText()).toContain('Browser blocked the redirect');
     expect(onClose).not.toHaveBeenCalled();
@@ -1605,6 +1784,7 @@ describe('ProviderConnectionDialog closing and cancellation', () => {
 
     const event = new KeyboardEvent('keydown', { key: 'Escape', cancelable: true });
     document.dispatchEvent(event);
+    flushSolid();
 
     expect(event.defaultPrevented).toBe(true);
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -1613,9 +1793,10 @@ describe('ProviderConnectionDialog closing and cancellation', () => {
   it('returns to the methods step from credential entry without closing', async () => {
     const onClose = renderDialog();
     const keyInput = await startApiFlow();
+    flushSolid();
     type(keyInput, 'sk-discarded');
 
-    findButton('Cancel')!.click();
+    click(findButton('Cancel')!);
 
     expect(onClose).not.toHaveBeenCalled();
     expect(dialog()!.querySelector('input[type="password"]')).toBeNull();
@@ -1628,7 +1809,7 @@ describe('ProviderConnectionDialog closing and cancellation', () => {
   it('hands off to terminal setup and closes', () => {
     const onClose = renderDialog();
 
-    findButton('Use terminal setup')!.click();
+    click(findButton('Use terminal setup')!);
 
     expect(openProviderSetupMock).toHaveBeenCalledTimes(1);
     expect(onClose).toHaveBeenCalledTimes(1);

@@ -9,22 +9,25 @@ import type {
   AutoApproveJudgeResponse,
 } from '../shared/protocol';
 import { AUTO_APPROVE_JUDGE_TIMEOUT_MS } from '../shared/protocol';
-import type { PermissionRule } from '../shared/opencode-types';
 import { isKnownReadOnlyPermission } from '../shared/permission-rules';
 import { asRecord } from '../shared/type-utils';
 import type { OpenCodeServer } from './server';
 import {
+  DENY_ALL_PERMISSION_RULES,
   PERMISSION_JUDGE_SESSION_METADATA,
   PERMISSION_JUDGE_SESSION_TITLE_PREFIX,
   type HiddenSessionManager,
 } from './hidden-session-manager';
 import { resolveHelperModel } from './helper-model-selection';
+import { parseJsonObject } from './one-shot-generation';
 import type { JevDecisions } from './jev-decisions';
 import type { NativeDecisions } from './native-decisions';
 import { logger } from './logger';
 import { tracePrompt } from './prompt-trace';
+import { resolveNativePermissionEffect } from './native-permission-rules';
 
-type OpenCodeRequest = Pick<OpenCodeServer, 'request'>;
+type OpenCodeRequest = Pick<OpenCodeServer, 'request'> &
+  Partial<Pick<OpenCodeServer, 'apiVersion'>>;
 type JevPermissionJudge = Pick<JevDecisions, 'isAutoApproveEnabled' | 'judgePermission' | 'model'>;
 type JudgeModel = NonNullable<AutoApproveJudgeRequest['model']>;
 type GitWorkTree = { gitDirectory: string; commonDirectory: string };
@@ -46,37 +49,9 @@ interface JudgeMessageRequest {
 
 const VERDICT_CACHE_TTL_MS = 15 * 60_000;
 const VERDICT_CACHE_LIMIT = 200;
-const DENY_ALL_PERMISSION_NAMES = [
-  'read',
-  'edit',
-  'glob',
-  'grep',
-  'list',
-  'bash',
-  'shell',
-  'task',
-  'external_directory',
-  'todowrite',
-  'question',
-  'webfetch',
-  'websearch',
-  'codesearch',
-  'lsp',
-  'doom_loop',
-  'skill',
-] as const;
-
-const DENY_ALL_PERMISSION_RULES: PermissionRule[] = [
-  ...DENY_ALL_PERMISSION_NAMES.map<PermissionRule>((permission) => ({
-    permission,
-    pattern: '*',
-    action: 'deny',
-  })),
-  { permission: '*', pattern: '*', action: 'deny' },
-  { permission: 'StructuredOutput', pattern: '*', action: 'allow' },
-];
 const SAFE_GIT_BRANCH_FLAGS = new Set(['--show-current', '--list', '-a', '-r', '-v', '-vv']);
 const GIT_PROBE_TIMEOUT_MS = 2_000;
+const CONFIG_PERMISSION_TIMEOUT_MS = 2_000;
 
 export class AutoApproveJudge {
   private readonly verdictCache = new Map<string, CachedVerdict>();
@@ -101,6 +76,14 @@ export class AutoApproveJudge {
     const permission = normalizePermissionRequest(request.permission);
     if (!permission) return { decision: 'ask', reason: 'Missing permission context.' };
     const approvedReferences = request.approvedReferences || [];
+    const configuredDecision =
+      this.server.apiVersion === 2 && (permission.type === 'bash' || permission.type === 'shell')
+        ? await this.judgeConfiguredShellPermission(permission, workspacePath)
+        : null;
+    if (configuredDecision) {
+      this.audit('configured-rule', permission, configuredDecision);
+      return configuredDecision;
+    }
     const localDecision = await this.judgeLocally(permission, workspacePath);
     if (localDecision) {
       this.audit('local-rule', permission, localDecision);
@@ -235,7 +218,7 @@ export class AutoApproveJudge {
   }
 
   private audit(
-    source: 'local-rule' | 'cache' | 'judge' | 'jev' | 'native',
+    source: 'configured-rule' | 'local-rule' | 'cache' | 'judge' | 'jev' | 'native',
     permission: NormalizedJudgePermission,
     response: AutoApproveJudgeResponse
   ) {
@@ -416,6 +399,55 @@ export class AutoApproveJudge {
       return { decision: 'allow', reason: 'Safe local command.' };
     }
     return null;
+  }
+
+  private async judgeConfiguredShellPermission(
+    permission: NormalizedJudgePermission,
+    workspacePath: string | undefined
+  ): Promise<AutoApproveJudgeResponse | null> {
+    const resources =
+      typeof permission.pattern === 'string' ? [permission.pattern] : permission.pattern;
+    if (
+      permission.hasMalformedPattern ||
+      !resources?.length ||
+      resources.some((resource) => !resource.trim())
+    )
+      return null;
+    try {
+      const config = asRecord(
+        await this.withTimeout(
+          this.request('GET', '/config', undefined, workspacePath),
+          CONFIG_PERMISSION_TIMEOUT_MS
+        )
+      );
+      if (!config)
+        return { decision: 'ask', reason: 'Cannot verify configured shell permissions.' };
+      const rules = config.permissions;
+      if (!Array.isArray(rules)) return null;
+      const effects = resources.map((resource) =>
+        resolveNativePermissionEffect(rules, 'shell', resource)
+      );
+      if (effects.includes('deny')) {
+        return { decision: 'reject', reason: 'Denied by configured shell permissions.' };
+      }
+      const configuredException = resources.some(
+        (resource, index) =>
+          effects[index] === 'ask' &&
+          rules.some((rule) => resolveNativePermissionEffect([rule], 'shell', resource) === 'allow')
+      );
+      if (configuredException) {
+        return { decision: 'ask', reason: 'Configured shell permissions require confirmation.' };
+      }
+      if (effects.every((effect) => effect === 'allow')) {
+        return { decision: 'allow', reason: 'Allowed by configured shell permissions.' };
+      }
+      return null;
+    } catch (error) {
+      logger.warn(
+        `Could not read configured shell permissions: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return { decision: 'ask', reason: 'Cannot verify configured shell permissions.' };
+    }
   }
 
   private getGitWorkTree(workspacePath: string) {
@@ -1600,19 +1632,6 @@ function normalizeActionSummary(value: unknown): string | undefined {
     .trim();
   if (!summary) return undefined;
   return summary.slice(0, 80).trimEnd();
-}
-
-function parseJsonObject(text: string) {
-  const trimmed = text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/```$/i, '')
-    .trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
 }
 
 function normalizeModel(value: AutoApproveJudgeRequest['model']) {

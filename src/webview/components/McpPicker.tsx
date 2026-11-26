@@ -1,9 +1,19 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
-import { Portal } from 'solid-js/web';
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  onSettled,
+  Show,
+  untrack,
+} from 'solid-js';
+import { Portal } from '@solidjs/web';
+import { ariaBoolean } from '../lib/aria';
 import type { McpStatus } from '../../shared/protocol';
 import { postMessage } from '../lib/bridge';
 import { client } from '../lib/client';
-import { trapModalFocus } from '../lib/modal-focus';
+import { modalFocus } from '../lib/modal-focus';
 import {
   getAvailableMcpNames,
   getSelectedMcpsForSession,
@@ -12,8 +22,9 @@ import {
   state,
 } from '../lib/state';
 import { observePopupViewport, placeDropdownAnchor } from '../lib/popup-position';
-import { checkIcon, xmarkIcon } from '../lib/ui-icons';
+import { checkIcon } from '../lib/ui-icons';
 import { PickerManageIcon } from './PickerManageIcon';
+import { DialogCloseButton } from './DialogCloseButton';
 import { UiIcon } from './UiIcon';
 
 function statusLabel(status: McpStatus['status']) {
@@ -34,7 +45,8 @@ export function McpPicker(props: {
   let menuRef: HTMLDivElement | undefined;
   let searchInputRef: HTMLInputElement | undefined;
 
-  const [query, setQuery] = createSignal(props.initialQuery ?? '');
+  // Initial search text only; the user edits it from here.
+  const [query, setQuery] = createSignal(untrack(() => props.initialQuery ?? ''));
   const [focusIndex, setFocusIndex] = createSignal(0);
   const [authServer, setAuthServer] = createSignal<{
     name: string;
@@ -75,9 +87,12 @@ export function McpPicker(props: {
   const selectedNames = createMemo(() => new Set(getSelectedMcpsForSession(props.sessionId) || []));
   const showSearch = () => allItems().length > 8 || !!props.initialQuery;
 
-  createEffect(() => {
-    setFocusIndex((current) => Math.max(0, Math.min(current, filteredItems().length - 1)));
-  });
+  createEffect(
+    () => filteredItems().length,
+    (count) => {
+      setFocusIndex((current) => Math.max(0, Math.min(current, count - 1)));
+    }
+  );
 
   function toggle(name: string) {
     const next = new Set(selectedNames());
@@ -189,7 +204,9 @@ export function McpPicker(props: {
     }
   }
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     // Best effort: the settings screen falls back to its own load if this fails.
     void import('./McpSettingsPanel').catch(() => undefined);
 
@@ -205,8 +222,11 @@ export function McpPicker(props: {
     if (showSearch()) searchInputRef?.focus();
     else menuRef?.focus();
 
-    if (!menuRef) return;
-    onCleanup(observePopupViewport(menuRef, reposition));
+    if (menuRef) cleanups.push(observePopupViewport(menuRef, reposition));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   return (
@@ -224,7 +244,7 @@ export function McpPicker(props: {
           props.popoverRef?.(el);
         }}
         class="dropdown-menu w-full"
-        tabIndex={-1}
+        tabindex={-1}
         onKeyDown={handleKeyDown}
         onClick={(e) => e.stopPropagation()}
         style={{ outline: 'none' }}
@@ -275,7 +295,7 @@ export function McpPicker(props: {
                     >
                       <button
                         class={`dropdown-item mcp-picker-item ${selectedNames().has(item.name) ? 'selected' : ''} ${focusIndex() === index() ? 'keyboard-focus' : ''}`}
-                        aria-pressed={selectedNames().has(item.name)}
+                        aria-pressed={ariaBoolean(selectedNames().has(item.name))}
                         aria-label={
                           item.status === 'needs_auth'
                             ? item.name
@@ -290,18 +310,18 @@ export function McpPicker(props: {
                         }}
                       >
                         <span class="mcp-picker-row">
+                          <span class="mcp-picker-checkbox" aria-hidden="true">
+                            <Show when={selectedNames().has(item.name)}>
+                              <UiIcon
+                                source={checkIcon}
+                                class="h-2.5 w-2.5"
+                                width={10}
+                                height={10}
+                              />
+                            </Show>
+                          </span>
                           <span class="dropdown-name-wrap">
                             <span class="dropdown-name">{item.name}</span>
-                            <span class="dropdown-check">
-                              <Show when={selectedNames().has(item.name)}>
-                                <UiIcon
-                                  source={checkIcon}
-                                  class="h-3 w-3 text-vscode-accent"
-                                  width={12}
-                                  height={12}
-                                />
-                              </Show>
-                            </span>
                           </span>
                         </span>
                         <Show when={item.error && item.status !== 'needs_auth'}>
@@ -359,8 +379,16 @@ export function McpPicker(props: {
                           </div>
                         </Show>
                         <Show when={item.status !== 'needs_auth'}>
-                          <span class={`model-capability-tag mcp-status-tag status-${item.status}`}>
-                            {statusLabel(item.status)}
+                          <span
+                            class={`mcp-status-tag status-${item.status}`}
+                            title={item.status === 'connected' ? 'Connected' : undefined}
+                          >
+                            <span class="mcp-status-dot" aria-hidden="true" />
+                            <span
+                              class={item.status === 'connected' ? 'sr-only' : 'mcp-status-label'}
+                            >
+                              {statusLabel(item.status)}
+                            </span>
                           </span>
                         </Show>
                       </div>
@@ -425,25 +453,45 @@ function McpAuthDialog(props: {
 }) {
   const needsConfiguration = () => currentStatus().status === 'needs_client_registration';
   const [authorizationUrl, setAuthorizationUrl] = createSignal('');
+  const [attemptID, setAttemptID] = createSignal('');
   const [canPasteRedirect, setCanPasteRedirect] = createSignal(false);
   const [authorizationCode, setAuthorizationCode] = createSignal('');
-  const [currentStatus, setCurrentStatus] = createSignal<McpStatus>(props.server.status);
-  const [isSubmitting, setIsSubmitting] = createSignal(false);
+  // Initial state only: the effect below follows live status updates for this server.
+  const [currentStatus, setCurrentStatus] = createSignal<McpStatus>(
+    untrack(() => props.server.status)
+  );
+  const [isSubmitting, publishSubmitting] = createSignal(false);
+  let submitting = false;
+  const setIsSubmitting = (value: boolean) => {
+    submitting = value;
+    publishSubmitting(value);
+  };
   const [errorMessage, setErrorMessage] = createSignal('');
   const [statusError, setStatusError] = createSignal('');
   const isConnected = () => currentStatus().status === 'connected';
+  const authError = () => (isConnected() ? '' : errorMessage() || statusError());
   const waitingForAuthorization = createMemo(
     () => !!authorizationUrl() && !isSubmitting() && !needsConfiguration() && !isConnected()
   );
   let disposed = false;
 
-  createEffect(() => {
-    const status = state.mcpStatus[props.server.name];
-    if (status) setCurrentStatus({ status: status.status, error: status.error });
-  });
+  createEffect(
+    () => {
+      const status = state.mcpStatus[props.server.name];
+      return status ? { status: status.status, error: status.error } : null;
+    },
+    (status) => {
+      if (status) setCurrentStatus({ status: status.status, error: status.error });
+    }
+  );
 
-  createEffect(() => {
-    if (!waitingForAuthorization()) return;
+  createEffect(waitingForAuthorization, (waiting) => {
+    const cleanups: Array<() => void> = [];
+
+    if (!waiting)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     const deadline = Date.now() + 5 * 60_000;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -466,10 +514,14 @@ function McpAuthDialog(props: {
       timer = setTimeout(() => void checkStatus(), 1_000);
     };
     timer = setTimeout(() => void checkStatus(), 1_000);
-    onCleanup(() => {
+    cleanups.push(() => {
       cancelled = true;
       clearTimeout(timer);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   onCleanup(() => {
@@ -477,15 +529,21 @@ function McpAuthDialog(props: {
     props.dialogRef?.(undefined);
   });
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
       props.onClose();
     };
     document.addEventListener('keydown', onKeyDown);
-    onCleanup(() => document.removeEventListener('keydown', onKeyDown));
+    cleanups.push(() => document.removeEventListener('keydown', onKeyDown));
     if (!needsConfiguration() && !isConnected()) void startAuth();
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   async function refreshStatus(isCurrent: () => boolean = () => !disposed) {
@@ -503,6 +561,14 @@ function McpAuthDialog(props: {
     setErrorMessage('');
     setStatusError('');
     try {
+      // OpenCode reconnects a server after sign-in only when it is not disabled, and a
+      // connect without credentials ends in needs_auth without starting a login.
+      if (currentStatus().status === 'disabled') {
+        await client.mcp.connect(props.server.name).catch(() => undefined);
+        if (disposed) return;
+        await refreshStatus().catch(() => undefined);
+        if (disposed || isConnected()) return;
+      }
       const authorization = await client.mcp.startAuth(props.server.name);
       if (disposed) return;
       const url = new URL(authorization.authorizationUrl);
@@ -512,6 +578,7 @@ function McpAuthDialog(props: {
         );
       }
       setAuthorizationUrl(url.href);
+      setAttemptID(authorization.oauthState);
       setCanPasteRedirect(authorization.paste === true);
       postMessage({ type: 'vscode/open-external', payload: { url: url.href } });
     } catch (error) {
@@ -523,11 +590,11 @@ function McpAuthDialog(props: {
 
   async function submitCode() {
     const code = authorizationCode().trim();
-    if (isSubmitting() || !code) return;
+    if (submitting || !code) return;
     setIsSubmitting(true);
     setErrorMessage('');
     try {
-      const status = await client.mcp.completeAuth(props.server.name, code);
+      const status = await client.mcp.completeAuth(props.server.name, code, attemptID());
       if (disposed) return;
       setCurrentStatus(status);
       await refreshStatus();
@@ -559,6 +626,7 @@ function McpAuthDialog(props: {
       if (disposed) return;
       setAuthorizationCode('');
       setAuthorizationUrl('');
+      setAttemptID('');
       await refreshStatus();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : String(error));
@@ -594,8 +662,8 @@ function McpAuthDialog(props: {
         onClick={(event) => event.stopPropagation()}
       >
         <div
-          ref={(element) => onCleanup(trapModalFocus(element))}
-          class="provider-connect-dialog"
+          ref={modalFocus()}
+          class="provider-connect-dialog mcp-auth-dialog"
           role="dialog"
           aria-modal="true"
           aria-labelledby="mcp-auth-title"
@@ -607,14 +675,7 @@ function McpAuthDialog(props: {
               </div>
               <div class="provider-connect-subtitle">{props.server.name}</div>
             </div>
-            <button
-              type="button"
-              class="provider-connect-close"
-              onClick={props.onClose}
-              aria-label="Close"
-            >
-              <UiIcon source={xmarkIcon} width={16} height={16} aria-hidden="true" />
-            </button>
+            <DialogCloseButton onClick={props.onClose} />
           </div>
           <div class="provider-connect-body">
             <Show
@@ -627,6 +688,11 @@ function McpAuthDialog(props: {
                   </div>
                   <Show when={props.server.status.error}>
                     <div class="provider-connect-instructions">{props.server.status.error}</div>
+                  </Show>
+                  <Show when={authError()}>
+                    <div class="provider-connect-error" role="alert">
+                      {authError()}
+                    </div>
                   </Show>
                   <div class="provider-connect-actions">
                     <button
@@ -699,72 +765,80 @@ function McpAuthDialog(props: {
                       changes the MCP login for all sessions using this connection.
                     </div>
                   </Show>
-                  <details open={canPasteRedirect()}>
+                  <details class="provider-connect-disclosure" open={canPasteRedirect()}>
                     <summary>
                       {canPasteRedirect()
                         ? 'Paste the browser redirect URL instead'
                         : 'Use an authorization code instead'}
                     </summary>
-                    <Show when={canPasteRedirect()}>
-                      <div id="mcp-auth-redirect-help" class="provider-connect-intro">
-                        If your browser cannot reach this machine, paste the full URL it redirected
-                        to.
-                      </div>
-                    </Show>
-                    <label class="provider-connect-field">
-                      <span>
-                        {canPasteRedirect() ? 'Browser redirect URL' : 'Authorization code'}
-                      </span>
-                      <input
-                        class="provider-connect-input"
-                        value={authorizationCode()}
-                        onInput={(event) => setAuthorizationCode(event.currentTarget.value)}
-                        autocomplete="off"
-                        spellcheck={false}
-                        placeholder={canPasteRedirect() ? 'Paste the full redirect URL' : undefined}
-                        aria-describedby={canPasteRedirect() ? 'mcp-auth-redirect-help' : undefined}
-                      />
-                    </label>
-                    <button
-                      type="submit"
-                      class="provider-connect-primary"
-                      disabled={isSubmitting() || !authorizationCode().trim()}
-                    >
-                      {isSubmitting()
-                        ? 'Working...'
-                        : canPasteRedirect()
-                          ? 'Submit redirect URL'
-                          : 'Complete authorization'}
-                    </button>
+                    <div class="provider-connect-disclosure-body">
+                      <Show when={canPasteRedirect()}>
+                        <div id="mcp-auth-redirect-help" class="provider-connect-intro">
+                          If your browser cannot reach this machine, paste the full URL it
+                          redirected to.
+                        </div>
+                      </Show>
+                      <label class="provider-connect-field">
+                        <span class="sr-only">
+                          {canPasteRedirect() ? 'Browser redirect URL' : 'Authorization code'}
+                        </span>
+                        <div class="provider-connect-inline">
+                          <input
+                            class="provider-connect-input"
+                            value={authorizationCode()}
+                            onInput={(event) => setAuthorizationCode(event.currentTarget.value)}
+                            autocomplete="off"
+                            spellcheck={false}
+                            placeholder={
+                              canPasteRedirect()
+                                ? 'http://127.0.0.1:.../callback?code=...'
+                                : 'Authorization code'
+                            }
+                            aria-describedby={
+                              canPasteRedirect() ? 'mcp-auth-redirect-help' : undefined
+                            }
+                          />
+                          <button
+                            type="submit"
+                            class="provider-connect-primary"
+                            disabled={isSubmitting() || !authorizationCode().trim()}
+                          >
+                            {isSubmitting() ? 'Working...' : 'Submit'}
+                          </button>
+                        </div>
+                      </label>
+                    </div>
                   </details>
-                  <div class="provider-connect-intro" aria-live="polite">
-                    Status: {currentStatus().status.replaceAll('_', ' ')}
-                  </div>
-                  <div class="provider-connect-actions">
-                    <button
-                      type="button"
-                      class="provider-connect-danger"
-                      disabled={isSubmitting()}
-                      onClick={() => void removeAndRestart()}
-                    >
-                      Remove credentials and restart
-                    </button>
-                    <button
-                      type="button"
-                      class="provider-connect-primary"
-                      disabled={isSubmitting()}
-                      onClick={() => void checkAuthorizationStatus()}
-                    >
-                      {isSubmitting() ? 'Refreshing...' : 'Refresh status'}
-                    </button>
+                  <Show when={authError()}>
+                    <div class="provider-connect-error" role="alert">
+                      {authError()}
+                    </div>
+                  </Show>
+                  <div class="provider-connect-actions provider-connect-status-row">
+                    <span class="provider-connect-status" aria-live="polite">
+                      Status: {currentStatus().status.replaceAll('_', ' ')}
+                    </span>
+                    <div class="provider-connect-button-group">
+                      <button
+                        type="button"
+                        class="provider-connect-secondary provider-connect-danger-text"
+                        disabled={isSubmitting()}
+                        onClick={() => void removeAndRestart()}
+                      >
+                        Remove credentials and restart
+                      </button>
+                      <button
+                        type="button"
+                        class="provider-connect-secondary"
+                        disabled={isSubmitting()}
+                        onClick={() => void checkAuthorizationStatus()}
+                      >
+                        {isSubmitting() ? 'Refreshing...' : 'Refresh status'}
+                      </button>
+                    </div>
                   </div>
                 </form>
               </Show>
-            </Show>
-            <Show when={!isConnected() && (errorMessage() || statusError())}>
-              <div class="provider-connect-error" role="alert">
-                {errorMessage() || statusError()}
-              </div>
             </Show>
           </div>
         </div>

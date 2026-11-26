@@ -1,3 +1,5 @@
+import { flush as flushSolid } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getSlashCommands } from './slash-commands';
 import { resetDefaultAppState, setState } from '../../lib/state';
@@ -34,6 +36,7 @@ describe('getSlashCommands', () => {
     const mcp = commands.find((command) => command.name === 'mcp');
     expect(mcp?.aliases).toEqual(['mcps']);
     expect(mcp?.acceptsArguments).toBe(true);
+    expect(mcp?.argumentHint).toBe('[server]');
     expect(commands.filter((command) => ['mcp', 'mcps'].includes(command.name))).toHaveLength(1);
     void mcp?.action(' at ');
     expect(onOpenMcps).toHaveBeenCalledWith('at');
@@ -42,7 +45,10 @@ describe('getSlashCommands', () => {
   it.each([1, 2] as const)(
     'reserves /btw and offers it only for an existing V2 conversation on API %s',
     (apiVersion) => {
-      setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion });
+      setState(
+        storePath('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion })
+      );
+      flushSolid();
       const onSideQuestion = vi.fn();
       const commands = getSlashCommands({
         hasCurrentSession: true,
@@ -62,6 +68,7 @@ describe('getSlashCommands', () => {
         void aside[0]!.action('Why?');
         expect(onSideQuestion).toHaveBeenCalledWith('Why?');
         expect(aside[0]!.acceptsArguments).toBe(true);
+        expect(aside[0]!.argumentHint).toBe('[question]');
       }
     }
   );
@@ -147,7 +154,10 @@ describe('getSlashCommands', () => {
   });
 
   it.each([1, 2] as const)('keeps command presentation neutral on API %s', (apiVersion) => {
-    setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion });
+    setState(
+      storePath('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion })
+    );
+    flushSolid();
     const commands = getSlashCommands({
       hasCurrentSession: true,
       canInit: false,
@@ -180,6 +190,35 @@ describe('getSlashCommands', () => {
     expect(JSON.stringify(commands)).not.toContain('Private prompt');
   });
 
+  it('preserves custom argument labels and provides a fallback for command definitions', () => {
+    const commands = getSlashCommands({
+      hasCurrentSession: false,
+      canInit: false,
+      onConnectProvider: () => {},
+      onOpenMcps: () => {},
+      onOpenSettings: () => {},
+      onExportSession: () => {},
+      onPauseSession: vi.fn(async () => {}),
+      onGenerateStats: () => {},
+      customCommands: [
+        {
+          name: 'deploy',
+          source: 'command',
+          template: '',
+          hints: [' environment ', '[version]', '<region>', ''],
+        },
+        { name: 'test', source: 'command', template: '' },
+        { name: 'no-args', source: 'mcp', template: '' },
+      ],
+    });
+    expect(commands.find((command) => command.name === 'deploy')?.argumentHint).toBe(
+      '[environment] [version] <region>'
+    );
+    expect(commands.find((command) => command.name === 'test')?.argumentHint).toBe('[arguments]');
+    expect(commands.find((command) => command.name === 'no-args')?.argumentHint).toBeUndefined();
+    expect(commands.find((command) => command.name === 'settings')?.argumentHint).toBeUndefined();
+  });
+
   it('keeps reserved built-ins hidden when a custom command reuses the name', () => {
     const commands = getSlashCommands({
       hasCurrentSession: true,
@@ -210,7 +249,10 @@ describe('getSlashCommands', () => {
   ] as const)(
     'gates /pause on API %s and current session %s',
     (apiVersion, hasCurrentSession, visible) => {
-      setState('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion });
+      setState(
+        storePath('serverStatus', { state: 'running', url: 'http://localhost:4096', apiVersion })
+      );
+      flushSolid();
       const commands = getSlashCommands({
         hasCurrentSession,
         canInit: false,

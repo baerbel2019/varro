@@ -1,6 +1,6 @@
 # OpenCode v1 and v2 support
 
-Research date: September 19, 2026. The implementation supports v1 from 1.16.0 and v2 from 2.0.5 through automatic extension-host adapters.
+Varro supports v1 from 1.16.0 and v2 from 2.0.6 through automatic extension-host adapters.
 
 V2 is recommended for new installations; v1 remains supported. See the [usage guide](usage.md#choose-and-update-opencode) for installation, version selection, updates, and configuration compatibility. Current packages both install `opencode`. Varro also recognizes older or custom `opencode2` installations and prefers that name during automatic discovery.
 
@@ -25,7 +25,7 @@ update does not block later deletion. Cancelled updates check their signal befor
 reading, and before replacing the annotation file, so cancellation while queued or preparing a write
 does not commit that update.
 
-`npm run test:compatibility:adapters` installs published binaries into isolated directories and tests the production adapters. The current tested versions are v1 `1.19.5` and v2 `2.3.0`, alongside the v1 `1.16.0` and v2 `2.0.5` support floors. Release-specific results are recorded below. The checks cover managed startup, credential recovery in a second window, restart, multi-window recovery after process exit, bootstrap, workspace path encoding, v2 configuration precedence, session updates, deterministic streamed model responses, actual fixture-only tool execution, message pagination, tail editing, helper generation, fork/revert, deletion, and native v2 permissions/forms. The generated report is `artifacts/opencode-adapters/verified.json`.
+`npm run test:compatibility:adapters` installs published binaries into isolated directories and tests the production adapters. The current tested versions are v1 `1.19.6` and v2 `2.4.2`, alongside the v1 `1.16.0` and v2 `2.0.6` support floors. Release-specific results are recorded below. The checks cover managed startup, credential recovery in a second window, restart, multi-window recovery after process exit, bootstrap, workspace path encoding, v2 configuration precedence and global reload, session updates, deterministic streamed model responses, actual fixture-only tool execution, message pagination, tail editing, helper generation, fork/revert, deletion, and native v2 permissions/forms. The generated report is `artifacts/opencode-adapters/verified.json`.
 
 Fresh VS Code sandbox windows passed `v2-first-run` and the existing `healthy-first-run` scenario. These editor checks verify activation, ownership, health, and event-stream connection. `test:compatibility:ui` additionally exercises the actual composer, successful replies, pre-turn failures, HTTP 401 handling, recovery through a working provider, and reopening history. Full visual streaming performance remains a separate verification task.
 
@@ -54,6 +54,16 @@ input in Varro would only hide it, not prevent backend execution. An upstream fi
 carry an explicit user-cancellation outcome through shell/job removal and suppress its
 background notification. Interrupting the entire session or racing to cancel the new
 inbox item is not a safe substitute for cancelling one process.
+
+OpenCode 2.4.0 adds `POST /api/experimental/job/{id}/cancel`. A cancelled job settles
+without a completion notice. When Stop is used on a session that is waiting for background
+work, Varro lists its running jobs, including descendant sessions' jobs, with
+`GET /api/experimental/job?sessionID={id}&descendants=true&status=running`, cancels each
+one, and then interrupts the session. Shell, subagent, image, video, and Code Mode jobs
+all stop without waking the session again. Shells marked as services keep running. Older
+servers, and servers that answer the new routes with 404, keep the `DELETE /api/shell/{id}`
+path described above. The per-process Stop action in the background-process dialog still
+uses shell deletion, matching the upstream app's shell rows.
 
 ### Background-job reconciliation
 
@@ -192,6 +202,234 @@ published-server check does not rerun or clear the startup failures recorded bel
 The full `npm run test` run passed 12,181 Vitest tests with 58 skipped, plus 284
 script tests with three skipped. There were no failures. Evidence is
 `artifacts/auxiliary-usage-all-tests.log`.
+
+### V2 minimum raised to 2.0.6
+
+Global provider configuration refresh calls `POST /api/location/reload`, first
+available in v2.0.6. V2.0.5 could not reload that configuration on an attached
+server. The v1 minimum and both SDK/client versions are unchanged.
+
+The focused v2.0.6 check changed a provider name in isolated global configuration
+and verified that OpenCode served the new name after Varro requested a reload,
+with the same server PID. This check is separate from the stream-timeout test,
+which still requires v2.0.20.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 28 | None | Yes, applicable automated cases |
+| v1.19.6 | 31 | 27 | None | Yes, applicable automated cases |
+| v2.0.6 | 48 | 10 | None | Yes, applicable automated cases |
+| v2.4.1 | 55 | 3 | None | Yes, applicable automated cases |
+
+The macOS ARM64 run passed all 164 applicable checks with no recovered server
+processes. Logs are in `artifacts/opencode-2.0.6-floor-adapters.log` and
+`artifacts/opencode-2.0.6-global-config-reload.log`.
+
+### 2.4.2 compatibility review
+
+Reviewed v2.4.1 to v2.4.2, `6f0514052a` through `fc31a48531`. The complete diff is
+retained in `artifacts/opencode-2.4.2-upstream.diff`. Existing HTTP paths, SSE events,
+and consumed session, message, part, permission, and form shapes are unchanged; most
+protocol changes are OpenAPI descriptions. New experimental push-notification routes and
+events, `GET /api/experimental/skill/:skillID/file/*`, and a 502 `SkillLoadError` on
+prompt and skill activation are additive. `Agent.Info` gains optional `instructions`,
+which Varro does not read. Prompt, command, skill, and shell requests now unarchive an
+archived session and emit `session.unarchived`, which Varro already handles. "Always
+allow" for a web fetch now saves a per-site rule; the server picks the saved pattern,
+so Varro's reply is unchanged. V1 `1.19.6` and both support floors are unchanged. No adapter changes
+were required.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 28 | None in tested cases | Yes, applicable automated cases |
+| v1.19.6 | 31 | 27 | None in tested cases | Yes, applicable automated cases |
+| v2.0.6 | 48 | 10 | None in tested cases | Yes, applicable automated cases |
+| v2.4.2 | 55 | 3 | None in tested cases | Yes, applicable automated cases |
+
+The matrix passed all 164 applicable checks, with 68 family/platform skips and no
+recovered processes. The first run failed one v2.4.2 case because the integration
+test's `vscode` mock lacked `workspace.getConfiguration`, which the usage report has
+read since `abc0e693`. The mock now returns defaults. All five compatibility-summary
+tests pass afterward. `npm run lint:check`, `npm run typecheck`,
+`npm run typecheck:suggestions`, and `npm run build` pass. Evidence is
+`artifacts/opencode-2.4.2-adapters.log`, `artifacts/opencode-adapters/run-GOFUCq/`,
+and `artifacts/opencode-2.4.2-build.log`. Real-editor visuals, native Windows, and
+Docker image builds are outside this bump's verification.
+
+### 2.4.1 compatibility review
+
+Reviewed v2.4.0 to v2.4.1, `44aed4fd14` through `6f0514052a`. The complete diff is
+retained in `artifacts/opencode-2.4.1-upstream.diff`. No HTTP paths, SSE events, or
+consumed session, message, job, permission, or form shapes changed. `ModelInfo` gains an
+optional `experimental.speed` behind the opt-in `model_speeds` flag; Varro does not read
+it, and no local types change. `@opencode/client` stops an event iterator promptly when
+its signal aborts, even if events are already queued. Assistant messages now save on the
+SQLite that ships with macOS 12, and automation route checks moved into the core service.
+The background-job list and cancellation routes that session Stop uses are unchanged.
+V1 `1.19.6` and both support floors are unchanged.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 27 | None in tested cases | Yes, applicable automated cases |
+| v1.19.6 | 31 | 26 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 47 | 10 | None in tested cases | Yes, applicable automated cases |
+| v2.4.1 | 54 | 3 | None in tested cases | Yes, applicable automated cases |
+
+The matrix passed all 162 applicable checks, with 66 family/platform skips and no
+leaked or recovered processes. All five compatibility-summary tests pass afterward.
+The 1,617 focused v2 adapter, transport, REST proxy, and shared tests pass, with the
+47 published-server integration cases covered by the matrix. `npm run lint:check`,
+`npm run typecheck`, `npm run typecheck:suggestions`, and `npm run build` pass.
+Evidence is `artifacts/opencode-2.4.1-adapters.log`,
+`artifacts/opencode-adapters/run-R4vIiV/`, and the other `artifacts/opencode-2.4.1-`
+logs. Real-editor visuals, native Windows, and Docker image builds are outside this
+bump's verification.
+
+### 2.4.0 compatibility review
+
+Reviewed v2.3.2 to v2.4.0, `c0ad18b402` through `44aed4fd14`, using a
+separate clean release checkout because the sibling checkout contained unrelated
+work. The complete diff is retained in `artifacts/opencode-2.4.0-upstream.diff`.
+All 142 existing HTTP paths remain available; four new paths expose experimental
+machine management and background-job cancellation. Consumed session/message/inbox,
+permission/form, and managed `serve`/upgrade contracts remain compatible. V1
+`1.19.6` and both support floors are unchanged.
+
+The new native `video` job kind required validation and waiting-status support.
+Varro now accepts its output path, prefers its native title, and preserves
+descendant ownership and completion/error notification handoff. Cancelled jobs
+remain settled. Subagent notifications now use
+`<background-result kind="subagent">` instead of `<subagent>`. Varro recognizes
+both envelopes for pending child work and strips both from displayed result text,
+while retaining native metadata as the sole source of child attribution. Shell
+notices use the new wrapper too; their command, completion/failure label, and
+output remain visible without the XML envelope. Fourteen regression cases failed
+before these fixes.
+
+Session Stop now uses the new `experimental.job.cancel` route on 2.4.0 and later; see
+the background-process notes above. The new `experimental.job.updated` SSE event is ephemeral; the existing snapshot
+reconciliation remains valid without subscribing to it. Code Mode file changes
+use the existing `metadata.files` contract. Assistant part rows are now the default;
+Varro's existing local-summary API fallback already handles them.
+
+Other changes remain server-owned: automations are enabled by default and use the
+top-level `automations` setting, replacing `experimental.automations` and
+`experimental.schedules`; scheduled shell actions and MCP push events are added.
+Video generation is available by default, media tools are renamed to
+`generate_image` and `generate_video`, MCP negotiation defaults to `auto`, and
+ChatGPT subscription model lists follow models.dev. Optional machine, home-memory,
+project-overlay, full Code Mode, and session-search behavior does not require
+Varro UI changes. No user configuration is migrated by this bump.
+
+All 1,175 focused adapter, transport, protocol, transcript, local-summary,
+development-compatibility, and component tests pass. The 47 published-server
+integration cases skipped in that focused run are exercised separately by the
+adapter matrix. `npm run lint`, `npm run fmt`, `npm run fmt:check`,
+`npm run lint:check`, `npm run typecheck`, `npm run typecheck:suggestions`, and
+`npm run build` pass, with no lint warnings or suggestion diagnostics.
+Evidence uses the `artifacts/opencode-2.4.0-` prefix. The lockfile also synchronizes
+the user's existing Varro `0.36.3` manifest version. npm audit reports zero
+vulnerabilities.
+
+The first published-server matrix passed 161 checks, failed one, and skipped 66
+family/platform cases, with no leaked or recovered processes. On v2.4.0, the
+configured-model stateless-generation case received the existing safe
+model-unavailable fallback instead of a native response. A focused rerun
+reproduced it. Upstream removed the generation handler's plugin-activation wait;
+configuration visibility and workspace-model readiness do not establish base
+model readiness.
+
+The fixture now waits up to five seconds for the exact configured model in the
+base configuration directory's native catalog, then submits generation once.
+That focused check passes, preserving the one-provider-call and no-helper-session
+assertions. No production generation retry or readiness workaround was added.
+Cold stateless generation can still use Varro's existing helper fallback after an
+explicit model-unavailable response. Keep that fallback and the base-catalog
+precondition rather than retrying admitted inference.
+
+Initial evidence remains in `artifacts/opencode-2.4.0-adapters.log`,
+`artifacts/opencode-adapters/run-gWzsRM/`, and the
+`artifacts/opencode-2.4.0-generation-` logs.
+
+The corrected full matrix passed all 162 applicable checks, with 66
+family/platform skips and no leaked or recovered processes. All five
+compatibility-summary tests passed afterward. Final evidence is
+`artifacts/opencode-2.4.0-adapters-final.log`,
+`artifacts/opencode-adapters/run-kIUFhI/`, and
+`artifacts/opencode-2.4.0-summary-tests-final.log`.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 27 | None in tested cases | Yes, applicable automated cases |
+| v1.19.6 | 31 | 26 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 47 | 10 | None in tested cases | Yes, applicable automated cases |
+| v2.4.0 | 54 | 3 | Base-model readiness precondition corrected; no remaining failures | Yes, applicable automated cases |
+
+The v1 dependency is unchanged, so the Docker v1 support-range matrix is not
+rerun. Real-editor visuals, live-account action parity, native Windows, and Docker
+image builds are outside this bump's verification.
+
+### 2.3.2 and 1.19.6 compatibility review
+
+Reviewed v2.3.0 to v2.3.2, `a554d70499` through `c0ad18b402`, and v1.19.5
+to v1.19.6, `810c0eba1a` through `f4e363c829`. Complete upstream diffs are
+retained in `artifacts/opencode-2.3.2-upstream.diff` and
+`artifacts/opencode-1.19.6-upstream.diff`. Both support floors remain unchanged.
+
+V2 replaces four experimental schedule paths with automation paths and adds
+video-generation and blob endpoints. Varro consumes none of those routes.
+The remaining 135 paths retain their operations; only the experimental job
+route changes its schema, adding the `codemode` job kind. Varro now validates
+that kind and uses its native title or "Code Mode script" in waiting status.
+Six regression cases failed before the fix. They cover reopening, descendant
+ownership, titles, completion/error handoff, and cancellation.
+
+Consumed SSE names and payloads, session/message/inbox records, permission/form
+schemas, and managed serve/upgrade arguments remain compatible. Nested Code Mode
+permission sources now point to their parent tool row on the server, and denial
+only settles sibling requests for the same source message. No Varro permission
+change is needed.
+
+Other v2 changes are server-owned: default background compaction with a
+`compaction.background` opt-out, CLAUDE.md instruction fallback, GPT-6.2 prompt
+caching and model metadata, UTF-8-safe shell output, and full Code Mode behind
+explicit opt-in. Read, webfetch, and websearch structured outputs are simpler;
+Varro projects their retained text content, not those structured fields.
+V1 bounds inline image bytes in model requests without removing transcript
+attachments and recognizes more context-overflow errors. Its generated SDK
+contract is unchanged apart from the version.
+
+All 615 focused adapter, transport, event, protocol, and development-compatibility
+tests pass, along with five native-form script tests. `npm run lint`,
+`npm run fmt`, `npm run fmt:check`, `npm run lint:check`, `npm run typecheck`,
+`npm run typecheck:suggestions`, and `npm run build` pass. Suggestion diagnostics
+are zero. Lint reports 12 warnings in unrelated E2E and AI-runner tests.
+
+`npm run test:compatibility` passed all 519 required checks across 14 v1
+releases, including 43/43 on v1.19.6 and 37/37 on the v1.16.0 floor. Advisory
+checks passed 76/78 cases. The floor and below-floor v1.15.13 probe retain the
+known incomplete MCP pagination marker. No support-floor change is indicated.
+The runner regenerated `scripts/opencode-compatibility/verified.json`; all five
+compatibility-summary tests passed afterward. Evidence is
+`artifacts/opencode-1.19.6-compatibility.log`.
+
+`npm run test:compatibility:adapters` passed all 162 applicable checks, with 66
+family/platform skips and no leaked or recovered processes. Evidence is
+`artifacts/opencode-2.3.2-adapters.log` and
+`artifacts/opencode-adapters/run-BHqJHl/`.
+
+| Published server | Passed | Skipped | Issues found | All cases complete |
+| --- | ---: | ---: | --- | --- |
+| v1.16.0 | 30 | 27 | None in tested cases | Yes, applicable automated cases |
+| v1.19.6 | 31 | 26 | None in tested cases | Yes, applicable automated cases |
+| v2.0.5 | 47 | 10 | None in tested cases | Yes, applicable automated cases |
+| v2.3.2 | 54 | 3 | None after Code Mode job fix | Yes, applicable automated cases |
+
+No further adapter fixes are indicated. Keep the Code Mode job regression cases
+when changing background status reconciliation. Real-editor visuals, live-account
+action parity, and native Windows checks are outside this bump's verification.
+npm audit reports seven high-severity findings in unchanged development
+dependencies; dependency-security remediation is separate from this bump.
 
 ### 2.3.0 compatibility review
 

@@ -46,6 +46,7 @@ function createCallbacks(): MessageRouterCallbacks {
     editorRouteChanged: vi.fn(),
     exportSession: vi.fn(() => Promise.resolve()),
     generateUsageReport: vi.fn(() => Promise.resolve()),
+    generateSessionUsageReport: vi.fn(() => Promise.resolve()),
     reloadWebview: vi.fn(() => Promise.resolve()),
     openFolder: vi.fn(() => Promise.resolve()),
     openTransferredSession: vi.fn(() => Promise.resolve()),
@@ -72,6 +73,7 @@ function createCallbacks(): MessageRouterCallbacks {
     handleApiRequest: vi.fn(() => Promise.resolve()),
     cancelApiRequest: vi.fn(),
     handleRalphMessage: vi.fn(),
+    handleWarmingMessage: vi.fn(),
     updateQueuedMessages: vi.fn(() => Promise.resolve()),
     claimQueuedMessage: vi.fn(),
     releaseQueuedMessage: vi.fn(),
@@ -171,7 +173,31 @@ describe('MessageRouter', () => {
       payload: { canAbort: true, canSwitchSessions: false, model },
     });
 
-    expect(cb.updateCommandState).toHaveBeenCalledWith(true, false, model, undefined, undefined);
+    expect(cb.updateCommandState).toHaveBeenCalledWith(true, false, model, undefined, undefined, {
+      canNavigateBack: false,
+      canNavigateForward: false,
+    });
+  });
+
+  it('dispatches session history availability with command state', async () => {
+    const cb = createCallbacks();
+    const router = new MessageRouter(cb);
+
+    await router.handleMessage({
+      type: 'commands/state',
+      payload: {
+        canAbort: false,
+        canSwitchSessions: true,
+        canNavigateBack: true,
+        canNavigateForward: false,
+        model: null,
+      },
+    });
+
+    expect(cb.updateCommandState).toHaveBeenCalledWith(false, true, null, undefined, undefined, {
+      canNavigateBack: true,
+      canNavigateForward: false,
+    });
   });
 
   it('dispatches session read acknowledgements', async () => {
@@ -528,6 +554,7 @@ const DISPATCH_EXPECTATIONS = {
         { providerID: 'anthropic', modelID: 'claude-opus-5' },
         'session-1',
         undefined,
+        { canNavigateBack: false, canNavigateForward: false },
       ],
     },
   ],
@@ -595,6 +622,7 @@ const DISPATCH_EXPECTATIONS = {
   ],
   'session/export': [{ callback: 'exportSession', args: ['session-1'] }],
   'usage/report': [{ callback: 'generateUsageReport', args: [true] }],
+  'usage/session-report': [{ callback: 'generateSessionUsageReport', args: ['session-1'] }],
   'vscode/open-settings': [{ callback: 'openSettings', args: ['varro.server'] }],
   'vscode/mermaid-preview': [{ callback: 'setMermaidPreviewOpen', args: [true] }],
   'server/restart': [{ callback: 'restartServer', args: [true] }],
@@ -680,6 +708,15 @@ const DISPATCH_EXPECTATIONS = {
     { callback: 'handleRalphMessage', args: [VALID_WEBVIEW_MESSAGES['ralph/update-model']] },
   ],
   'ralph/sync': [{ callback: 'handleRalphMessage', args: [VALID_WEBVIEW_MESSAGES['ralph/sync']] }],
+  'warming/sync': [
+    { callback: 'handleWarmingMessage', args: [VALID_WEBVIEW_MESSAGES['warming/sync']] },
+  ],
+  'warming/set': [
+    { callback: 'handleWarmingMessage', args: [VALID_WEBVIEW_MESSAGES['warming/set']] },
+  ],
+  'warming/samples': [
+    { callback: 'handleWarmingMessage', args: [VALID_WEBVIEW_MESSAGES['warming/samples']] },
+  ],
   log: [{ callback: 'log', args: [{ msg: 'hello', level: 'warn' }] }],
 } as const satisfies Record<WebviewMessage['type'], readonly DispatchExpectation[]>;
 

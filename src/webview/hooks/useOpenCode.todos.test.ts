@@ -1,26 +1,17 @@
-import { createRoot } from 'solid-js';
+import { flush as flushSolid } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { describe, expect, it, vi } from 'vitest';
-import type { ServerEventName } from '../../shared/protocol';
 import {
   assistantMessage,
+  captureServerEventHandlers,
   getClientMocks,
-  loadModules,
+  loadAndMountUseOpenCode,
   session,
   todoPart,
   userMessage,
 } from './useOpenCode.test-support';
 
-interface ServerEvent {
-  properties: unknown;
-}
-
 const clientMocks = getClientMocks();
-type ServerEventsOn = (
-  event: ServerEventName | '*',
-  handler: (data: ServerEvent) => void
-) => () => void;
-const serverEventsOn = vi.fn<ServerEventsOn>();
-Object.assign(clientMocks, { serverEventsOn });
 
 describe('useOpenCode todo synchronization', () => {
   it('loads persisted todos from the native session todo endpoint', async () => {
@@ -36,16 +27,14 @@ describe('useOpenCode todo synchronization', () => {
       { content: 'Native persisted todo', status: 'in_progress', priority: 'high' },
     ]);
 
-    const { stateModule, hookModule } = await loadModules();
-    const dispose = createRoot((cleanup) => {
-      hookModule.useOpenCode();
-      return cleanup;
-    });
+    const { stateModule, hookModule, dispose } = await loadAndMountUseOpenCode();
 
     try {
       await Promise.resolve();
+      flushSolid();
 
       await hookModule.selectSession('session-1');
+      flushSolid();
 
       expect(clientMocks.sessionTodos).toHaveBeenCalledWith('session-1', {
         directory: '/repo',
@@ -61,17 +50,12 @@ describe('useOpenCode todo synchronization', () => {
       ]);
     } finally {
       dispose();
+      flushSolid();
     }
   });
 
   it('rebuilds todos from refreshed messages after stale todo events', async () => {
-    const handlers = new Map<string, (data: ServerEvent) => void>();
-    serverEventsOn.mockImplementation((event, handler) => {
-      handlers.set(event, handler);
-      return () => {
-        handlers.delete(event);
-      };
-    });
+    const handlers = captureServerEventHandlers();
 
     clientMocks.health.mockResolvedValue({ healthy: true, version: '1.0.0' });
     clientMocks.sessionList.mockResolvedValue([]);
@@ -87,23 +71,24 @@ describe('useOpenCode todo synchronization', () => {
       },
     ]);
 
-    const { stateModule, hookModule } = await loadModules();
-    const dispose = createRoot((cleanup) => {
-      hookModule.useOpenCode();
-      return cleanup;
-    });
+    const { stateModule, dispose } = await loadAndMountUseOpenCode();
 
     try {
       await Promise.resolve();
+      flushSolid();
 
-      stateModule.setState('activeSessionId', 'session-1');
-      stateModule.setState('messages', [
-        { info: userMessage('user-1'), parts: [] },
-        {
-          info: assistantMessage('assistant-1', 'user-1'),
-          parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'in_progress')],
-        },
-      ]);
+      stateModule.setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
+      stateModule.setState(
+        storePath('messages', [
+          { info: userMessage('user-1'), parts: [] },
+          {
+            info: assistantMessage('assistant-1', 'user-1'),
+            parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'in_progress')],
+          },
+        ])
+      );
+      flushSolid();
 
       handlers.get('todo.updated')?.({
         properties: {
@@ -118,6 +103,7 @@ describe('useOpenCode todo synchronization', () => {
           ],
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([
         {
@@ -129,6 +115,7 @@ describe('useOpenCode todo synchronization', () => {
       ]);
 
       handlers.get('session.idle')?.({ properties: { sessionID: 'session-1' } });
+      flushSolid();
 
       await vi.waitFor(() => {
         expect(stateModule.state.todos).toEqual([
@@ -140,19 +127,15 @@ describe('useOpenCode todo synchronization', () => {
           },
         ]);
       });
+      flushSolid();
     } finally {
       dispose();
+      flushSolid();
     }
   });
 
   it('rebuilds todos from messages when the active assistant message completes', async () => {
-    const handlers = new Map<string, (data: ServerEvent) => void>();
-    serverEventsOn.mockImplementation((event, handler) => {
-      handlers.set(event, handler);
-      return () => {
-        handlers.delete(event);
-      };
-    });
+    const handlers = captureServerEventHandlers();
 
     clientMocks.health.mockResolvedValue({ healthy: true, version: '1.0.0' });
     clientMocks.sessionList.mockResolvedValue([]);
@@ -160,23 +143,24 @@ describe('useOpenCode todo synchronization', () => {
     clientMocks.providerList.mockResolvedValue({ providers: [], default: {} });
     clientMocks.questionList.mockResolvedValue([]);
 
-    const { stateModule, hookModule } = await loadModules();
-    const dispose = createRoot((cleanup) => {
-      hookModule.useOpenCode();
-      return cleanup;
-    });
+    const { stateModule, dispose } = await loadAndMountUseOpenCode();
 
     try {
       await Promise.resolve();
+      flushSolid();
 
-      stateModule.setState('activeSessionId', 'session-1');
-      stateModule.setState('messages', [
-        { info: userMessage('user-1'), parts: [] },
-        {
-          info: assistantMessage('assistant-1', 'user-1'),
-          parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'completed')],
-        },
-      ]);
+      stateModule.setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
+      stateModule.setState(
+        storePath('messages', [
+          { info: userMessage('user-1'), parts: [] },
+          {
+            info: assistantMessage('assistant-1', 'user-1'),
+            parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'completed')],
+          },
+        ])
+      );
+      flushSolid();
 
       handlers.get('todo.updated')?.({
         properties: {
@@ -191,6 +175,7 @@ describe('useOpenCode todo synchronization', () => {
           ],
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([
         {
@@ -209,6 +194,7 @@ describe('useOpenCode todo synchronization', () => {
           },
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([
         {
@@ -220,17 +206,12 @@ describe('useOpenCode todo synchronization', () => {
       ]);
     } finally {
       dispose();
+      flushSolid();
     }
   });
 
   it('clears stale event todos when the refreshed messages still have no todo parts', async () => {
-    const handlers = new Map<string, (data: ServerEvent) => void>();
-    serverEventsOn.mockImplementation((event, handler) => {
-      handlers.set(event, handler);
-      return () => {
-        handlers.delete(event);
-      };
-    });
+    const handlers = captureServerEventHandlers();
 
     clientMocks.health.mockResolvedValue({ healthy: true, version: '1.0.0' });
     clientMocks.sessionList.mockResolvedValue([]);
@@ -249,23 +230,24 @@ describe('useOpenCode todo synchronization', () => {
       },
     ]);
 
-    const { stateModule, hookModule } = await loadModules();
-    const dispose = createRoot((cleanup) => {
-      hookModule.useOpenCode();
-      return cleanup;
-    });
+    const { stateModule, dispose } = await loadAndMountUseOpenCode();
 
     try {
       await Promise.resolve();
+      flushSolid();
 
-      stateModule.setState('activeSessionId', 'session-1');
-      stateModule.setState('messages', [
-        { info: userMessage('user-1'), parts: [] },
-        {
-          info: assistantMessage('assistant-1', 'user-1'),
-          parts: [],
-        },
-      ]);
+      stateModule.setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
+      stateModule.setState(
+        storePath('messages', [
+          { info: userMessage('user-1'), parts: [] },
+          {
+            info: assistantMessage('assistant-1', 'user-1'),
+            parts: [],
+          },
+        ])
+      );
+      flushSolid();
 
       handlers.get('todo.updated')?.({
         properties: {
@@ -280,6 +262,7 @@ describe('useOpenCode todo synchronization', () => {
           ],
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([]);
 
@@ -291,27 +274,25 @@ describe('useOpenCode todo synchronization', () => {
           },
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([]);
 
       handlers.get('session.idle')?.({ properties: { sessionID: 'session-1' } });
+      flushSolid();
 
       await vi.waitFor(() => {
         expect(stateModule.state.todos).toEqual([]);
       });
+      flushSolid();
     } finally {
       dispose();
+      flushSolid();
     }
   });
 
   it('keeps visible todos during active progress when a newer assistant update has no todo parts yet', async () => {
-    const handlers = new Map<string, (data: ServerEvent) => void>();
-    serverEventsOn.mockImplementation((event, handler) => {
-      handlers.set(event, handler);
-      return () => {
-        handlers.delete(event);
-      };
-    });
+    const handlers = captureServerEventHandlers();
 
     clientMocks.health.mockResolvedValue({ healthy: true, version: '1.0.0' });
     clientMocks.sessionList.mockResolvedValue([]);
@@ -319,33 +300,39 @@ describe('useOpenCode todo synchronization', () => {
     clientMocks.providerList.mockResolvedValue({ providers: [], default: {} });
     clientMocks.questionList.mockResolvedValue([]);
 
-    const { stateModule, hookModule } = await loadModules();
-    const dispose = createRoot((cleanup) => {
-      hookModule.useOpenCode();
-      return cleanup;
-    });
+    const { stateModule, dispose } = await loadAndMountUseOpenCode();
 
     try {
       await Promise.resolve();
+      flushSolid();
 
-      stateModule.setState('activeSessionId', 'session-1');
-      stateModule.setState('messages', [
-        { info: userMessage('user-1'), parts: [] },
-        {
-          info: assistantMessage('assistant-1', 'user-1'),
-          parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'in_progress')],
-        },
-      ]);
-      stateModule.setState('sessionStatus', { 'session-1': { type: 'busy' } });
+      stateModule.setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
+      stateModule.setState(
+        storePath('messages', [
+          { info: userMessage('user-1'), parts: [] },
+          {
+            info: assistantMessage('assistant-1', 'user-1'),
+            parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'in_progress')],
+          },
+        ])
+      );
+      flushSolid();
+      stateModule.setState(storePath('sessionStatus', { 'session-1': { type: 'busy' } }));
+      flushSolid();
       stateModule.startLoading();
-      stateModule.setState('todos', [
-        {
-          id: 'todo-part-1-todo',
-          content: 'Summarize findings',
-          status: 'in_progress',
-          priority: 'medium',
-        },
-      ]);
+      flushSolid();
+      stateModule.setState(
+        storePath('todos', [
+          {
+            id: 'todo-part-1-todo',
+            content: 'Summarize findings',
+            status: 'in_progress',
+            priority: 'medium',
+          },
+        ])
+      );
+      flushSolid();
 
       handlers.get('message.updated')?.({
         properties: {
@@ -355,6 +342,7 @@ describe('useOpenCode todo synchronization', () => {
           },
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([
         {
@@ -366,17 +354,12 @@ describe('useOpenCode todo synchronization', () => {
       ]);
     } finally {
       dispose();
+      flushSolid();
     }
   });
 
   it('ignores todo.updated payload contents while the active assistant reply is still running', async () => {
-    const handlers = new Map<string, (data: ServerEvent) => void>();
-    serverEventsOn.mockImplementation((event, handler) => {
-      handlers.set(event, handler);
-      return () => {
-        handlers.delete(event);
-      };
-    });
+    const handlers = captureServerEventHandlers();
 
     clientMocks.health.mockResolvedValue({ healthy: true, version: '1.0.0' });
     clientMocks.sessionList.mockResolvedValue([]);
@@ -384,31 +367,35 @@ describe('useOpenCode todo synchronization', () => {
     clientMocks.providerList.mockResolvedValue({ providers: [], default: {} });
     clientMocks.questionList.mockResolvedValue([]);
 
-    const { stateModule, hookModule } = await loadModules();
-    const dispose = createRoot((cleanup) => {
-      hookModule.useOpenCode();
-      return cleanup;
-    });
+    const { stateModule, dispose } = await loadAndMountUseOpenCode();
 
     try {
       await Promise.resolve();
+      flushSolid();
 
-      stateModule.setState('activeSessionId', 'session-1');
-      stateModule.setState('messages', [
-        { info: userMessage('user-1'), parts: [] },
-        {
-          info: assistantMessage('assistant-1', 'user-1'),
-          parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'in_progress')],
-        },
-      ]);
-      stateModule.setState('todos', [
-        {
-          id: 'todo-part-1-todo',
-          content: 'Summarize findings',
-          status: 'in_progress',
-          priority: 'medium',
-        },
-      ]);
+      stateModule.setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
+      stateModule.setState(
+        storePath('messages', [
+          { info: userMessage('user-1'), parts: [] },
+          {
+            info: assistantMessage('assistant-1', 'user-1'),
+            parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'in_progress')],
+          },
+        ])
+      );
+      flushSolid();
+      stateModule.setState(
+        storePath('todos', [
+          {
+            id: 'todo-part-1-todo',
+            content: 'Summarize findings',
+            status: 'in_progress',
+            priority: 'medium',
+          },
+        ])
+      );
+      flushSolid();
 
       handlers.get('todo.updated')?.({
         properties: {
@@ -423,6 +410,7 @@ describe('useOpenCode todo synchronization', () => {
           ],
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([
         {
@@ -434,17 +422,12 @@ describe('useOpenCode todo synchronization', () => {
       ]);
     } finally {
       dispose();
+      flushSolid();
     }
   });
 
   it('ignores stale todo events after the active assistant message completes', async () => {
-    const handlers = new Map<string, (data: ServerEvent) => void>();
-    serverEventsOn.mockImplementation((event, handler) => {
-      handlers.set(event, handler);
-      return () => {
-        handlers.delete(event);
-      };
-    });
+    const handlers = captureServerEventHandlers();
 
     clientMocks.health.mockResolvedValue({ healthy: true, version: '1.0.0' });
     clientMocks.sessionList.mockResolvedValue([]);
@@ -452,36 +435,40 @@ describe('useOpenCode todo synchronization', () => {
     clientMocks.providerList.mockResolvedValue({ providers: [], default: {} });
     clientMocks.questionList.mockResolvedValue([]);
 
-    const { stateModule, hookModule } = await loadModules();
-    const dispose = createRoot((cleanup) => {
-      hookModule.useOpenCode();
-      return cleanup;
-    });
+    const { stateModule, dispose } = await loadAndMountUseOpenCode();
 
     try {
       await Promise.resolve();
+      flushSolid();
       const completedAssistant = assistantMessage('assistant-1', 'user-1');
       if (completedAssistant.role !== 'assistant') {
         throw new Error('Expected an assistant message fixture');
       }
       completedAssistant.time.completed = 1;
 
-      stateModule.setState('activeSessionId', 'session-1');
-      stateModule.setState('messages', [
-        { info: userMessage('user-1'), parts: [] },
-        {
-          info: completedAssistant,
-          parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'completed')],
-        },
-      ]);
-      stateModule.setState('todos', [
-        {
-          id: 'todo-part-1-todo',
-          content: 'Summarize findings',
-          status: 'completed',
-          priority: 'medium',
-        },
-      ]);
+      stateModule.setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
+      stateModule.setState(
+        storePath('messages', [
+          { info: userMessage('user-1'), parts: [] },
+          {
+            info: completedAssistant,
+            parts: [todoPart('todo-part-1', 'assistant-1', 'Summarize findings', 'completed')],
+          },
+        ])
+      );
+      flushSolid();
+      stateModule.setState(
+        storePath('todos', [
+          {
+            id: 'todo-part-1-todo',
+            content: 'Summarize findings',
+            status: 'completed',
+            priority: 'medium',
+          },
+        ])
+      );
+      flushSolid();
 
       handlers.get('todo.updated')?.({
         properties: {
@@ -496,6 +483,7 @@ describe('useOpenCode todo synchronization', () => {
           ],
         },
       });
+      flushSolid();
 
       expect(stateModule.state.todos).toEqual([
         {
@@ -507,6 +495,7 @@ describe('useOpenCode todo synchronization', () => {
       ]);
     } finally {
       dispose();
+      flushSolid();
     }
   });
 });

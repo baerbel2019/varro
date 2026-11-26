@@ -29,6 +29,15 @@ const vscodeMock = vi.hoisted(() => ({
     showTextDocument: vi.fn(() => Promise.resolve(undefined)),
   },
   languages: {
+    getLanguages: vi.fn(async () => [
+      'plaintext',
+      'markdown',
+      'json',
+      'shellscript',
+      'xml',
+      'typescript',
+      'javascript',
+    ]),
     setTextDocumentLanguage: vi.fn(async (document: MockDocument, languageId: string) => {
       if (document.languageId === languageId) return document;
       const updated = { ...document, languageId };
@@ -174,6 +183,22 @@ describe('ToolOutputDocumentProvider', () => {
     }
   });
 
+  it.each([
+    { title: 'plan-1234.md', language: 'markdown', path: '/plan-1234.md' },
+    { title: 'pasted-text-1234.txt', language: 'plaintext', path: '/pasted-text-1234.txt' },
+  ])('keeps the extension an attachment name already has: $title', async (input) => {
+    const provider = new ToolOutputDocumentProvider();
+
+    try {
+      await provider.open({ content: '# Plan', title: input.title, language: input.language });
+
+      const path = vscodeMock.Uri.from.mock.calls.at(-1)?.[0]?.path ?? '';
+      expect(path.endsWith(input.path)).toBe(true);
+    } finally {
+      provider.dispose();
+    }
+  });
+
   it('can keep a named document out of preview mode', async () => {
     const provider = new ToolOutputDocumentProvider();
 
@@ -219,6 +244,24 @@ describe('ToolOutputDocumentProvider', () => {
       );
       const uri = vscodeMock.Uri.from.mock.results[0]?.value as { toString(): string };
       expect(vscodeMock.provider?.provideTextDocumentContent(uri)).toBe('<svg />');
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it('opens unregistered language hints as plain text instead of failing', async () => {
+    const provider = new ToolOutputDocumentProvider();
+
+    try {
+      await expect(
+        provider.open({ content: 'raw', title: 'notes unsaved selection', language: 'text' })
+      ).resolves.toEqual(expect.anything());
+
+      expect(vscodeMock.languages.setTextDocumentLanguage).toHaveBeenCalledWith(
+        expect.anything(),
+        'plaintext'
+      );
+      expect(vscodeMock.window.showTextDocument).toHaveBeenCalledOnce();
     } finally {
       provider.dispose();
     }

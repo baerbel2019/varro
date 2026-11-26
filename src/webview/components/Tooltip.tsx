@@ -1,14 +1,14 @@
 import {
-  children,
   createEffect,
+  children,
   createSignal,
   createUniqueId,
   onCleanup,
-  onMount,
+  onSettled,
   Show,
 } from 'solid-js';
-import type { JSX } from 'solid-js';
-import { Portal } from 'solid-js/web';
+import { type JSX, Portal } from '@solidjs/web';
+
 import { registerComposerOverlayDismiss } from './chat-input/composer-overlay-dismiss';
 
 export const DEFAULT_TOOLTIP_DELAY = 1000;
@@ -27,6 +27,9 @@ export function Tooltip(props: {
   /** Attach to an existing editor-owned element without reparenting it. */
   target?: HTMLElement;
   placement?: 'top' | 'bottom' | 'left' | 'right';
+  variant?: 'tooltip' | 'panel';
+  /** Align a description panel to the full owning row rather than its text trigger. */
+  anchor?: () => HTMLElement | undefined;
   delay?: number;
   disabled?: boolean;
 }) {
@@ -38,12 +41,15 @@ export function Tooltip(props: {
   let tooltip: HTMLDivElement | undefined;
   let showTimer: ReturnType<typeof setTimeout> | undefined;
   let unregisterComposerDismiss: (() => void) | undefined;
+  let panelResizeObserver: ResizeObserver | undefined;
 
   const hide = () => {
     if (showTimer) clearTimeout(showTimer);
     showTimer = undefined;
     unregisterComposerDismiss?.();
     unregisterComposerDismiss = undefined;
+    panelResizeObserver?.disconnect();
+    panelResizeObserver = undefined;
     setVisible(false);
     setPosition(null);
   };
@@ -51,10 +57,13 @@ export function Tooltip(props: {
   const updatePosition = () => {
     if (!trigger || !tooltip) return;
 
-    const triggerBox = trigger.getBoundingClientRect();
+    const triggerBox = (props.anchor?.() ?? trigger).getBoundingClientRect();
+    if (props.variant === 'panel') {
+      tooltip.style.width = `${Math.min(triggerBox.width, Math.max(0, window.innerWidth - 16))}px`;
+    }
     const tooltipBox = tooltip.getBoundingClientRect();
     const viewportMargin = 8;
-    const gap = 6;
+    const gap = props.variant === 'panel' ? 7 : 6;
     if (props.placement === 'left' || props.placement === 'right') {
       const left =
         props.placement === 'right'
@@ -106,32 +115,50 @@ export function Tooltip(props: {
   };
 
   const show = () => {
-    if (props.disabled || trigger?.getAttribute('aria-expanded') === 'true') return;
     if (showTimer) clearTimeout(showTimer);
     unregisterComposerDismiss ??= registerComposerOverlayDismiss(hide);
     showTimer = setTimeout(() => {
       showTimer = undefined;
+      // The trigger can stage its truncation measurement during the same hover event.
+      if (props.disabled || trigger?.getAttribute('aria-expanded') === 'true') {
+        hide();
+        return;
+      }
       setVisible(true);
-      queueMicrotask(updatePosition);
+      queueMicrotask(() => {
+        if (!visible()) return;
+        updatePosition();
+        if (props.variant !== 'panel' || !tooltip || !globalThis.ResizeObserver) return;
+        panelResizeObserver?.disconnect();
+        panelResizeObserver = new ResizeObserver(updatePosition);
+        panelResizeObserver.observe(tooltip);
+        const anchor = props.anchor?.();
+        if (anchor) panelResizeObserver.observe(anchor);
+      });
     }, props.delay ?? DEFAULT_TOOLTIP_DELAY);
   };
 
-  createEffect(() => {
-    if (props.disabled) {
-      hide();
-      return;
+  createEffect(
+    () => ({ disabled: props.disabled, isVisible: visible() }),
+    ({ disabled, isVisible }) => {
+      if (disabled) {
+        hide();
+        return undefined;
+      }
+      if (!isVisible) return undefined;
+      const reposition = () => updatePosition();
+      window.addEventListener('resize', reposition);
+      window.addEventListener('scroll', reposition, true);
+      return () => {
+        window.removeEventListener('resize', reposition);
+        window.removeEventListener('scroll', reposition, true);
+      };
     }
-    if (!visible()) return;
-    const reposition = () => updatePosition();
-    window.addEventListener('resize', reposition);
-    window.addEventListener('scroll', reposition, true);
-    onCleanup(() => {
-      window.removeEventListener('resize', reposition);
-      window.removeEventListener('scroll', reposition, true);
-    });
-  });
+  );
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const resolved = props.target ?? resolvedChildren();
     if (!(resolved instanceof HTMLElement)) {
       throw new Error('Tooltip requires a single HTML element child');
@@ -163,7 +190,7 @@ export function Tooltip(props: {
       attributes: true,
       attributeFilter: ['aria-expanded'],
     });
-    onCleanup(() => {
+    cleanups.push(() => {
       triggerElement.removeEventListener('mouseenter', show);
       triggerElement.removeEventListener('mouseleave', hide);
       triggerElement.removeEventListener('focusin', show);
@@ -177,6 +204,10 @@ export function Tooltip(props: {
         triggerElement.removeAttribute('aria-describedby');
       }
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   onCleanup(hide);
@@ -191,27 +222,35 @@ export function Tooltip(props: {
               tooltip = element;
             }}
             id={tooltipId}
-            class="themed-tooltip"
-            classList={{
-              visible: position() !== null,
-              top: position()?.placement === 'top',
-              bottom: position()?.placement === 'bottom',
-              left: position()?.placement === 'left',
-              right: position()?.placement === 'right',
-            }}
+
+            class={[
+              'themed-tooltip',
+              {
+                panel: props.variant === 'panel',
+                visible: position() !== null,
+                top: position()?.placement === 'top',
+                bottom: position()?.placement === 'bottom',
+                left: position()?.placement === 'left',
+                right: position()?.placement === 'right',
+              },
+            ]}
             role="tooltip"
             style={{ left: `${position()?.left ?? 0}px`, top: `${position()?.top ?? 0}px` }}
           >
             {props.content}
-            <span
-              class="themed-tooltip-arrow"
-              style={{
-                left: `${position()?.arrowLeft ?? 0}px`,
-                top:
-                  position()?.arrowTop === undefined ? undefined : `${position()?.arrowTop ?? 0}px`,
-              }}
-              aria-hidden="true"
-            />
+            <Show when={props.variant !== 'panel'}>
+              <span
+                class="themed-tooltip-arrow"
+                style={{
+                  left: `${position()?.arrowLeft ?? 0}px`,
+                  top:
+                    position()?.arrowTop === undefined
+                      ? undefined
+                      : `${position()?.arrowTop ?? 0}px`,
+                }}
+                aria-hidden="true"
+              />
+            </Show>
           </div>
         </Portal>
       </Show>

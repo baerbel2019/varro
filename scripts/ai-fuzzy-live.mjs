@@ -7,12 +7,21 @@ import { fileURLToPath } from 'node:url';
 
 import {
   createCdpRequestClient,
+  dispatchCdpClick,
   executeVscodeCommand,
+  isVscodeWorkbenchTarget,
+  listCdpTargets,
+  openCdpSocket,
   reloadVscodeWindow,
   resizeVscodeSidebar,
   verifyVscodeLaunchIdentity,
 } from './vscode-launch-process.mjs';
-import { requireFixtureWorkspace } from './ai-fuzzy-preconditions.mjs';
+import {
+  parseArgs,
+  parseModel,
+  requiredOption,
+  requireFixtureWorkspace,
+} from './ai-fuzzy-preconditions.mjs';
 import { requireIsolatedTestServer } from './ai-test-isolation.mjs';
 import { AiOpenCodeClient } from './ai-opencode-client.mjs';
 import { normalizeCapturedEvents, savePlaybackCapture } from './ai-session-playback.mjs';
@@ -25,34 +34,6 @@ const DEFAULT_MODEL = 'openai/gpt-6-luna-fast';
 const DEFAULT_MAX_PROMPTS = 3;
 const DEFAULT_GATE_TIMEOUT_MS = 90_000;
 export const DEFAULT_AI18_FIXTURE_EDIT_PATH = 'packages/util/src/bom.ts';
-
-function parseArgs(argv) {
-  const [command, ...rest] = argv;
-  const options = {};
-  for (let index = 0; index < rest.length; index += 1) {
-    const argument = rest[index];
-    if (!argument.startsWith('--')) throw new Error(`Unexpected argument: ${argument}`);
-    const value = rest[index + 1];
-    if (!value || value.startsWith('--')) throw new Error(`Missing value for ${argument}`);
-    options[argument.slice(2)] = value;
-    index += 1;
-  }
-  return { command, options };
-}
-
-function required(options, name) {
-  const value = options[name]?.trim();
-  if (!value) throw new Error(`--${name} is required`);
-  return value;
-}
-
-function parseModel(value) {
-  const separator = value.indexOf('/');
-  if (separator <= 0 || separator === value.length - 1) {
-    throw new Error('--model must use provider/model format');
-  }
-  return { providerID: value.slice(0, separator), modelID: value.slice(separator + 1) };
-}
 
 export function modelDisplayName(value) {
   const { modelID } = parseModel(value);
@@ -277,7 +258,7 @@ export function summarizeCanonicalDelivery(messages, marker, tokens) {
           completed: Number.isFinite(entry.info.time?.completed),
           error: entry.info.error ?? null,
           text: entry.parts
-            .filter((part) => part?.type === 'text' || part?.type === 'reasoning')
+            .filter((part) => part?.type === 'text')
             .map((part) => part.text ?? '')
             .join('\n'),
         }))
@@ -500,11 +481,7 @@ function getContentFrameId(frameTree) {
 }
 
 async function inspectVarroTarget(port, target) {
-  const socket = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    socket.addEventListener('open', resolve, { once: true });
-    socket.addEventListener('error', reject, { once: true });
-  });
+  const socket = await openCdpSocket(target.webSocketDebuggerUrl);
   const controller = new CdpController(port, socket, null, null, target.id);
   try {
     const tree = await controller.call('Page.getFrameTree');
@@ -525,6 +502,7 @@ async function inspectVarroTarget(port, target) {
     );
     if (!mainContext) throw new Error('default content execution context is unavailable');
     controller.mainContextId = mainContext.id;
+    controller.mainContextUniqueId = mainContext.uniqueId;
     const inspected = await controller.call('Runtime.evaluate', {
       contextId: mainContext.id,
       expression: `(() => {
@@ -623,9 +601,7 @@ export class CdpController {
     let lastError = null;
     while (Date.now() < deadline) {
       try {
-        const targets = await fetch(`http://127.0.0.1:${String(port)}/json/list`).then((response) =>
-          response.json()
-        );
+        const targets = await listCdpTargets(port);
         const matchingTargets = targets.filter(
           (item) => item.type === 'iframe' && item.url.includes('extensionId=koltyakov.varro')
         );
@@ -696,9 +672,50 @@ export class CdpController {
     return result.result.value;
   }
 
-  startSessionEventCapture() {
-    return this.evaluate(`(() => {
-      globalThis.__varroSessionEventCapture?.stop();
+  observationOwner() {
+    const owner = {
+      targetId: this.targetId,
+      frameId: this.frameId,
+      viewId: this.targetContext?.viewId,
+      uniqueContextId: this.mainContextUniqueId,
+    };
+    if (!owner.targetId || !owner.frameId || !owner.viewId || !owner.uniqueContextId)
+      throw new Error(`Missing observation owner: ${JSON.stringify(owner)}`);
+    return owner;
+  }
+
+  async evaluateObservation(owner, phase, expression) {
+    try {
+      const current = this.observationOwner();
+      if (Object.keys(owner).some((key) => owner[key] !== current[key])) {
+        throw new Error(`observation owner changed to ${JSON.stringify(current)}`);
+      }
+      // A focus recovery may replace the action's isolated world. A real document
+      // replacement must fail rather than collect a new observer with no history.
+      const result = await this.call('Runtime.evaluate', {
+        uniqueContextId: owner.uniqueContextId,
+        expression,
+        returnByValue: true,
+        awaitPromise: true,
+      });
+      if (result.exceptionDetails)
+        throw new Error(
+          result.exceptionDetails.exception?.description ?? result.exceptionDetails.text
+        );
+      return result.result.value;
+    } catch (error) {
+      throw new Error(`${phase} in ${JSON.stringify(owner)}: ${controllerErrorMessage(error)}`, {
+        cause: error,
+      });
+    }
+  }
+
+  startSessionEventCapture(owner) {
+    return this.evaluateObservation(
+      owner,
+      'Start session-event capture',
+      `(() => {
+      if (globalThis.__varroSessionEventCapture) throw new Error('Session-event capture already installed');
       const startedAt = performance.now();
       const events = [];
       const listener = (message) => {
@@ -714,17 +731,22 @@ export class CdpController {
         stop() { window.removeEventListener('message', listener); },
       };
       return true;
-    })()`);
+    })()`
+    );
   }
 
-  finishSessionEventCapture() {
-    return this.evaluate(`(() => {
+  finishSessionEventCapture(owner) {
+    return this.evaluateObservation(
+      owner,
+      'Finish session-event capture',
+      `(() => {
       const capture = globalThis.__varroSessionEventCapture;
-      if (!capture) return [];
+      if (!capture) throw new Error('Installed session-event capture is missing');
       capture.stop();
       delete globalThis.__varroSessionEventCapture;
       return capture.events;
-    })()`);
+    })()`
+    );
   }
 
   evaluateInCurrentContext(expression) {
@@ -759,6 +781,7 @@ export class CdpController {
     this.requests = rebound.requests;
     this.contextId = rebound.contextId;
     this.mainContextId = rebound.mainContextId;
+    this.mainContextUniqueId = rebound.mainContextUniqueId;
     this.frameId = rebound.frameId;
     this.targetId = rebound.targetId;
     this.targetContext = rebound.targetContext;
@@ -976,36 +999,14 @@ export class CdpController {
   async click(selector, scope = null, edge = 'center') {
     const point = await this.point(selector, edge, scope);
     if (!point) return false;
-    for (const [type, buttons] of [
-      ['mousePressed', 1],
-      ['mouseReleased', 0],
-    ]) {
-      await this.call('Input.dispatchMouseEvent', {
-        type,
-        ...point,
-        button: 'left',
-        buttons,
-        clickCount: 1,
-      });
-    }
+    await dispatchCdpClick(this, point);
     return true;
   }
 
   async contextClick(selector, scope = null) {
     const point = await this.point(selector, 'center', scope);
     if (!point) return false;
-    for (const [type, buttons] of [
-      ['mousePressed', 2],
-      ['mouseReleased', 0],
-    ]) {
-      await this.call('Input.dispatchMouseEvent', {
-        type,
-        ...point,
-        button: 'right',
-        buttons,
-        clickCount: 1,
-      });
-    }
+    await dispatchCdpClick(this, point, { button: 'right', pressed: 2 });
     return true;
   }
 
@@ -1024,18 +1025,7 @@ export class CdpController {
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     })()`);
     if (!point) return false;
-    for (const [type, buttons] of [
-      ['mousePressed', 1],
-      ['mouseReleased', 0],
-    ]) {
-      await this.call('Input.dispatchMouseEvent', {
-        type,
-        ...point,
-        button: 'left',
-        buttons,
-        clickCount: 1,
-      });
-    }
+    await dispatchCdpClick(this, point);
     return true;
   }
 
@@ -1051,18 +1041,7 @@ export class CdpController {
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     })()`);
     if (!point) return false;
-    for (const [type, buttons] of [
-      ['mousePressed', 1],
-      ['mouseReleased', 0],
-    ]) {
-      await this.call('Input.dispatchMouseEvent', {
-        type,
-        ...point,
-        button: 'left',
-        buttons,
-        clickCount: 1,
-      });
-    }
+    await dispatchCdpClick(this, point);
     await new Promise((resolve) => setTimeout(resolve, 100));
     if ((await this.snapshot()).routeSessionId === sessionId) return true;
 
@@ -1095,19 +1074,7 @@ export class CdpController {
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     })()`);
     if (!point) return false;
-    for (const [type, buttons] of [
-      ['mousePressed', 1],
-      ['mouseReleased', 0],
-    ]) {
-      await this.call('Input.dispatchMouseEvent', {
-        type,
-        ...point,
-        button: 'left',
-        buttons,
-        modifiers: 1,
-        clickCount: 1,
-      });
-    }
+    await dispatchCdpClick(this, point, { modifiers: 1 });
     return true;
   }
 
@@ -1123,18 +1090,7 @@ export class CdpController {
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     })()`);
     if (!point) return false;
-    for (const [type, buttons] of [
-      ['mousePressed', 1],
-      ['mouseReleased', 0],
-    ]) {
-      await this.call('Input.dispatchMouseEvent', {
-        type,
-        ...point,
-        button: 'left',
-        buttons,
-        clickCount: 1,
-      });
-    }
+    await dispatchCdpClick(this, point);
     return true;
   }
 
@@ -1153,18 +1109,7 @@ export class CdpController {
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     })()`);
     if (!point) return false;
-    for (const [type, buttons] of [
-      ['mousePressed', 1],
-      ['mouseReleased', 0],
-    ]) {
-      await this.call('Input.dispatchMouseEvent', {
-        type,
-        ...point,
-        button: 'left',
-        buttons,
-        clickCount: 1,
-      });
-    }
+    await dispatchCdpClick(this, point);
     await new Promise((resolve) => setTimeout(resolve, 100));
     const remainsActionable = () =>
       this.evaluate(`(() => {
@@ -1208,12 +1153,15 @@ export class CdpController {
         (candidate) => candidate.getAttribute('data-queued-message-id') === itemId
       );
       if (!row) return null;
+      const steer = row.querySelector('button[aria-label="Send as Steer"]');
       return {
         id: itemId,
         ownerViewId: row.getAttribute('data-queued-message-owner'),
         sessionId: row.getAttribute('data-queued-message-session-id'),
         paused: !!row.querySelector('[aria-label="Play queued message"]'),
         editing: row.classList.contains('is-editing'),
+        steerAvailable: !!steer && !steer.disabled && !steer.hidden &&
+          steer.getBoundingClientRect().width > 0,
         text: row.textContent ?? '',
       };
     })()`);
@@ -1270,15 +1218,20 @@ export class CdpController {
     const normalized = shifted ? ' ' : key === 'Space' ? ' ' : key;
     const code = shifted || key === 'Space' ? 'Space' : key;
     const virtualKeyCode = {
+      Backspace: 8,
       Enter: 13,
       Tab: 9,
+      Escape: 27,
       ' ': 32,
       PageUp: 33,
       PageDown: 34,
       End: 35,
       Home: 36,
+      ArrowLeft: 37,
       ArrowUp: 38,
+      ArrowRight: 39,
       ArrowDown: 40,
+      Delete: 46,
     }[normalized];
     for (const type of ['keyDown', 'keyUp']) {
       const event = {
@@ -1523,6 +1476,8 @@ export class CdpController {
   }
 
   async dragTranscriptScrollbar(fraction) {
+    if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1)
+      throw new Error('Scrollbar fraction must be between 0 and 1');
     const attempts = [];
     for (let attempt = 0; attempt < 2; attempt++) {
       const geometry = await this.evaluate(`(() => {
@@ -1533,11 +1488,14 @@ export class CdpController {
       const travel = rect.height - thumb;
       return {
         range: list.scrollHeight - list.clientHeight,
+        travel,
         x: rect.right - Math.max(3, (list.offsetWidth - list.clientWidth) / 2),
         start: rect.top + list.scrollTop / (list.scrollHeight - list.clientHeight) * travel + thumb / 2,
-        end: ${JSON.stringify(fraction)} === 0
-          ? Math.max(1, rect.top - 40)
-          : Math.min(innerHeight - 1, rect.bottom + 40),
+         end: ${JSON.stringify(fraction)} === 0
+           ? Math.max(1, rect.top - 40)
+           : ${JSON.stringify(fraction)} === 1
+             ? Math.min(innerHeight - 1, rect.bottom + 40)
+             : rect.top + ${JSON.stringify(fraction)} * travel + thumb / 2,
       };
     })()`);
       if (!geometry) return { dispatched: attempts.length > 0, held: false, attempts };
@@ -1550,27 +1508,78 @@ export class CdpController {
         clickCount: 1,
       });
       let held;
+      let y = geometry.start;
+      const samples = [];
+      const sample = async () => {
+        const state = await this.evaluate(`(() => {
+          const list = document.querySelector('.interactive-list');
+          if (!list) return { held: false, visible: false };
+          const viewport = list.getBoundingClientRect();
+          return {
+            held: list.hasAttribute('data-pointer-scroll-owned'),
+            visible: [...list.querySelectorAll('[data-msg-id]')].some(row => {
+              const rect = row.getBoundingClientRect();
+              return rect.height > 0 && rect.bottom > viewport.top && rect.top < viewport.bottom;
+            }),
+            top: list.scrollTop,
+            range: list.scrollHeight - list.clientHeight,
+          };
+        })()`);
+        samples.push({ y, ...state });
+        return state.held && state.visible;
+      };
+      const move = async (nextY) => {
+        y = nextY;
+        await this.call('Input.dispatchMouseEvent', {
+          type: 'mouseMoved',
+          x: geometry.x,
+          y,
+          button: 'left',
+          buttons: 1,
+        });
+      };
+      const fractional = fraction > 0 && fraction < 1;
       try {
         await new Promise((resolve) => setTimeout(resolve, 400));
         for (let step = 1; step <= 12; step++) {
-          await this.call('Input.dispatchMouseEvent', {
-            type: 'mouseMoved',
-            x: geometry.x,
-            y: geometry.start + ((geometry.end - geometry.start) * step) / 12,
-            button: 'left',
-            buttons: 1,
-          });
+          await move(geometry.start + ((geometry.end - geometry.start) * step) / 12);
           await new Promise((resolve) => setTimeout(resolve, 25));
+          if (fractional && step === 11 && !(await sample())) break;
         }
         await new Promise((resolve) => setTimeout(resolve, 650));
-        held = await this.evaluate(
-          `document.querySelector('.interactive-list')?.hasAttribute('data-pointer-scroll-owned') === true`
-        );
+        if (fractional) {
+          if (samples[0].held && samples[0].visible && (await sample())) {
+            // Native thumb minima and track insets vary. Measure the last segment of
+            // this grab, then correct at most one segment without releasing the thumb.
+            const [from, to] = samples;
+            const dy = to.y - from.y;
+            const slope = (to.top - from.top) / dy;
+            const error = fraction * to.range - to.top;
+            const correction = error / slope;
+            if (
+              from.range === geometry.range &&
+              to.range === geometry.range &&
+              Math.abs(dy) >= 1 &&
+              slope > 0 &&
+              Math.abs(error) > to.range / geometry.travel + 1.5 &&
+              Math.abs(correction) <= Math.abs(dy)
+            ) {
+              await move(y + correction);
+              await new Promise((resolve) => setTimeout(resolve, 650));
+              await sample();
+            }
+          }
+          held = samples.every((entry) => entry.held);
+        } else {
+          held = await this.evaluate(
+            `document.querySelector('.interactive-list')?.hasAttribute('data-pointer-scroll-owned') === true`
+          );
+        }
       } finally {
         await this.call('Input.dispatchMouseEvent', {
           type: 'mouseReleased',
           x: geometry.x,
-          y: geometry.end,
+          y,
           button: 'left',
           buttons: 0,
           clickCount: 1,
@@ -1580,24 +1589,24 @@ export class CdpController {
       const range = after.transcript
         ? after.transcript.scrollHeight - after.transcript.clientHeight
         : null;
+      // The initial grab and destination each round to native mouse pixels. Their
+      // difference can be one track pixel, or tens of scroll CSS pixels in long history.
+      const targetTolerance =
+        fraction === 0 || fraction === 1 ? 1.5 : range / geometry.travel + 1.5;
+      const visible =
+        samples.every((entry) => entry.visible) && after.transcript?.visibleRows?.length;
       const reached =
-        after.transcript &&
-        (fraction === 0
-          ? after.transcript.scrollTop <= 1.5
-          : range - after.transcript.scrollTop <= 1.5);
-      attempts.push({ geometry, held, after, reached: !!reached });
+        visible && Math.abs(after.transcript.scrollTop - fraction * range) <= targetTolerance;
+      attempts.push({ geometry, samples, held, after, targetTolerance, reached: !!reached });
       // First-time virtual measurements can grow the range after the grab. Only that observed
       // targeting miss gets one re-grab with fresh geometry; never replay a blank-content failure.
-      if (
-        reached ||
-        !held ||
-        !after.transcript?.visibleRows?.length ||
-        range === null ||
-        Math.abs(range - geometry.range) <= 1.5
-      )
-        break;
+      if (reached || !held || !visible || range === null || range - geometry.range <= 1.5) break;
     }
-    return { dispatched: true, held: attempts.every((entry) => entry.held), attempts };
+    return {
+      dispatched: attempts.length > 0,
+      held: attempts.length > 0 && attempts.every((entry) => entry.held),
+      attempts,
+    };
   }
 
   countScoped(selector, scope) {
@@ -1995,18 +2004,7 @@ async function switchAwayAndBack(cdp, currentSessionId, currentTitle) {
     return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
   })()`);
   if (!alternate) return { dispatched: false, switchedAway: false, returned: false };
-  for (const [type, buttons] of [
-    ['mousePressed', 1],
-    ['mouseReleased', 0],
-  ]) {
-    await cdp.call('Input.dispatchMouseEvent', {
-      type,
-      ...alternate,
-      button: 'left',
-      buttons,
-      clickCount: 1,
-    });
-  }
+  await dispatchCdpClick(cdp, alternate);
   await new Promise((resolve) => setTimeout(resolve, 250));
   const switchedAway = (await cdp.snapshot()).title !== currentTitle;
   await cdp.click('[aria-label="Back to sessions"]');
@@ -2136,6 +2134,20 @@ function transcriptAtBoundary(action, state) {
 
 export function verifyActionEffect(action, before, after, details = {}) {
   if (!details.dispatched) return { verified: false, reason: 'input was not dispatched' };
+  if (action.action === 'click sticky or jump to latest' && details.navigationStart) {
+    const start = details.navigationStart;
+    const transcript = after?.transcript;
+    return transcriptMoved(before, start) &&
+      transcriptMoved(start, after) &&
+      before?.transcript?.sessionId &&
+      before?.transcript?.sessionId === start?.transcript?.sessionId &&
+      start?.transcript?.sessionId === transcript?.sessionId &&
+      transcript?.visibleRows?.length > 0 &&
+      Math.abs(transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop) <=
+        (details.streaming ? 64 : 1.5)
+      ? { verified: true }
+      : { verified: false, reason: 'detached jump start and return to latest were not verified' };
+  }
   if (action.action === 'show file diffs' || action.action === 'hide file diffs') {
     const enabled = action.action === 'show file diffs';
     return (
@@ -2256,8 +2268,9 @@ export function verifyActionEffect(action, before, after, details = {}) {
 }
 
 export async function executeActionPlan(cdp, plan, currentTitle, port, options = {}) {
-  const results = [];
+  const results = options.results ?? [];
   for (const action of plan) {
+    options.onActionStart?.(action);
     if (options.isActive && !(await options.isActive())) {
       results.push({ ...action, executed: false, reason: 'model stream settled' });
       break;
@@ -2364,7 +2377,29 @@ export async function executeActionPlan(cdp, plan, currentTitle, port, options =
         (await cdp.click('[data-sticky-msg-id]')) ||
         (await cdp.click('[aria-label="Scroll to latest message"]'));
       if (!dispatched && (await cdp.wheel('.interactive-list', -420, 'right'))) {
+        // The jump may return to the action's original pinned coordinate.
+        // Retain its actual detached start rather than judging that round trip as no movement.
+        const detachDeadline = Date.now() + 2_000;
+        do {
+          await new Promise((resolve) => setTimeout(resolve, 34));
+          details.navigationStart = await cdp.captureActionState(options.scope);
+        } while (!transcriptMoved(before, details.navigationStart) && Date.now() < detachDeadline);
         dispatched = await clickWithRetry(cdp, '[aria-label="Scroll to latest message"]');
+        if (dispatched) {
+          details.streaming = options.isActive ? await options.isActive() : false;
+          const arrivalDeadline = Date.now() + 2_000;
+          do {
+            await new Promise((resolve) => setTimeout(resolve, 34));
+            details.after = await cdp.captureActionState(options.scope);
+            const transcript = details.after?.transcript;
+            if (
+              transcript &&
+              Math.abs(transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop) <=
+                (details.streaming ? 64 : 1.5)
+            )
+              break;
+          } while (Date.now() < arrivalDeadline);
+        }
       }
     } else if (action.action === 'wheel transcript') {
       dispatched = await cdp.wheel('.interactive-list', action.delta, 'right');
@@ -2402,6 +2437,8 @@ export async function executeActionPlan(cdp, plan, currentTitle, port, options =
     if (details.targetingAttempts) result.targetingAttempts = details.targetingAttempts;
     if (details.held !== undefined) result.pointerHeld = details.held;
     if (details.nativeDrag) result.nativeDrag = details.nativeDrag;
+    if (details.navigationStart) result.navigationStart = details.navigationStart;
+    if (details.streaming !== undefined) result.streaming = details.streaming;
     if (effect.reason) result.reason = effect.reason;
     results.push(result);
     if (!effect.verified) break;
@@ -2570,7 +2607,7 @@ export function summarizeQueuedDelivery(messages, turns) {
     const responseMarker = turns[index]?.responseMarker ?? '';
     const text =
       assistant?.parts
-        ?.filter((part) => part?.type === 'text' || part?.type === 'reasoning')
+        ?.filter((part) => part?.type === 'text')
         .map((part) => part.text ?? '')
         .join('\n') ?? '';
     return (
@@ -2589,12 +2626,37 @@ export function summarizeQueuedDelivery(messages, turns) {
   const assistantIds = assistantEntries.map((entries) =>
     entries.length === 1 ? entries[0].info.id : null
   );
+  const assistantOutcomes = assistantEntries.map((entries, index) =>
+    entries.map((entry) => {
+      const text = (entry.parts ?? [])
+        .filter((part) => part?.type === 'text')
+        .map((part) => part.text ?? '')
+        .join('\n');
+      const reasoning = (entry.parts ?? [])
+        .filter((part) => part?.type === 'reasoning')
+        .map((part) => part.text ?? '')
+        .join('\n');
+      const marker = turns[index]?.responseMarker ?? '';
+      return {
+        id: entry.info.id,
+        parentID: entry.info.parentID,
+        finish: entry.info.finish,
+        completed: entry.info.time?.completed,
+        error: entry.info.error ?? null,
+        textLength: text.length,
+        textTail: text.slice(-2000),
+        textMarkerCount: marker ? text.split(marker).length - 1 : 0,
+        reasoningMarkerCount: marker ? reasoning.split(marker).length - 1 : 0,
+      };
+    })
+  );
   return {
     userCounts,
     assistantCounts,
     assistantValid,
     userIds,
     assistantIds,
+    assistantOutcomes,
     indexes,
     ordered:
       indexes.every((index) => index >= 0) &&
@@ -2627,18 +2689,10 @@ async function waitForTarget(port, requested, timeoutMs) {
 }
 
 async function readActiveVscodeTabTitle(port) {
-  const targets = await fetch(`http://127.0.0.1:${String(port)}/json/list`).then((response) =>
-    response.json()
-  );
-  const workbench = targets.find(
-    (target) => target.type === 'page' && target.title.includes('[Extension Development Host]')
-  );
+  const targets = await listCdpTargets(port);
+  const workbench = targets.find(isVscodeWorkbenchTarget);
   if (!workbench?.webSocketDebuggerUrl) return null;
-  const socket = new WebSocket(workbench.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    socket.addEventListener('open', resolve, { once: true });
-    socket.addEventListener('error', reject, { once: true });
-  });
+  const socket = await openCdpSocket(workbench.webSocketDebuggerUrl);
   const requests = createCdpRequestClient(socket);
   try {
     const result = await requests.call('Runtime.evaluate', {
@@ -2669,9 +2723,7 @@ async function waitForSessionSnapshot(cdp, title, sessionId, port, timeoutMs = 1
 }
 
 async function varroEditorTargetIds(port) {
-  const targets = await fetch(`http://127.0.0.1:${String(port)}/json/list`).then((response) =>
-    response.json()
-  );
+  const targets = await listCdpTargets(port);
   return targets
     .filter(
       (target) =>
@@ -2683,20 +2735,12 @@ async function varroEditorTargetIds(port) {
 }
 
 async function closeVscodeSessionEditorTabs(port, titles) {
-  const targets = await fetch(`http://127.0.0.1:${String(port)}/json/list`).then((response) =>
-    response.json()
-  );
-  const workbenches = targets.filter(
-    (target) => target.type === 'page' && target.title.includes('[Extension Development Host]')
-  );
+  const targets = await listCdpTargets(port);
+  const workbenches = targets.filter(isVscodeWorkbenchTarget);
   if (workbenches.length !== 1 || !workbenches[0]?.webSocketDebuggerUrl) {
     throw new Error(`Expected one VS Code workbench target, found ${String(workbenches.length)}`);
   }
-  const socket = new WebSocket(workbenches[0].webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    socket.addEventListener('open', resolve, { once: true });
-    socket.addEventListener('error', reject, { once: true });
-  });
+  const socket = await openCdpSocket(workbenches[0].webSocketDebuggerUrl);
   const requests = createCdpRequestClient(socket);
   let closed = 0;
   try {
@@ -2716,18 +2760,7 @@ async function closeVscodeSessionEditorTabs(port, titles) {
       });
       const value = point.result.value;
       if (!value) break;
-      for (const [type, buttons] of [
-        ['mousePressed', 1],
-        ['mouseReleased', 0],
-      ]) {
-        await requests.call('Input.dispatchMouseEvent', {
-          type,
-          ...value,
-          button: 'left',
-          buttons,
-          clickCount: 1,
-        });
-      }
+      await dispatchCdpClick(requests, value);
       closed += 1;
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -2846,8 +2879,7 @@ export async function waitForTargetDisappearance(
   port,
   targetId,
   timeoutMs,
-  listTargets = () =>
-    fetch(`http://127.0.0.1:${String(port)}/json/list`).then((response) => response.json()),
+  listTargets = () => listCdpTargets(port),
   pollIntervalMs = 100
 ) {
   const deadline = Date.now() + timeoutMs;
@@ -2929,13 +2961,15 @@ async function runMultiWebviewScenario({
   const runSessionTitles = manifest.runSessions
     .filter((session) => !session.deleted)
     .map((session) => session.title);
-  await openAi18SidebarSession(
-    sidebar,
-    tracked.id,
-    tracked.title,
-    launch.remoteDebuggingPort,
-    runSessionTitles
-  );
+  const openTrackedSession = () =>
+    openAi18SidebarSession(
+      sidebar,
+      tracked.id,
+      tracked.title,
+      launch.remoteDebuggingPort,
+      runSessionTitles
+    );
+  await openTrackedSession();
   if (!(await waitForSessionQuiescence(client, sidebar, tracked.id, timeoutMs * 3))) {
     throw new Error('AI-18 root session and queue did not become quiescent before replay');
   }
@@ -3088,13 +3122,7 @@ async function runMultiWebviewScenario({
 
   let editor = null;
   try {
-    await openAi18SidebarSession(
-      sidebar,
-      tracked.id,
-      tracked.title,
-      launch.remoteDebuggingPort,
-      runSessionTitles
-    );
+    await openTrackedSession();
     await sidebar.selectPermissionMode(permissionMode);
     await sampleConfiguration(sidebar, 'sidebar-source');
     const streamPrompt = `${streamMarker} Produce 120 numbered paragraphs of 35-45 words each. Emit every paragraph in order and end with ${responseMarker}-STREAM-END. Do not use tools, spawn subagents, delegate work, or change files.`;
@@ -3141,13 +3169,7 @@ async function runMultiWebviewScenario({
     await sidebar.rebind();
     const hiddenCount = await waitForSessionQueueCount(sidebar, tracked.id, 2, 5_000);
     evidence.counts.samples.push({ phase: 'hidden', count: hiddenCount.count });
-    await openAi18SidebarSession(
-      sidebar,
-      tracked.id,
-      tracked.title,
-      launch.remoteDebuggingPort,
-      runSessionTitles
-    );
+    await openTrackedSession();
     const hiddenQueue = await sidebar.captureActionState();
     evidence.queues.hiddenHandoff = {
       displayedCount: hiddenCount.count,
@@ -3412,13 +3434,7 @@ async function runMultiWebviewScenario({
     await sidebar.rebind();
     const closedCount = await waitForSessionQueueCount(sidebar, tracked.id, 1, 5_000);
     evidence.counts.samples.push({ phase: 'closed', count: closedCount.count });
-    await openAi18SidebarSession(
-      sidebar,
-      tracked.id,
-      tracked.title,
-      launch.remoteDebuggingPort,
-      runSessionTitles
-    );
+    await openTrackedSession();
     const closedQueue = await sidebar.captureActionState();
     evidence.queues.closedHandoff = {
       displayedCount: closedCount.count,
@@ -3463,13 +3479,7 @@ async function runMultiWebviewScenario({
       finalQueue.queueItems.length === 0 &&
       JSON.stringify(evidence.counts.samples.map((sample) => sample.count)) ===
         JSON.stringify([2, 1, 0]);
-    await openAi18SidebarSession(
-      sidebar,
-      tracked.id,
-      tracked.title,
-      launch.remoteDebuggingPort,
-      runSessionTitles
-    );
+    await openTrackedSession();
     await sidebar.key('.interactive-list', 'End');
     const finalRowCounts = await sidebar.evaluate(`(() => {
       const ids = ${JSON.stringify([
@@ -3745,6 +3755,27 @@ async function runLifecycleScenario({
       transferred?.ownerViewId === 'sidebar' && transferred.paused === true;
     evidence.queue.samples.push({ phase: 'hidden-transfer', row: transferred });
 
+    await executeVscodeCommand(launch.remoteDebuggingPort, 'View: Focus into Secondary Side Bar');
+    await sidebar.refreshContext();
+    const steerReady = await waitForObservation(
+      () => sidebar.readQueueRow(queued.item.id),
+      (row) => row?.ownerViewId === 'sidebar' && row.paused && !row.editing && row.steerAvailable,
+      15_000
+    );
+    evidence.queue.samples.push({ phase: 'sidebar-steer-ready', row: steerReady });
+    if (!steerReady) {
+      evidence.queue.steerReadinessFailure = await sidebar.evaluate(`(() => {
+        const row = [...document.querySelectorAll('[data-queued-message-id]')].find(
+          element => element.getAttribute('data-queued-message-id') === ${JSON.stringify(queued.item.id)}
+        );
+        return { focused: document.hasFocus(), rowClass: row?.className,
+          buttons: [...(row?.querySelectorAll('button') ?? [])].map(button => ({
+            label: button.getAttribute('aria-label'), disabled: button.disabled, hidden: button.hidden,
+            width: button.getBoundingClientRect().width, display: getComputedStyle(button).display,
+          })) };
+      })()`);
+      throw new Error('AI-19 sidebar steer control did not become actionable after handoff');
+    }
     evidence.queue.steerDispatched = await sidebar.clickQueueControl(
       queued.item.id,
       'Send as Steer'
@@ -3793,6 +3824,10 @@ async function runLifecycleScenario({
       timeoutMs * 3
     );
     evidence.delivery = queuedDelivery.delivery;
+    evidence.deliveryWait = {
+      settled: queuedDelivery.settled,
+      delivery: queuedDelivery.delivery,
+    };
     if (!(await waitForIdle(client, tracked.id, timeoutMs * 3))) {
       throw new Error('AI-19 streams did not settle');
     }
@@ -3805,6 +3840,9 @@ async function runLifecycleScenario({
     ).observed;
 
     const messages = await client.messages(tracked.id, 1000);
+    // The first delivery deadline can expire before the subsequent idle wait.
+    // Judge the canonical snapshot used below, not the earlier incomplete result.
+    evidence.delivery = summarizeQueuedDelivery(messages, [queueTurn]);
     const modelEvidence = promptModelFailures(
       messages,
       [streamMarker, queueTurn.promptMarker],
@@ -4050,9 +4088,38 @@ export async function executeActivityScenario({
   return evidence;
 }
 
+export async function revealRetainedActivity(
+  cdp,
+  sessionId,
+  scope,
+  { maxSteps = 40, wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}
+) {
+  const actions = [];
+  if (!scope?.messageIds?.length) return { found: false, actions, reason: 'No current-turn scope' };
+  for (let step = 0; step <= maxSteps; step++) {
+    if ((await cdp.snapshot()).routeSessionId !== sessionId)
+      return { found: false, actions, reason: 'Session route changed' };
+    const state = await cdp.captureActionState(scope);
+    if (state.disclosures?.some((disclosure) => disclosure.visible))
+      return { found: true, actions, state };
+    if (step === maxSteps || !state.transcript || state.transcript.scrollTop <= 1)
+      return {
+        found: false,
+        actions,
+        state,
+        reason: 'No visible current-turn retained disclosure',
+      };
+    const action = { input: 'wheel', delta: -420, before: state };
+    actions.push(action);
+    action.dispatched = await cdp.wheel('.interactive-list', action.delta, 'right');
+    if (!action.dispatched) return { found: false, actions, reason: 'Native wheel unavailable' };
+    await wait(100);
+  }
+}
+
 async function runLive(options) {
-  const manifestPath = path.resolve(required(options, 'manifest'));
-  const launchPath = path.resolve(required(options, 'launch'));
+  const manifestPath = path.resolve(requiredOption(options, 'manifest'));
+  const launchPath = path.resolve(requiredOption(options, 'launch'));
   const scenario = options.scenario ?? 'AI-07';
   if (!['AI-07', 'AI-08', 'AI-17', 'AI-18', 'AI-19'].includes(scenario)) {
     throw new Error('--scenario must be AI-07, AI-08, AI-17, AI-18, or AI-19');
@@ -4145,6 +4212,7 @@ async function runLive(options) {
   let controllerError = null;
   let descendantsBefore = null;
   let playbackSource = null;
+  let observationOwner;
   let activityObservationStarted = false;
   try {
     let childEdit;
@@ -4218,8 +4286,9 @@ async function runLive(options) {
           client.getSession(tracked.id),
           client.messages(tracked.id, 1000),
         ]);
+        observationOwner = cdp.observationOwner();
+        await cdp.startSessionEventCapture(observationOwner);
         playbackSource = { session, initialMessages };
-        await cdp.startSessionEventCapture();
       }
       if (scenario === 'AI-17') {
         if (!(await waitForSessionQuiescence(client, cdp, tracked.id, timeoutMs * 3))) {
@@ -4369,7 +4438,9 @@ async function runLive(options) {
       let scope = null;
       let activityExecution = null;
       if (scenario === 'AI-07' || scenario === 'AI-08') {
-        await cdp.evaluate(
+        await cdp.evaluateObservation(
+          observationOwner,
+          'Start frame observation',
           `(() => { (${installObserver.toString()})(); globalThis.varroAiStreamingObserver.start(); })()`
         );
         activityObservationStarted = true;
@@ -4490,12 +4561,23 @@ async function runLive(options) {
           break;
         }
 
-        actions = await executeActionPlan(
+        attemptRecord.actions = actions;
+        await executeActionPlan(
           cdp,
           manifest.actionPlan,
           tracked.title,
           launch.remoteDebuggingPort,
           {
+            results: actions,
+            onActionStart: (action) => {
+              attemptRecord.lastActionStarted = {
+                ...action,
+                targetId: cdp.targetId,
+                frameId: cdp.frameId,
+                actionContextId: cdp.contextId,
+                documentContextId: cdp.mainContextUniqueId,
+              };
+            },
             isActive: () => client.isBusy(tracked.id),
             readMessageOrder: async () =>
               (await client.messages(tracked.id, 1000)).map((message) => message.info.id),
@@ -4504,25 +4586,43 @@ async function runLive(options) {
             scope,
           }
         );
-        attemptRecord.actions = actions;
         const attemptActionFailure = actions.find((action) => !action.executed);
         if (!shouldRetryAi08WithFreshStream(attemptActionFailure, attempt, maxPrompts)) break;
       }
       const settled = await waitForIdle(client, tracked.id, timeoutMs);
       let activityObservation = null;
-      if (activityObservationStarted) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        activityObservation = await cdp.evaluate('globalThis.varroAiStreamingObserver.stop()');
-        activityObservationStarted = false;
-      }
       if (activityExecution) {
         activityExecution.settled = settled;
         activityExecution.finalSnapshot = await cdp.captureActionState(scope);
-        if (!settled || !activityExecution.finalSnapshot.disclosures?.length) {
+        if (settled && !activityExecution.finalSnapshot.disclosures?.some((item) => item.visible)) {
+          // Long final prose can unmount the earlier tool rows. Verify their
+          // retained projection by native navigation, not bottom-range membership.
+          activityExecution.retainedDisclosure = await revealRetainedActivity(
+            cdp,
+            tracked.id,
+            scope
+          );
+        }
+        if (
+          !settled ||
+          !(
+            activityExecution.finalSnapshot.disclosures?.some((item) => item.visible) ||
+            activityExecution.retainedDisclosure?.found
+          )
+        ) {
           activityExecution.executed = false;
           activityExecution.failurePhase ??= 'settled-projection';
           activityExecution.reason ??= 'Stream did not settle into a retained activity disclosure';
         }
+      }
+      if (activityObservationStarted) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        activityObservationStarted = false;
+        activityObservation = await cdp.evaluateObservation(
+          observationOwner,
+          'Finish frame observation',
+          'globalThis.varroAiStreamingObserver.stop()'
+        );
       }
       const fixtureAfterPreparation = await fixtureStatus(manifest.workspace);
       const actionFailure = actions.find((action) => !action.executed);
@@ -4573,6 +4673,7 @@ async function runLive(options) {
       if (scenario === 'AI-07' || scenario === 'AI-08') {
         Object.assign(result, {
           preparation: { passed: best?.missing.length === 0 },
+          observationOwner,
           activityExecution,
           activityObservation,
           scenarioVerification: 'NEEDS_AI_REVIEW',
@@ -4607,24 +4708,44 @@ async function runLive(options) {
     })();
   } catch (error) {
     controllerError = error;
+    if (observationOwner) {
+      Object.assign(manifest.livePreparation[scenario], { observationOwner, attempts });
+      const attempt = attempts.at(-1);
+      const last = attempt?.lastActionStarted;
+      const failed = attempt?.actions?.find((action) => !action.executed);
+      if (failed && !manifest.livePreparation[scenario].actionFailure) {
+        manifest.livePreparation[scenario].actionFailure = failed;
+      }
+      if (last && !attempt.actions.some((action) => action.step === last.step)) {
+        controllerError = new Error(
+          `${scenario} step ${last.step} (${last.action}): ${controllerErrorMessage(error)}`,
+          { cause: error }
+        );
+      }
+    }
   }
   if (activityObservationStarted) {
     try {
-      manifest.livePreparation[scenario].activityObservation = await cdp.evaluate(
+      manifest.livePreparation[scenario].activityObservation = await cdp.evaluateObservation(
+        observationOwner,
+        'Clean up frame observation',
         'globalThis.varroAiStreamingObserver.stop()'
       );
       await writeJsonAtomic(manifestPath, manifest);
     } catch (error) {
-      controllerError = new AggregateError(
-        [controllerError, error].filter(Boolean),
-        `${scenario} frame observation cleanup failed`
-      );
+      controllerError = controllerError
+        ? new AggregateError(
+            [controllerError, error],
+            `${scenario} controller failure followed by frame observation cleanup failure`,
+            { cause: controllerError }
+          )
+        : error;
     }
   }
   if (playbackSource) {
     try {
       const [events, finalMessages] = await Promise.all([
-        cdp.finishSessionEventCapture(),
+        cdp.finishSessionEventCapture(observationOwner),
         client.messages(tracked.id, 1000),
       ]);
       const capture = {
@@ -4641,6 +4762,15 @@ async function runLive(options) {
       await writeJsonAtomic(capturePath, capture);
       manifest.livePreparation[scenario].playbackCapture = capturePath;
       await writeJsonAtomic(manifestPath, manifest);
+      const initialIds = new Set(playbackSource.initialMessages.map((message) => message.info.id));
+      if (
+        capture.events.length === 0 &&
+        finalMessages.some((message) => !initialIds.has(message.info.id))
+      ) {
+        throw new Error(
+          `No captured session events for new canonical messages in ${JSON.stringify(observationOwner)}; incomplete capture saved at ${capturePath}`
+        );
+      }
       const playback = playbackLabel ? savePlaybackCapture(playbackDatabase, capture) : null;
       process.stdout.write(`${JSON.stringify({ capturePath, playback }, null, 2)}\n`);
     } catch (error) {

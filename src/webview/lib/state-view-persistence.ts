@@ -3,7 +3,13 @@ import {
   getRelativePathWithinWorkspace,
   normalizeWorkspaceIdentity,
 } from '../../shared/workspace-path';
-import { setShowSessionPicker, showSessionPicker, state } from './app-state';
+import {
+  readLatestActiveSessionId,
+  setShowSessionPicker,
+  showSessionPicker,
+  state,
+} from './app-state';
+import { resolveNewChatAgentModel } from './agent-model-selection';
 import { getSelectedModelForSession, setSelectedModel } from './state-model-selection';
 import { STORAGE_KEYS, readStored, writeStored } from './state-storage';
 import {
@@ -30,14 +36,15 @@ export function setPersistentShowSessionPicker(value: boolean) {
     persistLastOpenedView({ type: 'sessions-list' });
     return;
   }
-  restoreSelectedModelForComposer(state.activeSessionId);
+  // Opening a session and closing the list happen in one tick.
+  const activeSessionId = readLatestActiveSessionId();
+  restoreSelectedModelForComposer(activeSessionId);
   persistLastOpenedView(
-    state.activeSessionId
+    activeSessionId
       ? {
           type: 'session',
-          sessionId: state.activeSessionId,
-          directory: state.sessions.find((session) => session.id === state.activeSessionId)
-            ?.directory,
+          sessionId: activeSessionId,
+          directory: state.sessions.find((session) => session.id === activeSessionId)?.directory,
         }
       : { type: 'new-session' }
   );
@@ -49,8 +56,17 @@ export function getEffectiveComposerSessionId(): string | null {
 
 export function restoreSelectedModelForComposer(sessionId: string | null) {
   const model =
-    (sessionId ? getSelectedModelForSession(sessionId) : null) ?? getPersistedSelectedModel();
-  setSelectedModel(model, { persistGlobal: false });
+    (sessionId
+      ? getSelectedModelForSession(sessionId)
+      : resolveNewChatAgentModel(state.selectedAgent)) ?? getPersistedSelectedModel();
+  setSelectedModel(model, { persistGlobal: false, composerSessionId: sessionId });
+}
+
+/** Applies the new-chat agent's model once agents or providers finish loading. */
+export function syncNewChatComposerAgentModel() {
+  if (getEffectiveComposerSessionId()) return;
+  const model = resolveNewChatAgentModel(state.selectedAgent);
+  if (model) setSelectedModel(model, { persistGlobal: false, composerSessionId: null });
 }
 
 export function persistActiveSessionId(id: string | null) {

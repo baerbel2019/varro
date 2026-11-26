@@ -16,7 +16,9 @@ import checkIcon from 'iconoir/icons/check.svg';
 import checkCircleIcon from 'iconoir/icons/check-circle.svg';
 import checkSquareIcon from 'iconoir/icons/check-square.svg';
 import clockIcon from 'iconoir/icons/clock.svg';
+import clipboardCheckIcon from 'iconoir/icons/clipboard-check.svg';
 import codeBracketsSquareIcon from 'iconoir/icons/code-brackets-square.svg';
+import codeIcon from 'iconoir/icons/code.svg';
 import coinsIcon from 'iconoir/icons/coins.svg';
 import compressIcon from 'iconoir/icons/compress.svg';
 import copyIcon from 'iconoir/icons/copy.svg';
@@ -56,6 +58,7 @@ import navArrowRightIcon from 'iconoir/icons/nav-arrow-right.svg';
 import navArrowUpIcon from 'iconoir/icons/nav-arrow-up.svg';
 import openNewWindowIcon from 'iconoir/icons/open-new-window.svg';
 import pageIcon from 'iconoir/icons/page.svg';
+import pasteClipboardIcon from 'iconoir/icons/paste-clipboard.svg';
 import pauseIcon from 'iconoir/icons/pause.svg';
 import pauseSolidIcon from 'iconoir/icons/pause-solid.svg';
 import pinIcon from 'iconoir/icons/pin.svg';
@@ -63,6 +66,7 @@ import plusIcon from 'iconoir/icons/plus.svg';
 import playIcon from 'iconoir/icons/play.svg';
 import playSolidIcon from 'iconoir/icons/play-solid.svg';
 import priorityHighIcon from 'iconoir/icons/priority-high.svg';
+import reportsIcon from 'iconoir/icons/reports.svg';
 import runningIcon from 'iconoir/icons/running.svg';
 import searchIcon from 'iconoir/icons/search.svg';
 import settingsIcon from 'iconoir/icons/settings.svg';
@@ -76,6 +80,8 @@ import toolsIcon from 'iconoir/icons/tools.svg';
 import transitionUpIcon from 'iconoir/icons/transition-up.svg';
 import transitionUpSolidIcon from 'iconoir/icons/transition-up-solid.svg';
 import trashIcon from 'iconoir/icons/trash.svg';
+import triangleFlagIcon from 'iconoir/icons/triangle-flag.svg';
+import redoIcon from 'iconoir/icons/redo.svg';
 import undoIcon from 'iconoir/icons/undo.svg';
 import warningCircleIcon from 'iconoir/icons/warning-circle.svg';
 import warningCircleSolidIcon from 'iconoir/icons/warning-circle-solid.svg';
@@ -83,11 +89,15 @@ import warningTriangleIcon from 'iconoir/icons/warning-triangle.svg';
 import warningTriangleSolidIcon from 'iconoir/icons/warning-triangle-solid.svg';
 import wifiIcon from 'iconoir/icons/wifi.svg';
 import wrenchIcon from 'iconoir/icons/wrench.svg';
+import alignJustifyIcon from 'iconoir/icons/align-justify.svg';
+import alignRightIcon from 'iconoir/icons/align-right.svg';
 import xmarkIcon from 'iconoir/icons/xmark.svg';
 import xmarkCircleIcon from 'iconoir/icons/xmark-circle.svg';
 import xmarkCircleSolidIcon from 'iconoir/icons/xmark-circle-solid.svg';
 
 export {
+  alignJustifyIcon,
+  alignRightIcon,
   gymIcon,
   dollarCircleIcon,
   dollarIcon,
@@ -111,7 +121,9 @@ export {
   checkIcon,
   checkSquareIcon,
   clockIcon,
+  clipboardCheckIcon,
   codeBracketsSquareIcon,
+  codeIcon,
   coinsIcon,
   compressIcon,
   copyIcon,
@@ -146,6 +158,7 @@ export {
   navArrowUpIcon,
   openNewWindowIcon,
   pageIcon,
+  pasteClipboardIcon,
   pauseIcon,
   pauseSolidIcon,
   pinIcon,
@@ -153,6 +166,7 @@ export {
   playIcon,
   playSolidIcon,
   priorityHighIcon,
+  reportsIcon,
   runningIcon,
   searchIcon,
   settingsIcon,
@@ -166,6 +180,8 @@ export {
   transitionUpIcon,
   transitionUpSolidIcon,
   trashIcon,
+  triangleFlagIcon,
+  redoIcon,
   undoIcon,
   warningCircleIcon,
   warningCircleSolidIcon,

@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import type { WebviewMessage } from '../../shared/protocol';
 import {
+  MAX_PROMPT_CACHE_SAMPLES,
   WEBVIEW_MESSAGE_TYPES,
   isAllowedApiRequest,
   isAllowedExternalUrl,
@@ -60,6 +61,12 @@ function createRalphRun() {
 }
 
 describe('webview message validation', () => {
+  it('allows only session-scoped read-only goal inspection', () => {
+    expect(isAllowedApiRequest('GET', '/session/ses_one/goal?directory=%2Frepo')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/session/ses_one/goal')).toBe(false);
+    expect(isAllowedApiRequest('GET', '/session/ses_one/goal?sessionID=ses_other')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/api/rpc/opencode.goal/get')).toBe(false);
+  });
   it('accepts only bounded dictation requests with fixed actions and providers', () => {
     for (const action of ['status', 'start', 'stop', 'cancel']) {
       const message = { type: 'dictation/request', payload: { requestId: 'dictation-1', action } };
@@ -237,6 +244,9 @@ describe('webview message validation', () => {
     expect(isAllowedApiRequest('GET', '/varro/prompt-completion/test')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/prompt-completion/test?model=other')).toBe(false);
     expect(isAllowedApiRequest('GET', '/command')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/skill')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/skill?directory=%2Frepo')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/skill')).toBe(false);
     expect(isAllowedApiRequest('GET', '/session')).toBe(true);
     expect(isAllowedApiRequest('GET', '/session?limit=100')).toBe(true);
     expect(isAllowedApiRequest('GET', '/session?limit=30&search=dark+mode&roots=true')).toBe(true);
@@ -266,6 +276,8 @@ describe('webview message validation', () => {
     expect(isAllowedApiRequest('DELETE', '/session/abc/message/message-1')).toBe(true);
     expect(isAllowedApiRequest('GET', '/session/abc/todo')).toBe(true);
     expect(isAllowedApiRequest('POST', '/session/abc/unrevert')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/session/abc/revert-commit')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/session/abc/revert-commit')).toBe(false);
     expect(isAllowedApiRequest('POST', '/question/request-1/reply')).toBe(true);
     expect(isAllowedApiRequest('GET', '/permission')).toBe(true);
     expect(isAllowedApiRequest('POST', '/permission/request-1/reply')).toBe(true);
@@ -316,7 +328,13 @@ describe('webview message validation', () => {
       )
     ).toBe(true);
     expect(isAllowedApiRequest('GET', '/varro/session/session-1/diff-summary')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/varro/session/session-1/followup-usage')).toBe(true);
+    expect(
+      isAllowedApiRequest('GET', '/varro/session/session-1/followup-usage?directory=%2Frepo')
+    ).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session/session-1/pin')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/session/session-1/todo')).toBe(true);
+    expect(isAllowedApiRequest('GET', '/varro/session/session-1/todo')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/session/session-1/rename-if-untitled')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session/session-1/reorder-pin')).toBe(true);
     expect(isAllowedApiRequest('POST', '/varro/session-transfer/hide')).toBe(true);
@@ -426,6 +444,10 @@ describe('webview message validation', () => {
       false
     );
     expect(isAllowedApiRequest('GET', '/varro/session/session-1/diff-summary/extra')).toBe(false);
+    expect(isAllowedApiRequest('POST', '/varro/session/session-1/followup-usage')).toBe(false);
+    expect(isAllowedApiRequest('GET', '/varro/session/session-1/followup-usage?revision=1')).toBe(
+      false
+    );
     expect(isAllowedApiRequest('GET', '/varro/session/session-1/rename-if-untitled')).toBe(false);
     expect(isAllowedApiRequest('GET', '/varro/plan/open')).toBe(false);
     expect(isAllowedApiRequest('POST', '/varro/session/session-1/delete')).toBe(false);
@@ -479,14 +501,6 @@ describe('webview message validation', () => {
       parseWebviewMessage({
         type: 'api/request',
         payload: { id: 1, method: 'GET', path: 'https://example.com/' },
-      })
-    ).toBeNull();
-
-    // Unknown languages would be handed straight to setTextDocumentLanguage.
-    expect(
-      parseWebviewMessage({
-        type: 'vscode/open-text',
-        payload: { content: 'x', title: 'tool', language: 'javascript' },
       })
     ).toBeNull();
 
@@ -661,6 +675,46 @@ describe('webview message validation', () => {
     ).toEqual({
       type: 'vscode/open-text',
       payload: { content: '<svg />', title: 'SVG user message', language: 'xml' },
+    });
+  });
+
+  it('truncates long titles instead of dropping the open request', () => {
+    // Shell output titles carry the whole command, which can run far past the cap.
+    const command = `gh api repos/owner/repo/actions/runs/1 --jq '${'.x | '.repeat(80)}.y'`;
+    const parsed = parseWebviewMessage({
+      type: 'vscode/open-text',
+      payload: { content: '{}', title: `${command} (output)` },
+    });
+
+    expect(parsed?.type).toBe('vscode/open-text');
+    const title = parsed?.type === 'vscode/open-text' ? parsed.payload.title : '';
+    expect(title).toHaveLength(200);
+    expect(command.startsWith(title)).toBe(true);
+  });
+
+  it('passes editor language IDs through and degrades malformed hints to plain text', () => {
+    expect(
+      parseWebviewMessage({
+        type: 'vscode/open-text',
+        payload: {
+          content: 'const x = 1;',
+          title: 'a.ts unsaved selection',
+          language: 'typescript',
+        },
+      })
+    ).toEqual({
+      type: 'vscode/open-text',
+      payload: { content: 'const x = 1;', title: 'a.ts unsaved selection', language: 'typescript' },
+    });
+
+    expect(
+      parseWebviewMessage({
+        type: 'vscode/open-text',
+        payload: { content: 'x', title: 'snippet', language: 'ts title="a b"' },
+      })
+    ).toEqual({
+      type: 'vscode/open-text',
+      payload: { content: 'x', title: 'snippet', language: 'plaintext' },
     });
   });
 
@@ -1233,6 +1287,25 @@ describe('webview message validation', () => {
     expect(parseWebviewMessage({ type: 'usage/report' })).toBeNull();
   });
 
+  it('accepts session usage report requests', () => {
+    expect(
+      parseWebviewMessage({
+        type: 'usage/session-report',
+        payload: { sessionId: 'session-1', directory: '/repo' },
+      })
+    ).toEqual({
+      type: 'usage/session-report',
+      payload: { sessionId: 'session-1', directory: '/repo' },
+    });
+    expect(parseWebviewMessage({ type: 'usage/session-report', payload: {} })).toBeNull();
+    expect(
+      parseWebviewMessage({
+        type: 'usage/session-report',
+        payload: { sessionId: 'session-1', directory: 7 },
+      })
+    ).toBeNull();
+  });
+
   it('parses every Ralph command and reconstructs nested legacy runs', () => {
     const config = createRalphConfig();
     const run = createRalphRun();
@@ -1600,6 +1673,33 @@ describe('webview message validation', () => {
     });
     expect(
       parseWebviewMessage({
+        type: 'commands/state',
+        payload: {
+          canAbort: false,
+          canSwitchSessions: true,
+          canNavigateBack: true,
+          canNavigateForward: false,
+          model: null,
+        },
+      })
+    ).toEqual({
+      type: 'commands/state',
+      payload: {
+        canAbort: false,
+        canSwitchSessions: true,
+        canNavigateBack: true,
+        canNavigateForward: false,
+        model: null,
+      },
+    });
+    expect(
+      parseWebviewMessage({
+        type: 'commands/state',
+        payload: { canAbort: false, canSwitchSessions: true, canNavigateBack: 1, model: null },
+      })
+    ).toBeNull();
+    expect(
+      parseWebviewMessage({
         type: 'vscode/open',
         payload: { path: 'src/app.ts', view: 'diff', sessionID: 'session-1' },
       })
@@ -1622,6 +1722,12 @@ describe('webview message validation', () => {
   });
 
   it('validates session-scoped folder openings and read-only location metadata routes', () => {
+    expect(isAllowedApiRequest('GET', '/varro/session/ses_other/reference')).toBe(true);
+    expect(isAllowedApiRequest('POST', '/varro/session/ses_other/reference')).toBe(true);
+    expect(isAllowedApiRequest('PATCH', '/varro/session/ses_other/reference')).toBe(false);
+    expect(
+      isAllowedApiRequest('GET', '/varro/session/ses_other/reference?directory=%2Fother')
+    ).toBe(false);
     const message = {
       type: 'vscode/open-folder',
       payload: { sessionId: 'session-1', directory: '/repo' },
@@ -2024,6 +2130,7 @@ describe('parseWebviewMessage protocol coverage', () => {
     'chat/new-window',
     'vscode/open-settings',
     'server/restart',
+    'warming/sync',
   ]);
   const GARBAGE_PAYLOAD_TYPES = new Set<WebviewMessage['type']>(
     [...OPTIONAL_PAYLOAD_TYPES].filter((type) => type !== 'vscode/open-folder')
@@ -2301,4 +2408,19 @@ describe('parseWebviewMessage rejection paths', () => {
       expect(parsed.payload.hiddenModels).toHaveLength(10_000);
     }
   });
+});
+
+it('accepts bounded prompt cache history samples and rejects malformed ones', () => {
+  const sample = { providerID: 'openai', modelID: 'gpt-6.2-sol', at: 1, gapMs: 600_000, hit: true };
+  const parse = (samples: unknown[], sessionId = 'ses_1') =>
+    parseWebviewMessage({ type: 'warming/samples', payload: { sessionId, samples } });
+  expect(parse([sample])).toEqual({
+    type: 'warming/samples',
+    payload: { sessionId: 'ses_1', samples: [sample] },
+  });
+  expect(parse([{ ...sample, gapMs: 0 }])).toBeNull();
+  expect(parse([{ ...sample, hit: 'yes' }])).toBeNull();
+  expect(parse([{ ...sample, providerID: '' }])).toBeNull();
+  expect(parse([sample], '../etc')).toBeNull();
+  expect(parse(Array.from({ length: MAX_PROMPT_CACHE_SAMPLES + 1 }, () => sample))).toBeNull();
 });

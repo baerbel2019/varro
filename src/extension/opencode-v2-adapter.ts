@@ -24,11 +24,18 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { asRecord, isBoolean, isNumber, isString, type UnknownRecord } from '../shared/type-utils';
 import { parseFollowupTitle } from '../shared/followups';
+import { parseSessionGoal } from '../shared/session-goal';
 import { compareVersions, extractVersion } from './server-utils';
 import { withStartupDeadline } from '../shared/startup';
 import { parseSkillAttachment } from '../shared/skill-reference';
 import { isNativeFormAnswer, parseNativeForm } from '../shared/native-form';
 import { isSameWorkspacePath } from '../shared/workspace-path';
+import { readPastedTextDataUrl } from '../shared/pasted-text';
+import {
+  appendPromptTextAttachments,
+  isPromptTextAttachmentName,
+  type PromptTextAttachment,
+} from '../shared/prompt-text-attachments';
 import {
   getPdfDataUrlSize,
   getPdfInputSupport,
@@ -45,6 +52,7 @@ import {
 } from '../shared/side-question';
 import type { SideQuestionTurn } from '../shared/side-question';
 import { tracePrompt } from './prompt-trace';
+import { readSessionFollowupUsage } from './followup-usage';
 import type {
   ProviderAuthMethod,
   ProviderAuthPromptCondition,
@@ -72,6 +80,7 @@ import {
   v2ModelRef,
   v2Rules,
   isV2TranscriptMessage,
+  isV2UserPrompt,
   normalizeV2Error,
   type V2MessageContext,
 } from './opencode-v2-projection';
@@ -82,6 +91,9 @@ type WireRequest = (
   body?: unknown,
   options?: OpenCodeRequestOptions
 ) => Promise<unknown>;
+
+/** Recent messages scanned for the user prompt that opens a requested reply's turn. */
+const V2_DIFF_ANCHOR_SCAN_LIMIT = 200;
 
 function legacyModel(value: unknown): string | undefined {
   if (isString(value)) return value;
@@ -110,6 +122,9 @@ function mergeConfiguration(target: UnknownRecord, patch: UnknownRecord): void {
       const merged = { ...asRecord(target[key]) };
       mergeConfiguration(merged, record);
       target[key] = merged;
+    } else if (key === 'permissions' && Array.isArray(value)) {
+      const previous = target[key];
+      target[key] = [...(Array.isArray(previous) ? previous : []), ...value];
     } else target[key] = value;
   }
 }
@@ -261,6 +276,16 @@ function v2AuthAnswers(form: FormFields | undefined, value: unknown) {
   return Object.keys(answer).length > 0 ? answer : value;
 }
 
+/**
+ * V2 passes rejection feedback to the model verbatim as the tool error. Use V1's wording so
+ * the model reads it as a rejection with instructions, and Varro still labels the tool as
+ * rejected after reloads.
+ */
+function v2PermissionReplyMessage(reply: unknown, message: unknown): string | undefined {
+  if (reply !== 'reject' || !isString(message) || !message.trim()) return undefined;
+  return `The user rejected permission to use this specific tool call with the following feedback: ${message.trim()}`;
+}
+
 function nextBackgroundReviewAt(startedAt: number, now: number): number {
   const minutesRunning = Math.max(0, (now - startedAt) / 60_000);
   const nextMinute =
@@ -287,7 +312,11 @@ function parseBackgroundJobs(value: unknown): JobInfo[] {
         ? isString(job.shellID) && isString(job.command)
         : job.kind === 'subagent'
           ? isString(job.childSessionID) && isString(job.agent) && isString(job.description)
-          : job.kind === 'image' && isString(job.path) && isString(job.model))
+          : job.kind === 'image'
+            ? isString(job.path) && isString(job.model)
+            : job.kind === 'video'
+              ? isString(job.path)
+              : job.kind === 'codemode')
     )
       throw new Error('Invalid OpenCode v2 background job');
   }
@@ -382,8 +411,16 @@ export class OpenCodeV2Adapter {
       const model = asRecord(data.model);
       if (type === 'session.model.selected' && isString(model?.id) && isString(model.providerID))
         context.model = model as ModelRef;
-      if (type === 'session.inbox.enqueued' && isString(data.inboxID))
-        this.inputTypes.set(data.inboxID, String(asRecord(data.item)?.type));
+      if (type === 'session.inbox.enqueued' && isString(data.inboxID)) {
+        const item = asRecord(data.item);
+        const payload = asRecord(item?.payload);
+        const goalKickoff =
+          item?.type === 'synthetic' &&
+          asRecord(payload?.metadata)?.source === 'goal' &&
+          isString(payload?.description) &&
+          payload.description.length > 0;
+        this.inputTypes.set(data.inboxID, goalKickoff ? 'user' : String(item?.type));
+      }
       if (type === 'session.inbox.delivered' && isString(data.inboxID)) {
         if (this.inputTypes.get(data.inboxID) === 'user') {
           context.parentID = data.inboxID;
@@ -448,11 +485,14 @@ export class OpenCodeV2Adapter {
   }
 
   eventContext(sessionID: string): V2MessageContext | undefined {
+    const work = this.backgroundWork.describe(sessionID);
     return {
       ...this.contexts.get(sessionID),
       backgroundPending: this.backgroundWork.isWaiting(sessionID),
       backgroundStartedAt: this.backgroundWork.startedAt(sessionID),
-      backgroundCommand: this.backgroundWork.command(sessionID),
+      backgroundCommand: work.command,
+      backgroundKind: work.kind,
+      backgroundSessionID: work.childSessionID,
       backgroundServices: this.backgroundWork.serviceCount(sessionID),
       generationTiming: this.generationTiming,
     };
@@ -523,15 +563,17 @@ export class OpenCodeV2Adapter {
           if (existing >= 0) agents.splice(existing, 1);
           continue;
         }
+        const resolvedAgent = agents[existing];
         const model = v2ModelRef(agent.model);
         const normalized = {
           mode: 'primary',
           hidden: false,
-          ...agents[existing],
+          ...resolvedAgent,
           ...agent,
           name,
+          permission: agent.permission ?? resolvedAgent?.permission,
           options: {
-            ...asRecord(agents[existing]?.options),
+            ...asRecord(resolvedAgent?.options),
             ...asRecord(asRecord(agent.request)?.body),
           },
           model: model
@@ -540,7 +582,7 @@ export class OpenCodeV2Adapter {
                 modelID: model.id,
                 variant: model.variant,
               }
-            : agents[existing]?.model,
+            : resolvedAgent?.model,
         };
         if (existing >= 0) agents[existing] = normalized;
         else agents.push(normalized);
@@ -678,12 +720,15 @@ export class OpenCodeV2Adapter {
         }),
         ...waiting.map((id) => {
           const backgroundServices = this.backgroundWork.serviceCount(id);
+          const work = this.backgroundWork.describe(id);
           const projected: SessionStatus = {
             type: 'busy',
             background: true,
             backgroundStartedAt: this.backgroundWork.startedAt(id),
-            backgroundCommand: this.backgroundWork.command(id),
+            backgroundCommand: work.command,
           };
+          if (work.kind) projected.backgroundKind = work.kind;
+          if (work.childSessionID) projected.backgroundSessionID = work.childSessionID;
           if (backgroundServices > 0) projected.backgroundServices = backgroundServices;
           return [id, projected];
         }),
@@ -755,7 +800,7 @@ export class OpenCodeV2Adapter {
         await raw(
           'POST',
           `/api/session/${encodeURIComponent(sessionID)}/permission/${encodeURIComponent(id)}/reply`,
-          { decision: input.reply, message: input.message }
+          { decision: input.reply, message: v2PermissionReplyMessage(input.reply, input.message) }
         );
         this.permissions.delete(id);
       } else {
@@ -797,6 +842,17 @@ export class OpenCodeV2Adapter {
       const sessionID = decodeURIComponent(sessionRoute[1]!);
       const endpoint = `/api/session/${encodeURIComponent(sessionID)}`;
       const action = sessionRoute[2] ?? '';
+      if (action === 'goal' && method === 'GET') {
+        const response = asRecord(
+          await raw('POST', query('/api/rpc/opencode.goal/get', true), {
+            input: { sessionID },
+          })
+        );
+        if (response?.output === null) return null;
+        const goal = parseSessionGoal(response?.output);
+        if (!goal) throw new Error('Invalid OpenCode goal response');
+        return goal;
+      }
       if (
         (action === 'child-task-controls' && method === 'GET') ||
         ((action === 'interrupt-child' || action === 'background-parent') && method === 'POST')
@@ -1166,6 +1222,22 @@ export class OpenCodeV2Adapter {
         )) as SessionsResponse;
         return Promise.all(result.data.map((session) => this.session(session, options)));
       }
+      if (action === 'followup-usage' && method === 'GET') {
+        if (body !== undefined) throw new Error('Follow-up usage does not accept a body');
+        return readSessionFollowupUsage(
+          {
+            readInbox: () => data<SessionInboxInfo[]>('GET', `${endpoint}/inbox`),
+            readPage: async (cursor, limit) =>
+              (await raw(
+                'GET',
+                cursor
+                  ? `${endpoint}/message?limit=${limit}&cursor=${encodeURIComponent(cursor)}`
+                  : `${endpoint}/message?limit=${limit}&order=desc`
+              )) as SessionMessagesResponse,
+          },
+          { maxBytes: options.maxResponseBytes }
+        );
+      }
       if (action === 'message' && method === 'GET') {
         const target = new URL(`${endpoint}/message`, 'http://localhost');
         target.searchParams.set('order', 'desc');
@@ -1213,7 +1285,7 @@ export class OpenCodeV2Adapter {
             (message.type === 'idle' &&
               (message.outcome === 'failed' || message.outcome === 'interrupted'))
         );
-        const firstUser = ordered.findIndex((message) => message.type === 'user');
+        const firstUser = ordered.findIndex(isV2UserPrompt);
         let parent =
           firstAssistant >= 0 ? (this.messageParents.get(ordered[firstAssistant]!.id) ?? '') : '';
         let assistantFailed = false;
@@ -1233,7 +1305,7 @@ export class OpenCodeV2Adapter {
             bytes += Buffer.byteLength(JSON.stringify(context.data));
             if (bytes > (options.maxResponseBytes ?? 16 * 1024 * 1024))
               throw new OpenCodeResponseTooLargeError(options.maxResponseBytes ?? 16 * 1024 * 1024);
-            const user = context.data.find((message) => message.type === 'user');
+            const user = context.data.find(isV2UserPrompt);
             const preceding = context.data.slice(0, user ? context.data.indexOf(user) : undefined);
             assistantFailed ||= preceding.some(
               (message) => message.type === 'assistant' && !!message.error
@@ -1261,7 +1333,7 @@ export class OpenCodeV2Adapter {
             { ...context, ...this.failures.get(message.id) },
             options
           );
-          if (message.type === 'user') {
+          if (isV2UserPrompt(message)) {
             parent = message.id;
             assistantFailed = false;
           }
@@ -1281,12 +1353,13 @@ export class OpenCodeV2Adapter {
         const messageIDs = new Set(messages.map((message) => message.info.id));
         for (const item of inbox.toSorted((a, b) => a.time.created - b.time.created)) {
           if (messageIDs.has(item.id)) continue;
-          // Restart cancellation notices are admitted without waking an idle owner.
-          // Show the canonical notice now, under the same ID it keeps on delivery.
+          // Restart notices may not wake an idle owner, and a goal kickoff is the
+          // user's prompt. Show both now, under the same ID they keep on delivery.
           if (
             item.type === 'synthetic' &&
-            item.payload.metadata?.source === 'shell' &&
-            item.payload.metadata.state === 'cancelled'
+            ((item.payload.metadata?.source === 'shell' &&
+              item.payload.metadata.state === 'cancelled') ||
+              (item.payload.metadata?.source === 'goal' && !!item.payload.description))
           ) {
             const notice = projectV2Message(
               { ...item.payload, id: item.id, type: 'synthetic', time: item.time },
@@ -1471,6 +1544,23 @@ export class OpenCodeV2Adapter {
               { value: input.system }
             );
           }
+          // Command arguments replace the prompt text, so their pasted text stays attached.
+          const promptTextAttachments = new Map<UnknownRecord, PromptTextAttachment>();
+          if (action !== 'command') {
+            for (const part of parts) {
+              if (
+                part.type !== 'file' ||
+                part.mime !== 'text/plain' ||
+                !isString(part.filename) ||
+                !isPromptTextAttachmentName(part.filename) ||
+                !isString(part.url)
+              )
+                continue;
+              const content = readPastedTextDataUrl(part.url);
+              if (content !== null)
+                promptTextAttachments.set(part, { name: part.filename, text: content });
+            }
+          }
           const followupTitle = parseFollowupTitle(input.followupTitle);
           const metadata: UnknownRecord = {};
           if (input.delivery === 'steer' || input.delivery === 'queue')
@@ -1478,9 +1568,12 @@ export class OpenCodeV2Adapter {
           if (followupTitle) metadata.varroFollowupTitle = followupTitle;
           const payload = {
             id: input.messageID,
-            text: action === 'command' ? (input.arguments ?? text) : text,
+            text:
+              action === 'command'
+                ? (input.arguments ?? text)
+                : appendPromptTextAttachments(text, [...promptTextAttachments.values()]),
             files: parts
-              .filter((part) => part.type === 'file')
+              .filter((part) => part.type === 'file' && !promptTextAttachments.has(part))
               .map((part) => ({ uri: part.url, name: part.filename })),
             agents: parts
               .filter((part) => part.type === 'agent')
@@ -1526,9 +1619,11 @@ export class OpenCodeV2Adapter {
       }
       if (action === 'abort') {
         if (this.backgroundWork.isWaiting(sessionID)) {
+          const cancelledShells = await this.cancelBackgroundJobs(sessionID, raw);
           await Promise.all(
             this.backgroundWork
               .shellIDs(sessionID)
+              .filter((id) => !cancelledShells.has(id))
               .map((id) => raw('DELETE', query(`/api/shell/${encodeURIComponent(id)}`, true)))
           );
           this.backgroundWork.clearSession(sessionID);
@@ -1570,11 +1665,30 @@ export class OpenCodeV2Adapter {
         await raw('DELETE', `${endpoint}/revert`);
         return this.session(await data<SessionInfo>('GET', endpoint), options);
       }
-      if (action === 'diff')
-        return data(
-          'GET',
-          `${endpoint}/diff${url.searchParams.has('messageID') ? `?from=${encodeURIComponent(url.searchParams.get('messageID')!)}` : ''}`
-        );
+      if (action === 'revert-commit') {
+        await raw('POST', `${endpoint}/revert/commit`, {});
+        return this.session(await data<SessionInfo>('GET', endpoint), options);
+      }
+      if (action === 'diff') {
+        const messageID = url.searchParams.get('messageID');
+        // V2 anchors a turn diff on one of its user messages, while callers usually name the
+        // assistant reply. Only an unspecified message means the newest turn.
+        let from = messageID ?? undefined;
+        if (messageID) {
+          const messages = await data<SessionMessageInfo[]>(
+            'GET',
+            `${endpoint}/message?limit=${V2_DIFF_ANCHOR_SCAN_LIMIT}&order=desc`
+          );
+          const index = messages.findIndex((message) => message.id === messageID);
+          // An older message outside the scanned page is passed through unchanged.
+          if (index >= 0) {
+            from = messages.slice(index).find((message) => message.type === 'user')?.id;
+            // A reply whose opening prompt is outside the page has no diff we can name.
+            if (!from) return [];
+          }
+        }
+        return data('GET', `${endpoint}/diff${from ? `?from=${encodeURIComponent(from)}` : ''}`);
+      }
       if (action === 'todo') {
         const messages = await data<SessionMessageInfo[]>(
           'GET',
@@ -1798,6 +1912,61 @@ export class OpenCodeV2Adapter {
       }
     }
     return grouped;
+  }
+
+  /** Cancels running native jobs for a waiting session and returns the shells they owned. */
+  private async cancelBackgroundJobs(
+    sessionID: string,
+    raw: (verb: string, path: string, payload?: unknown) => Promise<unknown>
+  ): Promise<ReadonlySet<string>> {
+    // Native cancellation first shipped in 2.4.0. Older servers keep shell-only Stop.
+    if (
+      !this.serverVersion ||
+      compareVersions(this.serverVersion, '2.4.0') < 0 ||
+      this.backgroundJobsAvailable === false
+    )
+      return new Set();
+    const target = new URL('/api/experimental/job', 'http://localhost');
+    target.searchParams.set('sessionID', sessionID);
+    target.searchParams.set('descendants', 'true');
+    target.searchParams.set('status', 'running');
+    let jobs: JobInfo[];
+    try {
+      const response = asRecord(await raw('GET', target.pathname + target.search));
+      jobs = parseBackgroundJobs(response?.data).filter((job) => job.status === 'running');
+    } catch (error: unknown) {
+      // A deleted session or unavailable route leaves the shell-only fallback.
+      if (isNotFoundError(error)) return new Set();
+      throw error;
+    }
+    const choices = new Map<string, Promise<UnknownRecord>>();
+    const isService = (job: JobInfo) => {
+      if (job.kind !== 'shell') return Promise.resolve(false);
+      let saved = choices.get(job.sessionID);
+      if (!saved) {
+        saved = this.backgroundServices.read(job.sessionID);
+        choices.set(job.sessionID, saved);
+      }
+      return saved.then((value) => value[job.shellID] === true);
+    };
+    const services = await Promise.all(jobs.map(isService));
+    const cancelled = new Set<string>();
+    // Cancelled jobs settle without a completion notice, so Stop does not wake the
+    // session again. Services keep running, as they do with shell-only Stop.
+    const results = await Promise.allSettled(
+      jobs
+        .filter((_, index) => !services[index])
+        .map(async (job) => {
+          await raw('POST', `/api/experimental/job/${encodeURIComponent(job.id)}/cancel`, {});
+          if (job.kind === 'shell') cancelled.add(job.shellID);
+        })
+    );
+    const failure = results.find(
+      (result): result is PromiseRejectedResult =>
+        result.status === 'rejected' && !isNotFoundError(result.reason)
+    );
+    if (failure) throw failure.reason;
+    return cancelled;
   }
 
   private scheduleBackgroundJudgment(

@@ -71,8 +71,10 @@ For WSL, open the project in a VS Code WSL window, then install and authenticate
 
 | Version | Minimum supported | Tested with this release | npm package |
 | --- | --- | --- | --- |
-| v2, recommended | 2.0.5 | 2.3.0 | `@opencode/cli` |
-| v1, still supported | 1.16.0 | 1.19.5 | `opencode-ai` |
+| v2, recommended | 2.0.6 | 2.4.2 | `@opencode/cli` |
+| v1, still supported | 1.16.0 | 1.19.6 | `opencode-ai` |
+
+OpenCode v2.0.5 lacks the API Varro uses to reload global configuration. If you're still using it, let active sessions finish and update OpenCode before reconnecting.
 
 To keep using v1, retain your installation or run `npm install -g opencode-ai`. Set `varro.server.command` to its executable path. Setting it to `opencode` selects v1 only if that command resolves to a v1 installation. Varro detects the API automatically.
 
@@ -289,7 +291,7 @@ Unsent composer text and explicit file or folder attachments are restored after 
 ### Side questions
 
 With an OpenCode V2 conversation open, type `/btw Why did that test fail?`
-or choose **Ask a side question…** from the conversation's title menu. `/btw`
+or choose **Ask side-question** from the conversation's title menu. `/btw`
 without a question opens an empty form.
 
 Before the first question is sent, the dialog shows the independently centered
@@ -374,7 +376,7 @@ Commands offered in slash-command completion include:
 - `/connect` opens the provider connection dialog
 - `/settings` opens VS Code Settings filtered to Varro
 - `/export` opens a JSON export of the current session in the editor
-- `/stats` opens a Markdown token and assistant-duration report for the last 30 days across all OpenCode projects; `/stats all` also includes retained all-time usage
+- `/stats` opens a Markdown token and assistant-duration report across all OpenCode projects, with sections for Today, Yesterday (local calendar day), and the last 7 and 30 rolling days; `/stats all` also includes retained all-time usage
 - Usage reports include local V1 and V2 sessions. For migrated sessions, including Varro imports, only the session with the latest update time contributes usage. Equal update times prefer V2.
 - `/thinking` or `/reasoning` toggles thinking block visibility
 - `/compact` or `/summarize` compacts conversation context
@@ -420,6 +422,8 @@ the server host for larger histories. They do not read an unrelated local databa
 Some commands only appear when they apply. `/ralph` appears before a session exists, `/export` appears after one exists, and `/init` appears when the workspace can be initialized.
 
 `/diagnostics`, `/fork`, `/abort`, `/stop`, `/undo`, `/revert`, and `/redo` can be submitted directly when applicable but are intentionally hidden from slash-command completion. `/undo` or `/revert` undoes the last assistant response, and `/redo` reapplies it. These session-level actions are separate from composer undo and redo.
+
+OpenCode only stages a rewind until the next message, whether `/undo` ran in Varro, the OpenCode TUI, or another client. Varro hides the rewound messages and shows a **Rewound** row above the composer. **Restore** brings the messages back, along with any file changes the rewind rolled back. On v2, **Apply** removes them immediately; otherwise, your next message removes them.
 
 Use `Varro: Open Global AGENTS.md` to edit OpenCode's global instructions. `Varro: Initialize Project AGENTS.md` creates the project file when needed, opens it, and starts a new chat with `/init` ready to send using the current model.
 
@@ -495,7 +499,7 @@ Opening a session fetches the newest 200 messages. Scrolling to the top automati
 
 On large layouts, Varro can keep a persistent session pane beside the chat. Use `varro.chat.desktopSessionPaneSide` to choose whether that pane appears on the left or right.
 
-If the sidebar is hidden, Varro can show VS Code notifications when a plan is ready, a top-level session fails, or the agent is blocked on a permission or question. It also exposes a status bar item that summarizes waiting or completed top-level sessions, including ordinary completed sessions that do not produce a notification, and alerts in sibling workspaces. Clicking that item opens pending-attention sessions first, otherwise it focuses Varro.
+If the sidebar is hidden, Varro can show VS Code notifications when a plan is ready, a top-level session fails, or the agent is blocked on a permission or question. The Varro view icon shows a badge with the number of permissions and questions waiting outside the visible chat. It also exposes a status bar item that summarizes waiting or completed top-level sessions, including ordinary completed sessions that do not produce a notification, and alerts in sibling workspaces. Clicking that item opens pending-attention sessions first, otherwise it focuses Varro.
 
 If VS Code reloads while a session was running, Varro reconnects and restores canonical history and pending inputs. OpenCode V2 owns automatic execution recovery; Varro does not send a second restart-continuation prompt. Older V2 versions or standalone services may require an explicit follow-up. V1 retains Varro's existing elected-owner continuation. Recovery can repeat external effects, and active shells are not preserved as durable processes. See [restart continuity](restart-recovery.md).
 
@@ -709,6 +713,7 @@ The composer can show model and session metadata:
 - Available OpenAI/Codex and Z.ai usage-limit resets and their expiration times. Varro displays these resets and links to the provider's usage page, but does not redeem them.
 - Context usage, based on token totals from assistant messages and the selected model's context window.
 - Reported session cost in the context popup, when OpenCode supplies cost data.
+- A prompt-cache estimate in the context popup, when the latest completed response read or wrote the provider's prompt cache. It counts down that model's cache lifetime from when the response's request was sent, since providers count from the request, not from the end of a long response, and then shows **Likely expired**. It is an estimate, not a provider timer. See [Prompt cache lifetimes](#prompt-cache-lifetimes). In sessions whose context reaches `varro.chat.promptCacheWarningTokens` (250,000 by default; `0` turns it off), a closable warning above the composer also appears once the estimate runs out while the session is idle, showing how many tokens the next message will re-send uncached. Closing it hides it until a later response uses the cache again. See [Keep the prompt cache warm](#keep-the-prompt-cache-warm) to avoid the expiry.
 
 When an applicable provider quota has 25% or less remaining, a warning above the composer shows the percentage left in each low window and its reset time. The warning becomes critical at 10% remaining. A low weekly or monthly allowance appears even when the 5-hour allowance is healthy. **View usage** opens the provider's usage page in your browser and is hidden when its URL is unknown.
 
@@ -716,7 +721,43 @@ Closing a yellow warning hides each displayed quota until it becomes critical at
 
 For UI debugging, set `varro.debug.showQuotaWarning` to `true` to show available quotas regardless of remaining allowance or saved dismissals. The setting updates live. Closing the debug preview does not save a dismissal; toggle the setting off and on to show it again.
 
-If a provider or model hits a usage limit, Varro shows a usage-limit banner with actions to stop retrying or switch providers. This error notice takes priority over quota warnings.
+If a provider or model hits a usage limit, Varro shows a usage-limit banner above the composer. It replaces quota warnings and names the limited model.
+
+- While OpenCode retries on its own, the banner counts down to the next attempt and offers **Switch model…** and **Stop retrying**. It offers no **Continue**, because a new message would race the retry.
+- After the turn stops, the banner shows when the limit resets, from the provider's retry hint or Varro's polled quota. Until then **Switch model…** comes first and **Try anyway** sends `Continue` early. Once the reset time passes, **Continue** comes first.
+- Picking another model from **Switch model…** stops a retrying turn and continues it on the new model.
+- Throttling and provider overload use the warning color; an exhausted quota uses the error color. Varro never switches models on its own.
+
+### Keep the prompt cache warm
+
+Providers drop an idle session's prompt cache after a few minutes, so the next message re-sends the whole context at the uncached rate. On OpenCode v2, `varro.chat.promptCacheWarming` sends short keep-alive requests after each reply instead. Each keep-alive re-reads the whole context from the cache, which costs money or subscription quota: with typical cache pricing, about twelve keep-alives cost as much as re-sending the context once. Warming is off by default, and only user settings can turn it on.
+
+- `chosen` - turn **Keep warm** on per root session in the context popup's Prompt cache section. Varro sends OpenCode's transient `/generate` keep-alive shortly before the model's cache would expire (a minute early for 5-minute caches, 10% early for longer ones) while VS Code runs, for `varro.chat.promptCacheWarmingMinutes` (30 by default) after each reply. When the cache already lasts the whole window, such as GPT-5.6 and later with the default 30-minute window, it sends none. It skips running sessions, never warms subagent or helper sessions, and stops early when the last response outlasted the cache, when a keep-alive would arrive after the cache expired (for example after the computer slept), when a keep-alive finds the cache already gone, or when one fails. The popup shows the time left and why warming stopped. Choices are kept per workspace.
+- `all` - writes `warming` to the global OpenCode config, so OpenCode keeps every root session warm, including sessions from the TUI. Switching away from `all` removes the key from every global config file. This needs file-based configuration and is unavailable in attach-only mode.
+
+When OpenCode's own `warming` setting is already on, Varro sends no keep-alives of its own and the popup shows **Kept warm by OpenCode**.
+
+#### Prompt cache lifetimes
+
+The estimate and the keep-alive schedule follow each provider's documented behavior for the model that last used the cache. A request that reads the cache renews it, and the lifetime counts from when that request was sent. The model's effective `cache.ttl` setting (model settings over provider settings) applies where the provider accepts it.
+
+- Claude on any host (Anthropic, Bedrock, Vertex, OpenRouter, OpenCode Zen): 5 minutes, or 1 hour with `cache.ttl: "1h"`. Older Bedrock releases that only cache for 5 minutes stay at 5.
+- Claude Agent (Claude Code): 1 hour on a Claude subscription and 5 minutes on API billing, told apart by whether Claude Agent prices the model. Claude Code ignores `cache.ttl` and drops to 5 minutes while a subscription runs on extra usage. The lifetime counts from the end of each response, because one OpenCode step runs Claude Code's own request loop.
+- OpenAI GPT-5.6 and later (OpenAI, Azure, OpenRouter, OpenCode Zen): at least 30 minutes, or 12 hours with `cache.ttl: "12h"`. Entries often last longer, so after 30 minutes the popup shows **May be warm**, and it only reports **Likely expired** and shows the warning after about 3 hours. Keep-alives still follow the 30-minute minimum.
+- OpenAI GPT-5.5 and earlier models with 24-hour retention, such as GPT-5.1 and GPT-4.1: about 30 minutes. Organizations with Zero Data Retention keep the in-memory default of about 5 to 10 minutes on the earlier models.
+- Other OpenAI models: about 5 minutes (in-memory retention).
+- Other providers: the configured `cache.ttl`, or 5 minutes. GPT-named models on hosts that manage their own caching, such as GitHub Copilot, use this estimate too.
+
+Accounts differ by plan, data retention, and extra usage, so Varro also learns how long your caches actually last. Every request after 5 or more idle minutes on the same model shows whether the cache survived that gap. Varro collects these from live turns and from the history of sessions you open, per model and per provider, and keeps them in VS Code's global state. Once a model has enough evidence:
+
+- The likely lifetime becomes the longest idle gap that still found the cache at least half the time, before the gaps where most requests missed.
+- Gaps the cache survived with no misses beyond them only lengthen the estimate.
+- Misses can also shorten the lifetime keep-alives follow. Survived gaps never lengthen it, because a late keep-alive pays to rebuild the cache.
+- Recent evidence outweighs old, so a plan change is picked up.
+- Gaps after a compaction or a model switch are skipped.
+- Learning pauses while OpenCode's own `warming` is on. Sessions chosen for **Keep warm** don't contribute history, since their keep-alives leave no messages.
+
+The popup tooltip says when an estimate comes from your sessions.
 
 Provider and configuration changes are revalidated without interrupting running agents. When applying a refresh must wait, the Models view shows a queued configuration update and applies it after active work finishes. Embedded reauthentication can refresh an authentication-only change immediately.
 
@@ -923,6 +964,21 @@ When no explicit route is available, the helper request omits its model and Open
 
 All paths, up to the first 100,000 characters of the selected patch, and up to ten recent commit subjects are treated as untrusted input in a temporary tool-disabled session. Untracked file content has separate per-file and total size limits. On native Windows, Varro includes each untracked path with a `content unavailable` marker but omits its contents because Windows does not provide the atomic no-follow file read used to prevent path replacement during generation. Tracked unstaged diffs are unaffected. Split larger changes into smaller commits for the most accurate result. Varro never logs the patch, stages files, or executes the commit. It also rechecks the selected changes and commit input before applying a result, so a slow generation cannot silently overwrite newer work.
 
+## Walk Through Changes
+
+A walkthrough explains a diff briefly and in reading order. It covers only what matters, such as changed behavior, contracts, and risky logic, in a few stops that each build on the last, with one or two sentences per stop. Trivial edits like formatting, imports, renames, and comments stay out of the stops and get one compact summary at the end. Stops the change rests on are marked **Key change**; supporting ones are marked **Context**. A few stops carry a factual note, such as a design decision, a new dependency, or an untested promise. Walkthroughs never review or judge the code.
+
+Nothing runs automatically. Start a walkthrough with the list icon in the Source Control title bar, or run `Varro: Walk Through Changes`. It explains staged or unstaged changes, or asks which when both exist, including all uncommitted changes.
+
+The result opens as a Markdown report in the preview, like `/stats`. Each stop shows the exact diff hunks under one header per file, with the file and each hunk's start line linked so they open in the editor (in VS Code and VS Code Insiders; other forks show plain paths). **Also changed** holds the summary of trivial edits and one line listing the files no stop explains, including generated files such as lockfiles, which are never sent to the model, and binary or omitted content. The explanations are AI-written; regenerate after the code changes.
+
+Walkthroughs require OpenCode v2. They need a capable model, so they never use OpenCode's `small_model` or the commit-message model chain:
+
+1. The review model from `varro.review.model`, set with **Use for reviews** in a model's context menu in the Models view, where it shows a **review** tag. Add `#variant` to the setting, such as `openai/gpt-6-sol#high`, to pick its reasoning.
+2. Otherwise the active chat's selected model and reasoning.
+
+The diff is treated as untrusted input. How much diff a walkthrough sends depends on the model: up to half its context window, at most about 200k tokens, or about 50k when OpenCode does not report the window. The progress notification shows the estimated size. A larger diff first leaves out tests, then docs; the report header says so and lists those files under **Also changed**. If the rest still does not fit, Varro refuses rather than truncating and suggests staging a subset or picking a model with a larger context window.
+
 ## Output In The Chat
 
 Varro renders OpenCode output as structured UI instead of plain text only.
@@ -974,11 +1030,34 @@ Editable user messages expose an edit action. Sending the replacement removes th
 - `Varro: Show Output`
 - `Varro: Open Source Control`
 - `Varro: Generate Commit Message` generates from staged changes, or from the unstaged working tree when the index is empty, using the configured VS Code commit-message model, OpenCode `small_model`, OpenAI GPT Luna, GitHub Copilot GPT Luna, or the active chat model at low reasoning, in that order. It fills the selected Git repository's commit input without committing
+- `Varro: Walk Through Changes` explains staged, unstaged, or all uncommitted changes of the selected Git repository in reading order and opens the result as a Markdown report
 - `Varro: Open Global AGENTS.md`
 - `Varro: Initialize Project AGENTS.md`
 - `Varro: Add to Context` from Explorer, from the Command Palette (adds the active file), or `Cmd+Shift+K` / `Ctrl+Shift+K` when focus is outside the editor and terminal
 - `Varro: Add to Context` from the editor selection context menu, or `Cmd+Shift+K` / `Ctrl+Shift+K` with an editor selection. Without a selection the key keeps its VS Code default (`Delete Line`)
 - `Varro: Add to Context` from the terminal context menu, or `Cmd+Shift+K` / `Ctrl+Shift+K` while the terminal is focused
+
+VS Code's `focusedView` and `auxiliaryBarFocus` keys do not change while focus is inside a webview, so Varro sets its own context keys for keybinding `when` clauses:
+
+- `varro:chatFocused` - `true` while any Varro chat, in the sidebar or a chat editor, has focus
+- `varro:focusedChatSurface` - `sidebar` or `editor` for the focused chat; unset otherwise
+
+For example, one key can focus the chat on the first press and maximize the secondary sidebar on the second:
+
+```json
+[
+  {
+    "key": "ctrl+alt+v",
+    "command": "varro.chat.focusInput",
+    "when": "varro:focusedChatSurface != 'sidebar'"
+  },
+  {
+    "key": "ctrl+alt+v",
+    "command": "workbench.action.toggleMaximizedAuxiliaryBar",
+    "when": "varro:focusedChatSurface == 'sidebar'"
+  }
+]
+```
 
 ## Settings
 
@@ -1002,10 +1081,13 @@ Chat view:
 - `varro.chat.desktopSessionPaneSide` - on large screens, show the sessions pane on the `left` or `right`; defaults to `right`
 - Use the scope picker inside the session search field to choose which OpenCode sessions appear. **Folder** shows exact working-directory matches, **Nested** includes folders beneath it in the same OpenCode project, and **Project** shows the entire containing Git project. Varro remembers the choice for each project; non-Git folders offer Folder and Nested independently.
 - `varro.chat.autoRenameUntitledSessions` - generate a fallback title when OpenCode leaves a session untitled; defaults to `false`
+- `varro.chat.promptCacheWarming` - `off`, `chosen`, or `all`; keeps idle sessions' prompt caches alive after each reply on OpenCode v2. User settings only; defaults to `off`. See [Keep the prompt cache warm](#keep-the-prompt-cache-warm)
+- `varro.chat.promptCacheWarmingMinutes` - how long a session stays warm after each reply: `30`, `60`, `120`, or `180`; defaults to `30`
 
 Commit messages:
 
 - `varro.commitMessage.model` - provider/model used to generate commit messages; stored in VS Code user settings and selected from Varro's Models view
+- `varro.review.model` - provider/model, optionally `#variant`, used for changes walkthroughs; empty uses the active chat's selected model and reasoning. Stored in VS Code user settings and selected with **Use for reviews** in Varro's Models view
 - `varro.commitMessage.rules` - style and format instructions, resolved from user, workspace, and folder settings for the selected Git repository
 
 There are also deprecated debug-only settings used for development and recovery testing:
@@ -1017,7 +1099,7 @@ There are also deprecated debug-only settings used for development and recovery 
 ## Troubleshooting
 
 - OpenCode CLI missing: install v2 with `npm install -g @opencode/cli` on macOS, Linux, or WSL, or download the native Windows CLI from the [v2 install page](https://opencode.ai/v2/docs/). V1 remains available with `npm install -g opencode-ai`.
-- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.5`. This release was tested with v1 `1.19.5` and v2 `2.3.0`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
+- OpenCode CLI incompatible: Varro supports the v1 API from `1.16.0` and the v2 API from `2.0.6`. This release was tested with v1 `1.19.6` and v2 `2.4.2`. Varro selects the API automatically, including when `varro.server.command` points to a custom binary such as `opencode2`. Updates use the installed CLI's package family.
 - OpenCode v2 authentication: Varro captures managed-server credentials automatically and redacts them from output. Existing local services use their registered credentials. An externally managed server can also use `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` from the extension host's environment.
 - OpenCode v2 session settings: Varro stores mutable session annotations locally because the released v2 API cannot update session metadata. Session sharing is unavailable through this API, so its menu action is disabled. Existing v1-format configuration remains supported.
 - CLI not on `PATH`: set `varro.server.command` to the executable path.

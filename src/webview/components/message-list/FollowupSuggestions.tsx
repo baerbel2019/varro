@@ -1,11 +1,12 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, untrack } from 'solid-js';
-import { Portal } from 'solid-js/web';
+import { createEffect, For, Show, createMemo, createSignal, untrack } from 'solid-js';
+import { Portal } from '@solidjs/web';
 import type {
   FollowupAction,
   FollowupSource,
   FollowupSuggestionSet,
 } from '../../../shared/followups';
 import {
+  combineFollowupActions,
   parseFollowupSuggestions,
   parseFollowupSource,
   readFollowupText,
@@ -51,7 +52,8 @@ export function FollowupSuggestions(props: {
   const [sending, setSending] = createSignal(false);
   const [error, setError] = createSignal('');
   const [menu, setMenu] = createSignal<{
-    action: FollowupAction;
+    /** `null` targets the combined All action. */
+    action: FollowupAction | null;
     x: number;
     y: number;
   } | null>(null);
@@ -153,11 +155,19 @@ export function FollowupSuggestions(props: {
   }
 
   async function send(
-    action: FollowupAction,
+    group: readonly FollowupAction[],
     destination: 'current' | 'queue' | 'new-session' = 'current'
   ) {
     const value = current();
-    if (sendPending || !value || !value.actions.includes(action) || action.sessionId) return;
+    if (
+      sendPending ||
+      !value ||
+      !group.length ||
+      group.some((item) => !value.actions.includes(item) || item.sessionId) ||
+      (group.length > 1 && (!value.combinable || destination === 'new-session'))
+    )
+      return;
+    const action = group.length > 1 ? combineFollowupActions(group) : group[0]!;
     sendPending = true;
     setMenu(null);
     setSending(true);
@@ -167,11 +177,13 @@ export function FollowupSuggestions(props: {
     let optimisticPublished = false;
     const showSendError = () => {
       if (scope() !== sendScope || sourceKey() !== value.key) return;
-      if (optimisticPublished && !ready()) setReady(value);
-      if (ready() === value)
+      setReady((current) => {
+        if (current !== value && (!optimisticPublished || current !== null)) return current;
         setError(
           `Could not ${destination === 'queue' ? 'queue' : destination === 'new-session' ? 'run' : 'send'} this follow-up. Your main draft has not changed.`
         );
+        return value;
+      });
     };
     const validateBeforeSend = async () => {
       const latest = await client.varro.followups(value.sessionId, value.source, {
@@ -180,14 +192,20 @@ export function FollowupSuggestions(props: {
         allowGenerate: false,
         model,
       });
-      const latestAction = latest.actions.find(
-        (item) => item.title === action.title && item.prompt === action.prompt
+      const latestActions = group.map((selectedAction) =>
+        latest.actions.find(
+          (item) => item.title === selectedAction.title && item.prompt === selectedAction.prompt
+        )
       );
-      if (current() !== value || !latestAction) {
+      if (
+        current() !== value ||
+        latestActions.some((item) => !item) ||
+        (group.length > 1 && !latest.combinable)
+      ) {
         if (ready() === value) clear();
         return false;
       }
-      if (latestAction.sessionId) {
+      if (latestActions.some((item) => item?.sessionId)) {
         setReady({ ...value, ...latest });
         return false;
       }
@@ -292,149 +310,189 @@ export function FollowupSuggestions(props: {
     }
   }
 
-  createEffect(() => {
-    const currentScope = scope();
-    const working = props.working;
-    const currentTurnId = turnId();
-    const loading = state.messagesLoading;
-    const key = sourceKey();
-    const opening = state.followupOpening;
-    observedMessages();
-    const scopeChanged = previousScope !== currentScope;
-    if (scopeChanged) {
-      previousScope = currentScope;
-      armedTurn = null;
-      attempted.clear();
-      historicalAssistantIds = new Set<string>();
-      historicalUserIds = new Set<string>();
-    }
-    // Record every hydrated completed answer, not just the messages present at scope change.
-    // A stale busy status is not evidence that completed history streamed in this view.
-    const messages = untrack(() =>
-      state.messages.filter((entry) => entry.info.sessionID === state.activeSessionId)
-    );
-    if (scopeChanged || loading) {
-      untrack(() => {
-        for (const entry of messages) {
-          if (entry.info.role === 'user') historicalUserIds.add(entry.info.id);
-          else if (entry.info.time.completed) historicalAssistantIds.add(entry.info.id);
-        }
-      });
-    }
-    if (working && !loading && state.followupsEnabled && currentTurnId) {
-      untrack(() => {
-        const answers = messages.filter(
-          (entry) => entry.info.role === 'assistant' && entry.info.parentID === currentTurnId
-        );
-        const terminal = answers.some(
-          (entry) =>
-            entry.info.role === 'assistant' &&
-            !!entry.info.time.completed &&
-            (entry.info.finish === 'stop' || entry.info.finish === 'end_turn')
-        );
-        const unfinished = answers.some(
-          (entry) => entry.info.role === 'assistant' && !entry.info.time.completed
-        );
-        const newPrompt = messages.some(
-          (entry) =>
-            entry.info.id === currentTurnId &&
-            entry.info.role === 'user' &&
-            !historicalUserIds.has(entry.info.id)
-        );
-        if (!terminal && (unfinished || newPrompt)) armedTurn = currentTurnId;
-      });
-    }
-    if (sendPending && !scopeChanged) return;
-    untrack(clear);
-    const source = key ? parseFollowupSource(JSON.parse(key)) : null;
-    const sessionId = state.activeSessionId;
-    const completedAt = untrack(() => {
-      const answer = messages.find((entry) => entry.info.id === source?.assistantMessageId);
-      return answer?.info.role === 'assistant' ? answer.info.time.completed : undefined;
-    });
-    const unreadOpening =
-      opening?.sessionId === sessionId && !!completedAt && completedAt > opening.seenAt;
-    const liveTurn =
-      !!source &&
-      source.userMessageId === armedTurn &&
-      !historicalAssistantIds.has(source.assistantMessageId);
-    const allowGenerate = liveTurn || unreadOpening;
-    const attemptKey = `${currentScope}:${source?.userMessageId ?? ''}:${allowGenerate}`;
-    if (!source || !sessionId || attempted.has(attemptKey)) return;
-    attempted.add(attemptKey);
-    if (attempted.size > 64) attempted.delete(attempted.values().next().value!);
-    const controller = new AbortController();
-    onCleanup(() => controller.abort());
-    const directory = untrack(
-      () => state.sessions.find((session) => session.id === sessionId)?.directory
-    );
-    const model = untrack(sessionModel);
-    let finishRestore = !liveTurn ? untrack(() => props.onRestoreStart?.()) : undefined;
-    const releaseRestore = () => {
-      const finish = finishRestore;
-      finishRestore = undefined;
-      finish?.();
-    };
-    const publish = (suggestions: FollowupSuggestionSet) => {
-      if (controller.signal.aborted || scope() !== currentScope || sourceKey() !== key)
-        return false;
-      // Treat bridge output as inert plain text and enforce the same bounds as the host.
-      const validated = parseFollowupSuggestions(JSON.stringify(suggestions), {
-        allowSessionId: true,
-      });
-      if (!validated.actions.length) return false;
-      setReady({ key, source, sessionId, directory, ...validated });
-      return true;
-    };
-    const load = async () => {
-      if (finishRestore) {
-        const cacheController = new AbortController();
-        const timer = setTimeout(() => {
-          cacheController.abort();
-          releaseRestore();
-        }, INITIAL_CACHE_LOOKUP_TIMEOUT_MS);
-        onCleanup(() => {
-          clearTimeout(timer);
-          cacheController.abort();
-          releaseRestore();
-        });
-        try {
-          const cached = await client.varro.followups(sessionId, source, {
-            signal: AbortSignal.any([controller.signal, cacheController.signal]),
-            directory,
-            allowGenerate: false,
-            cacheOnly: true,
-            model,
-          });
-          if (!cacheController.signal.aborted && publish(cached)) return;
-        } catch {
-          // A failed or slow cache probe falls back to normal suggestions without holding reveal.
-        } finally {
-          clearTimeout(timer);
-          releaseRestore();
-        }
+  createEffect(
+    () => {
+      const currentScope = scope();
+      const working = props.working;
+      const currentTurnId = turnId();
+      const loading = state.messagesLoading;
+      const key = sourceKey();
+      const opening = state.followupOpening;
+      observedMessages();
+      return {
+        currentScope,
+        currentTurnId,
+        loading,
+        key,
+        opening: opening ? { sessionId: opening.sessionId, seenAt: opening.seenAt } : null,
+        canArm: working && !loading && state.followupsEnabled && !!currentTurnId,
+        sessionId: state.activeSessionId,
+      };
+    },
+    ({ currentScope, currentTurnId, loading, key, opening, canArm, sessionId }) => {
+      const cleanups: Array<() => void> = [];
+
+      const scopeChanged = previousScope !== currentScope;
+      if (scopeChanged) {
+        previousScope = currentScope;
+        armedTurn = null;
+        attempted.clear();
+        historicalAssistantIds = new Set<string>();
+        historicalUserIds = new Set<string>();
       }
-      if (controller.signal.aborted) return;
-      const suggestions = await client.varro.followups(sessionId, source, {
-        signal: controller.signal,
-        directory,
-        allowGenerate,
-        model,
+      // Record every hydrated completed answer, not just the messages present at scope change.
+      // A stale busy status is not evidence that completed history streamed in this view.
+      const messages = untrack(() =>
+        state.messages.filter((entry) => entry.info.sessionID === state.activeSessionId)
+      );
+      if (scopeChanged || loading) {
+        untrack(() => {
+          for (const entry of messages) {
+            if (entry.info.role === 'user') historicalUserIds.add(entry.info.id);
+            else if (entry.info.time.completed) historicalAssistantIds.add(entry.info.id);
+          }
+        });
+      }
+      if (canArm && currentTurnId) {
+        untrack(() => {
+          const answers = messages.filter(
+            (entry) => entry.info.role === 'assistant' && entry.info.parentID === currentTurnId
+          );
+          const terminal = answers.some(
+            (entry) =>
+              entry.info.role === 'assistant' &&
+              !!entry.info.time.completed &&
+              (entry.info.finish === 'stop' || entry.info.finish === 'end_turn')
+          );
+          const unfinished = answers.some(
+            (entry) => entry.info.role === 'assistant' && !entry.info.time.completed
+          );
+          const newPrompt = messages.some(
+            (entry) =>
+              entry.info.id === currentTurnId &&
+              entry.info.role === 'user' &&
+              !historicalUserIds.has(entry.info.id)
+          );
+          if (!terminal && (unfinished || newPrompt)) armedTurn = currentTurnId;
+        });
+      }
+      if (sendPending && !scopeChanged)
+        return () => {
+          for (const cleanup of cleanups.toReversed()) cleanup();
+        };
+      untrack(clear);
+      const source = key ? parseFollowupSource(JSON.parse(key)) : null;
+      const completedAt = untrack(() => {
+        const answer = messages.find((entry) => entry.info.id === source?.assistantMessageId);
+        return answer?.info.role === 'assistant' ? answer.info.time.completed : undefined;
       });
-      publish(suggestions);
-    };
-    void load().catch(() => {
-      // Optional inference must not change chat completion or log conversation text.
-      if (!controller.signal.aborted)
-        logWarn('Follow-ups request failed; check Varro output for generation diagnostics');
-    });
-  });
+      const unreadOpening =
+        opening?.sessionId === sessionId && !!completedAt && completedAt > opening.seenAt;
+      const liveTurn =
+        !!source &&
+        source.userMessageId === armedTurn &&
+        !historicalAssistantIds.has(source.assistantMessageId);
+      const allowGenerate = liveTurn || unreadOpening;
+      const attemptKey = `${currentScope}:${source?.userMessageId ?? ''}:${allowGenerate}`;
+      if (!source || !sessionId || attempted.has(attemptKey))
+        return () => {
+          for (const cleanup of cleanups.toReversed()) cleanup();
+        };
+      attempted.add(attemptKey);
+      if (attempted.size > 64) attempted.delete(attempted.values().next().value!);
+      const controller = new AbortController();
+      cleanups.push(() => controller.abort());
+      const directory = untrack(
+        () => state.sessions.find((session) => session.id === sessionId)?.directory
+      );
+      const model = untrack(sessionModel);
+      let finishRestore = !liveTurn ? untrack(() => props.onRestoreStart?.()) : undefined;
+      const releaseRestore = () => {
+        const finish = finishRestore;
+        finishRestore = undefined;
+        finish?.();
+      };
+      const publish = (suggestions: FollowupSuggestionSet) => {
+        if (controller.signal.aborted || scope() !== currentScope || sourceKey() !== key)
+          return false;
+        // Treat bridge output as inert plain text and enforce the same bounds as the host.
+        const validated = parseFollowupSuggestions(JSON.stringify(suggestions), {
+          allowSessionId: true,
+        });
+        if (!validated.actions.length) return false;
+        setReady({ key, source, sessionId, directory, ...validated });
+        return true;
+      };
+      const load = async () => {
+        if (finishRestore) {
+          const cacheController = new AbortController();
+          const timer = setTimeout(() => {
+            cacheController.abort();
+            releaseRestore();
+          }, INITIAL_CACHE_LOOKUP_TIMEOUT_MS);
+          cleanups.push(() => {
+            clearTimeout(timer);
+            cacheController.abort();
+            releaseRestore();
+          });
+          try {
+            const cached = await client.varro.followups(sessionId, source, {
+              signal: AbortSignal.any([controller.signal, cacheController.signal]),
+              directory,
+              allowGenerate: false,
+              cacheOnly: true,
+              model,
+            });
+            if (!cacheController.signal.aborted && publish(cached)) return;
+          } catch {
+            // A failed or slow cache probe falls back to normal suggestions without holding reveal.
+          } finally {
+            clearTimeout(timer);
+            releaseRestore();
+          }
+        }
+        if (controller.signal.aborted) return;
+        const suggestions = await client.varro.followups(sessionId, source, {
+          signal: controller.signal,
+          directory,
+          allowGenerate,
+          model,
+        });
+        publish(suggestions);
+      };
+      void load().catch(() => {
+        // Optional inference must not change chat completion or log conversation text.
+        if (!controller.signal.aborted)
+          logWarn('Follow-ups request failed; check Varro output for generation diagnostics');
+      });
+
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
+    }
+  );
 
   const current = () => {
     const value = ready();
     return value && sourceKey() === value.key && state.activeSessionId === value.sessionId
       ? value
       : null;
+  };
+  /** Unsent compatible actions. All is offered only for two or more. */
+  const combinableActions = () => {
+    const value = ready();
+    const pending = value?.combinable ? value.actions.filter((action) => !action.sessionId) : [];
+    return pending.length > 1 ? pending : [];
+  };
+  const openMenu = (
+    event: MouseEvent & { currentTarget: HTMLElement },
+    action: FollowupAction | null
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (sending() || !current()) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setMenu({ action, x: event.clientX || rect.left, y: event.clientY || rect.bottom });
   };
 
   return (
@@ -475,18 +533,8 @@ export function FollowupSuggestions(props: {
                         <button
                           type="button"
                           disabled={sending() || !current()}
-                          onClick={() => void send(action)}
-                          onContextMenu={(event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            if (sending() || !current()) return;
-                            const rect = event.currentTarget.getBoundingClientRect();
-                            setMenu({
-                              action,
-                              x: event.clientX || rect.left,
-                              y: event.clientY || rect.bottom,
-                            });
-                          }}
+                          onClick={() => void send([action])}
+                          onContextMenu={(event) => openMenu(event, action)}
                         >
                           <InlineCodeText text={action.title} />
                         </button>
@@ -503,6 +551,20 @@ export function FollowupSuggestions(props: {
                   </Show>
                 )}
               </For>
+              <Show when={combinableActions().length > 1}>
+                <Tooltip content={combineFollowupActions(combinableActions()).prompt}>
+                  <button
+                    type="button"
+                    class="followup-all"
+                    aria-label={`Send all ${combinableActions().length} follow-ups`}
+                    disabled={sending() || !current()}
+                    onClick={() => void send(combinableActions())}
+                    onContextMenu={(event) => openMenu(event, null)}
+                  >
+                    All
+                  </button>
+                </Tooltip>
+              </Show>
             </div>
             <Show when={error()}>
               <p class="followup-suggestions-error" role="alert">
@@ -513,27 +575,44 @@ export function FollowupSuggestions(props: {
         )}
       </Show>
       <Show when={menu()} keyed>
-        {(value) => (
-          <Portal>
-            <FollowupActionsMenu
-              x={value.x}
-              y={value.y}
-              onClose={() => setMenu(null)}
-              onCopy={() => {
-                void writeClipboard(value.action.prompt);
-                setMenu(null);
-              }}
-              onQueue={() => {
-                setMenu(null);
-                void send(value.action, 'queue');
-              }}
-              onRunInNewSession={() => {
-                setMenu(null);
-                void send(value.action, 'new-session');
-              }}
-            />
-          </Portal>
-        )}
+        {(value) => {
+          const target = value.action;
+          return (
+            <Portal>
+              <FollowupActionsMenu
+                x={value.x}
+                y={value.y}
+                onClose={() => setMenu(null)}
+                onCopy={() => {
+                  void writeClipboard(
+                    target ? target.prompt : combineFollowupActions(combinableActions()).prompt
+                  );
+                  setMenu(null);
+                }}
+                onQueue={() => {
+                  setMenu(null);
+                  void send(target ? [target] : combinableActions(), 'queue');
+                }}
+                onRunInNewSession={
+                  target
+                    ? () => {
+                        setMenu(null);
+                        void send([target], 'new-session');
+                      }
+                    : undefined
+                }
+                onSendAll={
+                  target && combinableActions().length > 1
+                    ? () => {
+                        setMenu(null);
+                        void send(combinableActions());
+                      }
+                    : undefined
+                }
+              />
+            </Portal>
+          );
+        }}
       </Show>
     </>
   );

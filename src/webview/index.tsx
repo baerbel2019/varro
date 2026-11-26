@@ -1,4 +1,4 @@
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { startHostExtension } from './host/extensions';
 import { AppRoot } from './App';
 import { cleanupBridge, initializeBridge, postMessage } from './lib/bridge';
@@ -78,9 +78,10 @@ function trackEditorLayoutSettling() {
     }, EDITOR_LAYOUT_SETTLE_MS);
   };
   const handleVisibilityChange = () => {
+    // Only the first layout needs a hold. Retained tabs must not hide painted content again.
+    if (!html.classList.contains(EDITOR_LAYOUT_PENDING_CLASS)) return;
     cancelSettle();
     cancelMaxWait();
-    html.classList.add(EDITOR_LAYOUT_PENDING_CLASS);
     if (document.visibilityState !== 'hidden') settle();
   };
   const handleResize = () => {

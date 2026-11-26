@@ -1,4 +1,13 @@
 import {
+  Show,
+  createSignal,
+  onSettled,
+  onCleanup,
+  createEffect,
+  createMemo,
+  untrack,
+} from 'solid-js';
+import {
   connectionInitialized,
   desktopSessionPaneSide,
   state,
@@ -19,14 +28,16 @@ import {
   setShowModels,
   showPermissionSettings,
   setShowPermissionSettings,
+  showSkillSettings,
+  setShowSkillSettings,
   showMcpSettings,
   setShowMcpSettings,
   requestComposerFocus,
 } from '../lib/state';
-import { Show, createSignal, onMount, onCleanup, createEffect, createMemo, on } from 'solid-js';
-import { selectSession, deleteSessionImmediately } from '../hooks/useOpenCode';
+import { selectSession, deleteSessionImmediately, refreshRoutingState } from '../hooks/useOpenCode';
 import { normalizeSessionTitle } from '../../shared/session-title';
 import { ChatWorkspace } from './chat/ChatWorkspace';
+import { createProviderSetupPrompt } from './chat/provider-setup-prompt';
 import { ralphStore } from '../lib/stores/ralph-store';
 import { getDiscardableActiveBlankSessionId, startNewChatDraft } from '../lib/new-chat-draft';
 import {
@@ -58,8 +69,9 @@ import { compareSessionsForDisplay } from '../lib/session-order';
 import {
   consumeProviderConnectionRequest,
   providerConnectionRequest,
+  requestProviderConnection,
 } from '../lib/provider-connection-state';
-import { client } from '../lib/client';
+import { client, serverEvents } from '../lib/client';
 import { createPendingBackgroundSessionIds } from '../lib/background-session-status';
 import type { Provider, Session } from '../types';
 import {
@@ -67,12 +79,27 @@ import {
   clearDirectSessionReturnUnless,
   getDirectSessionReturnId,
 } from '../lib/session-navigation';
+import {
+  EMPTY_SESSION_HISTORY,
+  canNavigateSessionHistory,
+  navigateSessionHistory,
+  recordSessionHistory,
+  removeFromSessionHistory,
+  type SessionHistoryDirection,
+  type SessionHistoryState,
+  type SessionHistoryView,
+} from '../lib/session-history';
 import { isFunction } from '../lib/runtime-values';
+import { asRecord, isString } from '../../shared/type-utils';
 import { ProviderConnectionDialog } from './ProviderConnectionDialog';
 import { BackgroundProcessDialog } from './BackgroundProcessDialog';
 import { SideQuestionDialog } from './SideQuestionDialog';
 import { sideQuestionView, closeSideQuestion } from '../lib/side-question';
 import { backgroundProcessView, closeBackgroundProcessView } from '../lib/background-process-view';
+import {
+  clearSubagentSessionsRequest,
+  subagentSessionsRequest,
+} from '../lib/subagent-sessions-view';
 import { readWebviewInstanceContext } from '../lib/state-stored-values';
 import { isSessionTransferHidden } from '../lib/session-transfer';
 
@@ -126,65 +153,92 @@ export function Chat() {
     methodID?: string;
   } | null>(null);
 
-  createEffect(() => {
-    const request = providerConnectionRequest();
-    if (!request || providerConnectionData()) return;
-    consumeProviderConnectionRequest(request.id);
-    const loadingState = {
-      providers: [],
-      error: '',
-      loading: true,
-      providerID: request.providerID,
-      methodID: request.methodID,
-    };
-    setProviderConnectionData(loadingState);
-    void client.config.providerCatalog().then(
-      (catalog) => {
-        if (providerConnectionData() !== loadingState) return;
-        setProviderConnectionData({
-          providers: catalog.all,
-          error: '',
-          loading: false,
-          providerID: request.providerID,
-          methodID: request.methodID,
-        });
-      },
-      (error) => {
-        if (providerConnectionData() !== loadingState) return;
-        setProviderConnectionData({
-          providers: [],
-          error: error instanceof Error ? error.message : String(error),
-          loading: false,
-          providerID: request.providerID,
-          methodID: request.methodID,
-        });
-      }
-    );
-  });
+  createEffect(
+    () => ({ request: providerConnectionRequest(), data: providerConnectionData() }),
+    ({ request, data }) => {
+      if (!request || data) return;
+      untrack(() => consumeProviderConnectionRequest(request.id));
+      const loadingState = {
+        providers: [],
+        error: '',
+        loading: true,
+        providerID: request.providerID,
+        methodID: request.methodID,
+      };
+      setProviderConnectionData(loadingState);
+      void client.config.providerCatalog().then(
+        (catalog) => {
+          if (providerConnectionData() !== loadingState) return;
+          setProviderConnectionData({
+            providers: catalog.all,
+            error: '',
+            loading: false,
+            providerID: request.providerID,
+            methodID: request.methodID,
+          });
+        },
+        (error) => {
+          if (providerConnectionData() !== loadingState) return;
+          setProviderConnectionData({
+            providers: [],
+            error: error instanceof Error ? error.message : String(error),
+            loading: false,
+            providerID: request.providerID,
+            methodID: request.methodID,
+          });
+        }
+      );
+    }
+  );
   const [sessionFilter, setSessionFilter] = createSignal<SessionListFilter | null>(null);
-  createEffect(() => {
-    const view = backgroundProcessView();
-    if (view && view.sessionID !== state.activeSessionId) closeBackgroundProcessView();
-  });
+  createEffect(
+    () => {
+      const view = backgroundProcessView();
+      return !!view && view.sessionID !== state.activeSessionId;
+    },
+    (close) => {
+      if (close) closeBackgroundProcessView();
+    }
+  );
   onCleanup(closeBackgroundProcessView);
-  createEffect(() => {
-    const view = sideQuestionView();
-    if (!view) return;
-    const session = state.sessions.find((entry) => entry.id === view.sessionID);
-    if (
-      state.activeSessionId !== view.sessionID ||
-      session?.directory !== view.directory ||
-      state.serverStatus.state !== 'running' ||
-      state.serverStatus.url !== view.serverURL ||
-      state.serverStatus.apiVersion !== 2
-    )
-      closeSideQuestion();
-  });
+  createEffect(
+    () => {
+      const view = sideQuestionView();
+      if (!view) return false;
+      const session = state.sessions.find((entry) => entry.id === view.sessionID);
+      return (
+        state.activeSessionId !== view.sessionID ||
+        session?.directory !== view.directory ||
+        state.serverStatus.state !== 'running' ||
+        state.serverStatus.url !== view.serverURL ||
+        state.serverStatus.apiVersion !== 2
+      );
+    },
+    (close) => {
+      if (close) closeSideQuestion();
+    }
+  );
   onCleanup(closeSideQuestion);
   const [subagentParentId, setSubagentParentId] = createSignal<string | null>(null);
   const [sidebarSubagentParentId, setSidebarSubagentParentId] = createSignal<string | null>(null);
   const [isDesktopSessionLayout, setIsDesktopSessionLayout] = createSignal(false);
   const [showReconnectBanner, setShowReconnectBanner] = createSignal(false);
+  // An inline prompt instead of opening provider setup: a server that briefly
+  // reports no providers must not take over the view.
+  const providerSetupNeeded = createProviderSetupPrompt({
+    isReady: () =>
+      connectionInitialized() &&
+      state.serverStatus.state === 'running' &&
+      !state.serverReconnecting &&
+      state.providersLoaded,
+    hasProviders: () => state.providers.length > 0,
+    refreshProviders: refreshRoutingState,
+  });
+  const showProviderSetupBanner = () => providerSetupNeeded() && !showModels();
+  const openProviderSetup = () => {
+    setShowModels(true);
+    requestProviderConnection();
+  };
   const [slowApiRequests, setSlowApiRequests] = createSignal<readonly SlowApiRequest[]>([]);
   const [sessionListNow, setSessionListNow] = createSignal(Date.now());
   const pendingBackgroundIds = createPendingBackgroundSessionIds(() => state.sessionStatus);
@@ -210,78 +264,94 @@ export function Chat() {
   let publishedUnreadWorkspace: string | null = null;
   const publishedUnreadStates = new Map<string, PublishedUnreadState>();
   let publishedCommandState = '';
-  createEffect(() => {
-    const workspacePath = state.editorContext.workspacePath;
-    // Publish from the settled indicators, and never while a session's turn is
-    // still running (including the settle window between steps). Raw indicators
-    // drop in and out of plan-ready/completed in the idle gaps of a stepping
-    // turn, and mirroring those flaps to the host makes its attention state -
-    // and the status bar item - flicker for the whole turn.
-    const indicators = sessionIndicators();
-    if (!workspacePath) return;
-    if (publishedUnreadWorkspace !== workspacePath) {
-      publishedUnreadWorkspace = workspacePath;
-      publishedUnreadStates.clear();
-    }
-    for (const session of state.sessions) {
-      if (!isPrimarySession(session)) continue;
-      if (indicators.runningIds.has(session.id)) continue;
-      const previous = publishedUnreadStates.get(session.id);
-      const completedAt = state.completedSessionResponses[session.id];
-      const seenAt = state.lastSeenSessions[session.id];
-      const kind = indicators.planReadyIds.has(session.id)
-        ? 'plan-ready'
-        : indicators.newlyCompletedIds.has(session.id)
-          ? 'completed'
-          : undefined;
-      let next: PublishedUnreadState | undefined;
-      if (kind) {
-        if (kind === 'completed') {
-          if (completedAt === undefined) continue;
-          next = { kind, unread: true, markerAt: completedAt };
-        } else {
-          const updatedAt = getSessionPlanUpdatedAt(session.id, session.time.updated);
-          const unread = isSessionUnread(session.id, updatedAt);
+  createEffect(
+    () => {
+      const workspacePath = state.editorContext.workspacePath;
+      // Publish from the settled indicators, and never while a session's turn is
+      // still running (including the settle window between steps). Raw indicators
+      // drop in and out of plan-ready/completed in the idle gaps of a stepping
+      // turn, and mirroring those flaps to the host makes its attention state -
+      // and the status bar item - flicker for the whole turn.
+      const indicators = sessionIndicators();
+      if (!workspacePath) return null;
+      const updates: Array<{ sessionId: string; directory: string; next: PublishedUnreadState }> =
+        [];
+      for (const session of state.sessions) {
+        if (!isPrimarySession(session)) continue;
+        if (indicators.runningIds.has(session.id)) continue;
+        const previous =
+          publishedUnreadWorkspace === workspacePath
+            ? publishedUnreadStates.get(session.id)
+            : undefined;
+        const completedAt = state.completedSessionResponses[session.id];
+        const seenAt = state.lastSeenSessions[session.id];
+        const kind = indicators.planReadyIds.has(session.id)
+          ? 'plan-ready'
+          : indicators.newlyCompletedIds.has(session.id)
+            ? 'completed'
+            : undefined;
+        let next: PublishedUnreadState | undefined;
+        if (kind) {
+          if (kind === 'completed') {
+            if (completedAt === undefined) continue;
+            next = { kind, unread: true, markerAt: completedAt };
+          } else {
+            const updatedAt = getSessionPlanUpdatedAt(session.id, session.time.updated);
+            const unread = isSessionUnread(session.id, updatedAt);
+            next = {
+              kind,
+              unread,
+              markerAt: unread ? updatedAt : (seenAt ?? updatedAt),
+            };
+          }
+        } else if (
+          seenAt !== undefined &&
+          (completedAt === undefined || seenAt >= completedAt) &&
+          getSelectedAgentForSession(session.id) !== 'plan'
+        ) {
           next = {
-            kind,
-            unread,
-            markerAt: unread ? updatedAt : (seenAt ?? updatedAt),
+            kind: 'completed',
+            unread: false,
+            markerAt: seenAt,
           };
+        } else if (completedAt !== undefined && seenAt !== undefined && seenAt >= completedAt) {
+          next = { kind: 'plan-ready', unread: false, markerAt: seenAt };
+        } else if (previous?.kind === 'plan-ready') {
+          next = { kind: 'plan-ready', unread: false, markerAt: session.time.updated };
         }
-      } else if (
-        seenAt !== undefined &&
-        (completedAt === undefined || seenAt >= completedAt) &&
-        getSelectedAgentForSession(session.id) !== 'plan'
-      ) {
-        next = {
-          kind: 'completed',
-          unread: false,
-          markerAt: seenAt,
-        };
-      } else if (completedAt !== undefined && seenAt !== undefined && seenAt >= completedAt) {
-        next = { kind: 'plan-ready', unread: false, markerAt: seenAt };
-      } else if (previous?.kind === 'plan-ready') {
-        next = { kind: 'plan-ready', unread: false, markerAt: session.time.updated };
+        if (!next) continue;
+        updates.push({ sessionId: session.id, directory: session.directory, next });
       }
-      if (!next) continue;
-      if (
-        previous?.kind === next.kind &&
-        previous.unread === next.unread &&
-        previous.markerAt === next.markerAt
-      ) {
-        continue;
+      return { workspacePath, updates };
+    },
+    (publication) => {
+      if (!publication) return;
+      const { workspacePath, updates } = publication;
+      if (publishedUnreadWorkspace !== workspacePath) {
+        publishedUnreadWorkspace = workspacePath;
+        publishedUnreadStates.clear();
       }
-      publishedUnreadStates.set(session.id, next);
-      postMessage({
-        type: 'session-unread-state/update',
-        payload: {
-          sessionId: session.id,
-          directory: session.directory,
-          ...next,
-        },
-      });
+      for (const { sessionId, directory, next } of updates) {
+        const previous = publishedUnreadStates.get(sessionId);
+        if (
+          previous?.kind === next.kind &&
+          previous.unread === next.unread &&
+          previous.markerAt === next.markerAt
+        ) {
+          continue;
+        }
+        publishedUnreadStates.set(sessionId, next);
+        postMessage({
+          type: 'session-unread-state/update',
+          payload: {
+            sessionId,
+            directory,
+            ...next,
+          },
+        });
+      }
     }
-  });
+  );
   const recycleBinSessionIds = createMemo(() => getRecycleBinSessionIds(state.recycleBinEntries));
   const visibleSessions = createMemo(() => {
     const indicators = sessionIndicators();
@@ -316,80 +386,150 @@ export function Chat() {
   const sessionsById = createMemo(
     () => new Map(state.sessions.map((session) => [session.id, session]))
   );
+  const activeSession = createMemo(() => {
+    const sessionId = state.activeSessionId;
+    return sessionId ? sessionsById().get(sessionId) || null : null;
+  });
+  const [sessionHistory, setSessionHistory] =
+    createSignal<SessionHistoryState>(EMPTY_SESSION_HISTORY);
+  const forgetSessionHistoryEntries = (sessionIds: Iterable<string>) => {
+    setSessionHistory((history) => {
+      let next = history;
+      for (const sessionId of sessionIds) next = removeFromSessionHistory(next, sessionId);
+      return next;
+    });
+  };
+  createEffect(recycleBinSessionIds, (sessionIds) => forgetSessionHistoryEntries(sessionIds));
+  onCleanup(
+    serverEvents.on('session.deleted', (event) => {
+      const sessionId = asRecord(asRecord(event.properties)?.info)?.id;
+      if (isString(sessionId)) forgetSessionHistoryEntries([sessionId]);
+    })
+  );
   const isEventStreamDegraded = createMemo(
     () => state.serverStatus.state === 'running' && state.serverStatus.eventStream === 'degraded'
   );
   const shouldRenderWorkspace = () =>
     isEditorSurface || !showSessionPicker() || isDesktopSessionLayout();
+  // Only the narrow sidebar shows the session list in place of the chat.
+  const canShowSessionListView = () => !isEditorSurface && !isDesktopSessionLayout();
+  const sessionHistoryView = createMemo((): SessionHistoryView => {
+    if (!shouldRenderWorkspace()) {
+      return { type: 'list', filter: sessionFilter(), subagentParentId: subagentParentId() };
+    }
+    // A cross-directory selection waits for activation before it becomes active.
+    const sessionId = state.pendingSessionSelectionId ?? state.activeSessionId;
+    if (!sessionId) return null;
+    const directory = sessionsById().get(sessionId)?.directory;
+    return directory ? { type: 'session', sessionId, directory } : { type: 'session', sessionId };
+  });
+  createEffect(sessionHistoryView, (view) => {
+    if (view) setSessionHistory((history) => recordSessionHistory(history, view));
+  });
+  const getSessionHistoryOptions = () => ({ canShowList: canShowSessionListView() });
   let reconnectBannerShowTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnectBannerHideTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnectBannerVisibleSince = 0;
   const pendingEmptySessionDeleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  createEffect(() => {
-    const activeSessionId = state.activeSessionId;
-    const selectedModel = state.selectedModel;
-    const modelPayload = selectedModel
-      ? {
-          providerID: selectedModel.providerID,
-          modelID: selectedModel.modelID,
-          variant: selectedModel.variant ? selectedModel.variant : undefined,
-        }
-      : null;
-    const canSwitchSessions =
-      shouldRenderWorkspace() &&
-      !showModels() &&
-      primarySessions().length >= 2 &&
-      Boolean(
-        activeSessionId && primarySessions().some((session) => session.id === activeSessionId)
-      );
-    const payload = {
-      canAbort: Boolean(activeSessionId) && isActiveSessionWorking(),
-      canSwitchSessions,
-      model: modelPayload,
-      modelVisible: shouldRenderWorkspace() && !showModels(),
-      sessionId: activeSessionId,
-    };
-    const key = JSON.stringify(payload);
-    if (key === publishedCommandState) return;
-    publishedCommandState = key;
-    postMessage({ type: 'commands/state', payload });
-  });
+  createEffect(
+    () => {
+      const activeSessionId = state.activeSessionId;
+      const selectedModel = state.selectedModel;
+      const modelPayload = selectedModel
+        ? {
+            providerID: selectedModel.providerID,
+            modelID: selectedModel.modelID,
+            variant: selectedModel.variant ? selectedModel.variant : undefined,
+          }
+        : null;
+      const canSwitchSessions =
+        shouldRenderWorkspace() &&
+        !showModels() &&
+        primarySessions().length >= 2 &&
+        Boolean(
+          activeSessionId && primarySessions().some((session) => session.id === activeSessionId)
+        );
+      return {
+        canAbort: Boolean(activeSessionId) && isActiveSessionWorking(),
+        canSwitchSessions,
+        canNavigateBack: canNavigateSessionHistory(
+          sessionHistory(),
+          'back',
+          sessionHistoryView(),
+          getSessionHistoryOptions()
+        ),
+        canNavigateForward: canNavigateSessionHistory(
+          sessionHistory(),
+          'forward',
+          sessionHistoryView(),
+          getSessionHistoryOptions()
+        ),
+        model: modelPayload,
+        modelVisible: shouldRenderWorkspace() && !showModels(),
+        sessionId: activeSessionId,
+      };
+    },
+    (payload) => {
+      const key = JSON.stringify(payload);
+      if (key === publishedCommandState) return;
+      publishedCommandState = key;
+      postMessage({ type: 'commands/state', payload });
+    }
+  );
 
   let initialEditorRouteReconciled = false;
-  createEffect(() => {
-    if (initialEditorRouteReconciled || !isEditorSurface || !connectionInitialized()) return;
-    initialEditorRouteReconciled = true;
-    const initialRoute = webviewContext.initialRoute;
-    if (initialRoute.type === 'session' && state.activeSessionId !== initialRoute.sessionId) {
-      void (initialRoute.directory
-        ? selectSession(initialRoute.sessionId, { directory: initialRoute.directory })
-        : selectSession(initialRoute.sessionId));
+  let preRestoreSessionId: string | null | undefined;
+  const [restoreSettled, setRestoreSettled] = createSignal(false);
+  createEffect(
+    () => {
+      if (!isEditorSurface || !connectionInitialized()) return null;
+      const sessionId = state.activeSessionId;
+      const title = activeSession()?.title;
+      const directory = activeSession()?.directory;
+      const rootSessionId = sessionId ? getSessionTreeRootId(sessionId) || sessionId : undefined;
+      const initialRoute = webviewContext.initialRoute;
+      const restorePending =
+        initialRoute.type === 'session' &&
+        initialRoute.sessionId !== sessionId &&
+        !restoreSettled();
+      return { sessionId, title, directory, rootSessionId, initialRoute, restorePending };
+    },
+    (route) => {
+      if (!route) return;
+      const { sessionId, title, directory, rootSessionId, initialRoute } = route;
+      if (!initialEditorRouteReconciled) {
+        initialEditorRouteReconciled = true;
+        if (initialRoute.type === 'session' && initialRoute.sessionId !== sessionId) {
+          preRestoreSessionId = sessionId;
+          void (
+            initialRoute.directory
+              ? selectSession(initialRoute.sessionId, { directory: initialRoute.directory })
+              : selectSession(initialRoute.sessionId)
+          ).finally(() => setRestoreSettled(true));
+          return;
+        }
+      }
+      // A selection can wait for directory activation. Don't serialize the old route in that gap.
+      if (route.restorePending && preRestoreSessionId === sessionId) return;
+      preRestoreSessionId = undefined;
+      persistLastOpenedView(
+        sessionId
+          ? directory
+            ? { type: 'session', sessionId, directory }
+            : { type: 'session', sessionId }
+          : { type: 'new-session' }
+      );
+      postMessage({
+        type: 'editor/route-changed',
+        payload: {
+          route: sessionId
+            ? { type: 'session', sessionId, directory, rootSessionId, title }
+            : { type: 'new-session' },
+        },
+      });
     }
-  });
-
-  createEffect(() => {
-    if (!isEditorSurface || !connectionInitialized()) return;
-    const sessionId = state.activeSessionId;
-    const title = activeSession()?.title;
-    const directory = activeSession()?.directory;
-    const rootSessionId = sessionId ? getSessionTreeRootId(sessionId) || sessionId : undefined;
-    persistLastOpenedView(
-      sessionId
-        ? directory
-          ? { type: 'session', sessionId, directory }
-          : { type: 'session', sessionId }
-        : { type: 'new-session' }
-    );
-    postMessage({
-      type: 'editor/route-changed',
-      payload: {
-        route: sessionId
-          ? { type: 'session', sessionId, directory, rootSessionId, title }
-          : { type: 'new-session' },
-      },
-    });
-  });
+  );
   onCleanup(() => {
     postMessage({
       type: 'commands/state',
@@ -409,8 +549,13 @@ export function Chat() {
     reconnectBannerHideTimer = undefined;
   };
 
-  onMount(() => {
-    if (!isFunction(window.matchMedia)) return;
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    if (!isFunction(window.matchMedia))
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
 
     const mediaQuery = window.matchMedia(DESKTOP_SESSION_LAYOUT_MEDIA_QUERY);
     const handleChange = (event: MediaQueryListEvent) => {
@@ -419,102 +564,122 @@ export function Chat() {
 
     setIsDesktopSessionLayout(mediaQuery.matches);
     mediaQuery.addEventListener('change', handleChange);
-    onCleanup(() => mediaQuery.removeEventListener('change', handleChange));
+    cleanups.push(() => mediaQuery.removeEventListener('change', handleChange));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const unsubscribe = onSlowApiRequestsChange(setSlowApiRequests);
-    onCleanup(unsubscribe);
+    cleanups.push(unsubscribe);
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const clock = setInterval(() => setSessionListNow(Date.now()), SESSION_LIST_CLOCK_INTERVAL_MS);
-    onCleanup(() => clearInterval(clock));
+    cleanups.push(() => clearInterval(clock));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
+  });
+
+  createEffect(isEventStreamDegraded, (isDegraded) => {
+    if (isDegraded) {
+      clearReconnectBannerHideTimer();
+      if (untrack(showReconnectBanner) || reconnectBannerShowTimer != null) return;
+
+      reconnectBannerShowTimer = setTimeout(() => {
+        reconnectBannerShowTimer = undefined;
+        reconnectBannerVisibleSince = Date.now();
+        setShowReconnectBanner(true);
+      }, RECONNECT_BANNER_SHOW_DELAY_MS);
+      return;
+    }
+
+    clearReconnectBannerShowTimer();
+    if (!untrack(showReconnectBanner)) return;
+
+    const remainingVisibleMs =
+      RECONNECT_BANNER_MIN_VISIBLE_MS - (Date.now() - reconnectBannerVisibleSince);
+    if (remainingVisibleMs <= 0) {
+      reconnectBannerVisibleSince = 0;
+      setShowReconnectBanner(false);
+      return;
+    }
+
+    if (reconnectBannerHideTimer != null) return;
+    reconnectBannerHideTimer = setTimeout(() => {
+      reconnectBannerHideTimer = undefined;
+      reconnectBannerVisibleSince = 0;
+      if (!isEventStreamDegraded()) setShowReconnectBanner(false);
+    }, remainingVisibleMs);
   });
 
   createEffect(
-    on(isEventStreamDegraded, (isDegraded) => {
-      if (isDegraded) {
-        clearReconnectBannerHideTimer();
-        if (showReconnectBanner() || reconnectBannerShowTimer != null) return;
-
-        reconnectBannerShowTimer = setTimeout(() => {
-          reconnectBannerShowTimer = undefined;
-          reconnectBannerVisibleSince = Date.now();
-          setShowReconnectBanner(true);
-        }, RECONNECT_BANNER_SHOW_DELAY_MS);
-        return;
-      }
-
-      clearReconnectBannerShowTimer();
-      if (!showReconnectBanner()) return;
-
-      const remainingVisibleMs =
-        RECONNECT_BANNER_MIN_VISIBLE_MS - (Date.now() - reconnectBannerVisibleSince);
-      if (remainingVisibleMs <= 0) {
-        reconnectBannerVisibleSince = 0;
-        setShowReconnectBanner(false);
-        return;
-      }
-
-      if (reconnectBannerHideTimer != null) return;
-      reconnectBannerHideTimer = setTimeout(() => {
-        reconnectBannerHideTimer = undefined;
-        reconnectBannerVisibleSince = 0;
-        if (!isEventStreamDegraded()) setShowReconnectBanner(false);
-      }, remainingVisibleMs);
-    })
+    () => state.activeSessionId,
+    (sessionId) => clearDirectSessionReturnUnless(sessionId)
   );
 
   createEffect(
-    on(
-      () => state.activeSessionId,
-      (sessionId) => clearDirectSessionReturnUnless(sessionId)
-    )
-  );
-
-  createEffect(
-    on(
-      sessionSearchFocusKey,
-      (key) => {
-        if (key === 0) return;
+    sessionSearchFocusKey,
+    (key) => {
+      if (key === 0) return;
+      // Actions persist the current view state; the focus key alone decides when they run.
+      untrack(() => {
         setSessionFilter(null);
         setSubagentParentId(null);
         setShowModels(false);
         setShowSessionPicker(true);
-      },
-      { defer: true }
-    )
+      });
+    },
+    { defer: true }
   );
 
-  createEffect(() => {
-    const indicators = sessionIndicators();
-    const candidateIds = new Set<string>();
-    for (const session of state.sessions) {
-      if (!shouldAutoDeleteEmptySession(session, state.activeSessionId, indicators)) continue;
-      candidateIds.add(session.id);
-      if (pendingEmptySessionDeleteTimers.has(session.id)) continue;
+  createEffect(
+    () => {
+      const indicators = sessionIndicators();
+      return state.sessions
+        .filter((session) =>
+          shouldAutoDeleteEmptySession(session, state.activeSessionId, indicators)
+        )
+        .map((session) => session.id);
+    },
+    (candidates) => {
+      const candidateIds = new Set(candidates);
+      for (const sessionId of candidates) {
+        if (pendingEmptySessionDeleteTimers.has(sessionId)) continue;
 
-      const timer = setTimeout(() => {
-        pendingEmptySessionDeleteTimers.delete(session.id);
-        const latestSession = state.sessions.find((item) => item.id === session.id);
-        if (!latestSession) return;
-        if (
-          !shouldAutoDeleteEmptySession(latestSession, state.activeSessionId, sessionIndicators())
-        ) {
-          return;
-        }
-        void deleteEmptySession(session.id);
-      }, EMPTY_SESSION_DELETE_DELAY_MS);
-      pendingEmptySessionDeleteTimers.set(session.id, timer);
-    }
+        const timer = setTimeout(() => {
+          pendingEmptySessionDeleteTimers.delete(sessionId);
+          const latestSession = state.sessions.find((item) => item.id === sessionId);
+          if (!latestSession) return;
+          if (
+            !shouldAutoDeleteEmptySession(latestSession, state.activeSessionId, sessionIndicators())
+          ) {
+            return;
+          }
+          void deleteEmptySession(sessionId);
+        }, EMPTY_SESSION_DELETE_DELAY_MS);
+        pendingEmptySessionDeleteTimers.set(sessionId, timer);
+      }
 
-    for (const [sessionId, timer] of pendingEmptySessionDeleteTimers) {
-      if (candidateIds.has(sessionId)) continue;
-      clearTimeout(timer);
-      pendingEmptySessionDeleteTimers.delete(sessionId);
+      for (const [sessionId, timer] of pendingEmptySessionDeleteTimers) {
+        if (candidateIds.has(sessionId)) continue;
+        clearTimeout(timer);
+        pendingEmptySessionDeleteTimers.delete(sessionId);
+      }
     }
-  });
+  );
 
   onCleanup(() => {
     clearReconnectBannerShowTimer();
@@ -622,31 +787,27 @@ export function Chat() {
     setShowSessionPicker(true);
   };
 
-  createEffect(() => {
-    if (!showSessionPicker()) {
+  createEffect(showSessionPicker, (show) => {
+    if (!show) {
       setSessionFilter(null);
       setSubagentParentId(null);
     }
   });
 
   createEffect(
-    on(
-      openAttentionSessionsKey,
-      () => {
-        openAttentionSessionsFromCommand();
-      },
-      { defer: true }
-    )
+    openAttentionSessionsKey,
+    () => {
+      untrack(openAttentionSessionsFromCommand);
+    },
+    { defer: true }
   );
 
   createEffect(
-    on(
-      openCompletedSessionsKey,
-      () => {
-        openCompletedSessions();
-      },
-      { defer: true }
-    )
+    openCompletedSessionsKey,
+    () => {
+      untrack(openCompletedSessions);
+    },
+    { defer: true }
   );
 
   const openAllSessions = async () => {
@@ -708,11 +869,75 @@ export function Chat() {
     void selectSession(orderedSessions[nextIndex]!.id);
   };
 
-  onMount(() => {
+  const navigateHistory = (direction: SessionHistoryDirection) => {
+    const target = navigateSessionHistory(
+      sessionHistory(),
+      direction,
+      sessionHistoryView(),
+      getSessionHistoryOptions()
+    );
+    if (!target) return;
+    // The view effect sees the entry at the new index and keeps forward entries.
+    setSessionHistory(target.history);
+    setShowModels(false);
+    setShowPermissionSettings(false);
+    setShowSkillSettings(false);
+    setShowMcpSettings(false);
+    const { entry } = target;
+    if (entry.type === 'list') {
+      setSessionFilter(entry.filter);
+      setSubagentParentId(entry.subagentParentId);
+      setShowSessionPicker(true);
+      return;
+    }
+    setSessionFilter(null);
+    setSubagentParentId(null);
+    setShowSessionPicker(false);
+    // Returning from the list to the session it covered needs no reload.
+    if (entry.sessionId === state.activeSessionId && !state.pendingSessionSelectionId) return;
+    void (entry.directory
+      ? selectSession(entry.sessionId, { directory: entry.directory })
+      : selectSession(entry.sessionId));
+  };
+
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const disposeBridge = onMessage((message) => {
+      if (message.type === 'command/navigate-history') {
+        navigateHistory(message.payload.direction);
+        return;
+      }
+      if (message.type === 'command/open-skill-settings') {
+        setShowModels(false);
+        setShowPermissionSettings(false);
+        setShowMcpSettings(false);
+        setShowSkillSettings(true);
+        return;
+      }
+      if (message.type === 'command/open-mcp-settings') {
+        setShowModels(false);
+        setShowPermissionSettings(false);
+        setShowSkillSettings(false);
+        setShowMcpSettings(true);
+        return;
+      }
       if (message.type !== 'command/switch-session') return;
       switchActiveSession(message.payload.direction === 'previous' ? -1 : 1);
     });
+    // Mouse side buttons report 3 (back) and 4 (forward). Suppress the frame's own
+    // navigation on press so release only drives Varro history.
+    const getMouseHistoryDirection = (event: MouseEvent): SessionHistoryDirection | null =>
+      event.button === 3 ? 'back' : event.button === 4 ? 'forward' : null;
+    const handleMouseDown = (event: MouseEvent) => {
+      if (getMouseHistoryDirection(event)) event.preventDefault();
+    };
+    const handleMouseUp = (event: MouseEvent) => {
+      const direction = getMouseHistoryDirection(event);
+      if (!direction) return;
+      event.preventDefault();
+      navigateHistory(direction);
+    };
     const handleKeydown = (event: KeyboardEvent) => {
       if (
         event.key !== 'Escape' ||
@@ -741,12 +966,19 @@ export function Chat() {
           requestComposerFocus();
           return;
         }
+        if (showSkillSettings()) {
+          setShowSkillSettings(false);
+          requestComposerFocus();
+          return;
+        }
         if (showPermissionSettings()) {
           setShowPermissionSettings(false);
+          requestComposerFocus();
           return;
         }
         if (showModels()) {
           setShowModels(false);
+          requestComposerFocus();
           return;
         }
         if (showSessionPicker()) return;
@@ -755,10 +987,18 @@ export function Chat() {
     };
 
     window.addEventListener('keydown', handleKeydown);
-    onCleanup(() => {
+    window.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mouseup', handleMouseUp);
+    cleanups.push(() => {
       disposeBridge();
       window.removeEventListener('keydown', handleKeydown);
+      window.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mouseup', handleMouseUp);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   const openSubagentListParentSession = () => {
@@ -816,6 +1056,17 @@ export function Chat() {
     setShowSessionPicker(true);
   };
 
+  createEffect(subagentSessionsRequest, (request) => {
+    if (!request) return;
+    clearSubagentSessionsRequest();
+    untrack(() => {
+      // Editor tabs have no session list, so open the named subagent instead.
+      if (!isEditorSurface) openSubagentSessions(request.rootSessionID);
+      else if (request.childSessionID) void selectSession(request.childSessionID);
+    });
+  });
+  onCleanup(clearSubagentSessionsRequest);
+
   const openSidebarSubagentSessions = (parentSessionId: string) => {
     if (showSessionPicker()) {
       setSessionFilter(null);
@@ -831,10 +1082,6 @@ export function Chat() {
     setSidebarSubagentParentId(null);
   };
 
-  const activeSession = createMemo(() => {
-    const sessionId = state.activeSessionId;
-    return sessionId ? sessionsById().get(sessionId) || null : null;
-  });
   const managedSubagentParent = createMemo(() => {
     const parentId = activeSession()?.parentID;
     return parentId ? sessionsById().get(parentId) || null : null;
@@ -858,16 +1105,15 @@ export function Chat() {
     return activeSession()?.parentID ? 'Back to sub-agent sessions' : 'Back to sessions';
   });
   createEffect(
-    on(
+    () =>
       [
-        () => state.activeSessionId,
-        () => activeSession()?.parentID || null,
-        () => getSessionTreeRootId(state.activeSessionId),
-      ],
-      ([, parentSessionId, rootSessionId]) => {
-        setSidebarSubagentParentId(parentSessionId ? rootSessionId || parentSessionId : null);
-      }
-    )
+        (() => state.activeSessionId)(),
+        (() => activeSession()?.parentID || null)(),
+        (() => getSessionTreeRootId(state.activeSessionId))(),
+      ] as const,
+    ([, parentSessionId, rootSessionId]) => {
+      setSidebarSubagentParentId(parentSessionId ? rootSessionId || parentSessionId : null);
+    }
   );
   const activeSubagentRootId = createMemo(() => {
     const session = activeSession();
@@ -938,8 +1184,11 @@ export function Chat() {
         showSessionPicker={isEditorSurface ? false : showSessionPicker()}
         showModels={showModels()}
         showPermissionSettings={showPermissionSettings()}
+        showSkillSettings={showSkillSettings()}
         showMcpSettings={showMcpSettings()}
         showReconnectBanner={showReconnectBanner()}
+        showProviderSetupBanner={showProviderSetupBanner()}
+        onConnectProvider={openProviderSetup}
         slowApiRequests={slowApiRequests()}
         sessionFilter={sessionFilter()}
         subagentParentId={subagentParentId()}

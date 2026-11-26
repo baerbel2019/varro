@@ -128,6 +128,7 @@ export const VALID_WEBVIEW_MESSAGES = {
   'model-preferences/migrate': { type: 'model-preferences/migrate', payload: MODEL_PREFERENCES },
   'session/export': { type: 'session/export', payload: { sessionId: 'session-1' } },
   'usage/report': { type: 'usage/report', payload: { includeAllTime: true } },
+  'usage/session-report': { type: 'usage/session-report', payload: { sessionId: 'session-1' } },
   'vscode/open-settings': { type: 'vscode/open-settings', payload: { query: 'varro.server' } },
   'vscode/mermaid-preview': { type: 'vscode/mermaid-preview', payload: { open: true } },
   'server/restart': { type: 'server/restart', payload: { force: true } },
@@ -217,5 +218,16 @@ export const VALID_WEBVIEW_MESSAGES = {
     payload: { managerSessionId: 'session-1', model: null },
   },
   'ralph/sync': { type: 'ralph/sync', payload: {} },
+  'warming/sync': { type: 'warming/sync' },
+  'warming/set': { type: 'warming/set', payload: { sessionId: 'session-1', enabled: true } },
+  'warming/samples': {
+    type: 'warming/samples',
+    payload: {
+      sessionId: 'session-1',
+      samples: [
+        { providerID: 'claude-agent', modelID: 'opus', at: 1_000, gapMs: 600_000, hit: true },
+      ],
+    },
+  },
   log: { type: 'log', payload: { msg: 'hello', level: 'warn' } },
 } as const satisfies Record<WebviewMessage['type'], WebviewMessage>;

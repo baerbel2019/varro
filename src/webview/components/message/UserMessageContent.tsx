@@ -1,24 +1,30 @@
 import {
+  createEffect,
   $PROXY,
   For,
-  Index,
   Show,
-  createEffect,
   createMemo,
   createRoot,
   createSignal,
   onCleanup,
+  runWithOwner,
   type Accessor,
+  getObserver,
+  untrack,
 } from 'solid-js';
-import { $RAW } from 'solid-js/store';
 import {
   formatExtensionContext,
   readExtensionContextBlock,
 } from '../../../shared/extension-context';
 import type { ExtensionContext } from '../../../shared/extension-context';
 import { readLegacyExtensionContext, showAttachmentDetails } from '../../host/extensions';
-import { Portal } from 'solid-js/web';
-import { createPastedText, readPastedTextDataUrl } from '../../../shared/pasted-text';
+import { Portal } from '@solidjs/web';
+import { ariaBoolean } from '../../lib/aria';
+import {
+  createPastedText,
+  getPastedTextLanguage,
+  readPastedTextDataUrl,
+} from '../../../shared/pasted-text';
 import {
   getChatAnnotationLabel,
   readChatAnnotationFilePart,
@@ -47,6 +53,12 @@ import {
 import { postMessage } from '../../lib/bridge';
 import type { MessageEditContext } from '../../lib/message-edit-state';
 import { splitSessionReferenceText, type SessionReference } from '../../lib/session-reference';
+import {
+  getSessionReferenceLookupScope,
+  lookupSessionReferences,
+} from '../../lib/session-reference-lookups';
+import { client } from '../../lib/client';
+import { showSessionActionFeedback } from '../chat/SessionActionFeedback';
 import { rememberDirectSessionReturn } from '../../lib/session-navigation';
 import { state } from '../../lib/state';
 import { observeSettledResize } from '../../lib/settled-resize-observer';
@@ -59,6 +71,7 @@ import type {
   Part,
   TextPart,
   ToolPart,
+  UserMessage,
 } from '../../types';
 import {
   formatContextLineRanges,
@@ -176,6 +189,7 @@ type InlineRenderableAttachment =
 
 type InlineTextSegment =
   | { type: 'text'; content: string }
+  | { type: 'goal-command' }
   | { type: 'attachment'; attachment: InlineRenderableAttachment }
   | { type: 'session'; reference: SessionReference }
   | Extract<ExternalLinkTextSegment, { type: 'external-link' }>;
@@ -183,8 +197,11 @@ type InlineTextSegment =
 const VISION_DELEGATION_CONTEXT_RE =
   /^\[Image for @[^:\]\n]+: [^\]\n]+\]\n(?:When calling the [^\n]+ subagent, include|Call the [^\n]+ subagent to inspect this image before responding\. Include) \{file:[^}\n]+\} in its task prompt\.$/;
 const USER_CODE_FENCE_RE = /```([^\n`]*)\n([\s\S]*?)```/g;
-function bindUserMessageOverflowFade(element: HTMLElement, trackText: () => string[]) {
+function bindUserMessageOverflowFade(trackText: () => string[]) {
+  let element: HTMLElement | undefined;
+  let stopObservingResize: (() => void) | undefined;
   const update = () => {
+    if (!element) return;
     const hasMoreBelow = element.scrollTop + element.clientHeight < element.scrollHeight - 1;
     element.classList.toggle('has-more-below', hasMoreBelow);
     for (const codeBlock of element.querySelectorAll<HTMLElement>(
@@ -197,16 +214,18 @@ function bindUserMessageOverflowFade(element: HTMLElement, trackText: () => stri
     }
   };
 
-  element.addEventListener('scroll', update, { passive: true });
-  const stopObservingResize = observeSettledResize(element, update);
-  createEffect(() => {
-    trackText();
+  createEffect(trackText, () => {
     queueMicrotask(update);
   });
   onCleanup(() => {
-    element.removeEventListener('scroll', update);
-    stopObservingResize();
+    element?.removeEventListener('scroll', update);
+    stopObservingResize?.();
   });
+  return (target: HTMLElement) => {
+    element = target;
+    element.addEventListener('scroll', update, { passive: true });
+    stopObservingResize = observeSettledResize(element, update);
+  };
 }
 
 function parseUserMessageSegments(text: string): UserMessageSegment[] {
@@ -311,13 +330,21 @@ const parsedUserMessageContentCache = new WeakMap<object, Accessor<ParsedUserMes
  * store-update drafts, which are not tracked, are parsed directly. Treat the result as read-only.
  */
 export function parseUserMessageContent(parts: Part[]): ParsedUserMessageContent {
-  // SAFETY: Store proxies expose their raw target through `$RAW`; other arrays return undefined.
-  const raw = (parts as Part[] & { [$RAW]?: Part[] & { [$PROXY]?: unknown } })[$RAW];
-  if (!raw || raw[$PROXY] !== parts) return parseUserMessageParts(parts);
-  let parsed = parsedUserMessageContentCache.get(raw);
+  // Imperative draft reads need the transaction's current fields, not a
+  // previously committed memo. Only tracking readers share the cached parse.
+  // SAFETY: $PROXY is the public store-proxy identity marker; plain arrays have no marker.
+  if (!getObserver() || (parts as Part[] & { [$PROXY]?: unknown })[$PROXY] !== parts) {
+    return parseUserMessageParts(parts);
+  }
+  let parsed = parsedUserMessageContentCache.get(parts);
   if (!parsed) {
-    parsed = createRoot(() => createMemo(() => parseUserMessageParts(parts)));
-    parsedUserMessageContentCache.set(raw, parsed);
+    // The shared cache outlives whichever virtual row first asks for it.
+    // Solid 2 roots otherwise inherit that row's disposal lifetime.
+    parsed = runWithOwner(null, () =>
+      createRoot(() => createMemo(() => parseUserMessageParts(parts)))
+    );
+    if (!parsed) throw new Error('Unable to create the shared prompt parser');
+    parsedUserMessageContentCache.set(parts, parsed);
   }
   return parsed();
 }
@@ -364,8 +391,9 @@ function parseUserMessageParts(parts: Part[]): ParsedUserMessageContent {
 
     if (part.synthetic && part.subagentResult) {
       const result = part.subagentResult;
-      const outcome =
-        result.state === 'completed'
+      const outcome = result.backgroundPending
+        ? 'progress'
+        : result.state === 'completed'
           ? 'completed'
           : result.state === 'error'
             ? 'failed'
@@ -419,14 +447,17 @@ function parseUserMessageParts(parts: Part[]): ParsedUserMessageContent {
   };
 }
 
-const SHELL_HEADER_RE = /^<shell\s+((?:"[^"]*"|'[^']*'|[^'">])*)>/;
+const SHELL_HEADER_RE =
+  /^<(?:shell|background-result kind="shell")\s+((?:"[^"]*"|'[^']*'|[^'">])*)>/;
 
 function automaticActionPart(part: TextPart, title: string): ToolPart {
   const text = part.text.trim();
   const result = part.subagentResult;
   if (result) {
     // Native metadata owns attribution. The wrapper is stripped only for display.
-    const output = text.replace(/^<subagent\s[^\n]*>\r?\n/, '').replace(/\r?\n<\/subagent>$/, '');
+    const output = text
+      .replace(/^<(?:subagent|background-result kind="subagent")(?:\s[^\n]*)?>\r?\n/, '')
+      .replace(/\r?\n<\/(?:subagent|background-result)>$/, '');
     const input = { description: title, subagent_type: result.agent };
     const metadata = { sessionID: result.sessionID };
     const time = { start: part.time?.start ?? 0, end: part.time?.end ?? part.time?.start ?? 0 };
@@ -450,7 +481,7 @@ function automaticActionPart(part: TextPart, title: string): ToolPart {
             },
     };
   }
-  const shell = text.startsWith('<shell ') ? SHELL_HEADER_RE.exec(text) : null;
+  const shell = SHELL_HEADER_RE.exec(text);
   const input: Record<string, string> = {};
   if (shell) {
     for (const match of shell[1]!.matchAll(/([\w-]+)=(?:"([^"]*)"|'([^']*)')/g)) {
@@ -460,7 +491,7 @@ function automaticActionPart(part: TextPart, title: string): ToolPart {
   const output = shell
     ? text
         .slice(shell[0].length)
-        .replace(/<\/shell>\s*$/, '')
+        .replace(/<\/(?:shell|background-result)>\s*$/, '')
         .trim()
     : part.text;
   const time = { start: part.time?.start ?? 0, end: part.time?.end ?? part.time?.start ?? 0 };
@@ -504,14 +535,45 @@ export function getAutomaticActionInfo(info: MessageEntry['info']): AssistantMes
 export function projectAutomaticActionMessage(message: MessageEntry): MessageEntry {
   if (message.info.role !== 'user') return message;
   const parsed = parseUserMessageContent(message.parts);
-  if (
+  return keepsUserMessage(message.info, message.parts, parsed)
+    ? message
+    : toAutomaticActionMessage(message.info, parsed);
+}
+
+type AutomaticActionProjection = {
+  message: MessageEntry;
+  content: ParsedUserMessageContent | null;
+};
+
+/**
+ * Projects like `projectAutomaticActionMessage` and also returns the parse that kept a user
+ * message unchanged, so one pass can reuse it instead of parsing the same parts again.
+ * `content` is null for assistant messages and for projected automatic actions.
+ */
+export function projectAutomaticActionMessageWithContent(
+  message: MessageEntry
+): AutomaticActionProjection {
+  if (message.info.role !== 'user') return { message, content: null };
+  const parsed = parseUserMessageContent(message.parts);
+  return keepsUserMessage(message.info, message.parts, parsed)
+    ? { message, content: parsed }
+    : { message: toAutomaticActionMessage(message.info, parsed), content: null };
+}
+
+function keepsUserMessage(info: UserMessage, parts: Part[], parsed: ParsedUserMessageContent) {
+  return (
     !parsed.automaticParts.length ||
     hasUserMessageContent(parsed) ||
-    message.info.summary?.diffsOmitted ||
-    message.parts.some((part) => part.type === 'compaction')
-  )
-    return message;
-  return { info: getAutomaticActionInfo(message.info), parts: parsed.automaticParts };
+    !!info.summary?.diffsOmitted ||
+    parts.some((part) => part.type === 'compaction')
+  );
+}
+
+function toAutomaticActionMessage(
+  info: UserMessage,
+  parsed: ParsedUserMessageContent
+): MessageEntry {
+  return { info: getAutomaticActionInfo(info), parts: parsed.automaticParts };
 }
 
 function getAutomaticAction(part: TextPart): string | null {
@@ -537,8 +599,9 @@ function getAutomaticAction(part: TextPart): string | null {
     return 'Resumed after interruption';
   }
   if (text.startsWith('Instructions from:')) return 'Loaded agent instructions';
-  if (text.startsWith('<shell ')) {
-    const header = SHELL_HEADER_RE.exec(text)?.[1] ?? '';
+  const shell = SHELL_HEADER_RE.exec(text);
+  if (shell) {
+    const header = shell[1] ?? '';
     if (/\bstate=(?:"cancelled"|'cancelled')/.test(header)) return 'Background command cancelled';
     if (/\bstate=(?:"(?:failed|error)"|'(?:failed|error)')/.test(header))
       return 'Background command failed';
@@ -1016,7 +1079,11 @@ function getDisplayMessageTexts(parsed: ParsedUserMessageContent): string[] {
 }
 
 export function getUserMessagePreviewText(parts: Part[]): string {
-  const parsed = parseUserMessageContent(parts);
+  return getUserMessagePreviewTextFromContent(parseUserMessageContent(parts));
+}
+
+/** Preview text for content the caller already parsed from the same parts. */
+export function getUserMessagePreviewTextFromContent(parsed: ParsedUserMessageContent): string {
   const firstText = getDisplayMessageTexts(parsed)
     .map((text) =>
       parsed.attachments.reduce(
@@ -1164,18 +1231,20 @@ export function UserMessageContent(props: {
   const [activeImageIndex, setActiveImageIndex] = createSignal(0);
   const [previewIndex, setPreviewIndex] = createSignal<number | null>(null);
 
-  createEffect(() => {
-    const maxIndex = imageParts().length - 1;
-    setActiveImageIndex((index) => {
-      if (maxIndex < 0) return 0;
-      return Math.min(index, maxIndex);
-    });
-    setPreviewIndex((index) => {
-      if (index === null) return null;
-      if (maxIndex < 0) return null;
-      return Math.min(index, maxIndex);
-    });
-  });
+  createEffect(
+    () => imageParts().length - 1,
+    (maxIndex) => {
+      setActiveImageIndex((index) => {
+        if (maxIndex < 0) return 0;
+        return Math.min(index, maxIndex);
+      });
+      setPreviewIndex((index) => {
+        if (index === null) return null;
+        if (maxIndex < 0) return null;
+        return Math.min(index, maxIndex);
+      });
+    }
+  );
 
   const previewPosition = () => {
     const index = previewIndex();
@@ -1266,7 +1335,7 @@ export function UserMessageContent(props: {
       <Show when={hasImageTiles()}>
         <div
           class="user-message-leading-content"
-          on:mouseenter={() => props.onMessageHoverChange?.(false)}
+          onMouseEnter={() => props.onMessageHoverChange?.(false)}
         >
           <Show when={displayAttachments().length > 0}>
             <MessageAttachmentRail
@@ -1315,7 +1384,7 @@ export function UserMessageContent(props: {
         >
           <div
             class="user-message-image-text-bubble"
-            on:mouseenter={() => props.onMessageHoverChange?.(true)}
+            onMouseEnter={() => props.onMessageHoverChange?.(true)}
           >
             <Show when={props.promptNumber}>
               {(promptNumber) => (
@@ -1379,7 +1448,7 @@ function UserMessageTextList(props: {
   return (
     <div
       class="user-message-text-scroll"
-      ref={(element) => bindUserMessageOverflowFade(element, () => props.messageTexts)}
+      ref={bindUserMessageOverflowFade(() => props.messageTexts)}
     >
       <For each={props.messageTexts}>
         {(text) => (
@@ -1482,6 +1551,22 @@ function UserMessageTextContent(props: {
       props.fileParts
     )) {
       if (segment.type === 'session' || segment.type === 'text') continue;
+      if (segment.type === 'goal-command') {
+        const marker = /^\/goal(?:\s|$)/.exec(props.text)?.[0] ?? '/goal';
+        slots.set(marker, {
+          marker,
+          render: () => (
+            <>
+              <InlineMessageAttachmentChip
+                attachment={{ type: 'skill', name: 'goal' }}
+                marker="/goal"
+              />
+              {marker.slice('/goal'.length)}
+            </>
+          ),
+        });
+        continue;
+      }
       if (segment.type === 'external-link') {
         if (segment.kind !== 'git') continue;
         slots.set(segment.href, {
@@ -1573,8 +1658,7 @@ function UserMessageCodeBlock(props: { content: string; language?: string }) {
       showCopyButton: false,
     })
   );
-  createEffect(() => {
-    html();
+  createEffect(html, () => {
     highlights.reconcile([root], 1);
   });
   onCleanup(() => highlights.dispose());
@@ -1589,6 +1673,10 @@ function InlineAttachmentText(props: {
   agentParts: AgentPart[];
   onOpenImagePreview: (index: number) => void;
 }) {
+  createEffect(
+    () => ({ content: props.content, scope: getSessionReferenceLookupScope() }),
+    ({ content, scope }) => lookupSessionReferences(content, scope)
+  );
   const segments = createMemo(() =>
     buildInlineTextSegments(
       props.content,
@@ -1603,6 +1691,14 @@ function InlineAttachmentText(props: {
     <For each={segments()}>
       {(segment) => {
         if (segment.type === 'text') return segment.content;
+        if (segment.type === 'goal-command') {
+          return (
+            <InlineMessageAttachmentChip
+              attachment={{ type: 'skill', name: 'goal' }}
+              marker="/goal"
+            />
+          );
+        }
         if (segment.type === 'session') {
           return <SessionReferenceLink reference={segment.reference} />;
         }
@@ -1686,7 +1782,7 @@ function TerminalMessageCodeBlock(props: {
     <div
       class="user-message-terminal-preview"
       role="button"
-      tabIndex={0}
+      tabindex={0}
       onClick={handleClick}
       onKeyDown={(event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -1875,6 +1971,11 @@ function buildInlineTextSegments(
   agentParts: AgentPart[],
   fileParts: FilePart[] = []
 ): InlineTextSegment[] {
+  const attachmentSegments: InlineTextSegment[] = [];
+  if (/^\/goal(?=\s|$)/.test(content)) {
+    attachmentSegments.push({ type: 'goal-command' });
+    content = content.slice('/goal'.length);
+  }
   const attachmentByMarker = new Map<string, InlineRenderableAttachment>();
 
   for (const part of fileParts) {
@@ -1934,7 +2035,6 @@ function buildInlineTextSegments(
   const markers = Array.from(attachmentByMarker.keys())
     .filter((marker) => content.includes(marker))
     .toSorted((a, b) => b.length - a.length);
-  const attachmentSegments: InlineTextSegment[] = [];
   if (markers.length === 0) {
     attachmentSegments.push({ type: 'text', content });
   } else {
@@ -1998,6 +2098,13 @@ function SessionReferenceLink(props: { reference: SessionReference }) {
   const firstWord = props.reference.title.match(/^\S+/)?.[0] ?? '';
   const openSession = (event: MouseEvent) => {
     event.preventDefault();
+    event.stopPropagation();
+    if (props.reference.external) {
+      void client.varro.session
+        .openReference(props.reference.id)
+        .catch(() => showSessionActionFeedback('Could not open the project window', 'warning'));
+      return;
+    }
     if (state.activeSessionId) {
       rememberDirectSessionReturn(props.reference.id, state.activeSessionId);
     }
@@ -2014,7 +2121,12 @@ function SessionReferenceLink(props: { reference: SessionReference }) {
       data-copy-marker={props.reference.marker}
       data-session-id={props.reference.id}
       data-session-directory={props.reference.directory}
-      title={`Open session ${props.reference.id}`}
+      data-session-external={props.reference.external ? 'true' : undefined}
+      title={
+        props.reference.external
+          ? `Open project folder ${props.reference.directory}`
+          : `Open session ${props.reference.id}`
+      }
       onClick={openSession}
     >
       <span class="link-leading-content">
@@ -2063,8 +2175,10 @@ function UserMessageImage(props: { part: FilePart; onOpenPreview: () => void }) 
 
   return (
     <figure
-      class="chat-image-figure"
-      classList={{ 'chat-image-figure-deferred': !!deferredFilePath(props.part.url) }}
+      class={[
+        'chat-image-figure',
+        { 'chat-image-figure-deferred': !!deferredFilePath(props.part.url) },
+      ]}
     >
       <button
         type="button"
@@ -2083,6 +2197,8 @@ function UserMessageImageTiles(props: {
   onOpenPreview: (index: number) => void;
 }) {
   let scroller: HTMLDivElement | undefined;
+  let stopObservingResize: (() => void) | undefined;
+  onCleanup(() => stopObservingResize?.());
   const [canScrollBack, setCanScrollBack] = createSignal(false);
   const [canScrollForward, setCanScrollForward] = createSignal(false);
   const updateScrollState = () => {
@@ -2098,10 +2214,12 @@ function UserMessageImageTiles(props: {
     });
   };
 
-  createEffect(() => {
-    void props.imageParts.length;
-    queueMicrotask(updateScrollState);
-  });
+  createEffect(
+    () => props.imageParts.length,
+    () => {
+      queueMicrotask(updateScrollState);
+    }
+  );
 
   return (
     <div class="user-message-image-tiles-shell">
@@ -2134,8 +2252,7 @@ function UserMessageImageTiles(props: {
       <div
         ref={(element) => {
           scroller = element;
-          const stopObservingResize = observeSettledResize(element, updateScrollState);
-          onCleanup(stopObservingResize);
+          stopObservingResize = observeSettledResize(element, updateScrollState);
           queueMicrotask(updateScrollState);
         }}
         class="user-message-image-tiles"
@@ -2144,7 +2261,7 @@ function UserMessageImageTiles(props: {
         onScroll={updateScrollState}
       >
         {/* Acknowledgement preserves attachment slots while replacing local IDs and objects. */}
-        <Index each={props.imageParts}>
+        <For keyed={false} each={props.imageParts}>
           {(part, index) => {
             const displayName = () => getImageDisplayName(part());
             return (
@@ -2152,16 +2269,18 @@ function UserMessageImageTiles(props: {
                 type="button"
                 class="user-message-image-tile"
                 aria-label={`Open image preview: ${displayName()}`}
-                on:click={(event) => {
-                  event.stopPropagation();
-                  props.onOpenPreview(index);
+                ref={(element) => {
+                  element.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    props.onOpenPreview(index);
+                  });
                 }}
               >
                 <InlineMessageImage src={part().url} alt={displayName()} allowCover={false} />
               </button>
             );
           }}
-        </Index>
+        </For>
       </div>
     </div>
   );
@@ -2206,7 +2325,7 @@ function InlineAgentChip(props: { part: AgentPart; marker: string }) {
   return <AgentChip part={props.part} inline marker={props.marker} />;
 }
 
-function InlineMessageAttachmentChip(props: { attachment: MessageAttachment }) {
+function InlineMessageAttachmentChip(props: { attachment: MessageAttachment; marker?: string }) {
   if (props.attachment.type === 'problem-reference')
     return <ProblemReferenceChip reference={props.attachment.reference} inline />;
   if (props.attachment.type === 'issues') {
@@ -2229,7 +2348,7 @@ function InlineMessageAttachmentChip(props: { attachment: MessageAttachment }) {
     return (
       <span
         class="inline-chip"
-        data-copy-marker={getInlineAttachmentCopyMarker(props.attachment)}
+        data-copy-marker={props.marker ?? getInlineAttachmentCopyMarker(props.attachment)}
         title={getAttachmentTitle(props.attachment)}
       >
         <MaterialChipIcon kind="skill" class="inline-chip-icon" />
@@ -2554,7 +2673,9 @@ function MessageAttachmentRail(props: {
   leading: boolean;
   label: string;
 }) {
-  const [visibleCount, setVisibleCount] = createSignal(Math.min(props.attachments.length, 3));
+  const [visibleCount, setVisibleCount] = createSignal(
+    untrack(() => Math.min(props.attachments.length, 3))
+  );
   const [menuOpen, setMenuOpen] = createSignal(false);
   const [menuPosition, setMenuPosition] = createSignal({ left: 0, top: 0 });
   let root: HTMLDivElement | undefined;
@@ -2562,13 +2683,14 @@ function MessageAttachmentRail(props: {
   let menu: HTMLDivElement | undefined;
 
   const remainingAttachments = createMemo(() => props.attachments.slice(visibleCount()));
-  const updateVisibleCount = () => {
-    if (!root || !measurement || root.clientWidth <= 0) return;
+  const updateVisibleCount = (element: HTMLElement, attachmentCount: number) => {
+    const capacityWidth = element.clientWidth;
+    if (!measurement || capacityWidth <= 0) return;
 
     const itemWidths = Array.from(
       measurement.querySelectorAll<HTMLElement>('.message-attachment-measure-item')
     ).map((item) => item.getBoundingClientRect().width);
-    if (itemWidths.length !== props.attachments.length || itemWidths.some((width) => width <= 0)) {
+    if (itemWidths.length !== attachmentCount || itemWidths.some((width) => width <= 0)) {
       return;
     }
 
@@ -2577,14 +2699,14 @@ function MessageAttachmentRail(props: {
       (total, width, index) => total + width + (index > 0 ? gap : 0),
       0
     );
-    if (totalWidth <= root.clientWidth) {
-      setVisibleCount(props.attachments.length);
+    if (totalWidth <= capacityWidth) {
+      setVisibleCount(attachmentCount);
       return;
     }
 
     const overflowControlWidth = 26;
     const overflowGap = 8;
-    const availableWidth = Math.max(0, root.clientWidth - overflowControlWidth - overflowGap);
+    const availableWidth = Math.max(0, capacityWidth - overflowControlWidth - overflowGap);
     let usedWidth = 0;
     let count = 0;
     for (const width of itemWidths) {
@@ -2596,20 +2718,32 @@ function MessageAttachmentRail(props: {
     setVisibleCount(Math.max(1, count));
   };
 
-  createEffect(() => {
-    if (props.attachments.length === 0) return;
-    updateVisibleCount();
-    if (!root) return;
-    const stopObservingResize = observeSettledResize(root, updateVisibleCount);
-    onCleanup(stopObservingResize);
-  });
+  createEffect(
+    () => [props.attachments.length, props.leading] as const,
+    ([count, leading]) => {
+      // Leading rails can extend beyond the text bubble; standalone rails use the parent's capacity.
+      const element = leading ? root : root?.parentElement;
+      if (count === 0 || !element) return;
+      const update = () => updateVisibleCount(element, count);
+      update();
+      return observeSettledResize(element, update);
+    }
+  );
 
-  createEffect(() => {
-    if (remainingAttachments().length === 0) setMenuOpen(false);
-  });
+  createEffect(
+    () => remainingAttachments().length,
+    (count) => {
+      if (count === 0) setMenuOpen(false);
+    }
+  );
 
-  createEffect(() => {
-    if (!menuOpen()) return;
+  createEffect(menuOpen, (open) => {
+    const cleanups: Array<() => void> = [];
+
+    if (!open)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
 
     const handlePointerDown = (event: PointerEvent) => {
       if (
@@ -2625,10 +2759,14 @@ function MessageAttachmentRail(props: {
     };
     document.addEventListener('pointerdown', handlePointerDown);
     window.addEventListener('keydown', handleKeyDown);
-    onCleanup(() => {
+    cleanups.push(() => {
       document.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('keydown', handleKeyDown);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   const toggleMenu = (event: MouseEvent) => {
@@ -2680,7 +2818,7 @@ function MessageAttachmentRail(props: {
           type="button"
           class="chat-attachment-chip clickable message-attachment-overflow-trigger"
           aria-label={`Show ${remainingAttachments().length} more attachments`}
-          aria-expanded={menuOpen()}
+          aria-expanded={ariaBoolean(menuOpen())}
           onPointerDown={(event) => {
             if (event.pointerType === 'mouse') event.preventDefault();
           }}
@@ -2829,7 +2967,7 @@ function MessageFileAttachment(props: { part: FilePart; inline?: boolean; marker
       if (content === null) throw new Error('Attachment is not a text document');
       postMessage({
         type: 'vscode/open-text',
-        payload: { content, title: label(), language: 'plaintext' },
+        payload: { content, title: label(), language: getPastedTextLanguage(label()) },
       });
     } catch (reason) {
       if (!controller.signal.aborted)
@@ -2850,12 +2988,14 @@ function MessageFileAttachment(props: { part: FilePart; inline?: boolean; marker
       data-copy-marker={props.marker}
       title={annotation() ? undefined : error() || label()}
       aria-label={error() ? `${label()}: ${error()}. Click to retry` : label()}
-      aria-busy={loading()}
+      aria-busy={ariaBoolean(loading())}
       role={canOpen() ? 'button' : undefined}
-      tabIndex={canOpen() ? 0 : undefined}
-      on:click={(event) => {
-        event.stopPropagation();
-        void open();
+      tabindex={canOpen() ? 0 : undefined}
+      ref={(element) => {
+        element.addEventListener('click', (event) => {
+          event.stopPropagation();
+          void open();
+        });
       }}
       onKeyDown={(event) => {
         if (canOpen() && (event.key === 'Enter' || event.key === ' ')) {

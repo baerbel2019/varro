@@ -1,5 +1,6 @@
+import { storePath } from '@solidjs/signals';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { MessageList } from '../components/MessageList';
 import { getAssistantDialogSummaryMap } from '../components/message-list/assistant-dialog';
 import { replaceMessages, resetDefaultAppState, setState, upsertPart } from '../lib/state';
@@ -11,8 +12,14 @@ import {
   getCompactActivityDisclosureLayoutSignatures,
   getRenderEmptyMessageIds,
 } from '../components/message-list/row-layout';
-import type { AssistantMessage, Message, Part, TextPart, UserMessage } from '../types';
-import { settlePerfEffects } from './harness';
+import type { Message, Part } from '../types';
+import {
+  settlePerfEffects,
+  createAssistantMessage,
+  createTextPart,
+  createUserMessage,
+  entry,
+} from './harness';
 
 const { messageRowPassCounts } = vi.hoisted(() => ({
   messageRowPassCounts: new Map<string, number>(),
@@ -20,24 +27,31 @@ const { messageRowPassCounts } = vi.hoisted(() => ({
 
 /* oxlint-disable anti-slop/no-module-mocking -- This benchmark measures MessageList integration without MessageRows render cost. */
 vi.mock('../components/message-list/MessageRows', async () => {
-  const { createRenderEffect } = await import('solid-js');
+  const { createRenderEffect, untrack } = await import('solid-js');
 
+  // Counting reads each passed row; it must not subscribe the render effect to those rows.
   function countMessagePass(message: { info: Message; parts: Part[] }) {
-    messageRowPassCounts.set(message.info.id, (messageRowPassCounts.get(message.info.id) ?? 0) + 1);
+    untrack(() => {
+      const id = message.info.id;
+      messageRowPassCounts.set(id, (messageRowPassCounts.get(id) ?? 0) + 1);
+    });
   }
 
   return {
     MessageRows(props: { messages: Array<{ info: Message; parts: Part[] }> }) {
-      createRenderEffect(() => {
-        for (const message of props.messages) {
-          countMessagePass(message);
+      createRenderEffect(
+        () => [...props.messages],
+        (messages) => {
+          for (const message of messages) {
+            countMessagePass(message);
+          }
         }
-      });
+      );
 
       return null;
     },
     MessageRow(props: { msg: { info: Message; parts: Part[] } }) {
-      createRenderEffect(() => countMessagePass(props.msg));
+      createRenderEffect(() => props.msg, countMessagePass);
 
       return null;
     },
@@ -55,52 +69,6 @@ let originalGlobalRequestAnimationFrame: typeof globalThis.requestAnimationFrame
 let originalWindowRequestAnimationFrame: typeof window.requestAnimationFrame | undefined;
 let originalGlobalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame | undefined;
 let originalWindowCancelAnimationFrame: typeof window.cancelAnimationFrame | undefined;
-
-function createAssistantMessage(id: string): AssistantMessage {
-  return {
-    id,
-    sessionID: 'session-1',
-    role: 'assistant',
-    time: { created: 1, completed: 2 },
-    parentID: 'parent-1',
-    modelID: 'gpt-4o',
-    providerID: 'openai',
-    mode: 'default',
-    path: { cwd: '/workspace', root: '/workspace' },
-    cost: 0,
-    tokens: {
-      input: 0,
-      output: 0,
-      reasoning: 0,
-      cache: { read: 0, write: 0 },
-    },
-  };
-}
-
-function createUserMessage(id: string): UserMessage {
-  return {
-    id,
-    sessionID: 'session-1',
-    role: 'user',
-    time: { created: 1 },
-    agent: 'build',
-    model: { providerID: 'openai', modelID: 'gpt-4o' },
-  };
-}
-
-function createTextPart(id: string, messageID: string, text: string): TextPart {
-  return {
-    id,
-    sessionID: 'session-1',
-    messageID,
-    type: 'text',
-    text,
-  };
-}
-
-function entry(info: Message, parts: Part[]) {
-  return { info, parts };
-}
 
 describe('MessageList perf guards', () => {
   beforeEach(() => {
@@ -211,7 +179,7 @@ describe('MessageList perf guards', () => {
       entry(createAssistantMessage('message-2'), [createTextPart('part-b', 'message-2', 'Beta')]),
       entry(createAssistantMessage('message-3'), [createTextPart('part-c', 'message-3', 'Gamma')]),
     ]);
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
 
     cleanup = render(() => MessageList(), container!);
     await settlePerfEffects();
@@ -221,8 +189,10 @@ describe('MessageList perf guards', () => {
     expect(messageRowPassCounts.get('message-3')).toBe(1);
 
     for (let index = 0; index < 10; index += 1) {
-      setState('messages', 0, 'parts', 0, (part) =>
-        part.type === 'text' ? { ...part, text: `${part.text}${index}` } : part
+      setState(
+        storePath('messages', 0, 'parts', 0, (part) =>
+          part.type === 'text' ? { ...part, text: `${part.text}${index}` } : part
+        )
       );
     }
 
@@ -347,10 +317,10 @@ describe('MessageList perf guards', () => {
         createTextPart('final-text', 'final', ''),
       ])
     );
-    setState('messages', messages);
-    setState('activeSessionId', 'session-1');
-    setState('streamingPartId', 'final-text');
-    setState('streamingText', text);
+    setState(storePath('messages', messages));
+    setState(storePath('activeSessionId', 'session-1'));
+    setState(storePath('streamingPartId', 'final-text'));
+    setState(storePath('streamingText', text));
     cleanup = render(() => MessageList(), container!);
     await settlePerfEffects();
     expect(baselineReads).toBeGreaterThan(0);
@@ -415,9 +385,9 @@ describe('MessageList perf guards', () => {
         []
       )
     );
-    setState('messages', messages);
-    setState('activeSessionId', 'session-1');
-    setState('sessionStatus', { 'session-1': { type: 'busy' } });
+    setState(storePath('messages', messages));
+    setState(storePath('activeSessionId', 'session-1'));
+    setState(storePath('sessionStatus', { 'session-1': { type: 'busy' } }));
     cleanup = render(() => MessageList(), container!);
     await settlePerfEffects();
     expect(historyReads).toBeGreaterThan(0);

@@ -1,13 +1,6 @@
-import {
-  Show,
-  createEffect,
-  createMemo,
-  createSignal,
-  createUniqueId,
-  on,
-  onCleanup,
-} from 'solid-js';
-import { Portal } from 'solid-js/web';
+import { ariaBoolean } from '../lib/aria';
+import { Show, createEffect, createMemo, createSignal, createUniqueId } from 'solid-js';
+import { Portal } from '@solidjs/web';
 import type { Permission } from '../types';
 import {
   alwaysAllowPermissionForProject,
@@ -18,7 +11,7 @@ import {
 import { getPermissionModeForSession } from '../lib/state-permission-modes';
 import { state } from '../lib/app-state';
 import { getToolKind } from '../lib/tool-normalization';
-import { cardShieldIcon } from '../lib/ui-icons';
+import { cardShieldIcon, messageTextIcon } from '../lib/ui-icons';
 import { CopyIconButton } from './CopyIconButton';
 import { UiIcon } from './UiIcon';
 import { isBoolean, isNumber, isString, isObject } from '../lib/runtime-values';
@@ -64,8 +57,11 @@ export function PermissionPrompt(props: {
   const [commandExpanded, setCommandExpanded] = createSignal(false);
   const [reviewScope, setReviewScope] = createSignal<'session' | 'project' | 'global'>();
   const [patternDraft, setPatternDraft] = createSignal('');
+  const [rejectReviewOpen, setRejectReviewOpen] = createSignal(false);
+  const [rejectDraft, setRejectDraft] = createSignal('');
   const currentPermissionId = createMemo(() => props.permission.id);
   const patternHintId = createUniqueId();
+  const rejectHintId = createUniqueId();
   const nativeServer = () =>
     state.serverStatus.state === 'running' && state.serverStatus.apiVersion === 2;
   const reviewedPatterns = () => [
@@ -87,19 +83,36 @@ export function PermissionPrompt(props: {
       return 'Each pattern must be 2000 characters or fewer.';
     return 'One pattern per line. * matches any text.';
   };
-  createEffect(
-    on(currentPermissionId, () => {
-      setCommandExpanded(false);
-      setReviewScope(undefined);
-      setPatternDraft('');
-      setAlwaysMenuOpen(false);
-      setResponseError(undefined);
-    })
-  );
+  createEffect(currentPermissionId, () => {
+    setCommandExpanded(false);
+    setReviewScope(undefined);
+    setPatternDraft('');
+    setRejectReviewOpen(false);
+    setRejectDraft('');
+    setAlwaysMenuOpen(false);
+    setResponseError(undefined);
+  });
   const [responseError, setResponseError] = createSignal<string>();
   const [alwaysMenuPosition, setAlwaysMenuPosition] = createSignal({ left: 0, top: 0 });
   let alwaysMenuButton: HTMLButtonElement | undefined;
   let alwaysMenu: HTMLDivElement | undefined;
+  let rejectReviewButton: HTMLButtonElement | undefined;
+  const openRejectReview = () => {
+    setAlwaysMenuOpen(false);
+    setResponseError(undefined);
+    setRejectReviewOpen(true);
+  };
+  const cancelRejectReview = () => {
+    if (responding()) return;
+    setRejectReviewOpen(false);
+    setResponseError(undefined);
+    queueMicrotask(() => rejectReviewButton?.focus());
+  };
+  const rejectInstruction = () => rejectDraft().trim();
+  const submitRejectReview = () => {
+    if (!rejectInstruction() || responding()) return;
+    void handleRespond('reject', rejectInstruction());
+  };
   const cancelReview = () => {
     if (responding()) return;
     setReviewScope(undefined);
@@ -114,14 +127,16 @@ export function PermissionPrompt(props: {
   const duplicateCount = () =>
     props.permission.groupMembers?.length || props.permission.duplicateIDs?.length || 0;
 
-  const handleRespond = async (response: 'once' | 'always' | 'reject') => {
+  const handleRespond = async (response: 'once' | 'always' | 'reject', message?: string) => {
     const permissionId = props.permission.id;
     if (respondingPermissionIds.has(permissionId)) return;
     setResponseError(undefined);
     respondingPermissionIds.add(permissionId);
     setRespondingPermissionVersion((version) => version + 1);
     try {
-      await respondPermission(sessionId(), permissionId, response);
+      await (message
+        ? respondPermission(sessionId(), permissionId, response, { message })
+        : respondPermission(sessionId(), permissionId, response));
     } catch (error) {
       setResponseError(error instanceof Error ? error.message : 'Failed to respond to permission');
     } finally {
@@ -182,8 +197,13 @@ export function PermissionPrompt(props: {
     }
   };
 
-  createEffect(() => {
-    if (!alwaysMenuOpen()) return;
+  createEffect(alwaysMenuOpen, (open) => {
+    const cleanups: Array<() => void> = [];
+
+    if (!open)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     const closeOnPointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
@@ -198,10 +218,14 @@ export function PermissionPrompt(props: {
     };
     window.addEventListener('pointerdown', closeOnPointerDown);
     window.addEventListener('keydown', closeOnEscape, true);
-    onCleanup(() => {
+    cleanups.push(() => {
       window.removeEventListener('pointerdown', closeOnPointerDown);
       window.removeEventListener('keydown', closeOnEscape, true);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   const shellCommand = createMemo(() => {
@@ -279,10 +303,12 @@ export function PermissionPrompt(props: {
                   const text = formatMetadataValue(value);
                   return (
                     <div
-                      class="permission-meta-entry"
-                      classList={{
-                        'permission-command-expanded': key === 'command' && commandExpanded(),
-                      }}
+                      class={[
+                        'permission-meta-entry',
+                        {
+                          'permission-command-expanded': key === 'command' && commandExpanded(),
+                        },
+                      ]}
                     >
                       <span class="permission-meta-key">{key}</span>
                       <div class="permission-meta-value-shell">
@@ -293,7 +319,7 @@ export function PermissionPrompt(props: {
                         <button
                           type="button"
                           class="permission-command-toggle"
-                          aria-expanded={commandExpanded()}
+                          aria-expanded={ariaBoolean(commandExpanded())}
                           onClick={() => setCommandExpanded((expanded) => !expanded)}
                         >
                           {commandExpanded() ? 'Collapse command' : 'Expand command'}
@@ -385,7 +411,7 @@ export function PermissionPrompt(props: {
                   ref={(element) => queueMicrotask(() => element.focus())}
                   aria-label="Approval resource patterns"
                   aria-describedby={patternHintId}
-                  aria-invalid={!validPatterns()}
+                  aria-invalid={ariaBoolean(!validPatterns())}
                   rows={2}
                   value={patternDraft()}
                   disabled={responding()}
@@ -395,8 +421,8 @@ export function PermissionPrompt(props: {
               </label>
               <div
                 id={patternHintId}
-                class="permission-approval-hint"
-                classList={{ 'is-invalid': !validPatterns() }}
+
+                class={['permission-approval-hint', { 'is-invalid': !validPatterns() }]}
               >
                 {patternHint()}
               </div>
@@ -423,7 +449,73 @@ export function PermissionPrompt(props: {
         )}
       </Show>
 
-      <Show when={!reviewScope()}>
+      <Show when={rejectReviewOpen() && !reviewScope()}>
+        <form
+          class="permission-approval-review permission-reject-review"
+          aria-label="Reject with instructions"
+          onKeyDown={(event) => {
+            if (event.key !== 'Escape' || responding()) return;
+            event.preventDefault();
+            event.stopPropagation();
+            cancelRejectReview();
+          }}
+          onSubmit={(event) => {
+            event.preventDefault();
+            submitRejectReview();
+          }}
+        >
+          <div class="permission-approval-fields">
+            <div class="permission-approval-heading">
+              <span>Reject with instructions</span>
+              <span class="permission-approval-scope">
+                {sourceAgent() ? `Sent to @${sourceAgent()}` : 'Sent to the agent'}
+              </span>
+            </div>
+            <label>
+              What should the agent do instead?
+              <textarea
+                ref={(element) => queueMicrotask(() => element.focus())}
+                aria-label="Instructions for the agent"
+                aria-describedby={rejectHintId}
+                rows={2}
+                maxlength={4000}
+                value={rejectDraft()}
+                disabled={responding()}
+                placeholder="For example: use the existing script instead"
+                onInput={(event) => setRejectDraft(event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+                  event.preventDefault();
+                  submitRejectReview();
+                }}
+              />
+            </label>
+            <div id={rejectHintId} class="permission-approval-hint">
+              The request is rejected and the agent continues with your instructions. Enter sends;
+              Shift+Enter adds a line.
+            </div>
+          </div>
+          <div class="permission-prompt-actions permission-approval-actions">
+            <button
+              class="question-btn question-btn-secondary"
+              type="button"
+              disabled={responding()}
+              onClick={cancelRejectReview}
+            >
+              Cancel
+            </button>
+            <button
+              class="question-btn question-btn-danger"
+              type="submit"
+              disabled={responding() || !rejectInstruction()}
+            >
+              {responding() ? 'Rejecting...' : 'Reject & send'}
+            </button>
+          </div>
+        </form>
+      </Show>
+
+      <Show when={!reviewScope() && !rejectReviewOpen()}>
         <div class="permission-prompt-actions">
           <button
             class="question-btn question-btn-primary"
@@ -444,7 +536,7 @@ export function PermissionPrompt(props: {
             type="button"
             aria-label="Allow always"
             aria-haspopup="menu"
-            aria-expanded={alwaysMenuOpen()}
+            aria-expanded={ariaBoolean(alwaysMenuOpen())}
             title="Choose where to allow matching requests"
             disabled={responding() || props.permission.recoveredIncomplete}
             onClick={() => {
@@ -475,19 +567,35 @@ export function PermissionPrompt(props: {
               />
             </svg>
           </button>
-          <button
-            class="question-btn question-btn-danger"
-            aria-label="Reject"
-            disabled={responding()}
-            onClick={() => void handleRespond('reject')}
-          >
-            <span class="permission-action-label permission-action-label-full" aria-hidden="true">
-              Reject
-            </span>
-            <span class="permission-action-label permission-action-label-short" aria-hidden="true">
-              Reject
-            </span>
-          </button>
+          <div class="permission-reject-split">
+            <button
+              class="question-btn question-btn-danger permission-reject-main"
+              aria-label="Reject"
+              disabled={responding()}
+              onClick={() => void handleRespond('reject')}
+            >
+              <span class="permission-action-label permission-action-label-full" aria-hidden="true">
+                Reject
+              </span>
+              <span
+                class="permission-action-label permission-action-label-short"
+                aria-hidden="true"
+              >
+                Reject
+              </span>
+            </button>
+            <button
+              ref={(element) => (rejectReviewButton = element)}
+              class="question-btn question-btn-danger permission-reject-instruct"
+              type="button"
+              aria-label="Reject with instructions"
+              title="Reject and tell the agent what to do instead"
+              disabled={responding()}
+              onClick={openRejectReview}
+            >
+              <UiIcon source={messageTextIcon} width={14} height={14} />
+            </button>
+          </div>
         </div>
       </Show>
       <Show when={alwaysMenuOpen()}>

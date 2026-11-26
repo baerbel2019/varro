@@ -43,7 +43,10 @@ const exportEditor = vi.hoisted(() => ({
 vi.mock('vscode', () => ({
   ProgressLocation: { Notification: 15 },
   commands: { executeCommand: vi.fn() },
-  workspace: { openTextDocument: exportEditor.openTextDocument },
+  workspace: {
+    openTextDocument: exportEditor.openTextDocument,
+    getConfiguration: () => ({ get: <T>(_key: string, fallback: T) => fallback }),
+  },
   window: {
     showTextDocument: exportEditor.showTextDocument,
     showErrorMessage: exportEditor.showErrorMessage,
@@ -248,6 +251,7 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
           },
           providers: {
             silent: {
+              name: 'Silent fixture provider',
               package: '@opencode/ai/providers/openai',
               settings: {
                 baseURL: `http://127.0.0.1:${address.port}/v1`,
@@ -550,6 +554,37 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
     }
   }, 30000);
 
+  it('reloads global provider config without restarting OpenCode', async (context) => {
+    const health = await transport.readHealthInfo();
+    if (transport.version !== 2 || compareVersions(health.version ?? '0', '2.0.6') < 0)
+      return context.skip();
+    const pid = transport.serverPid;
+    expect(pid).toBeGreaterThan(0);
+    const providerPath = `/api/provider/silent?location[directory]=${encodeURIComponent(join(root, 'workspace'))}`;
+    const readProviderName = async () =>
+      asRecord(asRecord(await transport.request('GET', providerPath))?.data)?.name;
+    await expect.poll(readProviderName, { timeout: 10000 }).toBe('Silent fixture provider');
+    const configPath = join(root, 'config/opencode/opencode.json');
+    const original = await readFile(configPath, 'utf8');
+    const config = asRecord(JSON.parse(original));
+    const provider = asRecord(asRecord(config?.providers)?.silent);
+    if (!provider) throw new Error('Missing isolated silent provider config');
+    const updatedName = 'Reloaded fixture provider';
+    let reloaded = false;
+    try {
+      provider.name = updatedName;
+      await writeFile(configPath, JSON.stringify(config));
+      expect(await transport.request('POST', '/global/dispose')).toBe(true);
+      reloaded = true;
+      await expect.poll(readProviderName, { timeout: 10000 }).toBe(updatedName);
+      expect(await transport.readHealthInfo()).toEqual(health);
+      expect(transport.serverPid).toBe(pid);
+    } finally {
+      await writeFile(configPath, original);
+      if (reloaded) await transport.request('POST', '/global/dispose');
+    }
+  }, 30000);
+
   it('bounds silent provider WebSockets after reloading an old runtime timeout policy', async (context) => {
     const health = await transport.readHealthInfo();
     if (transport.version !== 2 || compareVersions(health.version ?? '0', '2.0.20') < 0) {
@@ -758,6 +793,30 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
     expect(
       JSON.stringify(await transport.request('GET', '/api/config', undefined, { unscoped: true }))
     ).toContain('fixture');
+    const supportsConfiguredGeneration =
+      compareVersions((await transport.readHealthInfo()).version ?? '', '2.0.27') >= 0;
+    if (supportsConfiguredGeneration) {
+      // V2.4 no longer waits for plugin activation in the generation handler.
+      // Config visibility alone does not establish that the base model is ready.
+      await vi.waitFor(
+        async () => {
+          const catalog = asRecord(
+            await transport.request(
+              'GET',
+              `/api/model?types=chat&location[directory]=${encodeURIComponent(join(root, 'config/opencode'))}`,
+              undefined,
+              { unscoped: true }
+            )
+          );
+          expect(catalog?.data).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ providerID: 'fixture', id: 'fixture' }),
+            ])
+          );
+        },
+        { timeout: 5000 }
+      );
+    }
     const before = await transport.request('GET', '/session');
     const requestCount = modelRequests.length;
     const result = await tryGenerateOneShot(
@@ -769,10 +828,7 @@ describe.skipIf(!binary)('released OpenCode adapter contract', () => {
         signal: AbortSignal.timeout(20000),
       }
     );
-    // 2.0.27 waits for location plugins before resolving configured providers.
     // Earlier releases need the helper-session fallback without a provider call.
-    const supportsConfiguredGeneration =
-      compareVersions((await transport.readHealthInfo()).version ?? '', '2.0.27') >= 0;
     expect(result).toEqual(
       supportsConfiguredGeneration ? { text: 'Adapter stream verified.' } : null
     );

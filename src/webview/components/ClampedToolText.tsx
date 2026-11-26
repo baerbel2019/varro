@@ -1,6 +1,7 @@
-import { createEffect, createMemo, createSignal, onCleanup } from 'solid-js';
-import type { JSX } from 'solid-js';
+import { createEffect, createMemo, createSignal, Show } from 'solid-js';
+import { type JSX } from '@solidjs/web';
 import { postMessage } from '../lib/bridge';
+import { codeHighlighter, highlightCode, resolveCodeLanguage } from '../lib/code-highlighter';
 
 /** Logical lines shown before a value is clamped. Deliberately short: the
  *  preview is a glance at the shape of the output, not a place to read it. */
@@ -42,7 +43,7 @@ export function clampToolText(content: string) {
   return { clamped: true as const, preview: trimBlankEdges(capped), lineCount };
 }
 
-export function openToolText(payload: {
+function openToolText(payload: {
   content: string;
   title: string;
   language?: string;
@@ -63,12 +64,25 @@ export function ClampedToolText(props: {
   /** Names the editor tab when the full text is opened. */
   title: string;
   language?: string;
+  /** Syntax-highlights the preview in `language`. Plain text renders until highlighting lands. */
+  highlight?: boolean;
+  /** Shows the whole text at its natural height, e.g. while the value is being worked on. */
+  unclamped?: boolean;
   view?: 'markdown-preview';
   class?: string;
   role?: JSX.HTMLAttributes<HTMLPreElement>['role'];
   'aria-label'?: string;
 }) {
-  const result = createMemo(() => clampToolText(props.content));
+  const result = createMemo(() => {
+    if (!props.unclamped) return clampToolText(props.content);
+    const preview = trimBlankEdges(props.content.replace(/\r\n/g, '\n'));
+    return { clamped: false as const, preview, lineCount: countLines(preview) };
+  });
+  const highlightLanguage = () => {
+    if (!props.highlight) return undefined;
+    const language = resolveCodeLanguage(props.language);
+    return language === 'plaintext' ? undefined : language;
+  };
 
   // Slicing by logical lines is not enough on its own: one 2000-character line
   // wraps into far more rendered rows than the clamp promises. CSS caps the
@@ -79,17 +93,31 @@ export function ClampedToolText(props: {
     if (preRef) setWrapped(preRef.scrollHeight > preRef.clientHeight + 1);
   };
 
-  createEffect(() => {
-    // Re-measure when the text changes, e.g. streaming output.
-    void props.content;
-    if (!preRef) return;
-    measure();
-    queueMicrotask(measure);
-    if (globalThis.ResizeObserver === undefined) return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(preRef);
-    onCleanup(() => observer.disconnect());
-  });
+  createEffect(
+    () => props.content,
+    () => {
+      const cleanups: Array<() => void> = [];
+
+      // Re-measure when the text changes, e.g. streaming output.
+      if (!preRef)
+        return () => {
+          for (const cleanup of cleanups.toReversed()) cleanup();
+        };
+      measure();
+      queueMicrotask(measure);
+      if (globalThis.ResizeObserver === undefined)
+        return () => {
+          for (const cleanup of cleanups.toReversed()) cleanup();
+        };
+      const observer = new ResizeObserver(measure);
+      observer.observe(preRef);
+      cleanups.push(() => observer.disconnect());
+
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
+    }
+  );
 
   const truncated = () => result().clamped || wrapped();
 
@@ -115,8 +143,11 @@ export function ClampedToolText(props: {
     <pre
       id={props.id}
       ref={(el) => (preRef = el)}
-      class={`${props.class ?? ''} tool-text-clamped`}
-      classList={{ 'is-truncated': truncated() }}
+
+      class={[
+        props.class ?? '',
+        { 'tool-text-clamped': !props.unclamped, 'is-truncated': truncated() },
+      ]}
       onClick={openUnlessSelecting}
       title={
         truncated()
@@ -128,7 +159,36 @@ export function ClampedToolText(props: {
       role={props.role}
       aria-label={props['aria-label']}
     >
-      {result().preview}
+      <Show when={highlightLanguage()} fallback={result().preview}>
+        {(language) => <HighlightedCode text={result().preview} language={language()} />}
+      </Show>
     </pre>
   );
+}
+
+function HighlightedCode(props: { text: string; language: string }) {
+  // oxlint-disable-next-line no-unassigned-vars -- Solid assigns the JSX ref before effects run.
+  let element!: HTMLElement;
+  createEffect(
+    () => ({ text: props.text, language: props.language }),
+    ({ text, language }) => {
+      const cached = highlightCode(text, language);
+      if (cached !== null) {
+        element.innerHTML = cached;
+        return;
+      }
+      element.textContent = text;
+      // The element and text together own the result, so a stale highlight never lands.
+      return codeHighlighter.request(
+        text,
+        language,
+        (html) => {
+          if (html !== null && element.isConnected && element.textContent === text)
+            element.innerHTML = html;
+        },
+        1
+      );
+    }
+  );
+  return <code ref={element} class="tool-text-highlighted hljs" />;
 }

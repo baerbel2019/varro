@@ -4,6 +4,7 @@ import { getToolFileChanges } from '../shared/tool-file-change';
 import { asRecord, type UnknownRecord } from '../shared/type-utils';
 import { projectV2Event } from './opencode-v2-events';
 import { StreamingToolContent } from './streaming-tool-content';
+import { projectV2Message } from './opencode-v2-projection';
 
 function event(type: string, properties: UnknownRecord): ServerEvent {
   // SAFETY: These fixtures provide the routing required by each native tool event.
@@ -15,6 +16,40 @@ function event(type: string, properties: UnknownRecord): ServerEvent {
 }
 
 describe('streaming tool content', () => {
+  const foreignRoute = '/session/original/message/old/part/other?directory=%2Fprevious';
+
+  it.each(['called', 'success'])('preserves a deferred %s on the current route', (stage) => {
+    const projection = new StreamingToolContent();
+    for (const marker of [true, foreignRoute]) {
+      const fields =
+        stage === 'called'
+          ? { input: { path: 'a.ts' } }
+          : { content: [{ type: 'text', text: 'ok' }] };
+      const source = event(stage, { ...fields, deferred: marker });
+      const projected = projection.project(source);
+      expect(projected.properties).toMatchObject({
+        ...fields,
+        deferred: '/session/s1/message/m1/part/c1?directory=%2Fworkspace',
+      });
+      expect(JSON.stringify(projected)).not.toContain(foreignRoute);
+      expect(projection.project(event(stage, fields)).properties).not.toHaveProperty('deferred');
+    }
+  });
+
+  it('passes sequence-only and unrelated events through without rewriting them', () => {
+    const projection = new StreamingToolContent();
+    const sequenceOnly = {
+      ...event('success', { deferred: foreignRoute }),
+      sequenceOnly: true,
+    } satisfies ServerEvent;
+    const unrelated = {
+      type: 'session.idle',
+      properties: { sessionID: 's1' },
+    } satisfies ServerEvent;
+    expect(projection.project(sequenceOnly)).toBe(sequenceOnly);
+    expect(projection.project(unrelated)).toBe(unrelated);
+  });
+
   it('removes native image bodies and duplicate fields before forwarding progress or completion', () => {
     const projection = new StreamingToolContent();
     projection.project(event('input.started', { name: 'read' }));
@@ -131,5 +166,44 @@ describe('streaming tool content', () => {
       deferred: expect.any(String),
       error: expect.stringContaining('error'),
     });
+  });
+
+  it('keeps the child prompt identity of a failed subagent call equal to the reloaded call', () => {
+    const identity = { sessionID: 'ses_child', status: 'running', childPromptID: 'msg_prompt' };
+    const projection = new StreamingToolContent();
+    projection.project(event('input.started', { name: 'subagent' }));
+    projection.project(event('progress', { structured: identity }));
+    // Native failures carry the latest progress metadata.
+    const failed = projection.project(
+      event('failed', { structured: identity, error: { message: 'error '.repeat(10000) } })
+    );
+
+    const reloaded = projectV2Message(
+      {
+        id: 'm1',
+        type: 'assistant',
+        agent: 'build',
+        model: { providerID: 'openai', id: 'model' },
+        time: { created: 1, completed: 2 },
+        content: [
+          {
+            id: 'c1',
+            type: 'tool',
+            name: 'subagent',
+            time: { created: 1, completed: 2 },
+            state: {
+              status: 'error',
+              input: {},
+              error: { type: 'tool.execution', message: 'failed' },
+              metadata: identity,
+            },
+          },
+        ],
+      },
+      's1'
+    ).parts.find((part) => part.type === 'tool');
+
+    expect(failed.properties).toMatchObject({ deferred: expect.any(String), structured: identity });
+    expect(asRecord(reloaded?.state)?.metadata).toEqual(identity);
   });
 });

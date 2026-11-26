@@ -43,6 +43,61 @@ async function loadClient() {
 
 type ClientApi = Awaited<ReturnType<typeof loadClient>>['client'];
 
+it('normalizes V1 and V2 skills and only exposes file paths that can be opened', async () => {
+  const { client } = await loadClient();
+  bridgeMocks.apiCall.mockResolvedValueOnce([
+    { id: 'review', name: 'Review', description: 'Review code', path: '/skills/review/SKILL.md' },
+    { id: 'browser', name: 'Browser', path: 'skill://browser/SKILL.md' },
+    { name: 'pdf', description: 'PDFs', location: 'C:\\skills\\pdf\\SKILL.md' },
+    { name: 'customize-opencode', location: '<built-in>' },
+    { description: 'missing ID' },
+  ]);
+
+  await expect(client.skill.list()).resolves.toEqual([
+    { id: 'review', name: 'Review', description: 'Review code', path: '/skills/review/SKILL.md' },
+    { id: 'browser', name: 'Browser', description: '' },
+    { id: 'pdf', name: 'pdf', description: 'PDFs', path: 'C:\\skills\\pdf\\SKILL.md' },
+    { id: 'customize-opencode', name: 'customize-opencode', description: '' },
+  ]);
+  expect(bridgeMocks.apiCall).toHaveBeenCalledWith('GET', '/skill');
+});
+
+it('reads and validates session-scoped goals', async () => {
+  const { client } = await loadClient();
+  const goal = {
+    id: 'goal-1',
+    objective: 'Wait for 1 minute',
+    status: 'paused',
+    rounds: 1,
+    maxRounds: 50,
+    updatedAt: 100,
+  };
+  bridgeMocks.apiCall.mockResolvedValueOnce(goal);
+  await expect(client.session.goal('session/1', { directory: '/repo' })).resolves.toEqual(goal);
+  expect(bridgeMocks.apiCall).toHaveBeenCalledWith(
+    'GET',
+    '/session/session%2F1/goal?directory=%2Frepo',
+    undefined,
+    { signal: undefined }
+  );
+  bridgeMocks.apiCall.mockResolvedValueOnce(null);
+  await expect(client.session.goal('session-1')).resolves.toBeNull();
+  bridgeMocks.apiCall.mockResolvedValueOnce({ ...goal, status: 'unknown' });
+  await expect(client.session.goal('session-1')).rejects.toThrow('Malformed response');
+});
+
+it('looks up session metadata by exact ID and opens references without trusting a client path', async () => {
+  const { client } = await loadClient();
+  const reference = { id: 'ses_other', title: 'Other', directory: '/other', external: true };
+  bridgeMocks.apiCall.mockResolvedValueOnce(reference);
+  await expect(client.varro.session.reference('ses_other')).resolves.toEqual(reference);
+  expect(bridgeMocks.apiCall).toHaveBeenCalledWith('GET', '/varro/session/ses_other/reference');
+  await client.varro.session.openReference('ses_other');
+  expect(bridgeMocks.apiCall).toHaveBeenCalledWith('POST', '/varro/session/ses_other/reference');
+  bridgeMocks.apiCall.mockResolvedValueOnce({ ...reference, id: 'ses_wrong' });
+  await expect(client.varro.session.reference('ses_other')).rejects.toThrow('Malformed response');
+});
+
 it('reads and validates the session location for the header indicator', async () => {
   const { client } = await loadClient();
   const location = { directory: '/worktrees/feature', isGitWorktree: true };
@@ -313,6 +368,31 @@ describe('client', () => {
     ]);
   });
 
+  it('sends trimmed rejection instructions only with reject replies', async () => {
+    const { client } = await loadClient();
+    bridgeMocks.apiCall.mockResolvedValue(true);
+
+    await client.session.respondPermission('session-1', 'permission-reject', 'reject', {
+      message: '  Use pnpm instead.  ',
+    });
+    await client.session.respondPermission('session-1', 'permission-blank', 'reject', {
+      message: '   ',
+    });
+    await client.session.respondPermission('session-1', 'permission-once', 'once', {
+      message: 'ignored',
+    });
+
+    expect(bridgeMocks.apiCall.mock.calls).toEqual([
+      [
+        'POST',
+        '/permission/permission-reject/reply',
+        { reply: 'reject', message: 'Use pnpm instead.' },
+      ],
+      ['POST', '/permission/permission-blank/reply', { reply: 'reject' }],
+      ['POST', '/permission/permission-once/reply', { reply: 'once' }],
+    ]);
+  });
+
   it('loads a bounded session page with continuation metadata', async () => {
     const { client } = await loadClient();
     const sessions = [{ id: 'session-1' }];
@@ -473,6 +553,7 @@ describe('client', () => {
     await client.mcp.authenticate('browser server');
     await client.mcp.startAuth('browser server');
     await client.mcp.completeAuth('browser server', 'oauth-code');
+    await client.mcp.completeAuth('browser server', 'oauth-code', 'attempt-1');
     await client.mcp.removeAuth('browser server');
     await client.agent.list();
     await client.question.list();
@@ -571,6 +652,11 @@ describe('client', () => {
       ['POST', '/mcp/browser%20server/auth/authenticate'],
       ['POST', '/mcp/browser%20server/auth'],
       ['POST', '/mcp/browser%20server/auth/callback', { code: 'oauth-code' }],
+      [
+        'POST',
+        '/mcp/browser%20server/auth/callback',
+        { code: 'oauth-code', attemptID: 'attempt-1' },
+      ],
       ['DELETE', '/mcp/browser%20server/auth'],
       ['GET', '/agent'],
       ['GET', '/question'],
@@ -749,6 +835,39 @@ describe('client', () => {
       providers: [{ id: 'openai', models: {} }],
       default: {},
       defaultModel: undefined,
+    });
+  });
+
+  it('shows the Claude Agent provider as Claude without overriding custom names', async () => {
+    const { client } = await loadClient();
+    const providers = [
+      { id: 'claude-agent', name: 'Claude Agent', models: {} },
+      { id: 'anthropic', name: 'Claude Agent', models: {} },
+    ];
+    bridgeMocks.apiCall.mockImplementation((_method: string, path: string) => {
+      if (path === '/config/providers') return Promise.resolve({ providers, default: {} });
+      if (path === '/provider')
+        return Promise.resolve({ all: providers, default: {}, connected: ['claude-agent'] });
+      return Promise.reject(new Error('404 Not Found'));
+    });
+
+    const expected = [
+      { id: 'claude-agent', name: 'Claude', models: {} },
+      { id: 'anthropic', name: 'Claude Agent', models: {} },
+    ];
+    await expect(client.config.providers()).resolves.toMatchObject({ providers: expected });
+    await expect(client.config.providerCatalog()).resolves.toMatchObject({ all: expected });
+
+    bridgeMocks.apiCall.mockImplementation((_method: string, path: string) =>
+      path === '/config/providers'
+        ? Promise.resolve({
+            providers: [{ id: 'claude-agent', name: 'Work Claude', models: {} }],
+            default: {},
+          })
+        : Promise.reject(new Error('404 Not Found'))
+    );
+    await expect(client.config.providers()).resolves.toMatchObject({
+      providers: [{ id: 'claude-agent', name: 'Work Claude' }],
     });
   });
 

@@ -107,9 +107,11 @@ For web search on Varro-launched OpenCode V2 servers, Varro defaults to automati
 
 Use **Manage MCPs** at the bottom of the MCP picker to open the separate configuration screen. Use the **Global** and **This project** tabs to choose which servers connect automatically; unchecked servers stay available on demand. These settings update OpenCode configuration, including the startup connection setting. A project setting takes priority over Global, and **Use global** removes it. Choosing the global value writes no project entry, and a project entry with its own connection settings is kept until you edit it in the config file. Project-only servers must be added to global OpenCode configuration before their global setting can be changed. Defaults are editable when sessions are idle and file-based configuration is available; attached servers must be configured on their host.
 
+Use **Manage Skills** in the view's `...` menu to see the skills OpenCode discovered and turn them on or off with the same **Global** and **This project** tabs. Turning a skill off adds a `skill` deny rule to OpenCode permission configuration, and **Use global** removes the project rule. **Open** shows a local skill's `SKILL.md`.
+
 The MCP picker keeps its own session selection without changing defaults. On-demand servers stay visible and connect when selected. Connections are shared, so a server needed by a running session or child task remains connected until that work finishes. Selection is not per-session tool isolation.
 
-Follow-ups are enabled by default using the session's model and reasoning. Override with **Use for follow-ups** in a model's context menu or `varro.chat.followupModel`; opt out with `varro.chat.followupsEnabled: false`. Requires OpenCode V2; sends the current request and answer for extra inference that may consume tokens or subscription quota. Hover to preview prompts; click to send, preserving your agent, permissions, draft, and attachments. No history backfill or helper chats.
+Follow-ups are enabled by default using the session's model and reasoning. Override with **Use for follow-ups** in a model's context menu or `varro.chat.followupModel`; opt out with `varro.chat.followupsEnabled: false`. Requires OpenCode V2; sends the current request and answer for extra inference that may consume tokens or subscription quota. Hover to preview prompts; click to send, preserving your agent, permissions, draft, and attachments. When two or more suggestions are compatible, an **All** button (also **Send all follow-ups** in an action's context menu) sends them as one combined request. No history backfill or helper chats.
 
 For proxy accounting, opt in to `varro.chat.promptTrace` in user settings to add purpose and source attribution to auxiliary inference prompts. A compatible proxy hook must extract and strip the marker. See [prompt tracing and gateway integration](docs/prompt-tracing.md) for covered routes, metadata, and limitations.
 
@@ -123,19 +125,23 @@ For image analysis with a text-only model, configure an image-capable `vision` a
 
 The composer shows context-window fill; its popup breaks down tokens and reported cost. Run `/stats` or `Varro: Usage Stats` for cross-project token and duration reports covering today, 7 days, and 30 days. Use `/stats all` for retained and archived usage history.
 
+Varro can keep an idle session's prompt cache alive after each reply so the next message is cheaper; it is off by default because each keep-alive costs tokens. See [keeping the prompt cache warm](https://github.com/koltyakov/varro/blob/main/docs/usage.md#keep-the-prompt-cache-warm).
+
 Run `Varro: Export All-Time Usage to CSV` to save daily usage by provider, model, and recorded reasoning setting, with separate input, output, reasoning, and cache token columns. It includes the usage archive without double counting live copies. Dates are UTC; unavailable reasoning settings are marked `unknown`.
 
 Run `Varro: Delete Old OpenCode Sessions` from the Command Palette to choose how many months to keep across all projects and whether to preserve trimmed, non-resumable transcripts in a separate database. It uses last activity, always archives usage before deleting, and cleans session-owned temporary files without deleting original attachments or source files. Active sessions and parents with newer children stay. See [session cleanup](docs/session-cleanup.md) for recovery and archive details.
 
 ![Context window and session token breakdown](https://raw.githubusercontent.com/koltyakov/varro/main/assets/context.png)
 
-Supported providers expose quota windows and reset times. After a limit error, stop retries or switch providers. On v2, the `opencode-claude` plugin also supplies Claude Code limits through an authenticated local endpoint without Varro reading Claude credentials; this is unavailable in attach-only mode.
+Supported providers expose quota windows and reset times. After a limit error, the banner shows when the limit resets; stop retries or switch models. On v2, the `opencode-claude` plugin also supplies Claude Code limits through an authenticated local endpoint without Varro reading Claude credentials; this is unavailable in attach-only mode.
 
 ![Provider quota limits and reset windows](https://raw.githubusercontent.com/koltyakov/varro/main/assets/limits.png)
 
 ## Commit messages
 
 Select the Source Control wand or run `Varro: Generate Commit Message`. Varro drafts from staged changes, or unstaged changes if nothing is staged, and fills the commit input for review. It never stages or commits files and asks before replacing a draft. On native Windows, untracked files contribute paths only, not contents.
+
+Select the Source Control list icon or run `Varro: Walk Through Changes` to get an AI-guided reading order through your uncommitted changes as a Markdown report. Nothing runs automatically. See [walkthroughs](https://github.com/koltyakov/varro/blob/main/docs/usage.md#walk-through-changes).
 
 ## Server and updates
 
@@ -151,7 +157,7 @@ Global configuration reloads when OpenCode is idle. Project changes may need `Va
 
 - [VS Code](https://code.visualstudio.com/) or [VSCodium](https://vscodium.com/) 1.107 or newer
 - [Node.js](https://nodejs.org/) 22.22.2+ on Node 22, or Node 24.15.0+
-- [OpenCode v2 CLI](https://opencode.ai/docs/) 2.0.5+ recommended, or [v1 CLI](https://opencode.ai/v1/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.3.0 and v1 1.19.5
+- [OpenCode v2 CLI](https://opencode.ai/docs/) 2.0.6+ recommended, or [v1 CLI](https://opencode.ai/v1/docs/) 1.16.0+, on `PATH` or configured through `varro.server.command`. Tested with v2 2.4.2 and v1 1.19.6
 - A trusted, non-virtual workspace. Remote workspaces run Varro and OpenCode on the remote extension host
 
 ## Documentation

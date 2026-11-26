@@ -1,3 +1,4 @@
+import { flush as flushSolid } from 'solid-js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Message, Session } from '../types';
 import { setSessionHistoryPrompts } from '../lib/message-window';
@@ -10,14 +11,7 @@ import {
   reviewSessionWithDependencies,
   undoSessionWithDependencies,
 } from './session/session-controls';
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => {
-    resolve = next;
-  });
-  return { promise, resolve };
-}
+import { deferred } from '../test-fixtures';
 
 function userMessage(id: string): Message {
   return {
@@ -82,6 +76,26 @@ function completedTaskPart(id: string, sessionId = id) {
   };
 }
 
+type EditMessageDependencies = Parameters<typeof editMessageWithDependencies>[0];
+
+/** Required edit dependencies only; optional tree and recycle-bin hooks stay opt-in per test. */
+function editDeps(
+  overrides: Partial<EditMessageDependencies> & Pick<EditMessageDependencies, 'getMessages'>
+): EditMessageDependencies {
+  return {
+    getActiveSessionId: () => 'session-1',
+    isSessionWorking: () => false,
+    abortSession: vi.fn(async () => {}),
+    startLoading: vi.fn(),
+    deleteMessage: vi.fn(async () => {}),
+    syncSessionMessages: vi.fn(async () => {}),
+    sendEditedMessage: vi.fn(async () => true),
+    stopLoading: vi.fn(),
+    setError: vi.fn(),
+    ...overrides,
+  };
+}
+
 describe('session-controls helpers', () => {
   it.each([true, false])(
     'interrupts exactly child A with native interrupted=%s',
@@ -102,6 +116,7 @@ describe('session-controls helpers', () => {
           'child-a'
         )
       ).resolves.toEqual({ interrupted });
+      flushSolid();
       expect(markPendingAbort.mock.calls).toEqual(interrupted ? [['child-a']] : []);
       expect(interruptChild.mock.calls).toEqual([['child-a']]);
       expect(reconcile.mock.calls).toEqual([['child-a']]);
@@ -124,6 +139,7 @@ describe('session-controls helpers', () => {
         'child-a'
       )
     ).rejects.toThrow('connection lost');
+    flushSolid();
     expect(clearPendingAbort).not.toHaveBeenCalled();
     expect(reconcile.mock.calls).toEqual([['child-a']]);
   });
@@ -145,7 +161,9 @@ describe('session-controls helpers', () => {
     );
     current = false;
     result.resolve({ interrupted: false });
+    flushSolid();
     await stop;
+    flushSolid();
     expect(reconcile).not.toHaveBeenCalled();
     expect(clearPendingAbort).not.toHaveBeenCalled();
   });
@@ -170,6 +188,7 @@ describe('session-controls helpers', () => {
       setSessionUsageLimit: vi.fn(),
       logError: vi.fn(),
     });
+    flushSolid();
     expect(markPendingAbortTree).toHaveBeenCalledWith(ids);
     expect(abortRemoteSession.mock.calls).toEqual(ids.map((id) => [id]));
   });
@@ -180,6 +199,7 @@ describe('session-controls helpers', () => {
     await reviewSessionWithDependencies({
       sendMessage,
     });
+    flushSolid();
 
     expect(sendMessage).toHaveBeenCalledWith(
       'review the current changes in my code and provide feedback'
@@ -216,6 +236,7 @@ describe('session-controls helpers', () => {
         logError,
       })
     ).rejects.toThrow('abort failed');
+    flushSolid();
 
     expect(setSessionStatusEntry).toHaveBeenNthCalledWith(1, 'session-1', { type: 'idle' });
     expect(setSessionStatusEntry).toHaveBeenNthCalledWith(2, 'child-1', { type: 'idle' });
@@ -266,7 +287,9 @@ describe('session-controls helpers', () => {
       });
       expect(syncSessionMessages).not.toHaveBeenCalled();
       acknowledgement.resolve();
+      flushSolid();
       await stop;
+      flushSolid();
       expect(syncSessionMessages.mock.calls).toEqual([['session-1'], ['child-1']]);
       expect(clearPendingAbortTree).not.toHaveBeenCalled();
       expect(logError).toHaveBeenCalledTimes(refreshFails ? 2 : 0);
@@ -289,6 +312,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError: vi.fn(),
     });
+    flushSolid();
 
     expect(revertSession).toHaveBeenCalledWith('session-1', 'assistant-1');
   });
@@ -310,6 +334,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError: vi.fn(),
     });
+    flushSolid();
 
     expect(revertSession).toHaveBeenCalledWith('session-1', 'assistant-active');
   });
@@ -340,13 +365,11 @@ describe('session-controls helpers', () => {
     });
 
     await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1') },
           { info: assistantMessage('assistant-1') },
         ],
-        isSessionWorking: () => false,
         abortSession,
         startLoading: vi.fn(() => {
           callOrder.push('loading');
@@ -357,13 +380,12 @@ describe('session-controls helpers', () => {
         deleteMessage,
         syncSessionMessages,
         sendEditedMessage,
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt',
       { onOptimisticPublish: () => callOrder.push('publish') }
     );
+    flushSolid();
 
     expect(abortSession).not.toHaveBeenCalled();
     expect(invalidateMessageSync).toHaveBeenCalledTimes(1);
@@ -393,27 +415,20 @@ describe('session-controls helpers', () => {
     const child = { info: assistantMessage('child-assistant', 'child-1') };
 
     await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1') },
           child,
           { info: assistantMessage('assistant-1') },
         ],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
-        startLoading: vi.fn(),
         deferMessageRemovals: vi.fn(() => vi.fn()),
         pruneMessagesFrom: vi.fn(),
         deleteMessage,
-        syncSessionMessages: vi.fn(async () => {}),
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(deleteMessage.mock.calls).toEqual([
       ['session-1', 'assistant-1'],
@@ -445,9 +460,9 @@ describe('session-controls helpers', () => {
           },
           { info: assistantMessage('assistant-1'), parts: [] },
         ]);
+      flushSolid();
       const result = await editMessageWithDependencies(
-        {
-          getActiveSessionId: () => 'session-1',
+        editDeps({
           getMessages: () =>
             prefetched
               ? [{ info: userMessage('steer') }]
@@ -456,18 +471,16 @@ describe('session-controls helpers', () => {
                   { info: assistantMessage('assistant-1') },
                   { info: userMessage('steer') },
                 ],
-          isSessionWorking: () => false,
           startLoading,
           abortSession,
           deleteMessage,
           sendEditedMessage,
-          syncSessionMessages: vi.fn(async () => {}),
-          stopLoading: vi.fn(),
           setError,
-        },
+        }),
         'steer',
         'Revised instruction'
       );
+      flushSolid();
       expect(result).toBe(false);
       expect(setError).toHaveBeenCalledWith(
         expect.stringContaining('steering messages cannot be edited')
@@ -499,8 +512,7 @@ describe('session-controls helpers', () => {
     };
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           { info: assistantMessage('assistant-1'), parts: [taskPart] },
@@ -514,8 +526,6 @@ describe('session-controls helpers', () => {
           }),
         ],
         getSessionTreeIds: (id) => (id === 'child-1' ? ['child-1', 'grandchild-1'] : [id]),
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async (id) => {
           order.push(`abort:${id}`);
         }),
@@ -523,21 +533,18 @@ describe('session-controls helpers', () => {
           order.push(`recycle:${id}`);
         }),
         restoreSessionTreeFromRecycleBin: vi.fn(async () => {}),
-        startLoading: vi.fn(),
         deleteMessage: vi.fn(async (_sessionId, id) => {
           order.push(`delete:${id}`);
         }),
-        syncSessionMessages: vi.fn(async () => {}),
         sendEditedMessage: vi.fn(async () => {
           order.push('send');
           return true;
         }),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(true);
     expect(order).toEqual([
@@ -571,30 +578,25 @@ describe('session-controls helpers', () => {
     };
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           { info: assistantMessage('assistant-1'), parts: [taskPart] },
         ],
         getSessions: () => [session('session-1'), session('child-1', { parentID: 'session-1' })],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {
           throw new Error('recycle failed');
         }),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
         deleteMessage,
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
         setError,
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(deleteMessage).not.toHaveBeenCalled();
@@ -609,8 +611,7 @@ describe('session-controls helpers', () => {
     const setError = vi.fn();
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -620,23 +621,18 @@ describe('session-controls helpers', () => {
         ],
         getSessions: () => [session('session-1'), session('child-1', { parentID: 'session-1' })],
         getSessionTreeIds: (id) => [id],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {
           throw new Error('recycle response lost');
         }),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
-        deleteMessage: vi.fn(async () => {}),
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
         setError,
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(restore).toHaveBeenCalledWith('child-1');
@@ -648,8 +644,7 @@ describe('session-controls helpers', () => {
     const recycle = vi.fn(async () => {});
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -665,21 +660,14 @@ describe('session-controls helpers', () => {
           session('other-parent'),
           session('sibling-child', { parentID: 'other-parent' }),
         ],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: recycle,
         restoreSessionTreeFromRecycleBin: vi.fn(async () => {}),
-        startLoading: vi.fn(),
-        deleteMessage: vi.fn(async () => {}),
-        syncSessionMessages: vi.fn(async () => {}),
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(true);
     expect(recycle).not.toHaveBeenCalled();
@@ -690,8 +678,7 @@ describe('session-controls helpers', () => {
     const sync = vi.fn(async () => {});
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -705,23 +692,17 @@ describe('session-controls helpers', () => {
           session('child-2', { parentID: 'session-1' }),
         ],
         getSessionTreeIds: (id) => [id],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async (id) => {
           if (id === 'child-2') throw new Error('second recycle failed');
         }),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
-        deleteMessage: vi.fn(async () => {}),
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(restore.mock.calls).toEqual([['child-2'], ['child-1']]);
@@ -736,8 +717,7 @@ describe('session-controls helpers', () => {
     const sync = vi.fn(async () => {});
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -747,23 +727,20 @@ describe('session-controls helpers', () => {
         ],
         getSessions: () => [session('session-1'), session('child-1', { parentID: 'session-1' })],
         getSessionTreeIds: (id) => [id],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {}),
         restoreSessionTreeFromRecycleBin: vi.fn(async () => false),
-        startLoading: vi.fn(),
         deleteMessage: vi.fn(async () => {
           throw new Error('delete failed');
         }),
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
         stopLoading,
         setError,
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(stopLoading).toHaveBeenCalledOnce();
@@ -778,8 +755,7 @@ describe('session-controls helpers', () => {
     const stopLoading = vi.fn();
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -789,25 +765,21 @@ describe('session-controls helpers', () => {
         ],
         getSessions: () => [session('session-1'), session('child-1', { parentID: 'session-1' })],
         getSessionTreeIds: (id) => [id],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {}),
         restoreSessionTreeFromRecycleBin: vi.fn(async () => {
           throw new Error('restore request failed');
         }),
-        startLoading: vi.fn(),
         deleteMessage: vi.fn(async () => {
           throw new Error('delete failed');
         }),
-        syncSessionMessages: vi.fn(async () => {}),
-        sendEditedMessage: vi.fn(async () => true),
         stopLoading,
         setError,
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(stopLoading).toHaveBeenCalledOnce();
@@ -824,8 +796,7 @@ describe('session-controls helpers', () => {
     const setError = vi.fn();
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -840,23 +811,19 @@ describe('session-controls helpers', () => {
           session('child-2', { parentID: 'session-1' }),
         ],
         getSessionTreeIds: (id) => (id === 'child-1' ? ['child-1', 'grandchild-1'] : [id]),
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {}),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
         deleteMessage: vi.fn(async () => {
           throw new Error('delete failed');
         }),
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
         setError,
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(restore.mock.calls).toEqual([['child-2'], ['child-1']]);
@@ -871,8 +838,7 @@ describe('session-controls helpers', () => {
     const sync = vi.fn(async () => {});
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -882,21 +848,16 @@ describe('session-controls helpers', () => {
         ],
         getSessions: () => [session('session-1'), session('child-1', { parentID: 'session-1' })],
         getSessionTreeIds: (id) => [id],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {}),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
-        deleteMessage: vi.fn(async () => {}),
         syncSessionMessages: sync,
         sendEditedMessage: vi.fn(async () => false),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(restore).not.toHaveBeenCalled();
@@ -908,8 +869,7 @@ describe('session-controls helpers', () => {
     const sync = vi.fn(async () => {});
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [
           { info: userMessage('user-1'), parts: [] },
           {
@@ -923,23 +883,18 @@ describe('session-controls helpers', () => {
           session('grandchild-1', { parentID: 'child-1' }),
         ],
         getSessionTreeIds: (id) => (id === 'child-1' ? ['child-1', 'grandchild-1'] : [id]),
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {}),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
         deleteMessage: vi.fn(async () => {
           throw new Error('delete failed');
         }),
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(restore).toHaveBeenCalledWith('child-1');
@@ -962,26 +917,20 @@ describe('session-controls helpers', () => {
     });
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => messages,
         getSessions: () => [session('session-1'), session('child-1', { parentID: 'session-1' })],
         getSessionTreeIds: (id) => [id],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {}),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
         deleteMessage,
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(deleteMessage.mock.calls).toEqual([
@@ -1013,26 +962,20 @@ describe('session-controls helpers', () => {
     });
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => messages,
         getSessions: () => [session('session-1'), session('child-1', { parentID: 'session-1' })],
         getSessionTreeIds: (id) => [id],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
         abortActiveSessionTree: vi.fn(async () => {}),
         moveSessionTreeToRecycleBin: vi.fn(async () => {}),
         restoreSessionTreeFromRecycleBin: restore,
-        startLoading: vi.fn(),
         deleteMessage,
         syncSessionMessages: sync,
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(deleteMessage.mock.calls).toEqual([
@@ -1052,32 +995,27 @@ describe('session-controls helpers', () => {
     const prepareEditedMessageSend = vi.fn(() => async () => false);
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [{ info: userMessage('user-1') }],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
-        startLoading: vi.fn(),
         deferMessageRemovals: vi.fn(() => releaseRemovals),
         pruneMessagesFrom,
-        deleteMessage: vi.fn(async () => {}),
-        syncSessionMessages: vi.fn(async () => {}),
         sendEditedMessage: vi.fn(async () => false),
         prepareEditedMessageSend,
         stopLoading,
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt',
       { onOptimisticPublish }
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(prepareEditedMessageSend).toHaveBeenCalledWith(
       'updated prompt',
       'session-1',
       undefined,
-      { providerID: 'openai', modelID: 'gpt-4o' }
+      { providerID: 'openai', modelID: 'gpt-4o' },
+      'build'
     );
     expect(pruneMessagesFrom).toHaveBeenCalledWith('session-1', 'user-1');
     expect(restorePrunedMessages).not.toHaveBeenCalled();
@@ -1090,28 +1028,24 @@ describe('session-controls helpers', () => {
     const callOrder: string[] = [];
 
     await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [{ info: userMessage('user-1') }],
         isSessionWorking: () => true,
         abortSession: vi.fn(async () => {
           callOrder.push('abort');
         }),
-        startLoading: vi.fn(),
         deleteMessage: vi.fn(async () => {
           callOrder.push('delete');
         }),
-        syncSessionMessages: vi.fn(async () => {}),
         sendEditedMessage: vi.fn(async () => {
           callOrder.push('send');
           return true;
         }),
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(callOrder).toEqual(['abort', 'delete', 'send']);
   });
@@ -1122,23 +1056,20 @@ describe('session-controls helpers', () => {
     const syncSessionMessages = vi.fn(async () => {});
 
     const result = await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [{ info: userMessage('user-1') }],
         isSessionWorking: () => true,
         abortSession: vi.fn(async () => {
           throw new Error('abort failed');
         }),
-        startLoading: vi.fn(),
         deleteMessage,
         syncSessionMessages,
         sendEditedMessage,
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(result).toBe(false);
     expect(deleteMessage).not.toHaveBeenCalled();
@@ -1154,18 +1085,14 @@ describe('session-controls helpers', () => {
     const sendEditedMessage = vi.fn(async () => true);
 
     const edit = editMessageWithDependencies(
-      {
+      editDeps({
         getActiveSessionId: () => activeSessionId,
         getMessages: () => [{ info: userMessage('user-1') }],
         isSessionWorking: () => true,
         abortSession,
-        startLoading: vi.fn(),
         deleteMessage,
-        syncSessionMessages: vi.fn(async () => {}),
         sendEditedMessage,
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       'updated prompt',
       {
@@ -1178,10 +1105,13 @@ describe('session-controls helpers', () => {
     );
 
     await vi.waitFor(() => expect(abortSession).toHaveBeenCalledWith('session-1'));
+    flushSolid();
     activeSessionId = 'session-2';
     abortGate.resolve();
+    flushSolid();
 
     await expect(edit).resolves.toBe(true);
+    flushSolid();
     expect(deleteMessage).toHaveBeenCalledWith('session-1', 'user-1');
     expect(sendEditedMessage).toHaveBeenCalledWith('updated prompt', 'session-1', {
       droppedFiles: [{ path: '/repo/a.ts', relativePath: 'a.ts', type: 'file' }],
@@ -1211,17 +1141,21 @@ describe('session-controls helpers', () => {
     });
 
     await editMessageWithDependencies(makeDeps(), 'user-1', '   ');
+    flushSolid();
     await editMessageWithDependencies(
       makeDeps({ getActiveSessionId: () => null }),
       'user-1',
       'updated'
     );
+    flushSolid();
     await editMessageWithDependencies(makeDeps(), 'missing-message', 'updated');
+    flushSolid();
     await editMessageWithDependencies(
       makeDeps({ getMessages: () => [{ info: assistantMessage('assistant-1') }] }),
       'assistant-1',
       'updated'
     );
+    flushSolid();
     await editMessageWithDependencies(
       makeDeps({
         getMessages: () => [{ info: { ...userMessage('user-1'), sessionID: 'session-2' } }],
@@ -1229,6 +1163,7 @@ describe('session-controls helpers', () => {
       'user-1',
       'updated'
     );
+    flushSolid();
 
     expect(startLoading).not.toHaveBeenCalled();
     expect(deleteMessage).not.toHaveBeenCalled();
@@ -1239,22 +1174,16 @@ describe('session-controls helpers', () => {
     const sendEditedMessage = vi.fn(async () => true);
 
     await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [{ info: userMessage('user-1') }],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
-        startLoading: vi.fn(),
         deleteMessage,
-        syncSessionMessages: vi.fn(async () => {}),
         sendEditedMessage,
-        stopLoading: vi.fn(),
-        setError: vi.fn(),
-      },
+      }),
       'user-1',
       '',
       { allowEmptyText: true }
     );
+    flushSolid();
 
     expect(deleteMessage).toHaveBeenCalledWith('session-1', 'user-1');
     expect(sendEditedMessage).toHaveBeenCalledWith('', 'session-1', undefined);
@@ -1268,12 +1197,8 @@ describe('session-controls helpers', () => {
     const releaseRemovals = vi.fn();
 
     await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [{ info: userMessage('user-1') }],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
-        startLoading: vi.fn(),
         deferMessageRemovals: vi.fn(() => releaseRemovals),
         pruneMessagesFrom: vi.fn(),
         deleteMessage: vi.fn(async () => {
@@ -1283,10 +1208,11 @@ describe('session-controls helpers', () => {
         sendEditedMessage,
         stopLoading,
         setError,
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(syncSessionMessages).toHaveBeenCalledWith('session-1');
     expect(stopLoading).toHaveBeenCalled();
@@ -1299,23 +1225,17 @@ describe('session-controls helpers', () => {
     const setError = vi.fn();
 
     await editMessageWithDependencies(
-      {
-        getActiveSessionId: () => 'session-1',
+      editDeps({
         getMessages: () => [{ info: userMessage('user-1') }],
-        isSessionWorking: () => false,
-        abortSession: vi.fn(async () => {}),
-        startLoading: vi.fn(),
         deleteMessage: vi.fn(async () => {
           throw 'oops';
         }),
-        syncSessionMessages: vi.fn(async () => {}),
-        sendEditedMessage: vi.fn(async () => true),
-        stopLoading: vi.fn(),
         setError,
-      },
+      }),
       'user-1',
       'updated prompt'
     );
+    flushSolid();
 
     expect(setError).toHaveBeenCalledWith('Failed to edit message');
   });
@@ -1333,6 +1253,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError: vi.fn(),
     });
+    flushSolid();
 
     expect(upsertSession).toHaveBeenCalledWith(session('session-1'));
   });
@@ -1353,6 +1274,7 @@ describe('session-controls helpers', () => {
       getSession: () => undefined,
       stopLoading: vi.fn(),
     });
+    flushSolid();
 
     expect(setError).toHaveBeenCalledWith('Select a model before compacting the session');
   });
@@ -1374,6 +1296,7 @@ describe('session-controls helpers', () => {
       getSession: () => session('session-1'),
       stopLoading: vi.fn(),
     });
+    flushSolid();
 
     expect(setSessionCompacting).toHaveBeenNthCalledWith(1, 'session-1', true);
     expect(setSessionCompacting).toHaveBeenNthCalledWith(2, 'session-1', false);
@@ -1403,6 +1326,7 @@ describe('session-controls helpers', () => {
       setSessionUsageLimit: vi.fn(),
       logError: vi.fn(),
     });
+    flushSolid();
 
     expect(markPendingAbortTree).not.toHaveBeenCalled();
     expect(stopLoading).not.toHaveBeenCalled();
@@ -1421,6 +1345,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError: vi.fn(),
     });
+    flushSolid();
 
     expect(startLoading).not.toHaveBeenCalled();
   });
@@ -1438,6 +1363,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError: vi.fn(),
     });
+    flushSolid();
 
     expect(startLoading).not.toHaveBeenCalled();
   });
@@ -1461,6 +1387,7 @@ describe('session-controls helpers', () => {
       stopLoading,
       setError,
     });
+    flushSolid();
 
     expect(stopLoading).toHaveBeenCalled();
     expect(setError).toHaveBeenCalledWith('revert failed');
@@ -1484,6 +1411,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError,
     });
+    flushSolid();
 
     expect(setError).toHaveBeenCalledWith('Failed to undo');
   });
@@ -1501,6 +1429,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError: vi.fn(),
     });
+    flushSolid();
 
     expect(startLoading).not.toHaveBeenCalled();
   });
@@ -1521,6 +1450,7 @@ describe('session-controls helpers', () => {
       stopLoading,
       setError,
     });
+    flushSolid();
 
     expect(stopLoading).toHaveBeenCalled();
     expect(setError).toHaveBeenCalledWith('unrevert failed');
@@ -1541,6 +1471,7 @@ describe('session-controls helpers', () => {
       stopLoading: vi.fn(),
       setError,
     });
+    flushSolid();
 
     expect(setError).toHaveBeenCalledWith('Failed to redo');
   });
@@ -1561,6 +1492,7 @@ describe('session-controls helpers', () => {
       getSession: () => undefined,
       stopLoading: vi.fn(),
     });
+    flushSolid();
 
     expect(startLoading).not.toHaveBeenCalled();
   });
@@ -1585,6 +1517,7 @@ describe('session-controls helpers', () => {
       getSession: () => undefined,
       stopLoading,
     });
+    flushSolid();
 
     expect(stopLoading).toHaveBeenCalled();
     expect(setSessionCompacting).toHaveBeenCalledWith('session-1', false);
@@ -1609,6 +1542,7 @@ describe('session-controls helpers', () => {
       getSession: () => undefined,
       stopLoading: vi.fn(),
     });
+    flushSolid();
 
     expect(setError).toHaveBeenCalledWith('Failed to compact session');
   });
@@ -1630,6 +1564,7 @@ describe('session-controls helpers', () => {
         session('session-1', { time: { created: 0, updated: 0, compacting: Date.now() } }),
       stopLoading: vi.fn(),
     });
+    flushSolid();
 
     // Only called once to set compacting to true; never called with false
     expect(setSessionCompacting).toHaveBeenCalledTimes(1);
@@ -1657,6 +1592,7 @@ describe('session-controls helpers', () => {
       setSessionUsageLimit: vi.fn(),
       logError: vi.fn(),
     });
+    flushSolid();
 
     expect(skipPlanSession).not.toHaveBeenCalled();
     expect(abortRemoteSession).toHaveBeenCalledTimes(3);

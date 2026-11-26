@@ -1,3 +1,4 @@
+import { ariaBoolean } from '../../lib/aria';
 import { Show } from 'solid-js';
 import { hostMetadata } from '../../host/extensions';
 import type { Agent, Provider } from '../../types';
@@ -19,6 +20,11 @@ import { AttachButton } from './AttachButton';
 import { DictationButton } from './DictationButton';
 import { BusySendMenu } from './BusySendMenu';
 import { ContextPopup, ContextUsageButton, formatContextUsageTitle } from './ContextPopup';
+import type {
+  ContextPopupModel,
+  PromptCacheActivity,
+  PromptCacheWarmingView,
+} from './ContextPopup';
 import { ProviderLimitPopup } from './ProviderLimitPopup';
 import { SendControls } from './SendControls';
 import { StopButton } from './StopButton';
@@ -56,7 +62,7 @@ type SessionTokensInfo = {
   cacheWrite: number;
 };
 
-type ToolbarSharedProps = {
+export type ToolbarSharedProps = {
   compactTight: boolean;
   inputFrameRef?: HTMLElement;
   showPermissionControl: boolean;
@@ -80,6 +86,7 @@ type ToolbarSharedProps = {
   agentPopoverRef?: HTMLDivElement | ((el: HTMLDivElement) => void);
   getAgentLabel: (agent: Agent) => string;
   getAgentDetail: (agent: Agent) => string;
+  getAgentModelLabel?: (agent: Agent) => string | null;
   onToggleAgentPicker: () => void;
   onSelectAgent: (agent: Agent) => void;
   onAgentFocusIndex: (index: number) => void;
@@ -118,10 +125,15 @@ type ToolbarSharedProps = {
   sessionCost: number | null;
   subagentTokens: SessionTokensInfo;
   subagentCount: number;
+  sessionModels: ContextPopupModel[];
+  promptCache?: PromptCacheActivity | null;
+  promptCacheWarming?: PromptCacheWarmingView | null;
+  onTogglePromptCacheWarming?: (enabled: boolean) => void;
   contextCompactDisabled: boolean;
   onToggleContextPopup: () => void;
   onCloseContextPopup: () => void;
   onCompactSession: () => void;
+  onOpenSessionUsageReport: () => void;
   showAttachmentsControl: boolean;
   onAttach: () => void;
   showStopButton: boolean;
@@ -220,11 +232,13 @@ function ComposerWarning(
       }
     >
       <span
-        class="model-selection-cost-warning"
-        classList={{ 'prompt-completion-warning': !!props.promptCompletionError }}
+        class={[
+          'model-selection-cost-warning',
+          { 'prompt-completion-warning': !!props.promptCompletionError },
+        ]}
         role="img"
         aria-label={label()}
-        tabIndex={0}
+        tabindex={0}
       >
         <UiIcon source={warningTriangleIcon} width={16} height={16} />
       </span>
@@ -281,6 +295,7 @@ export function ChatInputMainToolbar(props: ChatInputMainToolbarProps) {
             showPicker={props.showAgentPicker}
             getLabel={props.getAgentLabel}
             getDetail={props.getAgentDetail}
+            getModelLabel={props.getAgentModelLabel}
             onToggle={props.onToggleAgentPicker}
             onSelect={props.onSelectAgent}
             onFocusIndex={props.onAgentFocusIndex}
@@ -452,7 +467,7 @@ export function ChatInputMetaToolbar(props: ChatInputMetaToolbarProps) {
                 type="button"
                 class="toolbar-lsp-count"
                 aria-label={`${props.activeLspNames.length} active LSP${props.activeLspNames.length === 1 ? '' : 's'}: ${props.activeLspNames.join(', ')}`}
-                aria-expanded={props.showLspPicker}
+                aria-expanded={ariaBoolean(props.showLspPicker)}
                 onClick={props.onToggleLsps}
               >
                 <span class="toolbar-lsp-count-label">
@@ -475,7 +490,7 @@ export function ChatInputMetaToolbar(props: ChatInputMetaToolbarProps) {
                 type="button"
                 class="toolbar-mcp-count"
                 aria-label={`${props.enabledMcpCount} of ${props.availableMcpCount} MCP${props.availableMcpCount === 1 ? '' : 's'} enabled`}
-                aria-expanded={props.showMcpPicker}
+                aria-expanded={ariaBoolean(props.showMcpPicker)}
                 onClick={props.onToggleMcps}
               >
                 <span class="toolbar-mcp-count-label">
@@ -502,6 +517,7 @@ export function ChatInputMetaToolbar(props: ChatInputMetaToolbarProps) {
                 badges={props.providerLimitBadges}
                 title={props.showProviderLimitPopup ? null : props.providerLimitTitle}
                 ariaLabel={props.providerLimitTitle}
+                expanded={props.showProviderLimitPopup}
                 onClick={props.onToggleProviderLimitPopup}
               />
               <Show when={props.showProviderLimitPopup}>
@@ -567,9 +583,14 @@ export function ChatInputMetaToolbar(props: ChatInputMetaToolbarProps) {
                     subagentTokens={props.subagentTokens}
                     subagentCount={props.subagentCount}
                     model={props.currentModel}
+                    models={props.sessionModels}
+                    promptCache={props.promptCache}
+                    warming={props.promptCacheWarming}
+                    onToggleWarming={props.onTogglePromptCacheWarming}
                     compactDisabled={props.contextCompactDisabled}
                     onClose={props.onCloseContextPopup}
                     onCompact={props.onCompactSession}
+                    onOpenUsageReport={props.onOpenSessionUsageReport}
                   />
                 </Show>
               </div>

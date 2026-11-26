@@ -1,4 +1,5 @@
-import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { ariaBoolean } from '../../lib/aria';
+import { createSignal, For, onSettled, Show } from 'solid-js';
 import type { ProviderLimitStatus, ProviderLimitWindow } from '../../../shared/protocol';
 import {
   alignPopupToBoundary,
@@ -8,6 +9,7 @@ import {
 import {
   formatProviderLimitWindowReset,
   formatProviderLimitWindowValue,
+  formatProviderLimitRetry,
   getOrderedProviderLimitWindows,
   getProviderLimitWindowRemainingPercent,
   getProviderLimitWindowUsedPercent,
@@ -15,6 +17,7 @@ import {
 import { postMessage } from '../../lib/bridge';
 import { getProviderUsageLink } from '../../lib/provider-usage';
 import { isFunction } from '../../lib/runtime-values';
+import { createProviderLimitDisplay } from '../../lib/provider-limit-display';
 import { navArrowRightIcon, openNewWindowIcon } from '../../lib/ui-icons';
 import { UiIcon } from '../UiIcon';
 
@@ -30,18 +33,36 @@ export function ProviderLimitPopup(props: {
   resetsOnly?: boolean;
   onClose: () => void;
 }) {
+  const limit = createProviderLimitDisplay(() => props.limit);
   const [resetCreditsExpanded, setResetCreditsExpanded] = createSignal(false);
-  const windows = () => getOrderedProviderLimitWindows(props.limit);
-  const planName = () =>
-    props.limit?.status === 'available' ? props.limit.planName || null : null;
-  const creditBalance = () =>
-    props.limit?.status === 'available' ? props.limit.creditBalance : undefined;
+  const windows = () => getOrderedProviderLimitWindows(limit());
+  // Claude Agent quotas belong to the Claude Code subscription, so name the account source.
+  const providerName = () =>
+    limit()?.providerID === 'claude-agent' ? 'Claude Code' : props.providerName;
+  const planName = () => {
+    const current = limit();
+    return current?.status === 'available' ? current.planName || null : null;
+  };
+  const creditBalance = () => {
+    const current = limit();
+    const balance = current?.status === 'available' ? current.creditBalance : undefined;
+    return balance === 0 ? undefined : balance;
+  };
   const resetCredits = () => {
-    if (props.limit?.status !== 'available') return null;
-    const resets = props.limit.usageLimitResets;
+    const current = limit();
+    if (current?.status !== 'available') return null;
+    const resets = current.usageLimitResets;
     return resets && resets.availableCount > 0 ? resets : null;
   };
-  const resetCreditsUsageLink = () => getProviderUsageLink(props.limit?.providerID);
+  const resetCreditsUsageLink = () => getProviderUsageLink(limit()?.providerID);
+  const failureMessage = () => {
+    const current = limit();
+    if (!current) return null;
+    if (current.status !== 'available') {
+      return `${current.failureKind === 'authentication' ? 'Authentication failed. ' : ''}${current.note}`;
+    }
+    return current.stale ? `Quota data is stale. ${current.note ?? ''}` : null;
+  };
   let popupEl: HTMLDivElement | undefined;
 
   const setRef = (el: HTMLDivElement) => {
@@ -50,22 +71,31 @@ export function ProviderLimitPopup(props: {
     if (isFunction(forwarded)) forwarded(el);
   };
 
-  onMount(() => {
-    if (!popupEl) return;
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    if (!popupEl)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     const reposition = () => {
       if (!popupEl) return;
       if (props.boundaryRef)
         alignPopupToBoundary(popupEl, props.boundaryRef, props.alignTo ?? 'right');
       clampPopupToViewport(popupEl);
     };
-    onCleanup(observePopupViewport(popupEl, reposition));
+    cleanups.push(observePopupViewport(popupEl, reposition));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   return (
     <div
       ref={setRef}
-      class="provider-limit-popup"
-      classList={{ 'provider-limit-popup-resets': props.resetsOnly }}
+
+      class={['provider-limit-popup', { 'provider-limit-popup-resets': props.resetsOnly }]}
       onClick={(e) => e.stopPropagation()}
     >
       <Show when={!props.resetsOnly}>
@@ -74,13 +104,14 @@ export function ProviderLimitPopup(props: {
         </div>
 
         <Show
-          when={props.limit?.status === 'available' && windows().length > 0}
+          when={limit()?.status === 'available' && windows().length > 0}
           fallback={
             <Show when={creditBalance() === undefined}>
-              <div class="provider-limit-popup-empty">
-                {props.limit?.status === 'unsupported' || props.limit?.status === 'error'
-                  ? props.limit.note || 'Limits unavailable'
-                  : 'No active limits'}
+              <div
+                class="provider-limit-popup-empty"
+                role={failureMessage() ? 'status' : undefined}
+              >
+                {failureMessage() || 'No active limits'}
               </div>
             </Show>
           }
@@ -88,6 +119,14 @@ export function ProviderLimitPopup(props: {
           <div class="provider-limit-popup-rows">
             <For each={windows()}>{(window) => <ProviderLimitRow window={window} />}</For>
           </div>
+        </Show>
+        <Show when={limit()?.status === 'available' && failureMessage()}>
+          <div class="provider-limit-popup-empty" role="status">
+            {failureMessage()}
+          </div>
+        </Show>
+        <Show when={formatProviderLimitRetry(limit())}>
+          {(retry) => <div class="provider-limit-popup-empty">{retry()}</div>}
         </Show>
 
         <Show when={creditBalance() !== undefined}>
@@ -111,7 +150,7 @@ export function ProviderLimitPopup(props: {
                 <button
                   type="button"
                   class="provider-limit-reset-toggle"
-                  aria-expanded={resetCreditsExpanded()}
+                  aria-expanded={ariaBoolean(resetCreditsExpanded())}
                   onClick={() => setResetCreditsExpanded((expanded) => !expanded)}
                 >
                   <span>Usage limit resets ({resets().availableCount})</span>
@@ -122,6 +161,12 @@ export function ProviderLimitPopup(props: {
                     height="10"
                   />
                 </button>
+              </Show>
+              <Show when={resets().stale}>
+                <div class="provider-limit-reset-unavailable" role="status">
+                  Reset credits may be outdated. Showing cached data because the latest refresh
+                  failed.
+                </div>
               </Show>
               <Show when={props.resetsOnly || resetCreditsExpanded()}>
                 <div class="provider-limit-reset-content">
@@ -173,9 +218,9 @@ export function ProviderLimitPopup(props: {
         }}
       </Show>
 
-      <Show when={!props.resetsOnly && props.providerName}>
+      <Show when={!props.resetsOnly && providerName()}>
         <div class="provider-limit-popup-provider">
-          {props.providerName}
+          {providerName()}
           <Show when={planName()}>{(name) => <> · {name()}</>}</Show>
         </div>
       </Show>

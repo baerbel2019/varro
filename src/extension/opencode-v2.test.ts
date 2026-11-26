@@ -2,7 +2,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { FormInfo, ModelInfo, SessionMessageAssistant, SessionInfo } from '@opencode/client';
+import type {
+  FormInfo,
+  ModelInfo,
+  SessionMessageAssistant,
+  SessionMessageUser,
+  SessionInfo,
+} from '@opencode/client';
 import { OpenCodeStartupOutput, openCodeApiVersion } from './opencode-connection';
 import {
   projectV2Message,
@@ -21,12 +27,46 @@ import { asRecord } from '../shared/type-utils';
 import type { UnknownRecord } from '../shared/type-utils';
 import { parseServerEvent } from '../shared/protocol';
 import { parseHealthResponse } from '../shared/health';
+import { isPermissionRejectedToolError } from '../shared/error-classification';
 import { normalizeRecycleBinSession } from '../shared/recycle-bin';
 import { formatSkillAttachment } from '../shared/skill-reference';
+import { pastedTextDataUrl } from '../shared/pasted-text';
+import { appendPromptTextAttachments } from '../shared/prompt-text-attachments';
 import { nativePdfFixture } from '../shared/native-pdf.test-support';
 
 vi.mock('./logger', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 afterEach(() => vi.unstubAllGlobals());
+
+describe('configured permission ordering', () => {
+  it('preserves permissions from every document in priority order, including agent rules', async () => {
+    const globalRule = { action: 'shell', resource: 'git *', effect: 'allow' };
+    const projectRule = { action: 'shell', resource: 'git push*', effect: 'deny' };
+    const globalAgentRule = { action: 'shell', resource: 'git reset*', effect: 'ask' };
+    const projectAgentRule = { action: 'edit', resource: '*', effect: 'deny' };
+    const adapter = new OpenCodeV2Adapter(async () => [
+      {
+        info: {
+          permissions: [globalRule],
+          agents: { build: { permissions: [globalAgentRule] } },
+        },
+      },
+      {
+        info: {
+          permissions: [projectRule],
+          agents: { build: { permissions: [projectAgentRule] } },
+        },
+      },
+    ]);
+    expect(await adapter.request('GET', '/config', undefined)).toMatchObject({
+      permissions: [globalRule, projectRule],
+      permission: [
+        { permission: 'bash', pattern: 'git *', action: 'allow' },
+        { permission: 'bash', pattern: 'git push*', action: 'deny' },
+      ],
+      agents: { build: { permissions: [globalAgentRule, projectAgentRule] } },
+    });
+  });
+});
 
 describe('saved project worktree inventory', () => {
   it('reads the native bare worktree inventory without loading a destination location', async () => {
@@ -410,6 +450,68 @@ describe('v2 prompt delivery', () => {
       expect(wire).toHaveBeenCalledTimes(2);
     }
   );
+
+  it('sends pasted text and annotations inside the prompt so compaction keeps them', async () => {
+    const wire = vi.fn(async () => ({ data: { id: 'ses_paste' } }));
+    const adapter = new OpenCodeV2Adapter(wire);
+    const annotation = 'Chat annotation\n\nSelected text:\n> passage\n\nComment:\nКак так?';
+    await adapter.request('POST', '/session/ses_paste/prompt_async', {
+      parts: [
+        { type: 'text', text: 'Check @annotation-a781acb7.txt' },
+        {
+          type: 'file',
+          mime: 'text/plain',
+          filename: 'annotation-a781acb7.txt',
+          url: pastedTextDataUrl(annotation),
+        },
+        {
+          type: 'file',
+          mime: 'image/png',
+          url: 'data:image/png;base64,aGVsbG8=',
+          filename: 'a.png',
+        },
+      ],
+      noReply: true,
+    });
+    expect(wire).toHaveBeenLastCalledWith(
+      'POST',
+      '/api/session/ses_paste/prompt',
+      expect.objectContaining({
+        text: appendPromptTextAttachments('Check @annotation-a781acb7.txt', [
+          { name: 'annotation-a781acb7.txt', text: annotation },
+        ]),
+        files: [{ uri: 'data:image/png;base64,aGVsbG8=', name: 'a.png' }],
+      }),
+      expect.anything()
+    );
+  });
+
+  it('projects prompt text attachments back to file parts', () => {
+    const annotation = 'Chat annotation\n\nSelected text:\n> passage\n\nComment:\nnote';
+    const user: SessionMessageUser = {
+      id: 'msg_paste',
+      type: 'user',
+      text: appendPromptTextAttachments('Check @annotation-a781acb7.txt', [
+        { name: 'annotation-a781acb7.txt', text: annotation },
+      ]),
+      time: { created: 1 },
+      files: [{ data: 'aGVsbG8=', mime: 'image/png', name: 'a.png', source: { type: 'inline' } }],
+      agents: [{ name: 'explore' }],
+    };
+    const projected = projectV2Message(user, 'ses_paste');
+    expect(projected.parts).toMatchObject([
+      { id: 'msg_paste:content:0', type: 'text', text: 'Check @annotation-a781acb7.txt' },
+      { id: 'msg_paste:content:1', type: 'file', filename: 'a.png' },
+      {
+        id: 'msg_paste:content:2',
+        type: 'file',
+        mime: 'text/plain',
+        filename: 'annotation-a781acb7.txt',
+        url: pastedTextDataUrl(annotation),
+      },
+      { id: 'msg_paste:content:3', type: 'agent', name: 'explore' },
+    ]);
+  });
 
   it('keeps unbacked skill markers and attachment examples as plain text', async () => {
     const wire = vi.fn(async () => ({ data: { id: 'ses_skills' } }));
@@ -1624,7 +1726,32 @@ describe('v2 provider refresh', () => {
   });
 });
 
-describe('v2 agent icon options', () => {
+describe('v2 agent catalog', () => {
+  it.each([
+    ['omitted', {}, [{ permission: 'edit', pattern: '*', action: 'deny' }]],
+    ['explicitly empty', { permissions: [] }, []],
+  ])('uses the expected rules when config permissions are %s', async (_, config, expected) => {
+    const adapter = new OpenCodeV2Adapter(async (_method, path) => {
+      if (path === '/api/agent')
+        return {
+          data: [
+            {
+              id: 'review',
+              mode: 'subagent',
+              permissions: [{ action: 'edit', resource: '*', effect: 'deny' }],
+              request: {},
+            },
+          ],
+        };
+      if (path === '/api/config') return [{ info: { agents: { review: config } } }];
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    expect(await adapter.request('GET', '/agent', undefined)).toMatchObject([
+      { name: 'review', permission: expected },
+    ]);
+  });
+
   it('merges configured icons into resolved and config-only agents', async () => {
     const adapter = new OpenCodeV2Adapter(async (_method, path) => {
       if (path === '/api/agent')
@@ -2970,6 +3097,68 @@ describe('v2 transcript and permission projection', () => {
     ]);
   });
 
+  it('sends rejection feedback with the V1 rejection wording and drops it for approvals', async () => {
+    const bodies: unknown[] = [];
+    const adapter = new OpenCodeV2Adapter(async (_method, path, body) => {
+      if (path.endsWith('/reply')) {
+        bodies.push(body);
+        return undefined;
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    for (const [id, reply, feedback] of [
+      ['perm_reject', 'reject', '  Use the existing helper instead.  '],
+      ['perm_blank', 'reject', '   '],
+      ['perm_once', 'once', 'ignored'],
+    ] as const) {
+      adapter.observe('permission.asked', { id, sessionID: 'ses_child' });
+      await adapter.request('POST', `/permission/${id}/reply`, { reply, message: feedback });
+    }
+
+    expect(bodies).toEqual([
+      {
+        decision: 'reject',
+        message:
+          'The user rejected permission to use this specific tool call with the following feedback: Use the existing helper instead.',
+      },
+      { decision: 'reject', message: undefined },
+      { decision: 'once', message: undefined },
+    ]);
+    expect(
+      isPermissionRejectedToolError({
+        status: 'error',
+        error: String(asRecord(bodies[0])?.message),
+      })
+    ).toBe(true);
+  });
+
+  it('commits a staged rewind and returns the refreshed session', async () => {
+    const calls: string[] = [];
+    const adapter = new OpenCodeV2Adapter(async (method, path) => {
+      calls.push(`${method} ${path}`);
+      if (method === 'POST' && path === '/api/session/ses_one/revert/commit') return undefined;
+      if (method === 'GET' && path === '/api/session/ses_one')
+        return {
+          data: {
+            id: 'ses_one',
+            projectID: 'project-1',
+            location: { directory: '/repo' },
+            title: 'Session',
+            time: { created: 1, updated: 2 },
+          },
+        };
+      return { data: [] };
+    });
+
+    await expect(
+      adapter.request('POST', '/session/ses_one/revert-commit', undefined)
+    ).resolves.toMatchObject({ id: 'ses_one' });
+    expect(calls.slice(0, 2)).toEqual([
+      'POST /api/session/ses_one/revert/commit',
+      'GET /api/session/ses_one',
+    ]);
+  });
+
   it.each([true, undefined])(
     'preserves optional paste=%s for MCP OAuth and forwards redirect URLs',
     async (paste) => {
@@ -3134,5 +3323,64 @@ describe('v2 transcript and permission projection', () => {
       metadata,
     });
     await expect(state.read('../escape')).rejects.toThrow('Invalid OpenCode session ID');
+  });
+});
+
+describe('OpenCodeV2Adapter turn diffs', () => {
+  it.each([
+    ['the user prompt that opened an assistant reply', 'msg_assistant', '?from=msg_user'],
+    ['a requested user prompt', 'msg_user', '?from=msg_user'],
+    ['an older message outside the recent page as given', 'msg_old', '?from=msg_old'],
+  ])('anchors a diff on %s', async (_label, messageID, query) => {
+    const wire = vi.fn(async (_method: string, path: string) => {
+      if (path.startsWith('/api/session/ses_one/message?'))
+        return {
+          data: [
+            { id: 'msg_assistant', type: 'assistant' },
+            { id: 'msg_user', type: 'user' },
+            { id: 'msg_previous', type: 'assistant' },
+          ],
+          cursor: {},
+        };
+      if (path.startsWith('/api/session/ses_one/diff')) return { data: [{ file: 'a.ts' }] };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const adapter = new OpenCodeV2Adapter(wire);
+
+    await expect(
+      adapter.request('GET', `/session/ses_one/diff?messageID=${messageID}`, undefined)
+    ).resolves.toEqual([{ file: 'a.ts' }]);
+
+    expect(wire).toHaveBeenCalledWith(
+      'GET',
+      '/api/session/ses_one/message?limit=200&order=desc',
+      undefined,
+      expect.anything()
+    );
+    expect(wire).toHaveBeenCalledWith(
+      'GET',
+      `/api/session/ses_one/diff${query}`,
+      undefined,
+      expect.anything()
+    );
+  });
+});
+
+describe('OpenCodeV2Adapter turn diffs without an anchor', () => {
+  it('returns no diff for a reply whose opening prompt is outside the scanned page', async () => {
+    const wire = vi.fn(async (_method: string, path: string) => {
+      if (path.startsWith('/api/session/ses_one/message?'))
+        return { data: [{ id: 'msg_assistant', type: 'assistant' }], cursor: {} };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+
+    await expect(
+      new OpenCodeV2Adapter(wire).request(
+        'GET',
+        '/session/ses_one/diff?messageID=msg_assistant',
+        undefined
+      )
+    ).resolves.toEqual([]);
+    expect(wire.mock.calls.some(([, path]) => path.includes('/diff'))).toBe(false);
   });
 });

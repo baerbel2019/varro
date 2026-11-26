@@ -6,6 +6,7 @@ type ApiRequestPayload = Extract<WebviewMessage, { type: 'api/request' }>['paylo
 type ApiCancelPayload = Extract<WebviewMessage, { type: 'api/cancel' }>['payload'];
 type ConfigUpdatePayload = Extract<WebviewMessage, { type: 'config/update' }>['payload'];
 type CommandStatePayload = Extract<WebviewMessage, { type: 'commands/state' }>['payload'];
+export type CommandHistoryState = { canNavigateBack: boolean; canNavigateForward: boolean };
 type DroppedContentFile = Extract<
   WebviewMessage,
   { type: 'files/drop-content' }
@@ -63,7 +64,8 @@ export interface MessageRouterCallbacks {
     canSwitchSessions: boolean,
     model: CommandStatePayload['model'],
     sessionId?: string | null,
-    modelVisible?: boolean
+    modelVisible?: boolean,
+    history?: CommandHistoryState
   ): void;
   acknowledgeSessionSeen(sessionId: string): void;
   updateSessionReadState(sessionId: string, seenAt: number): Promise<void>;
@@ -96,6 +98,7 @@ export interface MessageRouterCallbacks {
   ): void;
   exportSession(sessionId: string, directory?: string): Promise<void>;
   generateUsageReport(includeAllTime: boolean): Promise<void>;
+  generateSessionUsageReport(sessionId: string, directory?: string): Promise<void>;
   reloadWebview(): Promise<void>;
   openFolder(
     payload?: Extract<WebviewMessage, { type: 'vscode/open-folder' }>['payload']
@@ -129,6 +132,9 @@ export interface MessageRouterCallbacks {
   handleApiRequest(payload: ApiRequestPayload): Promise<void>;
   cancelApiRequest(payload: ApiCancelPayload): void;
   handleRalphMessage(msg: RalphMessage): void;
+  handleWarmingMessage(
+    msg: Extract<WebviewMessage, { type: 'warming/sync' | 'warming/set' | 'warming/samples' }>
+  ): void;
   updateQueuedMessages(payload: QueuedMessagesPayload): Promise<void>;
   claimQueuedMessage(
     payload: Extract<WebviewMessage, { type: 'queued-messages/claim' }>['payload']
@@ -210,7 +216,11 @@ export class MessageRouter {
             msg.payload.canSwitchSessions,
             msg.payload.model,
             msg.payload.sessionId,
-            msg.payload.modelVisible
+            msg.payload.modelVisible,
+            {
+              canNavigateBack: msg.payload.canNavigateBack === true,
+              canNavigateForward: msg.payload.canNavigateForward === true,
+            }
           );
           break;
         case 'session/seen':
@@ -301,6 +311,14 @@ export class MessageRouter {
         case 'usage/report':
           await this.callbacks.generateUsageReport(msg.payload.includeAllTime);
           break;
+        case 'usage/session-report':
+          await (msg.payload.directory
+            ? this.callbacks.generateSessionUsageReport(
+                msg.payload.sessionId,
+                msg.payload.directory
+              )
+            : this.callbacks.generateSessionUsageReport(msg.payload.sessionId));
+          break;
         case 'webview/reload':
           await this.callbacks.reloadWebview();
           break;
@@ -384,6 +402,11 @@ export class MessageRouter {
         case 'ralph/update-model':
         case 'ralph/sync':
           this.callbacks.handleRalphMessage(msg);
+          break;
+        case 'warming/sync':
+        case 'warming/set':
+        case 'warming/samples':
+          this.callbacks.handleWarmingMessage(msg);
           break;
         case 'log':
           this.handleLogMessage(msg);

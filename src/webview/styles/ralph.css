@@ -264,26 +264,9 @@
   cursor: not-allowed;
 }
 
-.ralph-form-stepper-button + .ralph-form-stepper-input {
-  border-left: 1px solid var(--color-vscode-border);
-}
-
+.ralph-form-stepper-button + .ralph-form-stepper-input,
 .ralph-form-stepper-input + .ralph-form-stepper-button {
   border-left: 1px solid var(--color-vscode-border);
-}
-
-.ralph-form-checkboxes {
-  display: flex;
-  gap: 14px;
-  align-items: center;
-}
-
-.ralph-form-checkbox {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  cursor: pointer;
 }
 
 .ralph-form-toggle {
@@ -425,11 +408,19 @@
     padding-inline: var(--chat-horizontal-padding);
   }
 
+  /* Both-edge gutters keep the track centered, so it only needs to give back the
+     gutter space the fixed header does not reserve once the capped width no longer fits. */
   .ralph-dashboard-list-track {
-    padding-left: var(--chat-horizontal-padding);
-    padding-right: max(
+    padding-inline: max(
       0px,
-      calc(var(--chat-horizontal-padding) - var(--ralph-dashboard-scrollbar-inset))
+      calc(
+        var(--chat-horizontal-padding) -
+          clamp(
+            0px,
+            (var(--chat-content-max-width) - 100%) / 2,
+            var(--ralph-dashboard-scrollbar-inset) / 2
+          )
+      )
     );
   }
 }
@@ -757,12 +748,7 @@
   border-color: color-mix(in srgb, var(--color-vscode-success) 45%, transparent);
 }
 
-.ralph-iter-status-failed {
-  color: var(--color-vscode-error);
-  background: color-mix(in srgb, var(--color-vscode-error) 16%, transparent);
-  border-color: color-mix(in srgb, var(--color-vscode-error) 45%, transparent);
-}
-
+.ralph-iter-status-failed,
 .ralph-iter-status-error {
   color: var(--color-vscode-error);
   background: color-mix(in srgb, var(--color-vscode-error) 16%, transparent);
@@ -770,12 +756,7 @@
 }
 
 .ralph-iter-status-unverified,
-.ralph-iter-status-pending {
-  color: var(--color-vscode-muted);
-  background: color-mix(in srgb, var(--color-vscode-fg) 6%, transparent);
-  border-color: color-mix(in srgb, var(--color-vscode-fg) 14%, transparent);
-}
-
+.ralph-iter-status-pending,
 .ralph-iter-status-aborted {
   color: var(--color-vscode-muted);
   background: color-mix(in srgb, var(--color-vscode-fg) 6%, transparent);
@@ -788,15 +769,6 @@
   font-size: 11px;
   color: var(--color-vscode-muted);
   white-space: nowrap;
-}
-
-.ralph-iter-files {
-  max-width: min(320px, 100%);
-  font-size: 11px;
-  color: var(--color-vscode-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .ralph-iter-tokens {
@@ -814,6 +786,9 @@
   container-type: inline-size;
   flex: 1 1 auto;
   min-width: 0;
+  /* The track pads by the fade width; pull the leading edge into the row gap so
+     the first pill keeps its spacing and is never faded while at rest. */
+  margin-left: calc(var(--space-6) * -1);
   overflow-x: hidden;
   overflow-y: hidden;
   white-space: nowrap;
@@ -839,6 +814,7 @@
   display: inline-flex;
   gap: 4px;
   min-width: max-content;
+  padding-inline: var(--space-6);
   animation: ralph-verdict-marquee 14s linear infinite alternate;
 }
 

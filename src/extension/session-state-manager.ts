@@ -74,6 +74,11 @@ export type RecoverySnapshot = {
 export type BlockingRequestReplayOptions = {
   previousRequests?: BlockingRequestSnapshot[];
   clearResolvedEmbedded?: boolean;
+  /**
+   * Embedded requests that may only have lost catalog visibility. While still pending on the
+   * host they are not resolved, so no synthetic reply is sent for them.
+   */
+  keepPendingRequestIds?: ReadonlySet<string>;
   workspacePath?: string | null;
   workspaceDirectory?: string | null;
   workspaceDirectoryIsOpenRoot?: boolean;
@@ -123,6 +128,11 @@ export interface SessionStateListener {
   /** Called when routing learns or changes a session's workspace directory. */
   onSessionDirectoryChange?(): void;
   onSessionMetadata?(session: Record<string, unknown>): void;
+  /**
+   * Whether an open root's session catalog authorizes a session outside its exact folder,
+   * such as a nested folder, project worktree, or moved conversation.
+   */
+  isCatalogSessionInWorkspace?(sessionID: string, workspacePath: string): boolean;
 }
 
 export interface NotificationGate {
@@ -155,6 +165,10 @@ export class SessionStateManager {
   private readonly serverBusySessions = new Set<string>();
   private readonly completedSessions = new Set<string>();
   private readonly completedSessionMarkers = new Map<string, number>();
+  private readonly lastAnnouncedCompletions = new Map<
+    string,
+    TerminalEvidence & { observedAt: number }
+  >();
   private readonly acknowledgedCompletedRoots: Map<string, AcknowledgedCompletionMarkers>;
   private readonly failedSessions = new Set<string>();
   private readonly failedSessionMarkers = new Map<string, number>();
@@ -172,7 +186,6 @@ export class SessionStateManager {
   };
   private readonly questionResponsePendingRequests = new Map<string, string>();
   private readonly deferredPermissionAttention = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly trailingBusyAfterCompletion = new Set<string>();
   private readonly trailingTerminalsWhileBusy = new Map<string, TerminalWave>();
   private readonly serverBusyTerminalEvidence = new Map<string, TerminalEvidence>();
   private readonly blockingRequestMutations = new Set<string>();
@@ -444,6 +457,29 @@ export class SessionStateManager {
     return !workspaceDirectoryIsOpenRoot || this.workspaceScopeFor(sessionID) === 'workspace';
   }
 
+  /**
+   * Visibility for presenting pending attention: the exact workspace rules plus sessions the
+   * workspace's session catalog authorizes. Snapshot omission handling keeps the narrower rule.
+   */
+  isSessionAttentionVisibleInWorkspace(
+    sessionID: string,
+    workspacePath: string | null | undefined,
+    workspaceDirectory: string | null | undefined,
+    workspaceDirectoryIsOpenRoot: boolean
+  ): boolean {
+    return (
+      this.isSessionVisibleInWorkspace(
+        sessionID,
+        workspacePath,
+        workspaceDirectory,
+        workspaceDirectoryIsOpenRoot
+      ) ||
+      Boolean(
+        workspacePath && this.listener.isCatalogSessionInWorkspace?.(sessionID, workspacePath)
+      )
+    );
+  }
+
   workspaceScopeFor(sessionID: string): SessionWorkspaceScope {
     for (const lineageSessionID of this.sessionLineageFor(sessionID)) {
       const scope = this.sessionWorkspaceScopes.get(lineageSessionID);
@@ -473,23 +509,24 @@ export class SessionStateManager {
     }
   }
 
-  removeSessionsOutsideWorkspaceDirectories(workspaceDirectories: readonly string[]): string[] {
+  /**
+   * Drops sessions outside the open folders. `retain` keeps sessions whose owning root is
+   * still open through its session catalog, such as worktrees and moved conversations.
+   */
+  removeSessionsOutsideWorkspaceDirectories(
+    workspaceDirectories: readonly string[],
+    retain?: (sessionID: string) => boolean
+  ): string[] {
     const removed = [...this.sessionDirectories]
-      .filter(([, directory]) =>
-        workspaceDirectories.every(
-          (workspaceDirectory) => !isSameWorkspacePath(directory, workspaceDirectory)
-        )
+      .filter(
+        ([sessionID, directory]) =>
+          workspaceDirectories.every(
+            (workspaceDirectory) => !isSameWorkspacePath(directory, workspaceDirectory)
+          ) && !retain?.(sessionID)
       )
       .map(([sessionID]) => sessionID);
     this.removeSessions(removed);
     return removed;
-  }
-
-  clearCompleted(): void {
-    if (this.completedSessions.size === 0) return;
-    this.completedSessions.clear();
-    this.completedSessionMarkers.clear();
-    this.listener.onStatusChange();
   }
 
   clearCompletedInWorkspace(workspacePath: string | null | undefined): void {
@@ -556,7 +593,7 @@ export class SessionStateManager {
   markSessionBusy(sessionID: string): SessionBusyAttempt | undefined {
     if (!sessionID) return undefined;
     this.touchSessionMetadata(sessionID);
-    this.trailingBusyAfterCompletion.delete(sessionID);
+    this.lastAnnouncedCompletions.delete(sessionID);
     const attempt = { sessionID, id: ++this.nextBusyAttemptID };
     this.addBusyGeneration(sessionID, attempt.id);
     if (this.markBusyInternal(sessionID)) {
@@ -646,14 +683,7 @@ export class SessionStateManager {
         const statusType = getString(asRecord(props?.status)?.type);
         if (!sessionID || !statusType) break;
         this.clearQuestionResponsePending(sessionID);
-        if (
-          statusType === 'busy' &&
-          this.trailingBusyAfterCompletion.delete(sessionID) &&
-          asRecord(props?.status)?.background !== true
-        )
-          break;
         if (statusType === 'busy' || statusType === 'retry') {
-          this.trailingBusyAfterCompletion.delete(sessionID);
           this.serverBusySessions.add(sessionID);
           this.addServerBusyGeneration(sessionID);
           changed = this.markBusyInternal(sessionID) || changed;
@@ -705,11 +735,20 @@ export class SessionStateManager {
           ) || changed;
         break;
       }
+      case 'session.next.prompted':
       case 'session.next.prompt.admitted': {
         const sessionID = getString(props?.sessionID);
         if (sessionID) {
-          this.trailingBusyAfterCompletion.delete(sessionID);
-          this.serverBusyTerminalEvidence.delete(sessionID);
+          if (type === 'session.next.prompt.admitted')
+            this.serverBusyTerminalEvidence.delete(sessionID);
+          const completion = this.lastAnnouncedCompletions.get(sessionID);
+          const promptedAt = getNumber(props?.timestamp);
+          if (
+            promptedAt === undefined ||
+            completion?.completedAt === undefined ||
+            promptedAt > completion.completedAt
+          )
+            this.lastAnnouncedCompletions.delete(sessionID);
         }
         break;
       }
@@ -723,7 +762,6 @@ export class SessionStateManager {
         const sessionID = getString(props?.sessionID);
         if (!sessionID) break;
         this.clearQuestionResponsePending(sessionID);
-        this.trailingBusyAfterCompletion.delete(sessionID);
         const error = asRecord(props?.error);
         changed =
           (error && isAbortedErrorRecord(error)
@@ -754,8 +792,16 @@ export class SessionStateManager {
 
         if (getString(info?.role) !== 'assistant') {
           if (getString(info?.role) === 'user') {
-            this.trailingBusyAfterCompletion.delete(sessionID);
             this.noteSuccessorProgress(sessionID);
+            // V1 can deliver the new user message without a prompt admission event.
+            const previous = this.lastAnnouncedCompletions.get(sessionID);
+            const createdAt = getNumber(asRecord(info?.time)?.created);
+            if (
+              previous &&
+              createdAt !== undefined &&
+              createdAt > (previous.completedAt ?? previous.observedAt)
+            )
+              this.lastAnnouncedCompletions.delete(sessionID);
           }
           break;
         }
@@ -925,18 +971,14 @@ export class SessionStateManager {
       }
       return {
         interruptedSessions: this.claimInterruptedSessions(),
-        blockingRequests: this.getLiveBlockingRequestSnapshots(),
+        blockingRequests: this.getBlockingRequestSnapshots(),
       };
     });
     this.recoverySnapshotPromise = operation;
-    void operation.then(
-      () => {
-        if (this.recoverySnapshotPromise === operation) this.recoverySnapshotPromise = undefined;
-      },
-      () => {
-        if (this.recoverySnapshotPromise === operation) this.recoverySnapshotPromise = undefined;
-      }
-    );
+    const clear = () => {
+      if (this.recoverySnapshotPromise === operation) this.recoverySnapshotPromise = undefined;
+    };
+    void operation.then(clear, clear);
     return operation;
   }
 
@@ -960,10 +1002,15 @@ export class SessionStateManager {
     };
   }
 
+  /**
+   * Applies a pending snapshot. `coveredSessionIDs` names catalog sessions outside the exact
+   * workspace whose directories the snapshot queried, so their omissions also count as resolved.
+   */
   reconcilePendingAttention(
     kind: PendingAttentionKind,
     requests: readonly unknown[],
-    reconciliation: PendingAttentionReconciliation = this.beginPendingAttentionReconciliation(kind)
+    reconciliation: PendingAttentionReconciliation = this.beginPendingAttentionReconciliation(kind),
+    coveredSessionIDs?: ReadonlySet<string>
   ): void {
     try {
       if (reconciliation.kind !== kind) {
@@ -989,7 +1036,8 @@ export class SessionStateManager {
         mutationRevision,
         reconciliation.workspacePath,
         reconciliation.workspaceDirectory,
-        reconciliation.workspaceDirectoryIsOpenRoot ?? false
+        reconciliation.workspaceDirectoryIsOpenRoot ?? false,
+        coveredSessionIDs
       );
     } finally {
       this.finishPendingAttentionReconciliation(reconciliation);
@@ -1009,7 +1057,8 @@ export class SessionStateManager {
     startedAtRevision: number,
     workspacePath?: string,
     workspaceDirectory?: string,
-    workspaceDirectoryIsOpenRoot = false
+    workspaceDirectoryIsOpenRoot = false,
+    coveredSessionIDs?: ReadonlySet<string>
   ): void {
     const snapshotCandidates = requests
       .map((value) => {
@@ -1033,6 +1082,7 @@ export class SessionStateManager {
       if (request.kind !== kind || snapshotIDs.has(id)) continue;
       if (
         workspacePath &&
+        !coveredSessionIDs?.has(request.sessionID) &&
         !this.isSessionVisibleInWorkspace(
           request.sessionID,
           workspacePath,
@@ -1163,7 +1213,7 @@ export class SessionStateManager {
       .filter(
         (item) =>
           !hiddenSessionIds.has(item.sessionID) &&
-          this.isSessionVisibleInWorkspace(
+          this.isSessionAttentionVisibleInWorkspace(
             item.sessionID,
             options?.workspacePath,
             options?.workspaceDirectory,
@@ -1175,6 +1225,9 @@ export class SessionStateManager {
     if (options?.clearResolvedEmbedded) {
       for (const item of options.previousRequests || []) {
         if (hiddenSessionIds.has(item.sessionID) || currentRequestIds.has(item.id)) continue;
+        if (options.keepPendingRequestIds?.has(item.id) && this.pendingAttention.has(item.id)) {
+          continue;
+        }
         if (item.kind === 'question') {
           post({
             type: 'server/event',
@@ -1277,28 +1330,6 @@ export class SessionStateManager {
   }
 
   private getBlockingRequestSnapshots(): BlockingRequestSnapshot[] {
-    return [...this.pendingAttention.entries()]
-      .map(([id, request]) => {
-        const snapshot: BlockingRequestSnapshot = {
-          id,
-          sessionID: request.sessionID,
-          kind: request.kind,
-          props: this.serializeBlockingRequestProps(request.kind, request.props),
-          directory: trimOptionalString(
-            request.directory || this.getSessionMetadata(this.sessionDirectories, request.sessionID)
-          ),
-        };
-        if (request.eventType) snapshot.eventType = request.eventType;
-        if (this.workspaceScopeFor(request.sessionID) === 'workspace') {
-          snapshot.workspaceScope = 'workspace';
-        }
-        return snapshot;
-      })
-      .toSorted((a, b) => a.id.localeCompare(b.id))
-      .slice(0, MAX_PERSISTED_BLOCKING_REQUESTS);
-  }
-
-  private getLiveBlockingRequestSnapshots(): BlockingRequestSnapshot[] {
     return [...this.pendingAttention.entries()]
       .map(([id, request]) => {
         const snapshot: BlockingRequestSnapshot = {
@@ -1505,7 +1536,6 @@ export class SessionStateManager {
     const label =
       kind === 'question' ? describeQuestionRequest(props) : describePermissionRequest(props);
     this.clearBusy(sessionID);
-    this.trailingBusyAfterCompletion.delete(sessionID);
     const pending: PendingAttentionEntry = {
       sessionID,
       kind,
@@ -1540,7 +1570,7 @@ export class SessionStateManager {
     changed = this.unclaimedInterruptedSessions.delete(sessionID) || changed;
     this.busyStartedAt.delete(sessionID);
     this.busyEvidenceRevisions.delete(sessionID);
-    this.trailingBusyAfterCompletion.delete(sessionID);
+    this.lastAnnouncedCompletions.delete(sessionID);
     this.trailingTerminalsWhileBusy.delete(sessionID);
     this.serverBusyTerminalEvidence.delete(sessionID);
     this.clearQuestionResponsePending(sessionID);
@@ -1792,8 +1822,34 @@ export class SessionStateManager {
     }
 
     this.clearBusy(sessionID);
+    const previous = this.lastAnnouncedCompletions.get(sessionID);
+    const hasDistinctAssistant =
+      evidence.messageID !== undefined &&
+      previous?.messageID !== undefined &&
+      evidence.messageID !== previous.messageID &&
+      (evidence.completedAt === undefined ||
+        previous.completedAt === undefined ||
+        evidence.completedAt > previous.completedAt);
+    const hasNewerCompletion =
+      evidence.completedAt !== undefined &&
+      previous?.completedAt !== undefined &&
+      evidence.completedAt > previous.completedAt &&
+      (evidence.messageID === undefined || evidence.messageID !== previous.messageID);
+    if (previous && !hasDistinctAssistant && !hasNewerCompletion) {
+      // A status-only resume still updates the UI. It doesn't announce the same turn again.
+      this.addCompletedSession(sessionID, previous.completedAt);
+      this.setSessionMetadata(this.lastAnnouncedCompletions, sessionID, {
+        messageID: previous.messageID ?? evidence.messageID,
+        completedAt: previous.completedAt ?? evidence.completedAt,
+        observedAt: previous.observedAt,
+      });
+      return true;
+    }
     this.addCompletedSession(sessionID, evidence.completedAt);
-    this.trailingBusyAfterCompletion.add(sessionID);
+    this.setSessionMetadata(this.lastAnnouncedCompletions, sessionID, {
+      ...evidence,
+      observedAt: Date.now(),
+    });
     this.listener.onSessionCompleted?.(
       sessionID,
       this.isPlanSession(sessionID) ? 'plan-ready' : 'completed'
@@ -2022,11 +2078,7 @@ export class SessionStateManager {
       kind === 'question' ? 'Varro is waiting for your input' : 'Varro needs permission approval';
     const message = `${prefix}${this.describeSessionSuffix(sessionID)}.`;
 
-    void vscode.window.showWarningMessage(message, 'Open Chat').then((action) => {
-      if (action === 'Open Chat') {
-        void vscode.commands.executeCommand('varro.chat.focusInput');
-      }
-    });
+    void vscode.window.showWarningMessage(message, 'Open Chat').then(focusChatOnOpenChat);
   }
 
   private showCompletionNotification(sessionID: string): void {
@@ -2034,11 +2086,7 @@ export class SessionStateManager {
     if (!this.notificationGate.shouldShow(sessionID)) return;
 
     const message = `Varro has a plan ready for review${this.describeSessionSuffix(sessionID)}.`;
-    void vscode.window.showInformationMessage(message, 'Open Chat').then((action) => {
-      if (action === 'Open Chat') {
-        void vscode.commands.executeCommand('varro.chat.focusInput');
-      }
-    });
+    void vscode.window.showInformationMessage(message, 'Open Chat').then(focusChatOnOpenChat);
   }
 
   private showFailureNotification(sessionID: string, detail: string | undefined): void {
@@ -2048,12 +2096,12 @@ export class SessionStateManager {
     const message = detail?.trim()
       ? `Varro hit an error${suffix}: ${detail.trim()}`
       : `Varro hit an error${suffix}.`;
-    void vscode.window.showErrorMessage(message, 'Open Chat').then((action) => {
-      if (action === 'Open Chat') {
-        void vscode.commands.executeCommand('varro.chat.focusInput');
-      }
-    });
+    void vscode.window.showErrorMessage(message, 'Open Chat').then(focusChatOnOpenChat);
   }
+}
+
+function focusChatOnOpenChat(action: string | undefined): void {
+  if (action === 'Open Chat') void vscode.commands.executeCommand('varro.chat.focusInput');
 }
 
 export function describeQuestionRequest(props: Record<string, unknown>): string {

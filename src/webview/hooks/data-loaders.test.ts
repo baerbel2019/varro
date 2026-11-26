@@ -1,3 +1,5 @@
+import { flush as flushSolid } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProviderLimitStatus, RecycleBinEntry } from '../../shared/protocol';
 import type { Agent, Command, Provider, QuestionRequest, Session, SessionStatus } from '../types';
@@ -30,6 +32,7 @@ import {
   loadWorkspaceStatusesWithDependencies,
   refreshProviderLimitWithDependencies,
 } from './data-loaders';
+import { deferred } from '../test-fixtures';
 
 const buildAgent = (name: string): Agent => ({
   name,
@@ -110,14 +113,6 @@ function createStateBoundLoader() {
   });
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
-}
-
 describe('data loaders', () => {
   const activationError = () => new Error('503 Location plugins did not finish activating');
 
@@ -136,10 +131,13 @@ describe('data loaders', () => {
     const operations = createDataLoaderOperations(deps);
     const startup = operations.loadEssentialSnapshots({ onWaitingForPlugins });
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
     expect(onWaitingForPlugins).toHaveBeenLastCalledWith(true);
     expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1000);
+    flushSolid();
     await expect(startup).resolves.toEqual({ state: 'loaded', failed: [] });
+    flushSolid();
     expect(deps.listProviders).toHaveBeenCalledTimes(3);
     expect(deps.listAgents).toHaveBeenCalledOnce();
     expect(deps.listCommands).toHaveBeenCalledOnce();
@@ -158,15 +156,19 @@ describe('data loaders', () => {
     const operations = createDataLoaderOperations(deps);
     const startup = operations.loadEssentialSnapshots({ onWaitingForPlugins });
     await vi.advanceTimersByTimeAsync(59_999);
+    flushSolid();
     expect(onWaitingForPlugins).toHaveBeenLastCalledWith(true);
     await vi.advanceTimersByTimeAsync(1);
+    flushSolid();
     await expect(startup).resolves.toEqual({
       state: 'failed',
       failed: ['routing catalogs'],
       error: '503 Location plugins did not finish activating',
     });
+    flushSolid();
     const calls = vi.mocked(deps.listProviders).mock.calls.length;
     await vi.advanceTimersByTimeAsync(60_000);
+    flushSolid();
     expect(deps.listProviders).toHaveBeenCalledTimes(calls);
     expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
     expect(onWaitingForPlugins).toHaveBeenLastCalledWith(false);
@@ -189,14 +191,18 @@ describe('data loaders', () => {
     const operations = createDataLoaderOperations(deps);
     const startup = operations.loadEssentialSnapshots();
     await vi.advanceTimersByTimeAsync(60_000);
+    flushSolid();
     await expect(startup).resolves.toMatchObject({
       state: 'failed',
       error: '503 Location plugins did not finish activating',
     });
+    flushSolid();
     expect(signals.length).toBeGreaterThan(0);
     expect(signals.every((signal) => signal?.aborted)).toBe(true);
     pending.resolve({ providers: [provider('late', {})], default: {} });
+    flushSolid();
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
     expect(deps.setProviders).not.toHaveBeenCalled();
     expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
@@ -215,6 +221,7 @@ describe('data loaders', () => {
       state: 'failed',
       failed: ['routing catalogs'],
     });
+    flushSolid();
     expect(deps.listProviders).toHaveBeenCalledTimes(2);
     expect(onWaitingForPlugins).not.toHaveBeenCalledWith(true);
   });
@@ -231,14 +238,19 @@ describe('data loaders', () => {
     const operations = createDataLoaderOperations(deps);
     const oldStartup = operations.loadEssentialSnapshots({ onWaitingForPlugins });
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
     expect(onWaitingForPlugins).toHaveBeenLastCalledWith(true);
     operations.invalidateWorkspace();
     const newWaiting = vi.fn();
     const newStartup = operations.loadEssentialSnapshots({ onWaitingForPlugins: newWaiting });
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
     await expect(oldStartup).resolves.toEqual({ state: 'superseded', failed: [] });
+    flushSolid();
     await expect(newStartup).resolves.toEqual({ state: 'loaded', failed: [] });
+    flushSolid();
     await vi.advanceTimersByTimeAsync(60_000);
+    flushSolid();
     expect(deps.listProviders).toHaveBeenCalledTimes(2);
     expect(onWaitingForPlugins).not.toHaveBeenCalledWith(false);
     expect(deps.finishWorkspaceCatalogReload).toHaveBeenCalledOnce();
@@ -249,6 +261,7 @@ describe('data loaders', () => {
     const deps = createLoaderDeps({ listProviders: vi.fn().mockRejectedValue(activationError()) });
     const operations = createDataLoaderOperations(deps);
     await expect(operations.reloadWorkspaceCatalogs()).resolves.toBe(false);
+    flushSolid();
     expect(deps.listProviders).toHaveBeenCalledTimes(2);
     expect(deps.finishWorkspaceCatalogReload).not.toHaveBeenCalled();
   });
@@ -257,6 +270,7 @@ describe('data loaders', () => {
     const readStartupDiagnostics = vi.fn(async () => []);
     const operations = createDataLoaderOperations(createLoaderDeps({ readStartupDiagnostics }));
     await expect(operations.loadEssentialSnapshots()).resolves.toMatchObject({ state: 'loaded' });
+    flushSolid();
     expect(readStartupDiagnostics).not.toHaveBeenCalled();
   });
 
@@ -274,14 +288,17 @@ describe('data loaders', () => {
     );
     const startup = operations.loadEssentialSnapshots({ onAddonWarning });
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
     expect(onAddonWarning).toHaveBeenCalledWith(
       'OpenCode also reports: MCP "atlassian" timed out. These failures may be separate from plugin activation.'
     );
     await vi.advanceTimersByTimeAsync(60_000);
+    flushSolid();
     await expect(startup).resolves.toMatchObject({
       state: 'failed',
       error: expect.stringContaining('MCP "atlassian" timed out'),
     });
+    flushSolid();
     expect(readStartupDiagnostics).toHaveBeenCalledOnce();
   });
 
@@ -299,7 +316,9 @@ describe('data loaders', () => {
     );
     const startup = operations.loadEssentialSnapshots({ onAddonWarning });
     await vi.advanceTimersByTimeAsync(500);
+    flushSolid();
     await expect(startup).resolves.toMatchObject({ state: 'loaded' });
+    flushSolid();
     expect(onAddonWarning).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -316,7 +335,9 @@ describe('data loaders', () => {
     const operations = createDataLoaderOperations(deps);
     const startup = operations.loadEssentialSnapshots();
     await vi.advanceTimersByTimeAsync(1000);
+    flushSolid();
     await expect(startup).resolves.toEqual({ state: 'failed', failed: ['routing catalogs'] });
+    flushSolid();
     expect(deps.listProviders).toHaveBeenCalledTimes(3);
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -334,11 +355,88 @@ describe('data loaders', () => {
     const operations = createDataLoaderOperations(deps);
     const startup = operations.loadEssentialSnapshots();
     await vi.advanceTimersByTimeAsync(500);
+    flushSolid();
     await operations.refreshRoutingState();
+    flushSolid();
     old.resolve({ providers: [provider('stale', {})], default: {} });
+    flushSolid();
     await expect(startup).resolves.toEqual({ state: 'loaded', failed: [] });
+    flushSolid();
     expect(deps.setProviders).toHaveBeenCalledExactlyOnceWith([provider('latest', {})], {}, []);
     expect(deps.listProviders).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('confirms an empty provider catalog before replacing loaded providers', async () => {
+    vi.useFakeTimers();
+    const deps = createLoaderDeps({
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockResolvedValueOnce({ providers: [provider('openai', {})], default: {} })
+        .mockResolvedValueOnce({ providers: [], default: {} })
+        .mockResolvedValue({ providers: [provider('openai', {})], default: {} }),
+    });
+    const operations = createDataLoaderOperations(deps);
+    await operations.refreshRoutingState();
+    flushSolid();
+
+    const refresh = operations.refreshRoutingState();
+    await vi.advanceTimersByTimeAsync(1_500);
+    flushSolid();
+    await refresh;
+    flushSolid();
+
+    expect(deps.listProviders).toHaveBeenCalledTimes(3);
+    expect(deps.setProviders).toHaveBeenCalledTimes(2);
+    expect(
+      vi.mocked(deps.setProviders).mock.calls.every(([providers]) => providers.length > 0)
+    ).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('confirms an empty first provider catalog when providers were connected before', async () => {
+    vi.useFakeTimers();
+    const deps = createLoaderDeps({
+      hadConnectedProviders: () => true,
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockResolvedValueOnce({ providers: [], default: {} })
+        .mockResolvedValue({ providers: [provider('openai', {})], default: {} }),
+    });
+    const operations = createDataLoaderOperations(deps);
+
+    const refresh = operations.refreshRoutingState();
+    await vi.advanceTimersByTimeAsync(1_500);
+    flushSolid();
+    await refresh;
+    flushSolid();
+
+    expect(deps.listProviders).toHaveBeenCalledTimes(2);
+    expect(deps.setProviders).toHaveBeenCalledExactlyOnceWith([provider('openai', {})], {}, []);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('applies an empty provider catalog once repeated reads confirm it', async () => {
+    vi.useFakeTimers();
+    const deps = createLoaderDeps({
+      listProviders: vi
+        .fn<DataLoaderDependencies['listProviders']>()
+        .mockResolvedValueOnce({ providers: [provider('openai', {})], default: {} })
+        .mockResolvedValue({ providers: [], default: {} }),
+    });
+    const operations = createDataLoaderOperations(deps);
+    await operations.refreshRoutingState();
+    flushSolid();
+
+    const refresh = operations.refreshRoutingState();
+    await vi.advanceTimersByTimeAsync(3_000);
+    flushSolid();
+    await refresh;
+    flushSolid();
+
+    expect(deps.listProviders).toHaveBeenCalledTimes(4);
+    expect(deps.setProviders).toHaveBeenLastCalledWith([], {}, []);
+    expect(deps.setProvidersLoaded).toHaveBeenLastCalledWith(true);
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -350,7 +448,9 @@ describe('data loaders', () => {
     expect(operations.loadSessions()).toBe(first);
     const essential = operations.loadEssentialSnapshots();
     pending.resolve([session('session-1')]);
+    flushSolid();
     await expect(essential).resolves.toEqual({ state: 'loaded', failed: [] });
+    flushSolid();
     expect(deps.listSessions).toHaveBeenCalledOnce();
 
     const failed = createDataLoaderOperations(
@@ -364,6 +464,7 @@ describe('data loaders', () => {
       state: 'failed',
       failed: ['pending questions'],
     });
+    flushSolid();
 
     const staleSessions = deferred<Session[]>();
     const stale = createDataLoaderOperations(
@@ -372,7 +473,9 @@ describe('data loaders', () => {
     const load = stale.loadEssentialSnapshots();
     stale.invalidateWorkspace();
     staleSessions.resolve([]);
+    flushSolid();
     await expect(load).resolves.toEqual({ state: 'superseded', failed: [] });
+    flushSolid();
   });
 
   it('preserves the selected draft agent when no session is active', async () => {
@@ -394,6 +497,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
 
     expect(setAllAgents).toHaveBeenCalledTimes(1);
     expect(setPrimaryAgents).toHaveBeenCalledTimes(1);
@@ -421,6 +525,7 @@ describe('data loaders', () => {
       },
       vi.fn()
     );
+    flushSolid();
 
     expect(setSelectedAgent).toHaveBeenCalledWith(expected, { persistGlobal: false });
   });
@@ -449,6 +554,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
 
     expect(setMcpStatus).toHaveBeenCalledWith({
       alpha: { status: 'connected' },
@@ -477,6 +583,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
 
     expect(setMcpStatus).not.toHaveBeenCalled();
     expect(setMcpDefaults).not.toHaveBeenCalled();
@@ -505,9 +612,13 @@ describe('data loaders', () => {
     activeSession.value = 'session-b';
     const loadB = operations.loadMcps();
     responseB.resolve({ beta: { status: 'connected' } });
+    flushSolid();
     await loadB;
+    flushSolid();
     responseA.resolve({ alpha: { status: 'connected' } });
+    flushSolid();
     await loadA;
+    flushSolid();
 
     expect(setMcpStatus).toHaveBeenCalledTimes(1);
     expect(setMcpStatus).toHaveBeenCalledWith({ beta: { status: 'connected' } });
@@ -529,7 +640,9 @@ describe('data loaders', () => {
     expect(listMcpStatus).toHaveBeenCalledTimes(1);
 
     response.resolve({ alpha: { status: 'connected' } });
+    flushSolid();
     await Promise.all([first, second]);
+    flushSolid();
   });
 
   it('starts a fresh MCP status load when an in-flight response predates a mutation', async () => {
@@ -554,9 +667,13 @@ describe('data loaders', () => {
     expect(listMcpStatus).toHaveBeenCalledTimes(2);
 
     responseB.resolve({ beta: { status: 'connected' } });
+    flushSolid();
     await freshLoad;
+    flushSolid();
     responseA.resolve({ alpha: { status: 'connected' } });
+    flushSolid();
     await staleLoad;
+    flushSolid();
 
     expect(setMcpStatus).toHaveBeenCalledOnce();
     expect(setMcpStatus).toHaveBeenCalledWith({ beta: { status: 'connected' } });
@@ -579,7 +696,9 @@ describe('data loaders', () => {
     );
     current = false;
     response.resolve({ alpha: { status: 'connected' } });
+    flushSolid();
     await load;
+    flushSolid();
 
     expect(setMcpDefaults).not.toHaveBeenCalled();
   });
@@ -614,6 +733,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
 
     expect(setProvidersLoaded).toHaveBeenNthCalledWith(1, false);
     expect(setProvidersLoaded).toHaveBeenNthCalledWith(2, true);
@@ -653,6 +773,7 @@ describe('data loaders', () => {
       },
       vi.fn()
     );
+    flushSolid();
 
     expect(setSelectedModel).toHaveBeenCalledWith(
       { providerID: 'openai', modelID: 'gpt-server' },
@@ -662,7 +783,8 @@ describe('data loaders', () => {
 
   it('keeps a hidden selected model while an existing session is active', async () => {
     const setSelectedModel = vi.fn();
-    setState('hiddenModels', ['openai:gpt-5']);
+    setState(storePath('hiddenModels', ['openai:gpt-5']));
+    flushSolid();
 
     try {
       await loadProvidersWithDependencies(
@@ -689,16 +811,19 @@ describe('data loaders', () => {
         },
         vi.fn()
       );
+      flushSolid();
 
       expect(setSelectedModel).not.toHaveBeenCalled();
     } finally {
-      setState('hiddenModels', []);
+      setState(storePath('hiddenModels', []));
+      flushSolid();
     }
   });
 
   it('preserves a hidden active-session model through provider operation wiring', async () => {
     const setSelectedModel = vi.fn();
-    setState('hiddenModels', ['openai:gpt-5']);
+    setState(storePath('hiddenModels', ['openai:gpt-5']));
+    flushSolid();
 
     try {
       const operations = createDataLoaderOperations(
@@ -723,10 +848,12 @@ describe('data loaders', () => {
       );
 
       await operations.loadProviders();
+      flushSolid();
 
       expect(setSelectedModel).not.toHaveBeenCalled();
     } finally {
-      setState('hiddenModels', []);
+      setState(storePath('hiddenModels', []));
+      flushSolid();
     }
   });
 
@@ -745,6 +872,7 @@ describe('data loaders', () => {
     );
 
     await operations.loadProviders();
+    flushSolid();
 
     expect(setSelectedModel).not.toHaveBeenCalled();
   });
@@ -773,6 +901,7 @@ describe('data loaders', () => {
     );
 
     await operations.loadProviders();
+    flushSolid();
 
     expect(selectedModel).toEqual(persistedModel);
     expect(setSelectedModel).toHaveBeenLastCalledWith(persistedModel, { persistGlobal: false });
@@ -788,6 +917,7 @@ describe('data loaders', () => {
       }),
     ];
     await operations.loadProviders();
+    flushSolid();
 
     expect(selectedModel).toEqual(persistedModel);
     expect(setSelectedModel).toHaveBeenLastCalledWith(persistedModel, { persistGlobal: false });
@@ -813,7 +943,9 @@ describe('data loaders', () => {
 
     beforeEach(() => {
       window.localStorage.clear();
+      flushSolid();
       resetDefaultAppState();
+      flushSolid();
       clientMocks.providerList.mockResolvedValue({
         providers: [loadedProvider],
         default: { openai: globalModel.modelID },
@@ -822,21 +954,27 @@ describe('data loaders', () => {
 
     afterEach(() => {
       window.localStorage.clear();
+      flushSolid();
       resetDefaultAppState();
+      flushSolid();
     });
 
     function selectSessionModel() {
       setStateSelectedModel({ ...globalModel });
-      setState('activeSessionId', 'session-1');
+      setState(storePath('activeSessionId', 'session-1'));
       setStateSelectedModel({ ...sessionModel }, { sessionId: 'session-1', persistGlobal: false });
     }
 
     it('inherits the last selected model in a new project without replacing the shared preference', async () => {
       setStateSelectedModel(sessionModel);
-      setState('editorContext', 'workspacePath', '/new-project');
+      flushSolid();
+      setState(storePath('editorContext', 'workspacePath', '/new-project'));
+      flushSolid();
       setStateSelectedModel(null, { persistGlobal: false });
+      flushSolid();
 
       await createStateBoundLoader().loadProviders();
+      flushSolid();
 
       expect(state.selectedModel).toEqual(sessionModel);
       expect(getPersistedSelectedModel()).toEqual(sessionModel);
@@ -845,10 +983,13 @@ describe('data loaders', () => {
 
     it('falls back to a visible model without forgetting the last choice for other projects', async () => {
       const unavailable = { providerID: 'other-project-provider', modelID: 'model' };
-      setState('lastSelectedModel', unavailable);
-      setState('hiddenModels', ['openai:gpt-global']);
+      setState(storePath('lastSelectedModel', unavailable));
+      flushSolid();
+      setState(storePath('hiddenModels', ['openai:gpt-global']));
+      flushSolid();
 
       await createStateBoundLoader().loadProviders();
+      flushSolid();
 
       expect(state.selectedModel).toEqual(sessionModel);
       expect(getPersistedSelectedModel()).toEqual(sessionModel);
@@ -858,9 +999,11 @@ describe('data loaders', () => {
     it.each(['project draft', 'active session'])(
       'keeps an open %s unchanged when another instance selects a model',
       async (composer) => {
-        setState('editorContext', 'workspacePath', '/existing-project');
+        setState(storePath('editorContext', 'workspacePath', '/existing-project'));
+        flushSolid();
         if (composer === 'active session') selectSessionModel();
         else setStateSelectedModel(globalModel);
+        flushSolid();
         const selected = composer === 'active session' ? sessionModel : globalModel;
         const lastSelectedModel = {
           ...(composer === 'active session' ? globalModel : sessionModel),
@@ -868,12 +1011,15 @@ describe('data loaders', () => {
         };
 
         applyModelPreferencesSnapshot({ ...getModelPreferencesSnapshot(), lastSelectedModel });
+        flushSolid();
 
         expect(state.selectedModel).toEqual(selected);
         expect(getPersistedSelectedModel()).toEqual(globalModel);
         const loader = createStateBoundLoader();
         await loader.loadProviders();
+        flushSolid();
         await loader.loadProviders();
+        flushSolid();
 
         expect(state.selectedModel).toEqual(selected);
         expect(getPersistedSelectedModel()).toEqual(globalModel);
@@ -883,8 +1029,10 @@ describe('data loaders', () => {
         }
 
         setPersistentShowSessionPicker(true);
+        flushSolid();
         expect(state.selectedModel).toEqual(globalModel);
         setPersistentShowSessionPicker(false);
+        flushSolid();
         expect(state.selectedModel).toEqual(selected);
       }
     );
@@ -892,10 +1040,12 @@ describe('data loaders', () => {
     it('keeps the global draft model when the session picker retains an active session', async () => {
       selectSessionModel();
       setPersistentShowSessionPicker(true);
+      flushSolid();
       expect(state.activeSessionId).toBe('session-1');
       expect(state.selectedModel).toEqual(globalModel);
 
       await createStateBoundLoader().loadProviders();
+      flushSolid();
 
       expect(state.selectedModel).toEqual(globalModel);
       expect(getSelectedModelForSession('session-1')).toEqual(sessionModel);
@@ -920,6 +1070,7 @@ describe('data loaders', () => {
           provider('github-copilot', sharedModels),
         ];
         setStateSelectedModel(selected);
+        flushSolid();
         clientMocks.providerList.mockResolvedValue({
           providers:
             omitted === 'provider' ? alternatives : [...alternatives, provider('openai', {})],
@@ -929,7 +1080,9 @@ describe('data loaders', () => {
         const loader = createStateBoundLoader();
 
         await loader.loadProviders();
+        flushSolid();
         await loader.loadProviders();
+        flushSolid();
 
         expect(state.selectedModel).toEqual(selected);
         expect(getPersistedSelectedModel()).toEqual(selected);
@@ -939,6 +1092,7 @@ describe('data loaders', () => {
           default: { openrouter: selected.modelID },
         });
         await loader.loadProviders();
+        flushSolid();
 
         expect(state.selectedModel).toEqual(selected);
         expect(getPersistedSelectedModel()).toEqual(selected);
@@ -948,8 +1102,10 @@ describe('data loaders', () => {
     it('restores the scoped model when the active session owns the composer', async () => {
       selectSessionModel();
       setStateSelectedModel(null, { persistGlobal: false });
+      flushSolid();
 
       await createStateBoundLoader().loadProviders();
+      flushSolid();
 
       expect(state.selectedModel).toEqual(sessionModel);
       expect(getSelectedModelForSession('session-1')).toEqual(sessionModel);
@@ -958,9 +1114,11 @@ describe('data loaders', () => {
 
     it('preserves a hidden model owned by the active composer session', async () => {
       selectSessionModel();
-      setState('hiddenModels', ['openai:gpt-session']);
+      setState(storePath('hiddenModels', ['openai:gpt-session']));
+      flushSolid();
 
       await createStateBoundLoader().loadProviders();
+      flushSolid();
 
       expect(state.selectedModel).toEqual(sessionModel);
       expect(getSelectedModelForSession('session-1')).toEqual(sessionModel);
@@ -979,16 +1137,20 @@ describe('data loaders', () => {
     );
 
     await operations.loadProviders();
+    flushSolid();
     expect(setProviders).toHaveBeenLastCalledWith(providers, {}, []);
 
     providers = [...providers, provider('newly-connected', {})];
     await operations.loadProviders();
+    flushSolid();
     expect(setProviders).toHaveBeenLastCalledWith(providers, {}, ['newly-connected']);
 
     providers = providers.filter((item) => item.id !== 'newly-connected');
     await operations.loadProviders();
+    flushSolid();
     providers = [...providers, provider('newly-connected', {})];
     await operations.loadProviders();
+    flushSolid();
     expect(setProviders).toHaveBeenLastCalledWith(providers, {}, []);
   });
 
@@ -1012,6 +1174,7 @@ describe('data loaders', () => {
     );
 
     await expect(operations.reloadWorkspaceCatalogs()).resolves.toBe(false);
+    flushSolid();
 
     expect(listAgents).toHaveBeenCalledTimes(2);
     expect(listCommands).toHaveBeenCalledOnce();
@@ -1057,14 +1220,22 @@ describe('data loaders', () => {
     // A fresh server emits catalog events while its first workspace requests run.
     const eventRefresh = operations.refreshRoutingState();
     eventAgents.resolve([buildAgent('latest')]);
+    flushSolid();
     eventProviders.resolve({ providers: [provider('latest', {})], default: {} });
+    flushSolid();
     eventCommands.resolve([{ name: 'latest-command', template: '', source: 'command' }]);
+    flushSolid();
     await eventRefresh;
+    flushSolid();
     startupAgents.resolve([buildAgent('stale')]);
+    flushSolid();
     startupProviders.resolve({ providers: [provider('stale', {})], default: {} });
+    flushSolid();
     startupCommands.resolve([{ name: 'stale-command', template: 'Private template' }]);
+    flushSolid();
 
     await expect(startup).resolves.toBe(true);
+    flushSolid();
     expect(listAgents).toHaveBeenCalledTimes(2);
     expect(listProviders).toHaveBeenCalledTimes(2);
     expect(listCommands).toHaveBeenCalledTimes(2);
@@ -1095,9 +1266,12 @@ describe('data loaders', () => {
 
     const startup = operations.reloadWorkspaceCatalogs();
     await operations.loadAgents();
+    flushSolid();
     startupAgents.resolve([buildAgent('stale')]);
+    flushSolid();
 
     await expect(startup).resolves.toBe(false);
+    flushSolid();
     expect(finishWorkspaceCatalogReload).not.toHaveBeenCalled();
   });
 
@@ -1120,8 +1294,10 @@ describe('data loaders', () => {
     try {
       const reload = operations.reloadWorkspaceCatalogs();
       await vi.runAllTimersAsync();
+      flushSolid();
 
       await expect(reload).resolves.toBe(false);
+      flushSolid();
       expect(listAgents).toHaveBeenCalledTimes(2);
       expect(listCommands).toHaveBeenCalledTimes(2);
       expect(listProviders).toHaveBeenCalledTimes(2);
@@ -1148,10 +1324,14 @@ describe('data loaders', () => {
     const reload = operations.reloadWorkspaceCatalogs();
     operations.invalidateWorkspace();
     agents.resolve([buildAgent('old')]);
+    flushSolid();
     commands.resolve([{ name: 'old', template: '/old' }]);
+    flushSolid();
     providers.resolve({ providers: [provider('old', {})], default: {} });
+    flushSolid();
 
     await expect(reload).resolves.toBe(false);
+    flushSolid();
     expect(finishWorkspaceCatalogReload).not.toHaveBeenCalled();
   });
 
@@ -1208,6 +1388,7 @@ describe('data loaders', () => {
       },
       vi.fn()
     );
+    flushSolid();
 
     const loadedProviders = setProviders.mock.calls[0]?.[0];
     expect(Object.keys(loadedProviders[0].models)).toEqual(['gpt-5.5']);
@@ -1239,6 +1420,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
 
     expect(setSessionStatuses).toHaveBeenCalledWith(statuses, {
       snapshotStartedAt: expect.any(Number),
@@ -1281,6 +1463,7 @@ describe('data loaders', () => {
       },
       vi.fn()
     );
+    flushSolid();
 
     expect(loadSessionStatuses).not.toHaveBeenCalled();
     expect(updateUsageLimitState).toHaveBeenCalledWith('session-1', retryStatus, []);
@@ -1289,11 +1472,15 @@ describe('data loaders', () => {
   it('does not clear a newer retry notice when an older status snapshot finishes', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
+    flushSolid();
     resetDefaultAppState();
+    flushSolid();
     resetSessionStatusSnapshotTracking();
+    flushSolid();
     const pendingStatuses = deferred<Record<string, SessionStatus>>();
     const loadedSession = session('session-1');
     sessionStore.setSessions([loadedSession]);
+    flushSolid();
 
     try {
       const hydration = hydrateSessionStatusesWithDependencies(
@@ -1310,8 +1497,10 @@ describe('data loaders', () => {
         },
         vi.fn()
       );
+      flushSolid();
 
       vi.setSystemTime(2_000);
+      flushSolid();
       const retryStatus = {
         type: 'retry',
         attempt: 2,
@@ -1319,6 +1508,7 @@ describe('data loaders', () => {
         next: 8_000,
       } satisfies SessionStatus;
       sessionStore.setSessionStatusEntry(loadedSession.id, retryStatus);
+      flushSolid();
       sessionStore.setSessionUsageLimit(
         loadedSession.id,
         deriveUsageLimitNotice({
@@ -1327,9 +1517,12 @@ describe('data loaders', () => {
           messages: [],
         })
       );
+      flushSolid();
 
       pendingStatuses.resolve({ [loadedSession.id]: { type: 'busy' } });
+      flushSolid();
       await hydration;
+      flushSolid();
 
       expect(state.sessionStatus[loadedSession.id]).toEqual(retryStatus);
       expect(state.sessionUsageLimits[loadedSession.id]).toMatchObject({
@@ -1340,7 +1533,9 @@ describe('data loaders', () => {
     } finally {
       vi.useRealTimers();
       resetDefaultAppState();
+      flushSolid();
       resetSessionStatusSnapshotTracking();
+      flushSolid();
     }
   });
 
@@ -1389,6 +1584,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
     await loadQuestionsWithDependencies(
       {
         listQuestions: async () => [question],
@@ -1396,6 +1592,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
     await loadSessionsWithDependencies(
       {
         listSessions: async () => sessions,
@@ -1403,6 +1600,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
     await loadRecycleBinWithDependencies(
       {
         listRecycleBin: async () => recycleBinEntries,
@@ -1410,6 +1608,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
     await refreshProviderLimitWithDependencies(
       {
         loadProviderLimit: async () => limit,
@@ -1419,6 +1618,7 @@ describe('data loaders', () => {
       'gpt-5',
       logError
     );
+    flushSolid();
 
     expect(setCommands).toHaveBeenCalledWith([{ name: 'review', template: '/review' }]);
     expect(setQuestions).toHaveBeenCalledWith([question]);
@@ -1442,6 +1642,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
 
     await loadWorkspaceStatusesWithDependencies(
       {
@@ -1450,6 +1651,7 @@ describe('data loaders', () => {
       },
       logError
     );
+    flushSolid();
 
     expect(setProviderAuthMethods).toHaveBeenCalledWith({
       openai: [{ type: 'oauth', label: 'Browser login' }],
@@ -1477,7 +1679,9 @@ describe('data loaders', () => {
     const load = operations.loadSessions();
     currentSessions = [...currentSessions, session('new-session')];
     response.resolve([session('existing')]);
+    flushSolid();
     await load;
+    flushSolid();
 
     expect(applySessions).toHaveBeenCalledWith([session('existing'), session('new-session')], true);
   });
@@ -1500,10 +1704,13 @@ describe('data loaders', () => {
     const staleLoad = operations.loadSessions();
     currentSessions = [];
     first.resolve([removed]);
+    flushSolid();
     await staleLoad;
+    flushSolid();
     expect(currentSessions).toEqual([]);
 
     await operations.loadSessions();
+    flushSolid();
     expect(currentSessions).toEqual([removed]);
   });
 
@@ -1524,6 +1731,7 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
 
     expect(currentSessions).toEqual([retained]);
     expect(clearQueuedMessagesForSession).toHaveBeenCalledOnce();
@@ -1545,6 +1753,7 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
 
     expect(hydrateSessionSelectedAgents).toHaveBeenCalledOnce();
     expect(hydrateSessionSelectedAgents).toHaveBeenCalledWith({
@@ -1558,10 +1767,15 @@ describe('data loaders', () => {
     { hasMore: false, incomplete: true, unavailableDirectories: ['/repo'] },
   ])('carries partial catalog completeness through session lifecycle: %j', async (partial) => {
     const stateModule = await import('../lib/state');
+    flushSolid();
     const { SessionLifecycleOperations } = await import('./session/session-lifecycle');
+    flushSolid();
     stateModule.setSessions([]);
-    stateModule.setState('completedSessionResponses', { unloaded: 100 });
-    stateModule.setState('skippedPlanSessions', { unloaded: 100 });
+    flushSolid();
+    stateModule.setState(storePath('completedSessionResponses', { unloaded: 100 }));
+    flushSolid();
+    stateModule.setState(storePath('skippedPlanSessions', { unloaded: 100 }));
+    flushSolid();
     const lifecycle = new SessionLifecycleOperations({
       getCurrentWorkspacePath: () => '/repo',
       clearPendingAbort: vi.fn(),
@@ -1582,12 +1796,15 @@ describe('data loaders', () => {
       })
     );
     await operations.loadSessions();
+    flushSolid();
     expect(stateModule.state.completedSessionResponses.unloaded).toBe(100);
     expect(stateModule.state.skippedPlanSessions.unloaded).toBe(100);
     lifecycle.upsertSession(session('recent'));
+    flushSolid();
     expect(stateModule.state.completedSessionResponses.unloaded).toBe(100);
     expect(stateModule.state.skippedPlanSessions.unloaded).toBe(100);
     await operations.loadSessions();
+    flushSolid();
     expect(stateModule.state.completedSessionResponses.unloaded).toBeUndefined();
     expect(stateModule.state.skippedPlanSessions.unloaded).toBeUndefined();
   });
@@ -1618,6 +1835,7 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
 
     expect(listSessions).toHaveBeenNthCalledWith(1, 100);
     expect(currentSessions).toEqual([newest, stale]);
@@ -1625,6 +1843,7 @@ describe('data loaders', () => {
     expect(clearQueuedMessagesForSession).not.toHaveBeenCalled();
 
     await operations.loadMoreSessions();
+    flushSolid();
 
     expect(listSessions).toHaveBeenNthCalledWith(2, 200);
     expect(currentSessions).toEqual([newest, oldest]);
@@ -1661,6 +1880,7 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
 
     expect(currentSessions).toEqual([healthy, failedRootSession]);
     expect(setSessionsHasMore).toHaveBeenLastCalledWith(false);
@@ -1689,6 +1909,7 @@ describe('data loaders', () => {
       })
     );
     await operations.loadSessions();
+    flushSolid();
     expect(currentSessions).toEqual([healthy, nested]);
     expect(clearQueuedMessagesForSession).not.toHaveBeenCalled();
   });
@@ -1713,6 +1934,7 @@ describe('data loaders', () => {
       })
     );
     await operations.loadSessions();
+    flushSolid();
     expect(currentSessions).toEqual([worktree]);
     expect(clearQueuedMessagesForSession).not.toHaveBeenCalled();
   });
@@ -1736,7 +1958,9 @@ describe('data loaders', () => {
     expect(setSessionsPaginationError).toHaveBeenLastCalledWith(null);
 
     response.resolve({ items: [], hasMore: false });
+    flushSolid();
     await load;
+    flushSolid();
   });
 
   it('clears a stale pagination error after a successful session refresh', async () => {
@@ -1749,6 +1973,7 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
 
     expect(setSessionsPaginationError).toHaveBeenLastCalledWith(null);
   });
@@ -1761,7 +1986,9 @@ describe('data loaders', () => {
     const operations = createDataLoaderOperations(createLoaderDeps({ listSessions }));
 
     await operations.loadMoreSessions();
+    flushSolid();
     await operations.loadMoreSessions();
+    flushSolid();
 
     expect(listSessions.mock.calls).toEqual([[200], [200]]);
   });
@@ -1784,9 +2011,13 @@ describe('data loaders', () => {
     const staleLoad = operations.loadSessions();
     const latestLoad = operations.loadSessions({ fresh: true });
     second.resolve([session('latest')]);
+    flushSolid();
     await latestLoad;
+    flushSolid();
     first.resolve([session('stale')]);
+    flushSolid();
     await staleLoad;
+    flushSolid();
 
     expect(currentSessions).toEqual([session('latest')]);
     expect(applySessions).toHaveBeenCalledTimes(1);
@@ -1866,20 +2097,34 @@ describe('data loaders', () => {
       operations.loadRecycleBin(),
     ];
     latestAgents.resolve([buildAgent('latest')]);
+    flushSolid();
     latestCommands.resolve([{ name: 'latest', template: '/latest' }]);
+    flushSolid();
     latestProviders.resolve({ providers: [provider('latest', {})], default: {} });
+    flushSolid();
     latestAuth.resolve({ latest: [{ type: 'api', label: 'Latest' }] });
+    flushSolid();
     latestWorkspaces.resolve([{ workspaceID: 'latest', status: 'connected' }]);
+    flushSolid();
     latestRecycleBin.resolve([]);
+    flushSolid();
     await Promise.all(latestLoads);
+    flushSolid();
 
     firstAgents.resolve([buildAgent('stale')]);
+    flushSolid();
     firstCommands.resolve([{ name: 'stale', template: '/stale' }]);
+    flushSolid();
     firstProviders.resolve({ providers: [provider('stale', {})], default: {} });
+    flushSolid();
     firstAuth.resolve({ stale: [{ type: 'api', label: 'Stale' }] });
+    flushSolid();
     firstWorkspaces.resolve([{ workspaceID: 'stale', status: 'connected' }]);
+    flushSolid();
     firstRecycleBin.resolve([]);
+    flushSolid();
     await Promise.all(staleLoads);
+    flushSolid();
 
     expect(setAllAgents).toHaveBeenCalledOnce();
     expect(setAllAgents).toHaveBeenCalledWith([buildAgent('latest')]);
@@ -1930,12 +2175,18 @@ describe('data loaders', () => {
       operations.hydrateSessionStatuses(),
       operations.loadSessions(),
     ]);
+    flushSolid();
     operations.invalidateWorkspace();
     agents.resolve([buildAgent('build')]);
+    flushSolid();
     recycleBin.resolve([]);
+    flushSolid();
     statuses.resolve({ 'session-old': { type: 'busy' } });
+    flushSolid();
     sessions.resolve([session('session-old')]);
+    flushSolid();
     await staleLoads;
+    flushSolid();
 
     expect(setAllAgents).not.toHaveBeenCalled();
     expect(setRecycleBinEntries).not.toHaveBeenCalled();
@@ -1972,7 +2223,9 @@ describe('data loaders', () => {
     const load = operations.loadQuestions();
     questions = [];
     response.resolve([answered, current]);
+    flushSolid();
     await load;
+    flushSolid();
 
     expect(questions).toEqual([current]);
     expect(setQuestions).toHaveBeenCalledWith([current]);
@@ -2000,10 +2253,13 @@ describe('data loaders', () => {
     const staleLoad = operations.loadQuestions();
     questions = [];
     first.resolve([answered]);
+    flushSolid();
     await staleLoad;
+    flushSolid();
     expect(questions).toEqual([]);
 
     await operations.loadQuestions();
+    flushSolid();
     expect(questions).toEqual([answered]);
   });
 
@@ -2022,9 +2278,11 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
     expect(applySessions).not.toHaveBeenCalled();
 
     await operations.loadSessions();
+    flushSolid();
     expect(applySessions).toHaveBeenCalledWith([], true);
     expect(logError).not.toHaveBeenCalled();
   });
@@ -2041,12 +2299,15 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
     operations.invalidateWorkspace();
     await operations.loadSessions();
+    flushSolid();
     expect(applySessions).not.toHaveBeenCalled();
 
     currentSessions = [];
     await operations.loadSessions();
+    flushSolid();
     expect(applySessions).toHaveBeenCalledOnce();
     expect(applySessions).toHaveBeenCalledWith([], true);
   });
@@ -2072,8 +2333,11 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
     await operations.loadSessions();
+    flushSolid();
     await operations.loadSessions();
+    flushSolid();
 
     expect(applySessions).toHaveBeenCalledTimes(1);
     expect(applySessions).toHaveBeenCalledWith(listedSessions, true);
@@ -2094,10 +2358,12 @@ describe('data loaders', () => {
     );
 
     await operations.loadSessions();
+    flushSolid();
     expect(setSessionsLoadError).toHaveBeenLastCalledWith('Failed to load sessions');
 
     fail = false;
     await operations.loadSessions();
+    flushSolid();
     expect(setSessionsLoadError).toHaveBeenLastCalledWith(null);
   });
 
@@ -2115,10 +2381,12 @@ describe('data loaders', () => {
     );
 
     await operations.loadRecycleBin();
+    flushSolid();
     expect(setRecycleBinLoadError).toHaveBeenLastCalledWith('Failed to load the recycle bin');
 
     fail = false;
     await operations.loadRecycleBin();
+    flushSolid();
     expect(setRecycleBinLoadError).toHaveBeenLastCalledWith(null);
   });
 });

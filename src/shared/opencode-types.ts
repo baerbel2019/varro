@@ -2,6 +2,8 @@ import type { SessionWorkspaceScope } from './protocol';
 import type { UnknownRecord } from './type-utils';
 import type { FileChange } from './tool-file-change';
 import type { NativeForm } from './native-form';
+import type { SessionGoal } from './session-goal';
+import type { BackgroundWorkKind } from './background-process';
 
 export type OutputFormatText = {
   type: 'text';
@@ -53,6 +55,8 @@ export type OpenCodeModelRouting = {
   agentModels: Record<string, OpenCodeModelRoute>;
   globalVisionModel?: OpenCodeModelRoute | null;
   commitMessageModel: OpenCodeModelRoute | null;
+  /** `varro.review.model`: walkthroughs use it instead of the chat's selected model. */
+  reviewModel?: OpenCodeModelRoute | null;
   autoApproveModel: OpenCodeModelRoute | null;
   promptCompletionModel?: OpenCodeModelRoute | null;
   followupModel?: OpenCodeModelRoute | null;
@@ -214,6 +218,7 @@ export type TextPart = {
   subagentResult?: {
     sessionID: string;
     state: 'completed' | 'error' | 'cancelled';
+    backgroundPending?: boolean;
     description?: string;
     agent?: string;
   };
@@ -458,7 +463,14 @@ export type Session = {
   metadata?: UnknownRecord;
   time: { created: number; updated: number; compacting?: number; archived?: number };
   permission?: PermissionRule[];
-  revert?: { messageID: string; partID?: string; snapshot?: string; diff?: string };
+  /** `diff` is V1's rolled-back patch; `files` lists V2's rolled-back file diffs. */
+  revert?: {
+    messageID: string;
+    partID?: string;
+    snapshot?: string;
+    diff?: string;
+    files?: unknown[];
+  };
 };
 
 export type Command = {
@@ -493,6 +505,10 @@ export type SessionStatus =
       background?: boolean;
       backgroundStartedAt?: number;
       backgroundCommand?: string;
+      /** Kind of the work named by `backgroundCommand`; unset for shell processes. */
+      backgroundKind?: BackgroundWorkKind;
+      /** Child session running the work named by `backgroundCommand`, for subagents. */
+      backgroundSessionID?: string;
       backgroundServices?: number;
     };
 
@@ -929,6 +945,7 @@ export type ServerEventPropertiesByName = {
   'session.unarchived': { sessionID: string };
   'session.deleted': { sessionID?: string; info: { id: string } };
   'session.status': { sessionID: string; status: SessionStatus };
+  'session.goal.updated': { sessionID: string; goal: SessionGoal | null };
   'session.error': SessionErrorProperties;
   'session.idle': { sessionID: string };
   'session.compacted': { sessionID: string };

@@ -3,7 +3,12 @@ import { writeFile } from 'node:fs/promises';
 import type { Message, Part } from '@opencode-ai/sdk/v2';
 import { expect, test } from '@playwright/test';
 import type { Page, TestInfo } from '@playwright/test';
-import { getScrollMetrics, getVisibleMessageAnchor, waitForAnimationFrames } from './helpers';
+import {
+  getListDistanceFromBottom,
+  getScrollMetrics,
+  getVisibleMessageAnchor,
+  waitForAnimationFrames,
+} from './helpers';
 import { appendDeltaToRapidStreaming } from './scroll-helpers';
 
 const SESSION_ID = 'session-rapid-streaming-jitter';
@@ -112,11 +117,7 @@ test('preserves a settled equation and its horizontal position as more math stre
   const equation = markdown.locator('[data-markdown-segment="stable"] .katex-display').first();
   await expect(equation).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
-  await expect
-    .poll(() =>
-      getScrollMetrics(page, '.interactive-list').then((metrics) => metrics.distanceFromBottom)
-    )
-    .toBeLessThanOrEqual(1);
+  await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThanOrEqual(1);
   await equation.hover();
   await page.mouse.wheel(200, 0);
   await expect.poll(() => equation.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
@@ -250,6 +251,85 @@ for (const numbered of [false, true]) {
     expect(gaps.length).toBeGreaterThan(5);
     expect(Math.max(...gaps) - Math.min(...gaps), JSON.stringify(gaps)).toBeLessThan(1);
     expect(gaps.at(-1)).toBeCloseTo(1, 0);
+  });
+}
+
+for (const numbered of [false, true]) {
+  test(`keeps nested ${numbered ? 'numbered' : 'bullet'} list spacing when later paragraphs make it loose`, async ({
+    page,
+  }) => {
+    // ses_e160e10e0ffeIjl71mdZKf95SK: the indented paragraph changes already-painted
+    // list text into <p> elements, which must not acquire top-level prose spacing.
+    await page.setViewportSize({ width: 544, height: 900 });
+    await page.goto('/e2e/harness/index.html?scenario=rapid-streaming-jitter');
+    const markdown = page.locator(`${ROW} .rendered-markdown`);
+    await expect(markdown).toHaveText('Starting...');
+    const marker = (index: number) => (numbered ? `${index}.` : '-');
+    let text = [
+      'Starting...',
+      '',
+      '## Issues found before accepting external results',
+      '',
+      `${marker(1)} **Runtime measurement validation needs tightening.**${numbered ? ' Confirmed directly in [`Metrics.record()`](tests/fixtures/comparative-benchmark/metrics.ts:15):' : ''}`,
+      '   - `usage: {}` becomes known zero input/output tokens.',
+      '   - An unknown event kind can increment browser requests.',
+    ].join('\n');
+    await appendDeltaToRapidStreaming(page, text.slice('Starting...'.length));
+    await expect(markdown.locator('li li')).toHaveCount(2);
+    const collector = await markdown.evaluateHandle((element) => {
+      const state = { running: true, gaps: [] as number[], paragraphWrappers: [] as boolean[] };
+      const sample = () => {
+        const nested = element.querySelector('li > ul');
+        const item = nested?.parentElement;
+        if (!nested || !item) throw new Error('Missing nested validation list');
+        const prose = document.createRange();
+        prose.setStart(item, 0);
+        prose.setEndBefore(nested);
+        // Measure glyphs, not the optional paragraph wrapper's line box.
+        const walker = document.createTreeWalker(item, NodeFilter.SHOW_TEXT);
+        let lastText: Node | null = null;
+        while (walker.nextNode()) {
+          if (prose.intersectsNode(walker.currentNode) && walker.currentNode.textContent?.trim()) {
+            lastText = walker.currentNode;
+          }
+        }
+        if (!lastText) throw new Error('Missing prose before nested validation list');
+        prose.selectNodeContents(lastText);
+        const lines = [...prose.getClientRects()].filter((rect) => rect.height > 0);
+        const bottom = Math.max(...lines.map((rect) => rect.bottom));
+        state.gaps.push(nested.getBoundingClientRect().top - bottom);
+        state.paragraphWrappers.push(item.firstElementChild?.tagName === 'P');
+        if (state.running) requestAnimationFrame(sample);
+      };
+      sample();
+      return state;
+    });
+    for (const delta of [
+      '\n\n   Require strict event schemas and mandatory usage fields,',
+      ' with negative tests through the dynamic adapter boundary.',
+      `\n\n${marker(2)} **Adapter trust is not certification.**`,
+      '\n\n   Adapters receive controller context containing expected outcomes.',
+      '\n\nFollowing paragraph.',
+    ]) {
+      text += delta;
+      await appendDeltaToRapidStreaming(page, delta);
+      await waitForAnimationFrames(page, 6);
+    }
+    await completeResponse(page, text);
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
+    await waitForAnimationFrames(page, 6);
+    const samples = await collector.evaluate((state) => {
+      state.running = false;
+      return { gaps: state.gaps, paragraphWrappers: state.paragraphWrappers };
+    });
+    await attachEvidence(test.info(), 'nested-list-spacing.json', JSON.stringify(samples));
+    expect(samples.paragraphWrappers).toContain(false);
+    expect(samples.paragraphWrappers).toContain(true);
+    expect(samples.gaps.length).toBeGreaterThan(5);
+    expect(
+      Math.max(...samples.gaps) - Math.min(...samples.gaps),
+      JSON.stringify(samples)
+    ).toBeLessThan(1);
   });
 }
 
@@ -461,6 +541,337 @@ test('hides streamed inline commands until the closing backtick arrives', async 
   await expect(markdown.locator('.streaming-markdown-pending')).toHaveCount(0);
 });
 
+const INLINE_ICON_TABLE = [
+  '| Screenshot | What the trace shows |',
+  '|---|---|',
+  '| [00002](./artifacts/00002.png), +5.6 ms | The compositor jumped 1,448 CSS px upward and submitted a frame with one missing tile at +2.8 ms. The main-thread `scroll` handler did not start until +14.1 ms. It ran for 100.6 ms, but text was already visible again at +18.3 ms. The slow handler delayed fresh paint; it did not trigger the first blank. |',
+  '| [00005](./artifacts/00005.png) and [00006](./artifacts/00006.png), +133.8 and +140.9 ms | A 1,053 px downward jump was followed by missing-tile draws at +127.7 ms and +138.9 ms. The webview painted and activated a new layer tree by +144.0 ms. The text was back in [00007](./artifacts/00007.png) at +150.2 ms. |',
+].join('\n');
+
+test('aligns visible link icons in tables and prose', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 458, height: 800 });
+  await page.goto('/e2e/harness/index.html?scenario=rapid-streaming-jitter&theme=dark');
+  const markdown = page.locator(`${ROW} .rendered-markdown`);
+  await expect(markdown).toHaveText('Starting...');
+  await completeResponse(
+    page,
+    [
+      'In the [primary compositor trace](./artifacts/compositor-trace.json), times are relative to the first drag move.',
+      '',
+      INLINE_ICON_TABLE,
+      '',
+      'The [DOM samples](./artifacts/dom-evidence.json) show that mounted rows covered both destinations. See the [trace docs](https://example.test/docs).',
+    ].join('\n')
+  );
+  const leading = markdown.locator('.link-leading-content');
+  await expect(leading).toHaveCount(7);
+  await page.evaluate(() => document.fonts.ready);
+
+  for (const size of [13.5, 18]) {
+    await markdown.evaluate((element, fontSize) => {
+      if (!(element instanceof HTMLElement)) throw new Error('Missing Markdown element');
+      element.style.fontSize = `${fontSize}px`;
+    }, size);
+    const offsets = await leading.evaluateAll(async (wrappers) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 96;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Missing icon measurement context');
+      const measurements = [];
+      for (const wrapper of wrappers) {
+        const icon = wrapper.querySelector('img');
+        const label = wrapper.querySelector('.link-leading-label');
+        if (!icon || !label) throw new Error('Missing link icon or label');
+
+        await icon.decode();
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(icon, 0, 0, canvas.width, canvas.height);
+        const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+        const lastPixel = data.findLastIndex((alpha, index) => index % 4 === 3 && alpha >= 128);
+        if (lastPixel < 0) throw new Error('Link icon has no visible pixels');
+        const inkBottom = Math.floor(lastPixel / (canvas.width * 4)) + 1;
+        let inkRight = 0;
+        for (let index = 3; index < data.length; index += 4) {
+          if ((data[index] ?? 0) >= 128)
+            inkRight = Math.max(inkRight, ((index - 3) / 4) % canvas.width);
+        }
+        // A zero-size inline block sits on the label's first baseline.
+        const marker = document.createElement('span');
+        marker.style.cssText = 'display: inline-block; width: 0; height: 0;';
+        label.prepend(marker);
+        const baseline = marker.getBoundingClientRect().top;
+        const iconBox = icon.getBoundingClientRect();
+        marker.remove();
+        measurements.push({
+          offset: iconBox.top + (iconBox.height * inkBottom) / canvas.height - baseline,
+          gap: icon.classList.contains('file-path-icon')
+            ? label.getBoundingClientRect().left -
+              (iconBox.left + (iconBox.width * (inkRight + 1)) / canvas.width)
+            : null,
+          label: label.textContent,
+          context: wrapper.closest('td') ? 'table cell' : 'prose',
+        });
+      }
+      return measurements;
+    });
+    await markdown.screenshot({ path: testInfo.outputPath(`inline-icons-${size}px.png`) });
+    // File artwork ends at different widths; the margin keeps the visible gap uniform.
+    const gaps = offsets.flatMap(({ gap }) => (gap === null ? [] : [gap]));
+    expect(gaps.length).toBeGreaterThan(1);
+    expect(Math.max(...gaps) - Math.min(...gaps), JSON.stringify(offsets)).toBeLessThanOrEqual(
+      0.15
+    );
+    for (const { offset, label, context } of offsets) {
+      expect(
+        Math.abs(offset),
+        `${label} in ${context} at ${size}px (offset ${offset}px)`
+      ).toBeLessThanOrEqual(1.25);
+      if (context === 'table cell') {
+        // Screenshot icons draw low in their box. At 1x, a whole-pixel miss shows as a full row.
+        expect(
+          Math.abs(offset),
+          `${label} in ${context} at ${size}px (offset ${offset}px)`
+        ).toBeLessThanOrEqual(0.1);
+      }
+    }
+  }
+});
+
+test('balances file artwork area with bounded dimensions and preserved proportions', async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 458, height: 800 });
+  await page.goto('/e2e/harness/index.html?scenario=rapid-streaming-jitter&theme=dark');
+  const markdown = page.locator(`${ROW} .rendered-markdown`);
+  await expect(markdown).toHaveText('Starting...');
+  const files = [
+    'main.go',
+    'go.mod',
+    'README.md',
+    'notes.md',
+    'index.php',
+    'Dockerfile',
+    'app.ts',
+    'package.json',
+    'App.tsx',
+    'index.css',
+    'app.c',
+    'image.png',
+    'unknown.custom',
+  ];
+  await completeResponse(
+    page,
+    files.map((file) => `[${file}](./${file}) after the icon.`).join('\n\n')
+  );
+  const icons = markdown.locator('img.file-path-icon');
+  await expect(icons).toHaveCount(files.length);
+  for (const fontSize of [13.5, 18]) {
+    await markdown.evaluate((element, size) => {
+      if (element instanceof HTMLElement) element.style.fontSize = `${size}px`;
+    }, fontSize);
+    const measurements = await icons.evaluateAll(async (elements: HTMLImageElement[]) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 1024;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Missing icon measurement context');
+      const result = [];
+      for (const icon of elements) {
+        await icon.decode();
+        context.clearRect(0, 0, 1024, 1024);
+        context.drawImage(icon, 0, 0, 1024, 1024);
+        const { data } = context.getImageData(0, 0, 1024, 1024);
+        let left = 1024;
+        let top = 1024;
+        let right = 0;
+        let bottom = 0;
+        for (let y = 0; y < 1024; y++) {
+          for (let x = 0; x < 1024; x++) {
+            if ((data[(y * 1024 + x) * 4 + 3] ?? 0) < 16) continue;
+            left = Math.min(left, x);
+            top = Math.min(top, y);
+            right = Math.max(right, x + 1);
+            bottom = Math.max(bottom, y + 1);
+          }
+        }
+        const box = icon.getBoundingClientRect();
+        const label = icon.parentElement?.querySelector('.link-leading-label');
+        if (!label) throw new Error('Missing icon label');
+        const svg = decodeURIComponent(icon.src.slice('data:image/svg+xml,'.length));
+        const viewBox = svg
+          .match(/\bviewBox="([^"]+)"/)?.[1]
+          ?.split(/\s+/)
+          .map(Number);
+        if (!viewBox) throw new Error('Missing normalized SVG viewBox');
+        result.push({
+          label: label.textContent,
+          width: box.width,
+          height: box.height,
+          artworkAspect: (viewBox[2] ?? 1) / (viewBox[3] ?? 1),
+          inkFill: { left, top, right, bottom },
+          gap: label.getBoundingClientRect().left - box.right,
+        });
+      }
+      return result;
+    });
+    for (const sample of measurements) {
+      const size = fontSize * 0.875;
+      expect(sample.height, sample.label ?? '').toBeLessThanOrEqual(size * 0.875 + 0.02);
+      expect(sample.width, sample.label ?? '').toBeLessThanOrEqual(size * 1.25 + 0.02);
+      const expectedArea = Math.min(
+        (size * 0.8) ** 2,
+        (size * 0.875) ** 2 * sample.artworkAspect,
+        (size * 1.25) ** 2 / sample.artworkAspect
+      );
+      expect(sample.height * sample.width, sample.label ?? '').toBeCloseTo(expectedArea, 0);
+      // Layout rounds lengths to 1/64px independently; check aspect error in CSS pixels.
+      expect(
+        Math.abs(sample.width - sample.height * sample.artworkAspect),
+        sample.label ?? ''
+      ).toBeLessThanOrEqual(0.06);
+      expect(sample.gap, sample.label ?? '').toBeCloseTo(fontSize * 0.25, 1);
+      expect(sample.inkFill.left, sample.label ?? '').toBeLessThanOrEqual(2);
+      expect(sample.inkFill.top, sample.label ?? '').toBeLessThanOrEqual(2);
+      expect(sample.inkFill.right, sample.label ?? '').toBeGreaterThanOrEqual(1022);
+      expect(sample.inkFill.bottom, sample.label ?? '').toBeGreaterThanOrEqual(1022);
+    }
+    const screenshot = await markdown.screenshot({
+      path: testInfo.outputPath(`normalized-file-icons-${fontSize}.png`),
+    });
+    const painted = await markdown.evaluate(async (element, png) => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${png}`;
+      await image.decode();
+      const canvas = document.createElement('canvas');
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Missing painted icon canvas');
+      context.drawImage(image, 0, 0);
+      const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+      const origin = element.getBoundingClientRect();
+      return [...element.querySelectorAll('img.file-path-icon')].map((icon) => {
+        const box = icon.getBoundingClientRect();
+        let left = Infinity;
+        let top = Infinity;
+        let right = -Infinity;
+        let bottom = -Infinity;
+        for (let y = Math.floor(box.top - origin.top); y < box.bottom - origin.top; y++) {
+          for (let x = Math.floor(box.left - origin.left); x < box.right - origin.left; x++) {
+            const offset = (y * canvas.width + x) * 4;
+            if (Math.max(data[offset] ?? 0, data[offset + 1] ?? 0, data[offset + 2] ?? 0) < 100)
+              continue;
+            left = Math.min(left, x);
+            top = Math.min(top, y);
+            right = Math.max(right, x + 1);
+            bottom = Math.max(bottom, y + 1);
+          }
+        }
+        return {
+          widthError: Math.abs(right - left - box.width),
+          heightError: Math.abs(bottom - top - box.height),
+        };
+      });
+    }, screenshot.toString('base64'));
+    for (const paint of painted) {
+      // Check actual pixels, not just the image box. CSS cropping left tiny artwork in a wide box.
+      expect(paint.widthError).toBeLessThanOrEqual(2);
+      expect(paint.heightError).toBeLessThanOrEqual(2);
+    }
+  }
+});
+
+test('paints screenshot icons with a clear gap before digits and at a consistent height', async ({
+  browser,
+  baseURL,
+}, testInfo) => {
+  // Retina rasterization exposes half-pixel dips that a 1x screenshot rounds away.
+  const browserContext = await browser.newContext({
+    baseURL,
+    deviceScaleFactor: 2,
+    viewport: { width: 458, height: 800 },
+  });
+  const page = await browserContext.newPage();
+  await page.goto('/e2e/harness/index.html?scenario=rapid-streaming-jitter&theme=dark');
+  const markdown = page.locator(`${ROW} .rendered-markdown`);
+  await expect(markdown).toHaveText('Starting...');
+  await completeResponse(page, INLINE_ICON_TABLE);
+  const icons = markdown.locator('td img.file-path-icon');
+  await expect(icons).toHaveCount(4);
+  await icons.evaluateAll((images: HTMLImageElement[]) =>
+    Promise.all(images.map((image) => image.decode()))
+  );
+  await page.evaluate(() => document.fonts.ready);
+  await markdown.scrollIntoViewIfNeeded();
+
+  const samples = [];
+  // Different line positions exercise the raster rounding that DOM rectangles don't capture.
+  for (const padding of [0, 0.25, 0.5, 0.75]) {
+    await markdown.evaluate((element, top) => {
+      if (!(element instanceof HTMLElement)) throw new Error('Missing Markdown element');
+      element.style.paddingTop = `${top}px`;
+    }, padding);
+    const screenshot = await page.screenshot({
+      path: testInfo.outputPath(`inline-icon-raster-${padding}.png`),
+      scale: 'device',
+    });
+    const offsets = await markdown.evaluate(async (element, pixels) => {
+      const screenshotImage = new Image();
+      screenshotImage.src = `data:image/png;base64,${pixels}`;
+      await screenshotImage.decode();
+      const canvas = document.createElement('canvas');
+      canvas.width = screenshotImage.width;
+      canvas.height = screenshotImage.height;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Missing screenshot canvas');
+      context.drawImage(screenshotImage, 0, 0);
+      const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+      const scale = window.devicePixelRatio;
+      const inkBounds = (box: DOMRect) => {
+        let left = Infinity;
+        let right = -Infinity;
+        let bottom = -Infinity;
+        for (let y = Math.floor(box.top * scale); y < Math.ceil(box.bottom * scale); y++) {
+          for (let x = Math.floor(box.left * scale); x < Math.ceil(box.right * scale); x++) {
+            // The screenshot uses the dark theme; both the blue label and teal icon have
+            // a brighter green channel than the background or border.
+            if ((data[(y * canvas.width + x) * 4 + 1] ?? 0) > 100) {
+              left = Math.min(left, x);
+              right = Math.max(right, x);
+              bottom = Math.max(bottom, y);
+            }
+          }
+        }
+        if (left === Infinity) throw new Error(`No visible pixels in ${JSON.stringify(box)}`);
+        return { left, right, bottom };
+      };
+      return Array.from(element.querySelectorAll('td .link-leading-content'), (wrapper) => {
+        const icon = wrapper.querySelector('img');
+        const label = wrapper.querySelector('.link-leading-label')?.firstChild;
+        if (!icon || !(label instanceof Text)) throw new Error('Missing icon or label');
+        const digit = document.createRange();
+        digit.setStart(label, 0);
+        digit.setEnd(label, 1);
+        const iconInk = inkBounds(icon.getBoundingClientRect());
+        const digitInk = inkBounds(digit.getBoundingClientRect());
+        return {
+          label: label.data,
+          offset: iconInk.bottom - digitInk.bottom,
+          gap: (digitInk.left - iconInk.right - 1) / scale,
+        };
+      });
+    }, screenshot.toString('base64'));
+    samples.push({ padding, offsets });
+  }
+  await browserContext.close();
+  const offsets = samples.flatMap((sample) => sample.offsets.map((entry) => entry.offset));
+  expect(new Set(offsets).size, JSON.stringify(samples)).toBe(1);
+  // Ink below the digits reads as a sunken icon.
+  expect(offsets[0], JSON.stringify(samples)).toBeLessThanOrEqual(0);
+  const gaps = samples.flatMap((sample) => sample.offsets.map((entry) => entry.gap));
+  expect(Math.min(...gaps), JSON.stringify(samples)).toBeGreaterThanOrEqual(3);
+  expect(Math.max(...gaps), JSON.stringify(samples)).toBeLessThanOrEqual(5);
+});
+
 test('keeps filename links inside narrow table cells throughout streaming and completion', async ({
   page,
 }) => {
@@ -600,6 +1011,111 @@ test('keeps preceding content stable while a streamed HTML disclosure forms', as
   await expect(markdown).toContainText('VFZ-TOOLS-END');
   expect(samples.length).toBeGreaterThan(20);
   expect(reversals).toEqual([]);
+});
+
+test('paints no transient structure while nested and quoted markers stream', async ({ page }) => {
+  // ses_dfde9136fffeaRG6Zgn3qN4oED: pausing at `    -` turned the preceding nested item into
+  // a setext heading; `> -`, `>`, and `--` painted empty items, quotations, or a paragraph.
+  test.setTimeout(60_000);
+  await page.setViewportSize({ width: 486, height: 900 });
+  await page.goto('/e2e/harness/index.html?scenario=rapid-streaming-jitter');
+  const markdown = page.locator(`${ROW} .rendered-markdown`);
+  await expect(markdown).toHaveText('Starting...');
+  const collector = await markdown.evaluateHandle((element) => {
+    const hiddenSelector = '.streaming-markdown-pending-block, .streaming-markdown-pending-hidden';
+    const visible = (node: Element) => !node.closest(hiddenSelector);
+    const visibleText = (node: Element) => {
+      // SAFETY: cloneNode preserves the node type of the source Element.
+      const copy = node.cloneNode(true) as Element;
+      for (const hidden of copy.querySelectorAll(hiddenSelector)) hidden.remove();
+      return copy.textContent?.trim() ?? '';
+    };
+    const state = {
+      running: true,
+      frames: 0,
+      findings: [] as string[],
+    };
+    const sample = () => {
+      state.frames += 1;
+      const findings = [
+        ...[...element.querySelectorAll(':is(li, blockquote) :is(h1, h2, h3, h4, h5, h6)')]
+          .filter(visible)
+          .map((heading) => `heading: ${heading.outerHTML}`),
+        ...[...element.querySelectorAll('li, blockquote')]
+          .filter((node) => visible(node) && !visibleText(node))
+          .map((node) => `empty ${node.tagName.toLowerCase()}: ${node.parentElement?.outerHTML}`),
+        ...[...element.querySelectorAll('p')]
+          .filter((node) => visible(node) && /^-{1,2}$/.test(visibleText(node)))
+          .map((node) => `partial rule: ${node.outerHTML}`),
+      ];
+      if (findings.length > 0)
+        state.findings.push(`frame ${state.frames}: ${findings.join(' | ')}`);
+      if (state.running) requestAnimationFrame(sample);
+    };
+    sample();
+    return state;
+  });
+  const body = [
+    '',
+    '',
+    '### Nested lists',
+    '',
+    '- Workspace',
+    '  - Source files',
+    '    - Components',
+    '      - Message list',
+    '      - Input field',
+    '    - Utilities',
+    '      - Parsing',
+    '  - Test files',
+    '    - Unit tests',
+    '',
+    '> A longer quotation may wrap across several lines depending on the available width.',
+    '>',
+    '> A second paragraph belongs to the same quotation.',
+    '>',
+    '> - A quoted list item.',
+    '> - Another quoted list item with **emphasis**.',
+    '',
+    '> The outer quotation begins here.',
+    '>',
+    '> > The inner quotation adds another level.',
+    '',
+    'All names below are fictional test data.',
+    '',
+    '---',
+    '',
+    'VFZ-MARKERS-END',
+  ].join('\n');
+  // Pause exactly after each bare marker and its following space, as streamed tokens can.
+  const cuts = new Set<number>([body.length]);
+  for (const match of body.matchAll(/\n[ \t]*(?:>[ \t]*)*(?:--|[-+*])?/g)) {
+    const end = match.index + match[0].length;
+    cuts.add(end);
+    if (body[end] === ' ') cuts.add(end + 1);
+  }
+  let start = 0;
+  for (const cut of [...cuts].toSorted((left, right) => left - right)) {
+    if (cut <= start) continue;
+    await appendDeltaToRapidStreaming(page, body.slice(start, cut));
+    await waitForAnimationFrames(page, 4);
+    start = cut;
+  }
+  const text = `Starting...${body}`;
+  await completeResponse(page, text);
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
+  await waitForAnimationFrames(page, 6);
+  const samples = await collector.evaluate((state) => {
+    state.running = false;
+    return { frames: state.frames, findings: state.findings };
+  });
+  await attachEvidence(test.info(), 'marker-boundary-frames.json', JSON.stringify(samples));
+  await expect(markdown).toContainText('VFZ-MARKERS-END');
+  await expect(markdown.locator('li li li')).toHaveCount(6);
+  await expect(markdown.locator('blockquote blockquote')).toHaveCount(1);
+  await expect(markdown.locator('hr')).toHaveCount(1);
+  expect(samples.frames).toBeGreaterThan(40);
+  expect(samples.findings).toEqual([]);
 });
 
 async function attachEvidence(testInfo: TestInfo, name: string, json: string) {
@@ -850,18 +1366,14 @@ for (const width of [1280, 390]) {
       await page.goto('/e2e/harness/index.html?scenario=rapid-streaming-jitter');
       const list = page.locator('.interactive-list');
       await expect(page.locator('.interactive-list-track')).toHaveClass(/virtualized/);
-      await expect
-        .poll(() => getScrollMetrics(page, '.interactive-list').then((m) => m.distanceFromBottom))
-        .toBeLessThan(15);
+      await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThan(15);
       await appendDeltaToRapidStreaming(page, '\n\nStable prose before detaching.\n\nOpen tail');
       await expect(page.locator(`${ROW} [data-markdown-segment="stable"]`)).toContainText(
         'Stable prose before detaching.'
       );
       await list.hover();
       await page.mouse.wheel(0, -480);
-      await expect
-        .poll(() => getScrollMetrics(page, '.interactive-list').then((m) => m.distanceFromBottom))
-        .toBeGreaterThan(300);
+      await expect.poll(() => getListDistanceFromBottom(page)).toBeGreaterThan(300);
       await waitForAnimationFrames(page, 8);
       const anchor = await getVisibleMessageAnchor(list);
 
@@ -906,9 +1418,7 @@ for (const width of [1280, 390]) {
       ).toBeGreaterThan(300);
 
       await page.mouse.wheel(0, 10000);
-      await expect
-        .poll(() => getScrollMetrics(page, '.interactive-list').then((m) => m.distanceFromBottom))
-        .toBeLessThan(15);
+      await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThan(15);
       const before = await getScrollMetrics(page, '.interactive-list');
       const followWatcher = await list.evaluateHandle((element) => {
         const state = { running: true, tops: [] as number[] };
@@ -926,10 +1436,7 @@ for (const width of [1280, 390]) {
         // The viewport follows with the same bounded easing as standalone blocks.
         // Keep the bottom-distance contract while observing every intermediate frame.
         await expect
-          .poll(
-            () => getScrollMetrics(page, '.interactive-list').then((m) => m.distanceFromBottom),
-            { timeout: 1500 }
-          )
+          .poll(() => getListDistanceFromBottom(page), { timeout: 1500 })
           .toBeLessThan(15);
       }
       const followTops = await followWatcher.evaluate((state) => {

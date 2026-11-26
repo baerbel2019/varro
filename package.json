@@ -1,7 +1,7 @@
 {
   "name": "varro",
   "displayName": "Varro: OpenCode Workbench",
-  "version": "0.34.15",
+  "version": "0.37.1",
   "description": "OpenCode agent workbench with project-aware chat, parallel sessions, plan and change review, model and permission controls, commit messages, and usage insights.",
   "categories": [
     "AI",
@@ -79,6 +79,7 @@
     "ai:playback": "node scripts/ai-session-playback.mjs",
     "ai:streaming": "node scripts/ai-streaming.mjs",
     "test:ai-runner": "npm run build && node scripts/ai-streaming-smoke.mjs",
+    "test:native-paint": "npm run build && node scripts/ai-native-paint.mjs",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.scripts.json",
     "typecheck:suggestions": "node scripts/check-ts-suggestions.mjs",
@@ -89,47 +90,49 @@
   },
   "dependencies": {
     "@imagemagick/magick-wasm": "0.0.46",
-    "@opencode-ai/sdk": "^1.19.5",
-    "@opencode/client": "^2.3.0",
+    "@opencode-ai/sdk": "^1.19.6",
+    "@opencode/client": "^2.4.2",
+    "@solidjs/signals": "2.0.4",
+    "@solidjs/web": "2.0.4",
     "cross-spawn": "7.0.6",
-    "dompurify": "3.4.18",
+    "dompurify": "3.5.0",
     "highlight.js": "11.12.0",
     "jsonc-parser": "3.3.1",
     "katex": "0.19.1",
-    "marked": "18.2.0",
+    "marked": "18.3.0",
     "mermaid": "^12.3.0",
-    "solid-js": "^1.9.19"
+    "solid-js": "2.0.4"
   },
   "devDependencies": {
     "@playwright/test": "1.65.1",
+    "@solidjs/vite-plugin": "3.0.1",
     "@tailwindcss/vite": "4.3.5",
     "@types/css.escape": "1.5.2",
-    "@types/node": "26.6.6",
+    "@types/node": "26.6.11",
     "@types/vscode": "1.107.0",
-    "@vitest/coverage-v8": "5.1.0",
+    "@vitest/coverage-v8": "5.1.2",
     "@vscode/vsce": "4.1.1",
     "css.escape": "1.5.1",
     "esbuild": "0.28.2",
     "iconoir": "7.12.2",
     "jsdom": "31.0.1",
     "material-icon-theme": "5.40.0",
-    "oxfmt": "0.78.0",
-    "oxlint": "1.93.0",
-    "oxlint-plugin-anti-slop": "github:dmmulroy/anti-slop#13909c9",
-    "oxlint-tsgolint": "7.0.2007",
+    "oxfmt": "0.80.0",
+    "oxlint": "1.95.0",
+    "oxlint-plugin-anti-slop": "github:dmmulroy/anti-slop#63dbb09",
+    "oxlint-tsgolint": "7.0.2009",
     "tailwindcss": "4.3.5",
     "typescript": "7.0.2",
-    "vite": "8.3.8",
-    "vite-plugin-solid": "2.11.16",
-    "vitest": "5.1.0",
+    "vite": "8.4.0",
+    "vitest": "5.1.2",
     "ws": "8.23.0"
   },
   "overrides": {
     "@azure/identity": {
-      "@azure/msal-node": "7.2.2"
+      "@azure/msal-node": "7.2.3"
     },
     "@vscode/vsce": {
-      "minimatch": "11.0.8"
+      "minimatch": "11.0.9"
     },
     "mermaid": {
       "katex": "0.19.1"
@@ -221,6 +224,21 @@
         "shortTitle": "Usage Stats"
       },
       {
+        "command": "varro.chat.openSkillSettings",
+        "title": "Varro: Manage Skills",
+        "shortTitle": "Manage Skills"
+      },
+      {
+        "command": "varro.chat.openMcpSettings",
+        "title": "Varro: Manage MCPs",
+        "shortTitle": "Manage MCPs"
+      },
+      {
+        "command": "varro.chat.openOpenCodeConfig",
+        "title": "Varro: Open Global OpenCode Config",
+        "shortTitle": "OpenCode.json"
+      },
+      {
         "command": "varro.chat.exportUsageCsv",
         "title": "Varro: Export All-Time Usage to CSV"
       },
@@ -248,6 +266,16 @@
         "enablement": "varro:canSwitchSessions"
       },
       {
+        "command": "varro.chat.navigateBack",
+        "title": "Varro: Go Back in Session History",
+        "enablement": "varro:canNavigateBack"
+      },
+      {
+        "command": "varro.chat.navigateForward",
+        "title": "Varro: Go Forward in Session History",
+        "enablement": "varro:canNavigateForward"
+      },
+      {
         "command": "varro.server.restart",
         "title": "Varro: Restart Server"
       },
@@ -273,6 +301,11 @@
         "command": "varro.generateCommitMessage",
         "title": "Varro: Generate Commit Message",
         "icon": "$(wand)"
+      },
+      {
+        "command": "varro.walkThroughChanges",
+        "title": "Varro: Walk Through Changes",
+        "icon": "$(list-ordered)"
       },
       {
         "command": "varro.cancelCommitMessage",
@@ -377,6 +410,11 @@
       ],
       "scm/title": [
         {
+          "command": "varro.walkThroughChanges",
+          "when": "scmProvider == git",
+          "group": "navigation@98"
+        },
+        {
           "command": "varro.generateCommitMessage",
           "when": "scmProvider == git && scmProviderRootUri not in varro:commitMessageGenerationRoots",
           "group": "navigation@99"
@@ -419,8 +457,20 @@
           "group": "1_main@2"
         },
         {
-          "command": "varro.openGitHub",
+          "command": "varro.chat.openSkillSettings",
           "group": "1_main@3"
+        },
+        {
+          "command": "varro.chat.openMcpSettings",
+          "group": "1_main@4"
+        },
+        {
+          "command": "varro.chat.openOpenCodeConfig",
+          "group": "1_main@5"
+        },
+        {
+          "command": "varro.openGitHub",
+          "group": "1_main@6"
         }
       ],
       "commandPalette": [
@@ -480,6 +530,18 @@
         "key": "ctrl+shift+k",
         "mac": "cmd+shift+k",
         "when": "terminalFocus && terminalTextSelected"
+      },
+      {
+        "command": "varro.chat.navigateBack",
+        "key": "alt+left",
+        "mac": "ctrl+-",
+        "when": "varro:focusedChatSurface == sidebar && varro:canNavigateBack"
+      },
+      {
+        "command": "varro.chat.navigateForward",
+        "key": "alt+right",
+        "mac": "ctrl+shift+-",
+        "when": "varro:focusedChatSurface == sidebar && varro:canNavigateForward"
       }
     ],
     "configuration": {
@@ -565,6 +627,11 @@
           "default": "rotating",
           "description": "Choose how pinned provider limits appear in the status bar. Providers selected in visible chats in this window are excluded. The tooltip shows available limits for the remaining pinned providers."
         },
+        "varro.usageReports.showCacheWrite": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show cache write tokens in a separate column in usage reports. When disabled, cache write tokens are included in the Input column."
+        },
         "varro.chat.showFileDiffs": {
           "type": "boolean",
           "default": false,
@@ -604,6 +671,39 @@
           "type": "boolean",
           "default": true,
           "description": "Enable VS Code Problems context in chat. Disable to hide the Problems attachment chip and exclude diagnostics from prompts, including queued messages."
+        },
+        "varro.chat.promptCacheWarningTokens": {
+          "type": "number",
+          "minimum": 0,
+          "default": 300000,
+          "markdownDescription": "Warn above the composer when an idle session's prompt cache has likely expired and its context holds at least this many tokens. The next message then re-sends the whole context at the uncached rate. Set to `0` to turn the warning off."
+        },
+        "varro.chat.promptCacheWarming": {
+          "type": "string",
+          "scope": "application",
+          "enum": [
+            "off",
+            "chosen",
+            "all"
+          ],
+          "enumDescriptions": [
+            "Never send keep-alive requests.",
+            "Keep warm only the sessions you turn on with Keep warm in the context popup. Varro sends the keep-alives while VS Code runs.",
+            "Turn on OpenCode's own `warming` setting in the global OpenCode config, which keeps every root session warm, also in the TUI."
+          ],
+          "default": "off",
+          "markdownDescription": "Keep an idle session's provider prompt cache alive after each reply, so the next message is cheaper and faster. Each keep-alive sends a short prompt with the whole session context and costs money or subscription quota; with typical cache pricing, about twelve keep-alives cost as much as re-sending the context once uncached. Requires OpenCode v2. `all` writes `warming` to the global OpenCode config and removes it when you switch away. Only user settings can turn this on."
+        },
+        "varro.chat.promptCacheWarmingMinutes": {
+          "type": "number",
+          "enum": [
+            30,
+            60,
+            120,
+            180
+          ],
+          "default": 30,
+          "markdownDescription": "How long a session stays warm after each reply when `#varro.chat.promptCacheWarming#` is on."
         },
         "varro.chat.showTurnTimer": {
           "type": "boolean",
@@ -678,7 +778,7 @@
           "type": "boolean",
           "scope": "application",
           "default": false,
-          "markdownDescription": "Include a VARRO_TRACE_V1 attribution line in auxiliary inference prompts for compatible proxy hooks: follow-ups, permission judging, commit messages, titles, side questions, background-process judging, and prompt completion. Sends purpose, known session/root IDs, and available request/helper IDs; requests without a source session use a hashed workspace ID when available. Requires a proxy hook to apply accounting metadata and strip the line before inference; otherwise the model receives it. Does not change conversation history, permissions, or enable inference features."
+          "markdownDescription": "Include a VARRO_TRACE_V1 attribution line in auxiliary inference prompts for compatible proxy hooks: follow-ups, permission judging, commit messages, titles, side questions, background-process judging, walkthroughs, and prompt completion. Sends purpose, known session/root IDs, and available request/helper IDs; requests without a source session use a hashed workspace ID when available. Requires a proxy hook to apply accounting metadata and strip the line before inference; otherwise the model receives it. Does not change conversation history, permissions, or enable inference features."
         },
         "varro.chat.followupModel": {
           "type": "string",
@@ -692,6 +792,14 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Let Varro generate a fallback title when OpenCode leaves a session untitled. Disable this to rely only on OpenCode's native session naming."
+        },
+        "varro.review.model": {
+          "type": "string",
+          "scope": "application",
+          "default": "",
+          "pattern": "^$|^[^/\\s]+/[^\\s]+$",
+          "patternErrorMessage": "Use provider/model or provider/model#variant, or leave the setting empty.",
+          "markdownDescription": "Provider/model used for changes walkthroughs, optionally with a reasoning variant as `provider/model#variant`. Leave empty to use the active chat's selected model and reasoning. Select a configured model from Varro's Models view with **Use for reviews**."
         },
         "varro.commitMessage.model": {
           "type": "string",
@@ -779,7 +887,7 @@
   },
   "volta": {
     "node": "24.22.3",
-    "npm": "12.2.2"
+    "npm": "12.2.3"
   },
   "allowScripts": {
     "@vscode/vsce-sign@2.1.1": true,

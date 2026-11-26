@@ -17,6 +17,7 @@ import {
   type EditorContext,
   type InlineProblemAttachment,
   type ExtensionMessage,
+  type PromptCacheWarmingSession,
   type ProviderLimitStatus,
   type RalphStatePayload,
   type RestartBlockedState,
@@ -26,6 +27,7 @@ import {
 } from './protocol';
 import { MAX_NATIVE_PDF_TOTAL_BYTES, isNativePdfAttachment } from './native-pdf';
 import { parseModelPreferences } from './model-preferences';
+import type { LearnedPromptCacheLifetime } from './prompt-cache-lifetime';
 import { asRecord, isBoolean, isNumber, isString } from './type-utils';
 import type { UnknownRecord } from './type-utils';
 
@@ -57,6 +59,8 @@ const KNOWN_TYPES = new Set<string>([
   'queued-messages/sync',
   'queued-messages/session-status',
   'queued-messages/claim-result',
+  'pinned-sessions/sync',
+  'todo-sessions/sync',
   'permission-modes/sync',
   'session-models/sync',
   'session-plan-state/sync',
@@ -75,9 +79,13 @@ const KNOWN_TYPES = new Set<string>([
   'command/search-sessions',
   'command/open-attention-sessions',
   'command/open-completed-sessions',
+  'command/open-skill-settings',
+  'command/open-mcp-settings',
   'command/switch-session',
+  'command/navigate-history',
   'command/abort',
   'ralph/state',
+  'warming/state',
 ]);
 
 /**
@@ -182,6 +190,8 @@ export function parseExtensionMessage<T>(value: T): ExtensionMessage | null {
     case 'command/search-sessions':
     case 'command/open-attention-sessions':
     case 'command/open-completed-sessions':
+    case 'command/open-skill-settings':
+    case 'command/open-mcp-settings':
     case 'command/abort':
       return { type };
 
@@ -213,6 +223,12 @@ export function parseExtensionMessage<T>(value: T): ExtensionMessage | null {
     case 'command/switch-session': {
       const payload = asRecord(record.payload);
       if (payload?.direction !== 'previous' && payload?.direction !== 'next') return null;
+      return { type, payload: { direction: payload.direction } };
+    }
+
+    case 'command/navigate-history': {
+      const payload = asRecord(record.payload);
+      if (payload?.direction !== 'back' && payload?.direction !== 'forward') return null;
       return { type, payload: { direction: payload.direction } };
     }
 
@@ -388,11 +404,28 @@ export function parseExtensionMessage<T>(value: T): ExtensionMessage | null {
         payload.debugResetWarningDays >= 5
       )
         config.debugResetWarningDays = payload.debugResetWarningDays;
+      if (
+        isNumber(payload.promptCacheWarningTokens) &&
+        Number.isFinite(payload.promptCacheWarningTokens) &&
+        payload.promptCacheWarningTokens >= 0
+      )
+        config.promptCacheWarningTokens = payload.promptCacheWarningTokens;
       if (isBoolean(payload.autoAttachProblems))
         config.autoAttachProblems = payload.autoAttachProblems;
       if (isBoolean(payload.autoAttachActiveFile))
         config.autoAttachActiveFile = payload.autoAttachActiveFile;
       return { type, payload: config };
+    }
+
+    case 'pinned-sessions/sync':
+    case 'todo-sessions/sync': {
+      const payload = asRecord(record.payload);
+      if (
+        !Array.isArray(payload?.sessionIds) ||
+        !payload.sessionIds.every(isSafePersistedSessionId)
+      )
+        return null;
+      return { type, payload: { sessionIds: [...payload.sessionIds] } };
     }
 
     case 'session/catalog-invalidated':
@@ -774,9 +807,66 @@ export function parseExtensionMessage<T>(value: T): ExtensionMessage | null {
       };
     }
 
+    case 'warming/state': {
+      const payload = asRecord(record.payload);
+      const sessionsRecord = asRecord(payload?.sessions);
+      if (
+        !payload ||
+        !sessionsRecord ||
+        !isBoolean(payload.available) ||
+        !isBoolean(payload.openCodeWarming) ||
+        (payload.mode !== 'off' && payload.mode !== 'chosen' && payload.mode !== 'all') ||
+        !isPositiveFinite(payload.durationMs)
+      ) {
+        return null;
+      }
+      const sessions: Record<string, PromptCacheWarmingSession> = {};
+      for (const [sessionId, entry] of Object.entries(sessionsRecord)) {
+        const session = asRecord(entry);
+        if (!session || !isSafePersistedSessionId(sessionId)) return null;
+        const { warmUntil, sentAt, ttlMs, stopped } = session;
+        if (
+          (warmUntil !== null && !isPositiveFinite(warmUntil)) ||
+          (sentAt !== null && !isPositiveFinite(sentAt)) ||
+          (ttlMs !== null && !isPositiveFinite(ttlMs)) ||
+          (stopped !== null &&
+            stopped !== 'expired' &&
+            stopped !== 'cache-miss' &&
+            stopped !== 'failed')
+        ) {
+          return null;
+        }
+        sessions[sessionId] = { warmUntil, sentAt, ttlMs, stopped };
+      }
+      const learnedRecord = asRecord(payload.learned);
+      if (!learnedRecord) return null;
+      const learned: Record<string, LearnedPromptCacheLifetime> = {};
+      for (const [key, entry] of Object.entries(learnedRecord)) {
+        const lifetime = asRecord(entry);
+        if (key.length > 1024 || !isPositiveFinite(lifetime?.ms) || !isBoolean(lifetime?.bounded))
+          return null;
+        learned[key] = { ms: lifetime.ms, bounded: lifetime.bounded };
+      }
+      return {
+        type,
+        payload: {
+          available: payload.available,
+          mode: payload.mode,
+          durationMs: payload.durationMs,
+          openCodeWarming: payload.openCodeWarming,
+          sessions,
+          learned,
+        },
+      };
+    }
+
     default:
       return null;
   }
+}
+
+function isPositiveFinite<T>(value: T): value is T & number {
+  return isNumber(value) && Number.isFinite(value) && value > 0;
 }
 
 function isChatFontSize<T>(value: T): value is T & number {

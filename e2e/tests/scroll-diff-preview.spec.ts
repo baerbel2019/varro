@@ -3,14 +3,54 @@ import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import type { WebviewMessage } from '../../src/shared/protocol';
 import {
+  getListDistanceFromBottom,
   getScrollMetrics,
   getStickyMessageAlignment,
   getVisibleMessageAnchor,
   installOuterScrollSentinel,
+  postWebviewMessage,
   sampleMessageTopAcrossFrames,
+  scrollToBottom,
   waitForAnimationFrame,
   waitForAnimationFrames,
 } from './helpers';
+
+type PartialDiffProbe = {
+  gate: boolean;
+  deferKeyScroll?: boolean;
+  holdScrollAfter?: number;
+  deliverHeldScroll?: () => void;
+  pending: Map<string, () => void>;
+  events: Array<{
+    type: string;
+    at: number;
+    part?: string;
+    trusted?: boolean;
+    top: number;
+    markerTop: number;
+    precedingHold: number;
+    precedingPreviews: number;
+  }>;
+  release: (step: number, file: number) => void;
+  record: (type: string, part?: string, trusted?: boolean) => void;
+};
+
+type PartialDiffWindow = typeof window & { partialDiffProbe: PartialDiffProbe };
+
+/** Posts the host configuration update that toggles inline file diff previews. */
+function setShowFileDiffs(page: Page, showFileDiffs: boolean) {
+  return postWebviewMessage(page, {
+    type: 'config/update',
+    payload: {
+      desktopSessionPaneSide: 'left',
+      defaultPermissionMode: 'default',
+      chatFontSize: 13,
+      chatEditorFontSize: 12,
+      chatFontFamily: 'default',
+      showFileDiffs,
+    },
+  });
+}
 
 async function updateDiffPreview(
   page: Page,
@@ -105,7 +145,965 @@ async function updateDiffPreviewWithPatch(
   );
 }
 
+async function installPartialDiffTail(page: Page, stepCount: number, linesPerEdit = 1) {
+  await page.evaluate(
+    ({ steps, lines }) => {
+      const sessionID = 'session-diff-preview-large-transcript';
+      const host = window as PartialDiffWindow & {
+        __sendToExtension: (message: WebviewMessage) => void;
+        __varroE2E: {
+          getSessionMessages: (id: string) => Array<{ info: Record<string, unknown> }>;
+          updateMessageInfo: (info: Record<string, unknown>) => void;
+          updateMessagePart: (part: unknown) => void;
+        };
+      };
+      const list = document.querySelector<HTMLElement>('.interactive-list')!;
+      const probe: PartialDiffProbe = {
+        gate: false,
+        pending: new Map(),
+        events: [],
+        release(step, file) {
+          const key = `${step}/${file}`;
+          const respond = this.pending.get(key);
+          if (!respond) throw new Error(`Missing pending detail ${key}`);
+          this.pending.delete(key);
+          respond();
+        },
+        record(type, part, trusted) {
+          const preceding = list.querySelector<HTMLElement>(
+            '[data-msg-id="message-partial-diff-1"]'
+          );
+          const marker = list.querySelector('[data-msg-id="message-partial-diff-2"] p');
+          this.events.push({
+            type,
+            at: performance.now(),
+            part,
+            trusted,
+            top: list.scrollTop,
+            markerTop: marker
+              ? marker.getBoundingClientRect().top - list.getBoundingClientRect().top
+              : 0,
+            precedingHold: Number.parseFloat(preceding?.style.minHeight ?? '') || 0,
+            precedingPreviews: preceding?.querySelectorAll('.file-change-inline-diffs').length ?? 0,
+          });
+        },
+      };
+      host.partialDiffProbe = probe;
+      const details = new Map<string, { key: string; part: unknown }>();
+      const originalSend = host.__sendToExtension;
+      host.__sendToExtension = (rawMessage: unknown) => {
+        const message = rawMessage as WebviewMessage;
+        if (message.type !== 'api/request') return originalSend(message);
+        const detail = details.get(message.payload.path);
+        if (!detail) return originalSend(message);
+        const respond = () =>
+          window.postMessage(
+            { type: 'api/response', payload: { id: message.payload.id, data: detail.part } },
+            '*'
+          );
+        if (probe.gate) probe.pending.set(detail.key, respond);
+        else respond();
+      };
+      window.addEventListener(
+        'message',
+        (event: MessageEvent<{ type?: string; payload?: { data?: { id?: string } } }>) => {
+          if (probe.gate && event.data?.type === 'api/response') {
+            const id = event.data.payload?.data?.id;
+            if (id?.startsWith('message-partial-diff-')) probe.record('response', id);
+          }
+        },
+        true
+      );
+      list.addEventListener(
+        'wheel',
+        (event) => {
+          if (probe.gate) probe.record('wheel', undefined, event.isTrusted);
+        },
+        { capture: true, passive: true }
+      );
+      list.addEventListener('scroll', (event) => {
+        if (probe.gate) probe.record('scroll', undefined, event.isTrusted);
+      });
+      const template = host.__varroE2E.getSessionMessages(sessionID).at(-1)!.info;
+      const emit = (type: string, properties: Record<string, unknown>) =>
+        window.postMessage({ type: 'server/event', payload: { type, properties } }, '*');
+      for (let step = 0; step < steps; step++) {
+        const messageID = `message-partial-diff-${step}`;
+        const info = { ...template, id: messageID, time: { created: Date.now() + step } };
+        host.__varroE2E.updateMessageInfo(info);
+        emit('message.updated', { info });
+        const parts: unknown[] = [
+          {
+            id: `${messageID}-text`,
+            messageID,
+            sessionID,
+            type: 'text',
+            text: `Retained partial step ${step}.`,
+          },
+        ];
+        for (let file = 0; file < 3; file++) {
+          const filePath = `src/partial-${step}-${file}.ts`;
+          const part = {
+            id: `${messageID}-edit-${file}`,
+            messageID,
+            sessionID,
+            type: 'tool',
+            tool: 'edit',
+            callID: `${messageID}-call-${file}`,
+            state: {
+              status: 'completed',
+              input: {
+                filePath,
+                oldString: Array.from({ length: lines }, () => 'export const value = 0;').join(
+                  '\n'
+                ),
+                newString: Array.from({ length: lines }, () => 'export const value = 1;').join(
+                  '\n'
+                ),
+              },
+              output: 'Done',
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+          };
+          const deferred = `/partial-diff/${step}/${file}`;
+          details.set(deferred, { key: `${step}/${file}`, part });
+          parts.push({
+            ...part,
+            deferred,
+            state: {
+              ...part.state,
+              input: {},
+              metadata: {
+                files: [{ filePath, type: 'update', additions: lines, deletions: lines }],
+              },
+            },
+          });
+        }
+        for (const part of parts) {
+          host.__varroE2E.updateMessagePart(part);
+          emit('message.part.updated', { part });
+        }
+      }
+    },
+    { steps: stepCount, lines: linesPerEdit }
+  );
+}
+
 test.describe('diff preview anchoring', () => {
+  test('keeps bottom follow through individually delayed sibling diff previews', async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 486, height: 794 });
+    await page.goto(
+      '/e2e/harness/index.html?scenario=diff-preview-large-transcript&expandedActivity=1&diffPreviewCompleted=1'
+    );
+    await expect(page.locator('.interactive-list')).toBeVisible();
+    await installPartialDiffTail(page, 4);
+    await expect(
+      page.locator('[data-msg-id="message-partial-diff-3"] .file-change-inline-diffs')
+    ).toHaveCount(3);
+    await waitForAnimationFrames(page, 30);
+    const toggle = (showFileDiffs: boolean) => setShowFileDiffs(page, showFileDiffs);
+    await toggle(false);
+    await expect(page.locator('.file-change-inline-diffs')).toHaveCount(0);
+    await waitForAnimationFrames(page, 30);
+    await page.evaluate(() => {
+      (window as PartialDiffWindow).partialDiffProbe.gate = true;
+    });
+    await toggle(true);
+    await expect
+      .poll(() => page.evaluate(() => (window as PartialDiffWindow).partialDiffProbe.pending.size))
+      .toBe(12);
+    await page.waitForTimeout(400);
+    const samples = await page.evaluate(async () => {
+      const probe = (window as PartialDiffWindow).partialDiffProbe;
+      const list = document.querySelector<HTMLElement>('.interactive-list')!;
+      const keys = [...probe.pending.keys()];
+      keys.forEach((key, index) => {
+        setTimeout(() => {
+          const [step, file] = key.split('/').map(Number);
+          probe.release(step!, file!);
+        }, index * 40);
+      });
+      const result: Array<{ gap: number; previews: number; reserve: number }> = [];
+      for (let frame = 0; frame < 90; frame++) {
+        await new Promise(requestAnimationFrame);
+        result.push({
+          gap: list.scrollHeight - list.clientHeight - list.scrollTop,
+          previews: list.querySelectorAll(
+            '[data-msg-id^="message-partial-diff-"] .file-change-inline-diffs'
+          ).length,
+          reserve:
+            list.querySelector<HTMLElement>('.append-scroll-bottom-reserve')?.offsetHeight ?? 0,
+        });
+      }
+      return result;
+    });
+    await testInfo.attach('staggered-preview-follow', {
+      body: JSON.stringify(samples),
+      contentType: 'application/json',
+    });
+    expect(samples.some((sample) => sample.previews > 0 && sample.previews < 12)).toBe(true);
+    expect(samples.at(-1)?.previews).toBe(12);
+    expect(
+      samples.every((sample) => sample.gap <= 1),
+      JSON.stringify(samples)
+    ).toBe(true);
+    expect(samples.every((sample) => sample.reserve === 0)).toBe(true);
+  });
+
+  for (const gesture of [
+    'wheel',
+    'wheel twice',
+    'wheel before late siblings',
+    'wheel after partial response',
+    'PageDown',
+    'PageDown with deferred scroll delivery',
+    'PageDown with final detail before scroll delivery',
+    'ArrowDown twice',
+    'ArrowDown twice with deferred scroll delivery',
+  ]) {
+    const partialOlderResponse = gesture === 'wheel after partial response';
+    test(`preserves the native prose destination for ${gesture} while details are pending`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width: 486, height: 794 });
+      const keyboard = gesture.startsWith('PageDown') || gesture.startsWith('ArrowDown');
+      const repeatArrow = gesture.startsWith('ArrowDown');
+      const finalDetail = gesture.includes('final detail');
+      const deferredScroll = gesture.endsWith('scroll delivery');
+      if (!deferredScroll) await page.clock.install();
+      else
+        await page.addInitScript(() => {
+          // Deliver the native scroll event after already-queued frame callbacks.
+          // The browser still owns the animation and the actual scroll coordinate.
+          const add = EventTarget.prototype.addEventListener;
+          EventTarget.prototype.addEventListener = function (type, listener, options) {
+            if (
+              type !== 'scroll' ||
+              // oxlint-disable-next-line anti-slop/no-runtime-typeof -- EventTarget accepts function and object listeners; only defer its function overload.
+              typeof listener !== 'function' ||
+              !(this instanceof HTMLElement) ||
+              (window as PartialDiffWindow).partialDiffProbe
+            )
+              return add.call(this, type, listener, options);
+            return add.call(
+              this,
+              type,
+              (event) => {
+                const probe = (window as PartialDiffWindow).partialDiffProbe;
+                if (this.matches('.interactive-list') && probe?.deferKeyScroll) {
+                  const deliver = () => {
+                    probe.record('deferred-scroll', undefined, event.isTrusted);
+                    listener.call(this, event);
+                  };
+                  if (
+                    probe.holdScrollAfter !== undefined &&
+                    this.scrollTop >= probe.holdScrollAfter
+                  )
+                    probe.deliverHeldScroll = deliver;
+                  else requestAnimationFrame(deliver);
+                } else listener.call(this, event);
+              },
+              options
+            );
+          };
+        });
+      await page.goto(
+        '/e2e/harness/index.html?scenario=diff-preview-large-transcript&expandedActivity=1&diffPreviewCompleted=1'
+      );
+      await expect(page.locator('.interactive-list')).toBeVisible();
+      const stepCount = keyboard ? 9 : 4;
+      const lateSiblings = gesture === 'wheel before late siblings';
+      await installPartialDiffTail(page, stepCount, lateSiblings ? 5 : 1);
+      const marker = page.locator('[data-msg-id="message-partial-diff-2"] p').first();
+      const preceding = page.locator('[data-msg-id="message-partial-diff-1"]');
+      await expect(
+        page.locator('[data-msg-id="message-partial-diff-3"] .diff-view-file')
+      ).toHaveCount(3);
+      await waitForAnimationFrames(page, 20);
+      const list = page.locator('.interactive-list');
+      const box = await list.boundingBox();
+      const markerBox = await marker.boundingBox();
+      if (!box || !markerBox) throw new Error('Missing partial-response marker');
+      await page.mouse.move(box.x + box.width - 4, box.y + box.height / 2);
+      await page.mouse.wheel(0, markerBox.y - box.y - 113);
+      await waitForAnimationFrames(page, 30);
+      const position = () =>
+        marker.evaluate(
+          (element) =>
+            element.getBoundingClientRect().top -
+            document.querySelector('.interactive-list')!.getBoundingClientRect().top
+        );
+      // The first large wheel can hydrate and round virtual rows. Correct that
+      // setup drift natively before recording the destination under test.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const offset = (await position()) - 113;
+        if (Math.abs(offset) <= 2) break;
+        await page.mouse.wheel(0, offset);
+        await waitForAnimationFrames(page, 20);
+      }
+      const before = await position();
+      expect(Math.abs(before - 113)).toBeLessThanOrEqual(2);
+      const showDiffs = (showFileDiffs: boolean) => setShowFileDiffs(page, showFileDiffs);
+      await showDiffs(false);
+      await waitForAnimationFrames(page, 30);
+      expect(Math.abs((await position()) - before)).toBeLessThanOrEqual(2);
+      const collapsedCardGaps = await page.evaluate(() =>
+        [...document.querySelectorAll('.assistant-file-edit-stack')].flatMap((stack) => {
+          const cards = [...stack.children].filter((element) =>
+            element.matches('.file-change-card')
+          );
+          return cards
+            .slice(1)
+            .map(
+              (card, index) =>
+                card.getBoundingClientRect().top - cards[index]!.getBoundingClientRect().bottom
+            );
+        })
+      );
+      expect(collapsedCardGaps.length).toBeGreaterThan(0);
+      expect(
+        collapsedCardGaps.every((gap) => Math.abs(gap - 9) <= 0.1),
+        `Collapsed edit-card gaps must match the 9 px bordered-card spacing: ${JSON.stringify(collapsedCardGaps)}`
+      ).toBe(true);
+      await page.evaluate(() => {
+        (window as PartialDiffWindow).partialDiffProbe.gate = true;
+      });
+      await showDiffs(true);
+      await expect
+        .poll(() =>
+          page.evaluate(() => (window as PartialDiffWindow).partialDiffProbe.pending.size)
+        )
+        .toBe(stepCount * 3);
+      await expect(preceding.locator('.file-change-inline-diffs')).toHaveCount(0);
+      if (finalDetail) {
+        await page.evaluate(() => {
+          const probe = (window as PartialDiffWindow).partialDiffProbe;
+          for (const [key, respond] of probe.pending) {
+            if (key === '1/2') continue;
+            probe.pending.delete(key);
+            respond();
+          }
+        });
+        await expect(
+          page.locator('[data-msg-id^="message-partial-diff-"] .file-change-inline-diffs')
+        ).toHaveCount(stepCount * 3 - 1);
+      }
+      if (keyboard) {
+        await marker.evaluate((element: HTMLElement) => {
+          element.tabIndex = -1;
+          element.focus({ preventScroll: true });
+        });
+        await expect(marker).toBeFocused();
+        await page.evaluate(
+          ({ defer, overlap }) => {
+            const probe = (window as PartialDiffWindow).partialDiffProbe;
+            probe.events.length = 0;
+            probe.deferKeyScroll = defer;
+            if (overlap) {
+              const scrollport = document.querySelector<HTMLElement>('.interactive-list')!;
+              // Coalesce the last few notifications until the single outstanding
+              // preview above the reader has replaced its summary.
+              probe.holdScrollAfter = scrollport.scrollTop + scrollport.clientHeight * 0.8;
+              scrollport.addEventListener('scrollend', () => probe.record('key-ended'), {
+                once: true,
+              });
+            }
+          },
+          { defer: deferredScroll, overlap: finalDetail }
+        );
+        if (repeatArrow) {
+          await marker.evaluate((el) =>
+            el.addEventListener('keydown', (event) => {
+              if (event instanceof KeyboardEvent && event.key === 'ArrowDown')
+                (window as PartialDiffWindow).partialDiffProbe.record(
+                  event.repeat ? 'repeat-key' : 'first-key',
+                  undefined,
+                  event.isTrusted
+                );
+            })
+          );
+          await page.keyboard.down('ArrowDown');
+          await waitForAnimationFrames(page, 2);
+          await page.keyboard.down('ArrowDown');
+          await page.keyboard.up('ArrowDown');
+          expect(
+            await page.evaluate(() =>
+              (window as PartialDiffWindow).partialDiffProbe.events
+                .filter((e) => e.trusted && e.type.endsWith('-key'))
+                .map((e) => e.type)
+            )
+          ).toEqual(['first-key', 'repeat-key']);
+        } else {
+          await page.keyboard.press('PageDown');
+        }
+        if (finalDetail) {
+          await page.waitForFunction(() => {
+            const probe = (window as PartialDiffWindow).partialDiffProbe;
+            return (
+              probe.deliverHeldScroll && probe.events.some((event) => event.type === 'key-ended')
+            );
+          });
+        } else await waitForAnimationFrames(page, 30);
+        const events = await page.evaluate(
+          () => (window as PartialDiffWindow).partialDiffProbe.events
+        );
+        if (deferredScroll)
+          expect(events.some((event) => event.type === 'deferred-scroll' && event.trusted)).toBe(
+            true
+          );
+        const tops = events
+          .filter((event) => event.type === 'scroll' && event.trusted)
+          .map((event) => event.markerTop);
+        expect(tops.length).toBeGreaterThan(1);
+        expect(before - (await position()), JSON.stringify(tops)).toBeGreaterThan(
+          repeatArrow ? 25 : box.height / 2
+        );
+        expect(tops.every((top, index) => !index || top <= tops[index - 1]! + 1)).toBe(true);
+        const destination = await list.evaluate((element) => {
+          const cutoff = element
+            .querySelector('.latest-user-message-sticky-bottom-solid')!
+            .getBoundingClientRect().bottom;
+          const paragraph = [
+            ...element.querySelectorAll('[data-msg-id^="message-partial-diff-"] p'),
+          ].find((node) => node.getBoundingClientRect().top >= cutoff);
+          if (
+            !paragraph ||
+            paragraph.getBoundingClientRect().bottom > element.getBoundingClientRect().bottom
+          )
+            throw new Error('Missing painted paragraph at the PageDown destination');
+          return {
+            id: paragraph.closest<HTMLElement>('[data-msg-id]')!.dataset.msgId!,
+            top: paragraph.getBoundingClientRect().top,
+          };
+        });
+        const samples = await page
+          .locator(`[data-msg-id="${destination.id}"] p`)
+          .first()
+          .evaluate(
+            async (paragraph, { steps, overlap }) => {
+              const probe = (window as PartialDiffWindow).partialDiffProbe;
+              if (overlap) {
+                probe.release(1, 2);
+                const pendingRow = document.querySelector<HTMLElement>(
+                  '[data-msg-id="message-partial-diff-1"]'
+                )!;
+                for (let frame = 0; frame < 24 && pendingRow.style.minHeight; frame++) {
+                  await new Promise(requestAnimationFrame);
+                }
+                if (
+                  pendingRow.querySelectorAll('.file-change-inline-diffs').length !== 3 ||
+                  pendingRow.style.minHeight
+                )
+                  throw new Error('Final preview has not committed before scroll delivery');
+                probe.deferKeyScroll = false;
+                probe.deliverHeldScroll!();
+              } else {
+                probe.deferKeyScroll = false;
+                for (let row = 0; row < steps; row++) {
+                  for (let file = 0; file < 3; file++) probe.release(row, file);
+                }
+              }
+              const positions: number[] = [];
+              for (let frame = 0; frame < 24; frame++) {
+                await new Promise(requestAnimationFrame);
+                positions.push(paragraph.getBoundingClientRect().top);
+              }
+              return positions;
+            },
+            { steps: stepCount, overlap: finalDetail }
+          );
+        await expect(preceding.locator('.file-change-inline-diffs')).toHaveCount(3);
+        expect(
+          samples.every((top) => Math.abs(top - destination.top) <= 2),
+          JSON.stringify({ destination, samples })
+        ).toBe(true);
+        return;
+      }
+      // Freeze the next presentation callback, not response delivery or native input.
+      // This makes the recorded response-between-frames ordering deterministic.
+      const now = await page.evaluate(() => Date.now());
+      await page.clock.pauseAt(now + 16);
+      expect(Math.abs((await position()) - before)).toBeLessThanOrEqual(2);
+      const inputScrollTop = await list.evaluate((element) => element.scrollTop);
+      await page.evaluate(() => {
+        (window as PartialDiffWindow).partialDiffProbe.events.length = 0;
+      });
+      if (partialOlderResponse) {
+        await page.evaluate(() => (window as PartialDiffWindow).partialDiffProbe.release(0, 0));
+        await expect(
+          page.locator('[data-msg-id="message-partial-diff-0"] .file-change-inline-diffs')
+        ).toHaveCount(1);
+      }
+      await page.mouse.wheel(0, -96);
+      await expect
+        // Hydration compensation can already have changed the live scrollTop.
+        // Check native movement at receipt, before that correction, instead.
+        .poll(() =>
+          page.evaluate(
+            () =>
+              (window as PartialDiffWindow).partialDiffProbe.events.find(
+                (event) => event.type === 'wheel' && event.trusted
+              )?.top
+          )
+        )
+        .toBe(inputScrollTop - 96);
+      await page.clock.runFor(17);
+      if (gesture === 'wheel twice') {
+        expect(Math.abs((await position()) - (before + 96))).toBeLessThanOrEqual(2);
+        await page.mouse.wheel(0, 16);
+        await expect
+          .poll(() =>
+            page.evaluate(
+              () =>
+                (window as PartialDiffWindow).partialDiffProbe.events.filter(
+                  (event) => event.type === 'wheel' && event.trusted
+                ).length
+            )
+          )
+          .toBe(2);
+        await page.clock.runFor(17);
+      }
+      const afterInput = await position();
+      // Never add another 96 to the passive wheel listener's already-scrolled rectangle.
+      const expectedTop = before + (gesture === 'wheel twice' ? 80 : 96);
+      await page.evaluate(() => {
+        (window as PartialDiffWindow).partialDiffProbe.record('after-input');
+      });
+      const samples = [afterInput];
+      // Let the detached settle loop sleep before the first preview commits. Growth below
+      // the selected prose doesn't move it; the three preceding siblings arrive separately.
+      if (lateSiblings) await page.clock.runFor(700);
+      for (const step of lateSiblings ? [3, 1, 0, 2] : [0, 1, 2, 3]) {
+        for (let file = 0; file < 3; file++) {
+          if (partialOlderResponse && step === 0 && file === 0) continue;
+          await page.evaluate(
+            ({ row, part }) => (window as PartialDiffWindow).partialDiffProbe.release(row, part),
+            { row: step, part: file }
+          );
+          await expect(
+            page.locator(`[data-msg-id="message-partial-diff-${step}"] .file-change-inline-diffs`)
+          ).toHaveCount(file + 1);
+          if (lateSiblings) samples.push(await position());
+          // Two separate detail deliveries can precede the next follow/measurement frame.
+          if (!lateSiblings || step !== 1 || file !== 0) await page.clock.runFor(17);
+          samples.push(await position());
+        }
+      }
+      await page.clock.runFor(300);
+      samples.push(await position());
+      const events = await page.evaluate(
+        () => (window as PartialDiffWindow).partialDiffProbe.events
+      );
+      await test.info().attach('partial-response-input-order', {
+        body: JSON.stringify(
+          { partialOlderResponse, before, expectedTop, samples, events },
+          null,
+          2
+        ),
+        contentType: 'application/json',
+      });
+      const wheel = events.find((event) => event.type === 'wheel' && event.trusted);
+      const wheelIndex = events.findIndex((event) => event === wheel);
+      const inputIndex = events.findIndex((event) => event.type === 'after-input');
+      if (gesture === 'wheel twice') {
+        const wheels = events.filter((e) => e.type === 'wheel' && e.trusted);
+        expect(wheels).toHaveLength(2);
+        expect(wheels[1]!.at - wheels[0]!.at).toBeLessThan(180);
+      }
+      expect(wheel).toBeDefined();
+      expect(wheel!.top).toBe(inputScrollTop - 96);
+      expect(wheel!.precedingHold).toBeGreaterThan(0);
+      expect(wheel!.precedingPreviews).toBe(0);
+      expect(
+        events
+          .slice(wheelIndex + 1, inputIndex)
+          .some((event) => event.type === 'scroll' && event.trusted)
+      ).toBe(true);
+      expect(events.slice(0, wheelIndex).filter((event) => event.type === 'response')).toEqual(
+        partialOlderResponse
+          ? [expect.objectContaining({ part: 'message-partial-diff-0-edit-0' })]
+          : []
+      );
+      const precedingResponses = events
+        .map((event, index) => ({ event, index }))
+        .filter(
+          ({ event }) =>
+            event.type === 'response' && event.part?.startsWith('message-partial-diff-1-')
+        );
+      expect(precedingResponses).toHaveLength(3);
+      expect(precedingResponses.every(({ index }) => index > inputIndex)).toBe(true);
+      expect(await preceding.evaluate((element) => element.style.minHeight)).toBe('');
+      await page.clock.resume();
+      if (partialOlderResponse) {
+        await test.info().attach('partial-response-settled', {
+          body: await page.screenshot(),
+          contentType: 'image/png',
+        });
+      }
+      expect(
+        samples.every((top) => Math.abs(top - expectedTop) <= 2),
+        JSON.stringify({ expectedTop, samples })
+      ).toBe(true);
+    });
+  }
+
+  for (const input of [
+    { delay: 100, delta: -32 },
+    { delay: 0, delta: -96 },
+    { delay: 100, delta: -96 },
+    { delay: 100, delta: -180 },
+    { delay: 100, delta: -96, edge: 'overlay' },
+    { delay: 100, delta: -96, edge: 'solid' },
+  ]) {
+    test(`preserves painted prose when the preceding visible diff tail is removed, wheel ${input.delta} after ${input.delay}ms${'edge' in input ? ` at the painted ${input.edge} edge` : ''}`, async ({
+      page,
+    }) => {
+      const edge = 'edge' in input ? input.edge : undefined;
+      const edgeSelector =
+        edge === 'solid'
+          ? '.latest-user-message-sticky-bottom-solid'
+          : '.latest-user-message-sticky-overlay';
+      await page.setViewportSize({ width: 486, height: 794 });
+      await page.goto(
+        '/e2e/harness/index.html?scenario=diff-preview-large-transcript&expandedActivity=1&diffPreviewCompleted=1'
+      );
+      await expect(page.locator('.interactive-list')).toBeVisible();
+      await page.evaluate((extraTail) => {
+        const sessionID = 'session-diff-preview-large-transcript';
+        const host = window as typeof window & {
+          __sendToExtension: (message: WebviewMessage) => void;
+          diffTailPending: number;
+          diffTailGate: boolean;
+          releaseDiffTailResponses: () => void;
+          __varroE2E: {
+            getSessionMessages: (id: string) => Array<{ info: Record<string, unknown> }>;
+            updateMessageInfo: (info: Record<string, unknown>) => void;
+            updateMessagePart: (part: unknown) => void;
+          };
+        };
+        const originalSend = host.__sendToExtension;
+        const details = new Map<string, { part: unknown; delay: number }>();
+        host.diffTailPending = 0;
+        host.diffTailGate = false;
+        const queuedResponses: Array<() => void> = [];
+        host.releaseDiffTailResponses = () => {
+          host.diffTailGate = false;
+          for (const respond of queuedResponses.splice(0)) respond();
+        };
+        host.__sendToExtension = (rawMessage: unknown) => {
+          const message = rawMessage as WebviewMessage;
+          if (message.type !== 'api/request') return originalSend(message);
+          const detail = details.get(message.payload.path);
+          if (!detail) return originalSend(message);
+          host.diffTailPending++;
+          setTimeout(() => {
+            const respond = () => {
+              host.diffTailPending--;
+              window.postMessage(
+                {
+                  type: 'api/response',
+                  payload: { id: message.payload.id, data: detail.part },
+                },
+                '*'
+              );
+            };
+            if (host.diffTailGate) queuedResponses.push(respond);
+            else respond();
+          }, detail.delay);
+        };
+        const template = host.__varroE2E.getSessionMessages(sessionID).at(-1)!.info;
+        const emit = (type: string, properties: Record<string, unknown>) =>
+          window.postMessage({ type: 'server/event', payload: { type, properties } }, '*');
+        for (let step = 0; step < (extraTail ? 5 : 4); step++) {
+          const messageID = `message-diff-tail-step-${step}`;
+          const info = { ...template, id: messageID, time: { created: Date.now() + step } };
+          host.__varroE2E.updateMessageInfo(info);
+          emit('message.updated', { info });
+          const text = {
+            id: `${messageID}-text`,
+            messageID,
+            sessionID,
+            type: 'text',
+            text: `Retained step ${step}.`,
+          };
+          const patch = {
+            id: `${messageID}-patch`,
+            messageID,
+            sessionID,
+            type: 'tool',
+            tool: 'apply_patch',
+            callID: `${messageID}-call`,
+            state: {
+              status: 'completed',
+              input: {
+                patchText: [
+                  '*** Begin Patch',
+                  ...Array.from({ length: 3 }, (_, file) =>
+                    [
+                      `*** Update File: src/tail-${file}.ts`,
+                      '@@',
+                      '-export const oldValue = 0;',
+                      '+export const newValue = 1;',
+                    ].join('\n')
+                  ),
+                  '*** End Patch',
+                ].join('\n'),
+              },
+              output: 'Done',
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+          };
+          const deferred = `/diff-tail/${step}`;
+          details.set(deferred, { part: patch, delay: 350 + step * 35 });
+          const summary = {
+            ...patch,
+            deferred,
+            state: {
+              ...patch.state,
+              input: {},
+              metadata: {
+                files: Array.from({ length: 3 }, (_, file) => ({
+                  filePath: `src/tail-${file}.ts`,
+                  type: 'update',
+                  additions: 1,
+                  deletions: 1,
+                })),
+              },
+            },
+          };
+          for (const part of [text, summary]) {
+            host.__varroE2E.updateMessagePart(part);
+            emit('message.part.updated', { part });
+          }
+        }
+      }, !!edge);
+      const marker = page.locator('[data-msg-id="message-diff-tail-step-2"] p').first();
+      await expect(
+        page.locator(`[data-msg-id="message-diff-tail-step-${edge ? 4 : 3}"] .diff-view-file`)
+      ).toHaveCount(3);
+      await waitForAnimationFrames(page, 20);
+      const list = page.locator('.interactive-list');
+      const box = await list.boundingBox();
+      const markerBox = await marker.boundingBox();
+      if (!box || !markerBox) throw new Error('Missing retained diff-tail marker');
+      let targetTop = 113;
+      if (edge) {
+        const overlay = await page.locator(edgeSelector).boundingBox();
+        if (!overlay) throw new Error('Missing sticky overlay edge');
+        targetTop = Math.ceil(overlay.y + overlay.height - box.y) + 2;
+      }
+      await page.mouse.move(edge ? box.x + box.width - 4 : box.x + 8, box.y + box.height / 2);
+      await page.mouse.wheel(0, markerBox.y - box.y - targetTop);
+      await waitForAnimationFrames(page, 30);
+      if (edge) {
+        // Native scrolling can first change the sticky prompt's measured height.
+        // Establish the edge against that settled overlay, not its prior geometry.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const markerTop = await marker.evaluate((element) => element.getBoundingClientRect().top);
+          const overlay = await page.locator(edgeSelector).boundingBox();
+          if (!overlay) throw new Error('Missing sticky overlay after native scroll');
+          const clearance = markerTop - overlay.y - overlay.height;
+          if (clearance > 0 && clearance < 8) break;
+          await page.mouse.wheel(0, clearance - 2);
+          await waitForAnimationFrames(page, 20);
+        }
+      }
+      const before = await marker.evaluate((element) => element.getBoundingClientRect().top);
+      expect(before - box.y).toBeGreaterThan(8);
+      expect(before - box.y).toBeLessThan(box.height - 40);
+      if (edge) {
+        const overlay = await page.locator(edgeSelector).boundingBox();
+        if (!overlay) throw new Error('Missing settled sticky overlay');
+        const clearance = before - overlay.y - overlay.height;
+        expect(clearance).toBeGreaterThan(0);
+        expect(clearance).toBeLessThan(8);
+        if (edge === 'solid') {
+          const fade = await page.locator('.latest-user-message-sticky-bottom-fade').boundingBox();
+          if (!fade) throw new Error('Missing translucent sticky fade');
+          expect(before).toBeLessThan(fade.y + fade.height);
+        }
+        await test.info().attach('painted-sticky-edge', {
+          body: JSON.stringify({ edge, before, overlay, clearance }),
+          contentType: 'application/json',
+        });
+      }
+      for (const [index, showFileDiffs] of [false, true, false, true].entries()) {
+        if (index === 3) {
+          await page.evaluate(() => {
+            (window as typeof window & { diffTailGate: boolean }).diffTailGate = true;
+          });
+        }
+        await setShowFileDiffs(page, showFileDiffs);
+        let expectedTop = before;
+        let trackedMarker = marker;
+        let wheelEvidence: string | undefined;
+        if (index === 3) {
+          // A newer native destination must win while the same details are pending.
+          if (input.delay > 0) await page.waitForTimeout(input.delay);
+          expect(
+            await page.evaluate(
+              () => (window as typeof window & { diffTailPending: number }).diffTailPending
+            )
+          ).toBeGreaterThan(0);
+          await expect(
+            page.locator('[data-msg-id="message-diff-tail-step-1"] .file-change-inline-diffs')
+          ).toHaveCount(0);
+          await page.mouse.wheel(0, input.delta);
+          await waitForAnimationFrames(page, 2);
+          const nativeTop = await marker.evaluate((element) => element.getBoundingClientRect().top);
+          expect(Math.abs(nativeTop - before + input.delta)).toBeLessThanOrEqual(2);
+          const precedingMarker = page
+            .locator('[data-msg-id="message-diff-tail-step-1"] p')
+            .first();
+          const visibility = await precedingMarker.evaluate((element) => {
+            const listElement = document.querySelector('.interactive-list')!;
+            const sticky = listElement.querySelector('.latest-user-message-sticky-overlay')!;
+            return {
+              precedingTop: element.getBoundingClientRect().top,
+              stickyBottom: sticky.getBoundingClientRect().bottom,
+            };
+          });
+          if (input.delta === -180) {
+            // Once genuinely exposed, the earlier paragraph may own the new destination.
+            expect(visibility.precedingTop).toBeGreaterThan(visibility.stickyBottom + 8);
+            trackedMarker = precedingMarker;
+          } else if (input.delta === -96) {
+            expect(visibility.precedingTop).toBeLessThan(visibility.stickyBottom);
+          }
+          expectedTop = await trackedMarker.evaluate(
+            (element) => element.getBoundingClientRect().top
+          );
+          wheelEvidence = JSON.stringify({ input, before, nativeTop, expectedTop, visibility });
+        }
+        const samples = await trackedMarker.evaluate(async (element, release) => {
+          const tops: number[] = [element.getBoundingClientRect().top];
+          if (release) {
+            (
+              window as typeof window & { releaseDiffTailResponses: () => void }
+            ).releaseDiffTailResponses();
+          }
+          for (let frame = 0; frame < 60; frame++) {
+            await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+            tops.push(element.getBoundingClientRect().top);
+          }
+          return tops;
+        }, index === 3);
+        if (wheelEvidence) {
+          await test.info().attach('pending-wheel-anchor', {
+            body: wheelEvidence,
+            contentType: 'application/json',
+          });
+        }
+        expect(
+          samples.every((top) => Math.abs(top - expectedTop) <= 2),
+          JSON.stringify(samples)
+        ).toBe(true);
+        const previews = page.locator(
+          '[data-msg-id="message-diff-tail-step-2"] .file-change-inline-diffs'
+        );
+        if (showFileDiffs) await expect(previews).not.toHaveCount(0);
+        else await expect(previews).toHaveCount(0);
+      }
+    });
+  }
+
+  test('detached diff hide reserves only the painted destination before returning to latest', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 486, height: 794 });
+    await page.goto(
+      '/e2e/harness/index.html?scenario=diff-preview-large-transcript&expandedActivity=1&diffPreviewCompleted=1'
+    );
+    await expect(page.locator('.interactive-list')).toBeVisible();
+    await installPartialDiffTail(page, 4, 6);
+    const list = page.locator('.interactive-list');
+    const row = list.locator('[data-msg-id="message-partial-diff-3"]');
+    const previews = row.locator('.diff-view-file');
+    const setDiffs = (enabled: boolean) => setShowFileDiffs(page, enabled);
+    const geometry = () =>
+      list.evaluate((el) => ({
+        lastBottom:
+          el.querySelector('[data-msg-id="message-partial-diff-3"]')!.getBoundingClientRect()
+            .bottom - el.getBoundingClientRect().top,
+        bottom: el.scrollHeight - el.clientHeight - el.scrollTop,
+        reserve:
+          el.querySelector('.append-scroll-bottom-reserve')?.getBoundingClientRect().height ?? 0,
+        client: el.clientHeight,
+      }));
+    await expect(previews).toHaveCount(3);
+    let naturalTail = 0;
+    for (const enabled of [false, true, false]) {
+      await setDiffs(enabled);
+      await expect(previews).toHaveCount(enabled ? 3 : 0);
+      await waitForAnimationFrames(page, 40);
+      if (!enabled) {
+        const hidden = await geometry();
+        naturalTail = hidden.client + hidden.bottom - hidden.lastBottom - hidden.reserve;
+      }
+    }
+    await page.evaluate(() => {
+      (window as PartialDiffWindow).partialDiffProbe.gate = true;
+    });
+    await setDiffs(true);
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as PartialDiffWindow).partialDiffProbe.pending.has('3/2'))
+      )
+      .toBe(true);
+    await page.evaluate(() => {
+      const probe = (window as PartialDiffWindow).partialDiffProbe;
+      for (const [key, send] of probe.pending) {
+        if (key !== '3/2') {
+          probe.pending.delete(key);
+          send();
+        }
+      }
+    });
+    await expect(previews).toHaveCount(2);
+    await waitForAnimationFrames(page, 30);
+    await page.evaluate(() => {
+      const probe = (window as PartialDiffWindow).partialDiffProbe;
+      probe.gate = false;
+      probe.release(3, 2);
+    });
+    await expect(previews).toHaveCount(3);
+    await waitForAnimationFrames(page, 15);
+    await expect.poll(async () => (await geometry()).bottom).toBeLessThanOrEqual(1);
+    const marker = row.locator('p').first();
+    const viewport = await list.boundingBox();
+    if (!viewport) throw Error('Missing list');
+    await page.mouse.move(viewport.x + 6, viewport.y + viewport.height / 2);
+    await page.mouse.wheel(0, -160);
+    await waitForAnimationFrames(page, 20);
+    const before = await marker.evaluate((el) => el.getBoundingClientRect().top);
+    expect(before).toBeGreaterThan(viewport.y);
+    expect(before).toBeLessThan(viewport.y + viewport.height);
+    expect((await geometry()).bottom).toBeGreaterThan(100);
+    await setDiffs(false);
+    await expect(previews).toHaveCount(0);
+    await waitForAnimationFrames(page, 40);
+    const detached = await geometry();
+    expect(
+      Math.abs((await marker.evaluate((el) => el.getBoundingClientRect().top)) - before)
+    ).toBeLessThanOrEqual(2);
+    // A deficit is necessary to keep this exact paragraph reachable, but must not extend the range beyond it.
+    expect(detached.reserve).toBeGreaterThan(0);
+    const button = page.getByRole('button', { name: 'Scroll to latest message' });
+    if (await button.isVisible()) await button.click();
+    else await list.press('End');
+    await waitForAnimationFrames(page, 20);
+    await expect(row).toBeInViewport();
+    expect((await geometry()).bottom).toBeLessThanOrEqual(1);
+    expect(detached.bottom).toBeLessThanOrEqual(2);
+    expect(
+      Math.abs(detached.reserve - (detached.client - detached.lastBottom - naturalTail))
+    ).toBeLessThanOrEqual(2);
+  });
+
   test('keeps the painted running diff through deferred completion hydration', async ({ page }) => {
     await page.setViewportSize({ width: 486, height: 794 });
     await page.goto(
@@ -367,22 +1365,7 @@ test.describe('diff preview anchoring', () => {
       page.locator('[data-msg-id="message-wheel-diff-59"] .file-change-card')
     ).toHaveCount(4);
     await waitForAnimationFrames(page, 12);
-    await page.evaluate(() => {
-      window.postMessage(
-        {
-          type: 'config/update',
-          payload: {
-            desktopSessionPaneSide: 'left',
-            defaultPermissionMode: 'default',
-            chatFontSize: 13,
-            chatEditorFontSize: 12,
-            chatFontFamily: 'default',
-            showFileDiffs: true,
-          },
-        },
-        '*'
-      );
-    });
+    await setShowFileDiffs(page, true);
     await expect(page.locator('.diff-view-widget').first()).toBeAttached();
     await waitForAnimationFrames(page, 30);
     const tracker = await page.evaluateHandle(() => {
@@ -434,22 +1417,7 @@ test.describe('diff preview anchoring', () => {
     expect(Math.abs(anchor.top)).toBeLessThanOrEqual(2);
     expect(await page.locator('.diff-view-widget').count()).toBeGreaterThan(0);
     const positions = sampleMessageTopAcrossFrames(list, anchor.id, 24);
-    await page.evaluate(() => {
-      window.postMessage(
-        {
-          type: 'config/update',
-          payload: {
-            desktopSessionPaneSide: 'left',
-            defaultPermissionMode: 'default',
-            chatFontSize: 13,
-            chatEditorFontSize: 12,
-            chatFontFamily: 'default',
-            showFileDiffs: false,
-          },
-        },
-        '*'
-      );
-    });
+    await setShowFileDiffs(page, false);
     await expect(page.locator('.diff-view-widget')).toHaveCount(0);
     const samples = await positions;
     expect(samples.every((top) => top !== null && Math.abs(top - anchor.top) <= 1)).toBe(true);
@@ -543,22 +1511,7 @@ test.describe('diff preview anchoring', () => {
     }, id);
     await expect(page.locator(`[data-msg-id="${id}"] .file-change-card`)).toHaveCount(12);
     await waitForAnimationFrames(page, 12);
-    await page.evaluate(() =>
-      window.postMessage(
-        {
-          type: 'config/update',
-          payload: {
-            desktopSessionPaneSide: 'left',
-            defaultPermissionMode: 'default',
-            chatFontSize: 13,
-            chatEditorFontSize: 12,
-            chatFontFamily: 'default',
-            showFileDiffs: true,
-          },
-        },
-        '*'
-      )
-    );
+    await setShowFileDiffs(page, true);
     // Outlast the old two-stable-frame/12-frame settle while the request is still pending.
     await page.waitForTimeout(350);
     const samples = await page.evaluate(async () => {
@@ -624,23 +1577,7 @@ test.describe('diff preview anchoring', () => {
         await expect(page.locator(`[data-msg-id="${messageId}"] .file-change-card`)).toHaveCount(
           12
         );
-        const setDiffView = async (showFileDiffs: boolean) =>
-          page.evaluate((value) => {
-            window.postMessage(
-              {
-                type: 'config/update',
-                payload: {
-                  desktopSessionPaneSide: 'left',
-                  defaultPermissionMode: 'default',
-                  chatFontSize: 13,
-                  chatEditorFontSize: 12,
-                  chatFontFamily: 'default',
-                  showFileDiffs: value,
-                },
-              },
-              '*'
-            );
-          }, showFileDiffs);
+        const setDiffView = async (showFileDiffs: boolean) => setShowFileDiffs(page, showFileDiffs);
         await setDiffView(!enabled);
         const preview = page.locator(`[data-msg-id="${messageId}"] .file-change-inline-diffs`);
         await expect(preview).toHaveCount(enabled ? 0 : 1);
@@ -1142,10 +2079,7 @@ test.describe('diff preview anchoring', () => {
     ).toBe(true);
     expect(await list.locator('[data-msg-id]').count()).toBeLessThan(50);
 
-    await list.evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-      element.dispatchEvent(new Event('scroll'));
-    });
+    await scrollToBottom(list);
     await waitForAnimationFrames(page, 4);
     const summary = page.locator(`[data-msg-id="${editMessageId}"] .assistant-activity-summary`);
     await expect(page.locator(`[data-msg-id="${editMessageId}"] .diff-view-file`)).toBeVisible();
@@ -1157,9 +2091,7 @@ test.describe('diff preview anchoring', () => {
     await page.getByLabel('Send (Enter)').click();
 
     await expect(page.locator('.chat-turn-user').last()).toContainText('Make one more change');
-    await expect
-      .poll(() => getScrollMetrics(page, '.interactive-list').then((m) => m.distanceFromBottom))
-      .toBeLessThan(15);
+    await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThan(15);
     await expect(summary).toContainText('Explored: 1 file');
     await expect(summary).not.toContainText('edit');
     await expect(page.locator(`[data-msg-id="${editMessageId}"] .diff-view-file`)).toBeVisible();
@@ -1433,9 +2365,7 @@ test.describe('diff preview anchoring', () => {
 
     const header = page.locator(`[data-msg-id="${messageId}"] .diff-view-item`);
     // Wait for layout stability so bottom-follow cannot move the header away from the pointer.
-    await expect
-      .poll(() => getScrollMetrics(page, '.interactive-list').then((m) => m.distanceFromBottom))
-      .toBeLessThanOrEqual(1);
+    await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThanOrEqual(1);
     await header.hover({ position: { x: 4, y: 4 } });
     await expect
       .poll(() => toggle.evaluate((button) => getComputedStyle(button).opacity))
@@ -1507,11 +2437,7 @@ test.describe('diff preview anchoring', () => {
     const jumpToLatest = page.locator('.jump-to-latest-button');
     await expect(jumpToLatest).toBeVisible();
     await jumpToLatest.click();
-    await expect
-      .poll(() =>
-        getScrollMetrics(page, '.interactive-list').then((metrics) => metrics.distanceFromBottom)
-      )
-      .toBeLessThan(3);
+    await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThan(3);
 
     const focusPreview = page.locator(
       '[data-msg-id="message-diff-preview-assistant-58"] .diff-view-lines'
@@ -1532,11 +2458,7 @@ test.describe('diff preview anchoring', () => {
     expect(focusedMetrics.distanceFromBottom).toBeGreaterThan(200);
 
     await page.locator('[contenteditable="true"]').focus();
-    await expect
-      .poll(() =>
-        getScrollMetrics(page, '.interactive-list').then((metrics) => metrics.distanceFromBottom)
-      )
-      .toBeLessThan(3);
+    await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThan(3);
   });
 
   test('keeps a focused diff header fixed when it is expanded after scrolling', async ({
@@ -1597,19 +2519,13 @@ test.describe('diff preview anchoring', () => {
     const toggle = page.locator(`[data-msg-id="${messageId}"] .diff-view-toggle`);
     await expect(toggle).toBeAttached();
 
-    await list.evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-      element.dispatchEvent(new Event('scroll'));
-    });
+    await scrollToBottom(list);
     await waitForAnimationFrames(page, 3);
 
     await toggle.evaluate((button) => (button as HTMLButtonElement).click());
     await expect(toggle).toHaveAttribute('aria-expanded', 'true');
     await waitForAnimationFrames(page, 4);
-    await list.evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-      element.dispatchEvent(new Event('scroll'));
-    });
+    await scrollToBottom(list);
     await waitForAnimationFrames(page, 3);
 
     await toggle.evaluate((button) => {
@@ -1665,11 +2581,7 @@ test.describe('diff preview anchoring', () => {
         )
       )
       .toBeGreaterThan(1_000);
-    await expect
-      .poll(() =>
-        getScrollMetrics(page, '.interactive-list').then((metrics) => metrics.distanceFromBottom)
-      )
-      .toBeLessThan(3);
+    await expect.poll(() => getListDistanceFromBottom(page)).toBeLessThan(3);
 
     await list.evaluate((element) => {
       element.dispatchEvent(new WheelEvent('wheel', { deltaY: -8, bubbles: true }));
@@ -1705,10 +2617,7 @@ test.describe('diff preview anchoring', () => {
     }
     await waitForAnimationFrames(page, 5);
 
-    await list.evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-      element.dispatchEvent(new Event('scroll'));
-    });
+    await scrollToBottom(list);
     await waitForAnimationFrames(page, 3);
 
     const box = await list.boundingBox();
@@ -1838,20 +2747,32 @@ test.describe('diff preview anchoring', () => {
       }
     });
     const outerScrollTop = await installOuterScrollSentinel(page);
-    const sawLoading = await sticky.evaluate((card) => {
-      (card as HTMLElement).click();
-      const loading = card.querySelector<HTMLElement>('.latest-user-message-sticky-loading');
-      const spinner = card.querySelector<HTMLElement>('.latest-user-message-sticky-spinner');
-      const bounds = loading?.getBoundingClientRect();
-      return (
-        !(loading?.textContent?.includes('Loading…') ?? false) &&
-        !!spinner &&
-        !!bounds &&
-        bounds.width > 0 &&
-        bounds.height > 0
-      );
+    // Initial history is needed to discover the boundary. Hold only the subsequent
+    // request so feedback can be observed while pending, after the click returns.
+    await page.evaluate(() => {
+      const url = new URL(location.href);
+      url.searchParams.set('deferHistory', '1');
+      history.replaceState(null, '', url);
     });
-    expect(sawLoading).toBe(true);
+    await sticky.evaluate((card) => (card as HTMLElement).click());
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const host = window as typeof window & {
+            __varroE2E: { pendingHistoryRequestCount(): number };
+          };
+          return host.__varroE2E.pendingHistoryRequestCount();
+        })
+      )
+      .toBeGreaterThan(0);
+    await expect(sticky.locator('.latest-user-message-sticky-spinner')).toBeVisible();
+    await expect(sticky.locator('.latest-user-message-sticky-loading')).not.toContainText(
+      'Loading…'
+    );
+    await page.evaluate(() => {
+      const host = window as typeof window & { __varroE2E: { releaseHistoryRequests(): void } };
+      host.__varroE2E.releaseHistoryRequests();
+    });
 
     await expect(targetCard).toBeAttached();
     await expect

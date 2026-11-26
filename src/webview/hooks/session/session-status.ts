@@ -6,7 +6,6 @@ import { deriveUsageLimitNotice } from '../../lib/usage-limit';
 import type { UsageLimitNotice } from '../../lib/usage-limit';
 import {
   getLatestAssistantFinishedAt,
-  latestAssistantFinished,
   latestAssistantFinishedBeforeLoading,
 } from '../../lib/message-metrics';
 import { isRunningSessionStatus } from '../../lib/session-event-reducer';
@@ -318,8 +317,13 @@ export function updateUsageLimitStateWithDependencies(
           modelID: rawNotice.modelID || context.modelID,
         }
       : rawNotice;
+  const latestMessage = messages.findLast(
+    ({ info }) => info.sessionID === sessionID && !(info.role === 'user' && info.pendingDelivery)
+  );
   deps.applyUsageLimitNotice(sessionID, notice, {
-    preserveExistingOnNull: status?.type === 'idle',
+    // A status-only load or a prompt awaiting its assistant cannot disprove a
+    // cached limit. The current assistant's outcome can.
+    preserveExistingOnNull: status?.type === 'idle' && latestMessage?.info.role !== 'assistant',
   });
 }
 
@@ -386,16 +390,16 @@ export async function recheckSessionStatusWithDependencies(
       const syncs: Array<PromiseSettledResult<void>> = [
         await settleVoid(deps.syncSession(sessionId)),
       ];
-      let syncedMessages = false;
       const shouldSyncMessages = deps.shouldResyncSessionAfterIdle(sessionId);
       if (shouldSyncMessages) {
         const result = await settleVoid(deps.syncSessionMessages(sessionId));
-        syncedMessages = result.status === 'fulfilled';
         syncs.push(result);
       }
       logRejectedSyncs(deps, syncs);
       if (deps.isActiveSession(sessionId)) {
         const messages = deps.getMessages?.() ?? [];
+        // Progress received during either sync takes precedence over the idle snapshot,
+        // even when the latest assistant message has already completed.
         const currentStatus = deps.getCurrentSessionStatus?.(sessionId);
         const latestMessage = messages.at(-1);
         const settledCompaction =
@@ -405,14 +409,6 @@ export async function recheckSessionStatusWithDependencies(
           );
         if (!settledCompaction && hasUnsettledLatestTurn(messages)) {
           deps.startLoading();
-        } else if (
-          syncedMessages &&
-          latestAssistantFinished(messages) &&
-          isRunningSessionStatus(currentStatus) &&
-          !(currentStatus?.type === 'busy' && currentStatus.background)
-        ) {
-          deps.setSessionStatusEntry?.(sessionId, { type: 'idle' });
-          deps.stopLoading();
         } else if (
           isRunningSessionStatus(currentStatus) ||
           (!settledCompaction &&

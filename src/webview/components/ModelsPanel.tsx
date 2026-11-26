@@ -1,15 +1,17 @@
+import { ariaBoolean } from '../lib/aria';
 import {
+  createEffect,
   For,
   Show,
-  createEffect,
   createMemo,
   createSignal,
   onCleanup,
-  onMount,
+  onSettled,
   untrack,
 } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { setHostDragImage } from '../host/extensions';
-import { Portal } from 'solid-js/web';
+import { Portal } from '@solidjs/web';
 import { asRecord } from '../../shared/type-utils';
 import type { PromptCompletionAvailability } from '../../shared/prompt-completion';
 import { showSessionActionFeedback } from './chat/SessionActionFeedback';
@@ -32,6 +34,7 @@ import {
   setProviderOrder,
   setProviderLimitPin,
   setProviderLimit,
+  requestComposerFocus,
   setProviderVisible,
   setShowModels,
   setState,
@@ -76,6 +79,7 @@ import {
   xmarkIcon,
 } from '../lib/ui-icons';
 import { NavArrowLeftControlIcon } from './ControlIcons';
+import { DialogCloseButton } from './DialogCloseButton';
 import { UiIcon } from './UiIcon';
 
 type ModelProvider = (typeof state.providers)[number];
@@ -98,7 +102,7 @@ type ModelRenameState = {
   displayName: string;
 };
 type ModelRouteTag = {
-  kind: 'agent' | 'small' | 'approve' | 'commit' | 'complete' | 'followups';
+  kind: 'agent' | 'small' | 'approve' | 'commit' | 'review' | 'complete' | 'followups';
   text: string;
   label: string;
   change?: 'old' | 'new' | 'removed' | 'overridden';
@@ -137,10 +141,12 @@ function getOrderedProviderModels(provider: ModelProvider) {
 }
 
 export function ModelsPanel() {
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     void refreshRoutingState();
     void loadJevStatus();
-    onCleanup(
+    cleanups.push(
       onMessage((message) => {
         if (message.type === 'providers/refresh' || message.type === 'config/update') {
           void loadRouting();
@@ -148,6 +154,10 @@ export function ModelsPanel() {
         }
       })
     );
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   const [query, setQuery] = createSignal('');
@@ -161,29 +171,31 @@ export function ModelsPanel() {
   const [contextMenu, setContextMenu] = createSignal<ModelContextMenuState | null>(null);
   const [providerContextMenu, setProviderContextMenu] =
     createSignal<ProviderContextMenuState | null>(null);
-  createEffect(() => {
-    const menu = providerContextMenu();
-    const workspacePath = state.editorContext.workspacePath;
-    if (!menu || untrack(() => isProviderLimitPinned(menu.providerID))) return;
-    let current = true;
-    onCleanup(() => {
-      current = false;
-    });
-    void client.config.providerLimit(menu.providerID, null).then(
-      (limit) => {
-        if (current && workspacePath === state.editorContext.workspacePath)
-          setProviderLimit(menu.providerID, null, limit);
-      },
-      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Quota lookup rejections are narrowed before showing feedback.
-      (error: unknown) => {
-        if (!current) return;
-        showSessionActionFeedback(
-          `Could not check provider limits: ${error instanceof Error ? error.message : String(error)}`,
-          'warning'
-        );
-      }
-    );
-  });
+  createEffect(
+    () => ({ menu: providerContextMenu(), workspacePath: state.editorContext.workspacePath }),
+    ({ menu, workspacePath }) => {
+      if (!menu || untrack(() => isProviderLimitPinned(menu.providerID))) return;
+      let current = true;
+      void client.config.providerLimit(menu.providerID, null).then(
+        (limit) => {
+          if (current && workspacePath === state.editorContext.workspacePath)
+            setProviderLimit(menu.providerID, null, limit);
+        },
+        // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Quota lookup rejections are narrowed before showing feedback.
+        (error: unknown) => {
+          if (!current) return;
+          showSessionActionFeedback(
+            `Could not check provider limits: ${error instanceof Error ? error.message : String(error)}`,
+            'warning'
+          );
+        }
+      );
+
+      return () => {
+        current = false;
+      };
+    }
+  );
   const [draggedProviderID, setDraggedProviderID] = createSignal<string | null>(null);
   const [dragOverProviderID, setDragOverProviderID] = createSignal<string | null>(null);
   const [renameDialog, setRenameDialog] = createSignal<ModelRenameState | null>(null);
@@ -252,13 +264,12 @@ export function ModelsPanel() {
       ([sessionId, status]) => parentSessionIds.has(sessionId) && isRunningSessionStatus(status)
     ).length;
   });
-  let refreshWasPending = state.providerRefreshPending;
-
-  createEffect(() => {
-    const refreshIsPending = state.providerRefreshPending;
-    if (refreshWasPending && !refreshIsPending) setPreviousRouting(null);
-    refreshWasPending = refreshIsPending;
-  });
+  createEffect(
+    () => state.providerRefreshPending,
+    (refreshIsPending, refreshWasPending) => {
+      if (refreshWasPending && !refreshIsPending) setPreviousRouting(null);
+    }
+  );
 
   const normalizedQuery = createMemo(() => query().trim().toLocaleLowerCase());
 
@@ -384,6 +395,7 @@ export function ModelsPanel() {
       | 'small_model'
       | 'agent'
       | 'commit_message'
+      | 'review'
       | 'auto_approve'
       | 'prompt_completion'
       | 'followups';
@@ -561,7 +573,7 @@ export function ModelsPanel() {
     }
     setShowReloadIndicator(true);
     setShowRefreshAnimation(true);
-    setState('providersRefreshing', true);
+    setState(storePath('providersRefreshing', true));
     reloadIndicatorTimer = setTimeout(() => {
       setShowReloadIndicator(false);
     }, MIN_RELOAD_INDICATOR_MS);
@@ -648,16 +660,27 @@ export function ModelsPanel() {
 
   onCleanup(() => clearTimeout(reloadIndicatorTimer));
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     updateScrollbarInset();
     void loadRouting();
-    if (!bodyRef) return;
+    if (!bodyRef)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     const observer = new ResizeObserver(() => updateScrollbarInset());
     observer.observe(bodyRef);
-    onCleanup(() => observer.disconnect());
+    cleanups.push(() => observer.disconnect());
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const onPointerDown = () => {
       closeContextMenu();
       setProviderContextMenu(null);
@@ -678,16 +701,19 @@ export function ModelsPanel() {
     };
     window.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('keydown', onEscape);
-    onCleanup(() => {
+    cleanups.push(() => {
       window.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('keydown', onEscape);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   return (
     <div
-      class="models-panel"
-      classList={{ 'models-list-refreshed': showRefreshAnimation() }}
+      class={['models-panel', { 'models-list-refreshed': showRefreshAnimation() }]}
       ref={(element) => (panelRef = element)}
       onAnimationIteration={(event) => {
         if (
@@ -705,10 +731,13 @@ export function ModelsPanel() {
             <Tooltip content="Back">
               <button
                 class="chat-header-btn"
-                onClick={() => setShowModels(false)}
+                onClick={() => {
+                  setShowModels(false);
+                  requestComposerFocus();
+                }}
                 aria-label="Back"
               >
-                <NavArrowLeftControlIcon class="models-header-back-icon" />
+                <NavArrowLeftControlIcon class="chat-header-back-icon" />
               </button>
             </Tooltip>
             <span class="models-header-title">Models</span>
@@ -729,8 +758,8 @@ export function ModelsPanel() {
                 }}
                 aria-label="Provider actions"
                 aria-haspopup="menu"
-                aria-expanded={showProviderActions()}
-                aria-busy={isReloading()}
+                aria-expanded={ariaBoolean(showProviderActions())}
+                aria-busy={ariaBoolean(isReloading())}
               >
                 <UiIcon
                   source={menuIcon}
@@ -929,6 +958,12 @@ export function ModelsPanel() {
                       modelsReorderable={!normalizedQuery()}
                       dragging={draggedProviderID() === providerID}
                       dragOver={dragOverProviderID() === providerID}
+                      contextMenuModelID={
+                        contextMenu()?.providerID === providerID
+                          ? (contextMenu()?.modelID ?? null)
+                          : null
+                      }
+                      providerContextMenuOpen={providerContextMenu()?.providerID === providerID}
                       onDragStart={(event) => startProviderDrag(event, providerID)}
                       onDragOver={(event) => dragOverProvider(event, providerID)}
                       onDragLeave={() => {
@@ -1052,6 +1087,27 @@ export function ModelsPanel() {
                   ? "Don't use for "
                   : 'Use for '}
                 <strong>commit messages</strong>
+              </button>
+              <button
+                type="button"
+                class="models-context-menu-item"
+                disabled={isSaving()}
+                title="Changes walkthroughs use this model. Leave unset to use the active chat's selected model and reasoning."
+                onClick={() =>
+                  void saveRouting({
+                    target: 'review',
+                    providerID: menu.providerID,
+                    modelID: menu.modelID,
+                    unset: isModelRoute(routing().reviewModel, menu.providerID, menu.modelID)
+                      ? true
+                      : undefined,
+                  })
+                }
+              >
+                {isModelRoute(routing().reviewModel, menu.providerID, menu.modelID)
+                  ? "Don't use for "
+                  : 'Use for '}
+                <strong>reviews</strong>
               </button>
               <button
                 type="button"
@@ -1306,14 +1362,7 @@ export function ModelsPanel() {
                     </div>
                     <div class="provider-connect-subtitle">{rename().originalName}</div>
                   </div>
-                  <button
-                    type="button"
-                    class="provider-connect-close"
-                    onClick={() => setRenameDialog(null)}
-                    aria-label="Close"
-                  >
-                    <UiIcon source={xmarkIcon} width={16} height={16} aria-hidden="true" />
-                  </button>
+                  <DialogCloseButton onClick={() => setRenameDialog(null)} />
                 </div>
                 <div class="provider-connect-body">
                   <div class="provider-connect-form">
@@ -1405,13 +1454,16 @@ export function ModelsPanel() {
 
 function ModelCatalogDialog(props: { provider: ModelProvider; onClose: () => void }) {
   const [query, setQuery] = createSignal('');
-  const [catalogProvider, setCatalogProvider] = createSignal<ModelProvider>(props.provider);
+  const openingProvider = untrack(() => props.provider);
+  const [catalogProvider, setCatalogProvider] = createSignal<ModelProvider>(openingProvider);
   const [isLoading, setIsLoading] = createSignal(true);
   const [loadError, setLoadError] = createSignal('');
   const allModels = createMemo(() =>
     sortProviderModels(Object.values(catalogProvider().models), catalogProvider().id)
   );
-  const initialModelIDs = new Set(getListedProviderModels(props.provider).map((model) => model.id));
+  const initialModelIDs = untrack(
+    () => new Set(getListedProviderModels(openingProvider).map((model) => model.id))
+  );
   const [selectedModelIDs, setSelectedModelIDs] = createSignal(new Set(initialModelIDs));
   const normalizedQuery = createMemo(() => query().trim().toLocaleLowerCase());
   const hasChanges = createMemo(() => {
@@ -1454,7 +1506,9 @@ function ModelCatalogDialog(props: { provider: ModelProvider; onClose: () => voi
   const visibleModels = createMemo(() => matchingModels().slice(0, MODEL_CATALOG_RESULT_LIMIT));
   let searchInputRef: HTMLInputElement | undefined;
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     let active = true;
     void (async () => {
       try {
@@ -1474,12 +1528,14 @@ function ModelCatalogDialog(props: { provider: ModelProvider; onClose: () => voi
         }
         setCatalogProvider(refreshedProvider);
         setState(
-          'providers',
-          state.providers.map((provider) =>
-            provider.id === refreshedProvider.id ? refreshedProvider : provider
+          storePath(
+            'providers',
+            state.providers.map((provider) =>
+              provider.id === refreshedProvider.id ? refreshedProvider : provider
+            )
           )
         );
-        setState('providerDefaults', { ...state.providerDefaults, ...result.default });
+        setState(storePath('providerDefaults', { ...state.providerDefaults, ...result.default }));
       } catch (error) {
         if (!active) return;
         setLoadError(error instanceof Error ? error.message : String(error));
@@ -1488,9 +1544,13 @@ function ModelCatalogDialog(props: { provider: ModelProvider; onClose: () => voi
       setIsLoading(false);
       queueMicrotask(() => searchInputRef?.focus());
     })();
-    onCleanup(() => {
+    cleanups.push(() => {
       active = false;
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   function toggleModel(modelID: string, selected: boolean) {
@@ -1535,14 +1595,7 @@ function ModelCatalogDialog(props: { provider: ModelProvider; onClose: () => voi
                   : `Search ${allModels().length} available models. Added models appear in model pickers.`}
               </div>
             </div>
-            <button
-              type="button"
-              class="provider-connect-close"
-              onClick={props.onClose}
-              aria-label="Close"
-            >
-              <UiIcon source={xmarkIcon} width={16} height={16} aria-hidden="true" />
-            </button>
+            <DialogCloseButton onClick={props.onClose} />
           </div>
           <div class="models-model-catalog-search">
             <input
@@ -1645,6 +1698,9 @@ function ProviderSection(props: {
   modelsReorderable: boolean;
   dragging: boolean;
   dragOver: boolean;
+  /** Model whose context menu is open, so its row stays identified while the menu covers it. */
+  contextMenuModelID: string | null;
+  providerContextMenuOpen: boolean;
   onDragStart: (event: DragEvent) => void;
   onDragOver: (event: DragEvent) => void;
   onDragLeave: () => void;
@@ -1672,29 +1728,28 @@ function ProviderSection(props: {
   );
 
   const [expanded, setExpanded] = createSignal(
-    hasRouteTags() || (isProviderVisible(props.provider.id) && enabledCount() > 0)
+    untrack(() => hasRouteTags() || (isProviderVisible(props.provider.id) && enabledCount() > 0))
   );
   const [draggedModelID, setDraggedModelID] = createSignal<string | null>(null);
   const [dragOverModelID, setDragOverModelID] = createSignal<string | null>(null);
-  let providerWasVisible = isProviderVisible(props.provider.id);
-  let previousModelCount = props.models.length;
-  let previouslyHadRouteTags = hasRouteTags();
-
-  createEffect(() => {
-    const providerIsVisible = isProviderVisible(props.provider.id);
-    const modelCount = props.models.length;
-    const tagged = hasRouteTags();
-    if (providerIsVisible !== providerWasVisible) {
-      setExpanded(tagged || (providerIsVisible && enabledCount() > 0));
-    } else if (!providerIsVisible && tagged && !previouslyHadRouteTags) {
-      setExpanded(true);
-    } else if (providerIsVisible && previousModelCount === 0 && modelCount > 0) {
-      setExpanded(true);
+  createEffect(
+    () => ({
+      visible: isProviderVisible(props.provider.id),
+      modelCount: props.models.length,
+      tagged: hasRouteTags(),
+      hasEnabledModels: enabledCount() > 0,
+    }),
+    ({ visible, modelCount, tagged, hasEnabledModels }, previous) => {
+      if (!previous) return;
+      if (visible !== previous.visible) {
+        setExpanded(tagged || (visible && hasEnabledModels));
+      } else if (!visible && tagged && !previous.tagged) {
+        setExpanded(true);
+      } else if (visible && previous.modelCount === 0 && modelCount > 0) {
+        setExpanded(true);
+      }
     }
-    providerWasVisible = providerIsVisible;
-    previousModelCount = modelCount;
-    previouslyHadRouteTags = tagged;
-  });
+  );
 
   const allEnabled = () => props.models.length > 0 && enabledCount() === props.models.length;
   const someEnabled = () => enabledCount() > 0 && !allEnabled();
@@ -1776,7 +1831,7 @@ function ProviderSection(props: {
       onDrop={props.onDrop}
     >
       <div
-        class="models-provider-header"
+        class={`models-provider-header${props.providerContextMenuOpen ? ' is-context-target' : ''}`}
         onContextMenu={(event) => {
           event.preventDefault();
           props.onOpenProviderContextMenu({
@@ -1790,7 +1845,7 @@ function ProviderSection(props: {
           <button
             type="button"
             class="models-provider-drag-handle"
-            draggable={true}
+            draggable="true"
             title="Drag to reorder provider"
             aria-label={`Reorder provider: ${props.provider.name}`}
             onDragStart={props.onDragStart}
@@ -1899,7 +1954,7 @@ function ProviderSection(props: {
 
                 return (
                   <label
-                    class={`models-model-row${draggedModelID() === model.id ? ' is-dragging' : ''}${dragOverModelID() === model.id ? ' is-drag-over' : ''}`}
+                    class={`models-model-row${draggedModelID() === model.id ? ' is-dragging' : ''}${dragOverModelID() === model.id ? ' is-drag-over' : ''}${props.contextMenuModelID === model.id ? ' is-context-target' : ''}`}
                     onDragEnter={(event) => dragOverModel(event, model.id)}
                     onDragOver={(event) => dragOverModel(event, model.id)}
                     onDragLeave={(event) => {
@@ -1928,9 +1983,9 @@ function ProviderSection(props: {
                     >
                       <span
                         class="models-model-drag-handle"
-                        draggable={true}
+                        draggable="true"
                         role="button"
-                        tabIndex={0}
+                        tabindex={0}
                         title="Drag to reorder model"
                         aria-label={`Reorder model: ${getModelDisplayName(props.provider.id, model.id, model.name)}`}
                         onClick={(event) => {
@@ -2188,6 +2243,10 @@ function getModelRouteTags(
     tags.push({ kind: 'commit', text: 'commit', label: 'Commit message model' });
   }
 
+  if (isModelRoute(routing.reviewModel, providerID, modelID)) {
+    tags.push({ kind: 'review', text: 'review', label: 'Review model (changes walkthroughs)' });
+  }
+
   if (
     routing.autoApproveModel?.providerID === providerID &&
     routing.autoApproveModel.modelID === modelID
@@ -2290,6 +2349,7 @@ function createEmptyRouting(): OpenCodeModelRouting {
     smallModel: null,
     agentModels: {},
     commitMessageModel: null,
+    reviewModel: null,
     autoApproveModel: null,
     promptCompletionModel: null,
     followupModel: null,
@@ -2303,6 +2363,7 @@ function normalizeModelRouting<T>(value: T): OpenCodeModelRouting {
   // preview.html proxies directly to OpenCode, which may expose raw opencode.json keys.
   const smallModel = parseModelRoute(record.smallModel) ?? parseModelRoute(record.small_model);
   const commitMessageModel = parseModelRoute(record.commitMessageModel);
+  const reviewModel = parseModelRoute(record.reviewModel);
   const autoApproveModel = parseModelRoute(record.autoApproveModel);
   const promptCompletionModel = parseModelRoute(record.promptCompletionModel);
   const followupModel = parseModelRoute(record.followupModel);
@@ -2339,6 +2400,7 @@ function normalizeModelRouting<T>(value: T): OpenCodeModelRouting {
     smallModel,
     agentModels,
     commitMessageModel,
+    reviewModel,
     autoApproveModel,
     promptCompletionModel,
     followupModel,
@@ -2376,17 +2438,19 @@ function ProviderCheckbox(props: {
   indeterminate: boolean;
   onChange: () => void;
 }) {
-  // oxlint-disable-next-line no-unassigned-vars
   let ref: HTMLInputElement | undefined;
 
-  createEffect(() => {
-    if (ref) ref.indeterminate = props.indeterminate;
-  });
+  createEffect(
+    () => props.indeterminate,
+    (value) => {
+      if (ref) ref.indeterminate = value;
+    }
+  );
 
   return (
     <label class="models-checkbox-label">
       <input
-        ref={ref}
+        ref={(element) => (ref = element)}
         type="checkbox"
         class="models-checkbox"
         checked={props.checked}

@@ -1,3 +1,5 @@
+import { flush as flushSolid } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resetDefaultAppState, setState } from '../lib/state';
 import type { Provider, Agent } from '../types';
@@ -296,10 +298,14 @@ describe('routing-state helpers', () => {
       },
     };
     const providers = [provider('hidden-provider', models), provider('openai', models)];
-    setState('providers', providers);
-    if (hidden === 'provider') setState('hiddenProviders', ['hidden-provider']);
-    if (hidden === 'model') setState('hiddenModels', ['hidden-provider:hidden']);
-    if (hidden === 'removed') setState('removedModels', ['hidden-provider:hidden']);
+    setState(storePath('providers', providers));
+    flushSolid();
+    if (hidden === 'provider') setState(storePath('hiddenProviders', ['hidden-provider']));
+    flushSolid();
+    if (hidden === 'model') setState(storePath('hiddenModels', ['hidden-provider:hidden']));
+    flushSolid();
+    if (hidden === 'removed') setState(storePath('removedModels', ['hidden-provider:hidden']));
+    flushSolid();
 
     for (const selectedModel of [null, { providerID: 'hidden-provider', modelID: 'hidden' }]) {
       expect(
@@ -317,7 +323,8 @@ describe('routing-state helpers', () => {
   });
 
   it('does not select anything when all configured models are hidden', () => {
-    setState('hiddenProviders', ['openai']);
+    setState(storePath('hiddenProviders', ['openai']));
+    flushSolid();
     expect(
       reconcileLoadedProviders({
         selectedModel: null,
@@ -337,7 +344,8 @@ describe('routing-state helpers', () => {
   });
 
   it('replaces a hidden draft provider even when it is no longer connected', () => {
-    setState('hiddenProviders', ['disconnected']);
+    setState(storePath('hiddenProviders', ['disconnected']));
+    flushSolid();
     expect(
       reconcileLoadedProviders({
         selectedModel: { providerID: 'disconnected', modelID: 'old' },
@@ -369,8 +377,10 @@ describe('routing-state helpers', () => {
       ])
     );
     const providers = [provider('catalog', models)];
-    setState('providers', providers);
-    setState('addedModels', ['catalog:model-59']);
+    setState(storePath('providers', providers));
+    flushSolid();
+    setState(storePath('addedModels', ['catalog:model-59']));
+    flushSolid();
     expect(
       reconcileLoadedProviders({
         selectedModel: null,
@@ -411,7 +421,8 @@ describe('routing-state helpers', () => {
         lastSelectedModel: { providerID: 'missing', modelID: 'last' },
       }).nextSelectedModel
     ).toEqual(args.defaultModel);
-    setState('hiddenModels', ['openai:last']);
+    setState(storePath('hiddenModels', ['openai:last']));
+    flushSolid();
     expect(reconcileLoadedProviders(args).nextSelectedModel).toEqual(args.defaultModel);
   });
 

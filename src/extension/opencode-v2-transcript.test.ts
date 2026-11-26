@@ -610,6 +610,43 @@ describe('V2 generated transcript records', () => {
     }
   );
 
+  it.each(['ses_child', 'ses_wrong'])('checks the native running envelope for %s', (childID) => {
+    const projected = projectV2Message(
+      {
+        ...base,
+        type: 'synthetic',
+        text: `<subagent sessionID="${childID}" state="running" description="Audit">\nPartial result\n</subagent>`,
+        metadata: { source: 'subagent', childID: 'ses_child', state: 'completed' },
+      },
+      'ses_one'
+    );
+    const result = expect(projected.parts[0]);
+    if (childID === 'ses_child') result.toHaveProperty('subagentResult.backgroundPending', true);
+    else result.not.toHaveProperty('subagentResult.backgroundPending');
+  });
+
+  it.each([
+    { kind: 'subagent', childID: 'ses_child', pending: true },
+    { kind: 'subagent', childID: 'ses_wrong', pending: false },
+    { kind: 'shell', childID: 'ses_child', pending: false },
+  ])('checks the v2.4 $kind running envelope for $childID', ({ kind, childID, pending }) => {
+    const projected = projectV2Message(
+      {
+        ...base,
+        type: 'synthetic',
+        text: `<background-result kind="${kind}" sessionID="${childID}" state="running" description="Audit">\nPartial result\n</background-result>`,
+        metadata: { source: 'subagent', childID: 'ses_child', state: 'completed' },
+      },
+      'ses_one'
+    );
+    expect(projected.parts[0]).toMatchObject({
+      subagentResult: { sessionID: 'ses_child', state: 'completed' },
+    });
+    if (pending)
+      expect(projected.parts[0]).toHaveProperty('subagentResult.backgroundPending', true);
+    else expect(projected.parts[0]).not.toHaveProperty('subagentResult.backgroundPending');
+  });
+
   it.each([
     undefined,
     { source: 'other', childID: 'ses_child', state: 'completed' },

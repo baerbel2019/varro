@@ -190,12 +190,6 @@
   -webkit-user-select: none;
 }
 
-.question-option-input {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-}
-
 .question-option:hover {
   border-color: color-mix(in srgb, var(--color-vscode-border) 24%, transparent);
   background: color-mix(in srgb, var(--color-vscode-hover) 84%, transparent);
@@ -209,10 +203,6 @@
 .question-option:focus-visible {
   outline: 2px solid var(--color-vscode-accent);
   outline-offset: 1px;
-}
-
-.question-option-input:focus-visible {
-  outline: none;
 }
 
 .question-radio,
@@ -464,7 +454,7 @@ body.vscode-light .question-custom-input {
 
 .server-status-command {
   width: 100%;
-  max-width: 300px;
+  max-width: 340px;
   min-width: 0;
   text-align: left;
 }
@@ -489,13 +479,13 @@ body.vscode-light .question-custom-input {
   background: transparent;
   color: var(--color-vscode-fg);
   font-family: var(--font-mono);
-  overflow: hidden;
   font-size: 11px;
   font-weight: 400;
   line-height: 1.45;
-  white-space: pre;
-  text-overflow: ellipsis;
+  /* Wrap instead of truncating: the command must stay readable before it is run or copied. */
+  white-space: pre-wrap;
   word-break: normal;
+  overflow-wrap: anywhere;
 }
 
 .server-status-command-button {
@@ -702,7 +692,7 @@ body.vscode-high-contrast-light {
   --color-code-operator: var(--color-vscode-fg);
 }
 
-body.vscode-high-contrast
+body:is(.vscode-high-contrast, .vscode-high-contrast-light)
   :is(
     .assistant-turn-content,
     .todo-block,
@@ -711,21 +701,7 @@ body.vscode-high-contrast
     .chat-thinking-box,
     .diff-view-widget,
     .composer-completion-menu,
-    .toolbar-popover,
-    .dropdown-menu,
-    .model-picker-details,
-    .provider-limit-popup,
-    .context-popup
-  ),
-body.vscode-high-contrast-light
-  :is(
-    .assistant-turn-content,
-    .todo-block,
-    .chat-queue-container,
-    .chat-tool-invocation-part,
-    .chat-thinking-box,
-    .diff-view-widget,
-    .composer-completion-menu,
+    .composer-completion-help,
     .toolbar-popover,
     .dropdown-menu,
     .model-picker-details,
@@ -736,23 +712,12 @@ body.vscode-high-contrast-light
   box-shadow: none;
 }
 
-body.vscode-high-contrast
+body:is(.vscode-high-contrast, .vscode-high-contrast-light)
   :is(
     .toolbar-picker,
     .chat-send-button.enabled,
     .send-mode-options,
     .question-btn,
-    .chat-stop-button,
-    .question-option,
-    .server-status-action-button
-  ),
-body.vscode-high-contrast-light
-  :is(
-    .toolbar-picker,
-    .chat-send-button.enabled,
-    .send-mode-options,
-    .question-btn,
-    .chat-stop-button,
     .question-option,
     .server-status-action-button
   ) {
@@ -760,8 +725,7 @@ body.vscode-high-contrast-light
   outline-offset: -1px;
 }
 
-body.vscode-high-contrast :is(button:focus-visible, input:focus-visible, textarea:focus-visible),
-body.vscode-high-contrast-light
+body:is(.vscode-high-contrast, .vscode-high-contrast-light)
   :is(button:focus-visible, input:focus-visible, textarea:focus-visible) {
   outline: 2px solid var(--color-vscode-contrast-active-border);
 }
@@ -992,6 +956,10 @@ body.vscode-high-contrast-light
   font: 11px / 1.5 var(--font-mono);
 }
 
+.permission-reject-review textarea {
+  font: 12px / 1.45 var(--font-sans);
+}
+
 .permission-approval-review textarea:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -1px;
@@ -1149,6 +1117,31 @@ body.vscode-high-contrast-light
   padding-right: 8px;
   padding-left: 8px;
   white-space: nowrap;
+}
+
+.permission-reject-split {
+  display: flex;
+  min-width: 0;
+}
+
+.permission-prompt-actions .question-btn.permission-reject-main {
+  flex: 1 1 auto;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.permission-prompt-actions .question-btn.permission-reject-instruct {
+  flex: 0 0 26px;
+  width: 26px;
+  padding: 0;
+  /* Hairline on high-DPI screens; one device pixel elsewhere. */
+  border-left: 0.5px solid color-mix(in srgb, black 30%, transparent);
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.permission-reject-instruct .ui-icon {
+  flex-shrink: 0;
 }
 
 .permission-prompt-actions.permission-approval-actions {

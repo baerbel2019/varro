@@ -1,13 +1,6 @@
-import {
-  createEffect,
-  createMemo,
-  createSignal,
-  For,
-  on,
-  onCleanup,
-  onMount,
-  Show,
-} from 'solid-js';
+import { storePath } from '@solidjs/signals';
+import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show } from 'solid-js';
+import { ariaBoolean } from '../lib/aria';
 import { refreshSessionMcps } from '../hooks/useOpenCode';
 import { parseMcpConfigSnippet } from '../../shared/mcp-config';
 import type { McpConfigScope } from '../../shared/mcp-config';
@@ -22,8 +15,7 @@ import {
   setState,
   state,
 } from '../lib/state';
-import { navArrowLeftIcon } from '../lib/ui-icons';
-import { UiIcon } from './UiIcon';
+import { NavArrowLeftControlIcon } from './ControlIcons';
 
 type McpScope = McpConfigScope;
 
@@ -67,19 +59,12 @@ export function McpSettingsPanel() {
     if (saving()) return 'Saving...';
     return loading() && hasDefaults() ? 'Refreshing...' : '';
   };
-  const sessionsWorking = createMemo(() =>
-    Object.values(state.sessionStatus).some(
-      (status) => status?.type === 'busy' || status?.type === 'retry'
-    )
-  );
   // Attached servers expose only effective values, which the project scope shows.
   const activeScope = () => (state.mcpDefaults?.editable ? scope() : 'project');
+  // Product decision: MCP configuration is available at any time. Never gate it on running,
+  // retrying, or waiting sessions; a "when running sessions finish" lock was reverted twice.
   const canEditConfig = () =>
-    ready() &&
-    !loading() &&
-    !saving() &&
-    state.mcpDefaults?.editable === true &&
-    !sessionsWorking();
+    ready() && !loading() && !saving() && state.mcpDefaults?.editable === true;
   const canChangeDefault = (name: string, target: McpScope) =>
     canEditConfig() && (target !== 'global' || isBoolean(state.mcpDefaults?.global[name]));
 
@@ -184,7 +169,7 @@ export function McpSettingsPanel() {
     const next = MCP_SCOPES.find((item) => item.scope !== scope());
     if (!next) return;
     setScope(next.scope);
-    tabList?.querySelector<HTMLButtonElement>('[aria-selected="true"]')?.focus();
+    tabList?.querySelector<HTMLButtonElement>(`#mcp-settings-tab-${next.scope}`)?.focus();
   }
 
   async function load() {
@@ -231,21 +216,19 @@ export function McpSettingsPanel() {
   }
 
   createEffect(
-    on(
-      () => state.editorContext.workspacePath,
-      (workspacePath, previous) => {
-        // Startup values belong to the workspace that loaded them.
-        if (previous !== undefined && previous !== workspacePath) {
-          setState('mcpDefaults', null);
-          setConfigJson('');
-          setConfigName('');
-          setAddedMessage('');
-        }
-        void load();
+    () => state.editorContext.workspacePath,
+    (workspacePath, previous) => {
+      // Startup values belong to the workspace that loaded them.
+      if (previous !== undefined && previous !== workspacePath) {
+        setState(storePath('mcpDefaults', null));
+        setConfigJson('');
+        setConfigName('');
+        setAddedMessage('');
       }
-    )
+      void load();
+    }
   );
-  onMount(() => backButton?.focus());
+  onSettled(() => backButton?.focus());
   onCleanup(() => {
     disposed = true;
     generation += 1;
@@ -267,7 +250,7 @@ export function McpSettingsPanel() {
               requestComposerFocus();
             }}
           >
-            <UiIcon source={navArrowLeftIcon} width={16} height={16} />
+            <NavArrowLeftControlIcon class="chat-header-back-icon" />
           </button>
           <h1>MCP settings</h1>
           <Show when={activity()}>
@@ -316,17 +299,7 @@ export function McpSettingsPanel() {
             </div>
           </Show>
           <Show when={hasDefaults()}>
-            <Show
-              when={!state.mcpDefaults?.editable}
-              fallback={
-                <Show when={sessionsWorking()}>
-                  <p class="mcp-settings-notice" role="status">
-                    Defaults can be changed when running sessions finish. Session toggles remain
-                    available in the picker.
-                  </p>
-                </Show>
-              }
-            >
+            <Show when={!state.mcpDefaults?.editable}>
               <p class="mcp-settings-notice">
                 This server is managed elsewhere. Edit its MCP defaults on the OpenCode server host.
               </p>
@@ -347,9 +320,9 @@ export function McpSettingsPanel() {
                       type="button"
                       role="tab"
                       id={`mcp-settings-tab-${item.scope}`}
-                      aria-selected={scope() === item.scope}
+                      aria-selected={ariaBoolean(scope() === item.scope)}
                       aria-controls="mcp-settings-tabpanel"
-                      tabIndex={scope() === item.scope ? 0 : -1}
+                      tabindex={scope() === item.scope ? 0 : -1}
                       disabled={saving() || openingConfig()}
                       onClick={() => setScope(item.scope)}
                     >
@@ -374,9 +347,9 @@ export function McpSettingsPanel() {
               </Show>
               <Show
                 when={names().length > 0}
-                fallback={<p class="mcp-settings-note">No MCP servers configured.</p>}
+                fallback={<p class="mcp-settings-empty">No MCP servers configured.</p>}
               >
-                <div class="mcp-settings-servers" aria-busy={saving() || loading()}>
+                <div class="mcp-settings-servers" aria-busy={ariaBoolean(saving() || loading())}>
                   <For each={names()}>
                     {(name) => (
                       <div class="mcp-settings-server">

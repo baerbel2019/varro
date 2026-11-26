@@ -1,4 +1,28 @@
 import {
+  Show,
+  Loading,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onSettled,
+  untrack,
+} from 'solid-js';
+import { storePath } from '@solidjs/signals';
+import {
+  getAgentConfiguredModel,
+  rememberAgentModel,
+  resolveAgentSwitchModel,
+} from '../lib/agent-model-selection';
+import { ariaBoolean } from '../lib/aria';
+import {
+  consumePlanImplementationDraft,
+  isPlanImplementationDraftRequestCurrent,
+  planImplementationDraftRequest,
+} from '../lib/plan-implementation-draft';
+import { getBuildAgentName } from '../hooks/routing-state';
+import {
+  getPastedTextLanguage,
   createPastedText,
   isLargeTextPaste,
   pastedTextBytes,
@@ -7,6 +31,7 @@ import {
 } from '../../shared/pasted-text';
 import { captureExtensionContexts } from '../host/extensions';
 import { getFollowupActionTitle } from '../../shared/followups';
+import { createRecordSnapshots } from '../lib/record-snapshots';
 import type { ExtensionContext } from '../../shared/extension-context';
 import { cloneExtensionContexts } from '../../shared/extension-context';
 import {
@@ -14,18 +39,6 @@ import {
   databaseContextDetail,
   databaseAttachmentDetail,
 } from '../../shared/database-context';
-import {
-  Show,
-  Suspense,
-  batch,
-  createEffect,
-  createMemo,
-  createSignal,
-  on,
-  onCleanup,
-  onMount,
-  untrack,
-} from 'solid-js';
 import { isSameWorkspacePath, normalizeWorkspaceIdentity } from '../../shared/workspace-path';
 import { requestWorkspaceSelection } from '../lib/workspace-selection';
 import { toggleIssuesEnabled } from '../lib/state-attachments';
@@ -39,6 +52,7 @@ import type {
   DatabaseTableReference,
   ExtensionMessage,
   InitialWebviewState,
+  SessionModelRoute,
   SessionTokenBreakdown,
   SessionWorkspaceTarget,
 } from '../../shared/protocol';
@@ -61,6 +75,11 @@ import {
 import {
   state,
   inputText,
+  readLatestDraftText,
+  currentDraftKey,
+  draftSessionId,
+  onBeforeDraftSwitch,
+  writeOwnedDraft,
   inputTextMutationVersion,
   setState,
   setInputText,
@@ -72,6 +91,7 @@ import {
   hasActiveQuestion,
   hasActivePermission,
   setSelectedAgent,
+  requestComposerFocus,
   setSelectedModel,
   resolveSelectedModel,
   addClipboardImages,
@@ -119,7 +139,6 @@ import {
   isSessionCompacting,
   isSessionAwaitingInput,
   isSessionStatusWorking,
-  isSessionTreeStatusWorking,
   replaceClipboardImages,
   replaceNativePdfs,
   setNativePdfContextFile,
@@ -132,6 +151,7 @@ import {
   loadingLastActivityAt,
   loadingStartedAt,
   showTurnTimer,
+  getModelRouteNames,
   getReviewerModelNames,
   getMessageLookup,
 } from '../lib/state';
@@ -157,9 +177,13 @@ import {
   reviewSession,
   updatePermissionModeForSession,
 } from '../hooks/useOpenCode';
-import { resolveAgentModelDefault } from '../hooks/routing-state';
 import { normalizeModelVariant } from '../../shared/model-variant';
 import { getPromptCompletionVariant } from '../../shared/prompt-completion';
+import {
+  promptCacheHistorySamples,
+  promptCacheLifetimeFor,
+  promptCacheUsedAt,
+} from '../../shared/prompt-cache-lifetime';
 import {
   editingMessage,
   getMessageEditDraftBackup,
@@ -179,8 +203,8 @@ import {
   formatVariantInitial,
   formatVariantLabel,
   getProviderLimitCompactBadges,
-  hasProviderLimitWindowWithinThreshold,
 } from '../lib/format';
+import { createProviderLimitDisplay } from '../lib/provider-limit-display';
 import { getVariantsForModel } from '../lib/model-variants';
 import {
   getContextWindow,
@@ -204,7 +228,7 @@ import {
 import { getLeafPathName, isSamePath } from '../lib/path-display';
 import { splitExternalLinkText } from '../lib/external-link';
 import { editPencilIcon } from '../lib/ui-icons';
-import type { Session } from '../types';
+import type { MessageEntry, Session } from '../types';
 import {
   formatContextLineRanges,
   getSelectionRangesFromEditorContext,
@@ -214,6 +238,8 @@ import {
   TERMINAL_SELECTION_MARKER,
 } from '../../shared/context-files';
 import { normalizeSessionTitle } from '../../shared/session-title';
+import { SESSION_ID_RE } from '../lib/session-reference';
+import { lookupSessionReference } from '../lib/session-reference-lookups';
 import { isSubagentCardVisible } from '../lib/subagent-visibility';
 import { createOpenCodeMessageID } from '../../shared/opencode-id';
 import { getQueuedAttachmentSnapshot } from '../hooks/session/session-send';
@@ -249,6 +275,8 @@ import {
 import type { CompressedImage, ImageCompressionAnalysis } from '../lib/image-compression';
 import { loadImage } from '../lib/image-loading';
 import { ChatInputMainToolbar, ChatInputMetaToolbar } from './chat-input/ChatInputToolbar';
+import type { ToolbarSharedProps } from './chat-input/ChatInputToolbar';
+import type { PromptCacheActivity, PromptCacheWarmingView } from './chat-input/ContextPopup';
 import { dismissComposerOverlays } from './chat-input/composer-overlay-dismiss';
 import {
   RichComposerArea,
@@ -262,9 +290,12 @@ import {
   type QueuedMessageItem,
 } from './chat-input/QueuedMessages';
 import { BackgroundServices } from './chat-input/BackgroundServices';
-import { sessionStore } from '../lib/stores/session-store';
+import { SessionGoalRow } from './chat-input/SessionGoalRow';
+import { SessionRewindRow } from './chat-input/SessionRewindRow';
+import { captureSessionStatusSnapshotTime, sessionStore } from '../lib/stores/session-store';
 import { hasUserMessageContent, parseUserMessageContent } from './message/UserMessageContent';
 import { UsageLimitBanner } from './chat-input/UsageLimitBanner';
+import { PromptCacheWarning } from './chat-input/PromptCacheWarning';
 import { ProviderQuotaWarning } from './chat-input/ProviderQuotaWarning';
 import {
   combineContextCharacters,
@@ -287,6 +318,7 @@ import {
   isPdfBytes,
 } from '../../shared/native-pdf';
 import {
+  getExhaustedQuotaResetAt,
   getSafeUsageLimitAction,
   getUsageLimitPresentation,
   isUsageLimitNoticeVisibleForModel,
@@ -297,6 +329,7 @@ import {
   getLatestAssistantMessageInfoWithTokens,
   getSessionCost,
   accumulateSessionMessageTotals,
+  collectSessionModels,
   getSessionTreeTokenBreakdown,
   getSessionTreeTokenBreakdownFromTotals,
   getUserMessageHistoryText,
@@ -381,8 +414,11 @@ import { McpPicker } from './McpPicker';
 import { ModelPicker } from './ModelPicker';
 
 const COMPOSER_BUSY_DISPLAY_SETTLE_DELAY_MS = 700;
+/** Root sessions whose history this webview already sent for prompt cache learning. */
+const sentPromptCacheHistory = new Set<string>();
 const AUTHORITATIVE_QUEUED_STATUS_MAX_AGE_MS = 5_000;
 const QUEUED_STATUS_RECONCILIATION_DELAY_MS = 1_000;
+const QUEUED_RUNNING_STATUS_RECONCILIATION_DELAY_MS = 5_000;
 
 interface CurrentComposerModel {
   providerID: string | null;
@@ -527,7 +563,11 @@ function openContextFileInEditor(file: DroppedFile) {
   if (file.pastedText !== undefined) {
     postMessage({
       type: 'vscode/open-text',
-      payload: { content: file.pastedText, title: file.relativePath, language: 'plaintext' },
+      payload: {
+        content: file.pastedText,
+        title: file.relativePath,
+        language: getPastedTextLanguage(file.relativePath),
+      },
     });
     return;
   }
@@ -556,36 +596,40 @@ function captureEditDraftBackup(): MessageEditContext & { text: string } {
   };
 }
 
-function applyEditContext(context: MessageEditContext, mergeWholeFileIntoActiveContext = false) {
-  setState('attachedDiagnostics', context.attachedDiagnostics ?? null);
-  setState('inlineProblems', cloneInlineProblems(context.inlineProblems));
+function normalizeEditFiles(files: DroppedFile[], mergeWholeFileIntoActiveContext: boolean) {
   const activeFile = state.editorContext.activeFile;
-  replaceContextFiles(
-    context.files.flatMap((file) => {
-      const matchesActiveFile =
-        activeFile &&
-        file.type === 'file' &&
-        (isSamePath(file.path, activeFile.path) ||
-          isSamePath(file.path, activeFile.relativePath) ||
-          isSamePath(file.relativePath, activeFile.relativePath) ||
-          [file.path, file.relativePath].some((path) => {
-            const normalizedPath = path.replace(/^\.\//, '');
-            return (
-              !normalizedPath.includes('/') &&
-              !normalizedPath.includes('\\') &&
-              isSamePath(normalizedPath, getLeafPathName(activeFile.relativePath))
-            );
-          }));
-      if (!matchesActiveFile) return [file];
-      if (mergeWholeFileIntoActiveContext && !file.lineRanges?.length) return [];
-      return [{ ...file, path: activeFile.path, relativePath: activeFile.relativePath }];
-    })
-  );
+  return files.flatMap((file) => {
+    const matchesActiveFile =
+      activeFile &&
+      file.type === 'file' &&
+      (isSamePath(file.path, activeFile.path) ||
+        isSamePath(file.path, activeFile.relativePath) ||
+        isSamePath(file.relativePath, activeFile.relativePath) ||
+        [file.path, file.relativePath].some((path) => {
+          const normalizedPath = path.replace(/^\.\//, '');
+          return (
+            !normalizedPath.includes('/') &&
+            !normalizedPath.includes('\\') &&
+            isSamePath(normalizedPath, getLeafPathName(activeFile.relativePath))
+          );
+        }));
+    if (!matchesActiveFile) return [file];
+    if (mergeWholeFileIntoActiveContext && !file.lineRanges?.length) return [];
+    return [{ ...file, path: activeFile.path, relativePath: activeFile.relativePath }];
+  });
+}
+
+function applyEditContext(context: MessageEditContext, files: DroppedFile[]) {
+  setState(storePath('attachedDiagnostics', context.attachedDiagnostics ?? null));
+  setState(storePath('inlineProblems', cloneInlineProblems(context.inlineProblems)));
+  replaceContextFiles(files);
   const droppedImages = replaceClipboardImages(context.images);
   replaceNativePdfs(context.pdfs ?? []);
   setState(
-    'terminalSelection',
-    context.terminalSelection ? { ...context.terminalSelection } : null
+    storePath(
+      'terminalSelection',
+      context.terminalSelection ? { ...context.terminalSelection } : null
+    )
   );
   return droppedImages;
 }
@@ -794,10 +838,12 @@ function attachCurrentDiagnostics() {
     showSessionActionFeedback('No issues found');
     return;
   }
-  setState('attachedDiagnostics', {
-    diagnostics: state.editorContext.diagnostics.map((diagnostic) => ({ ...diagnostic })),
-    total: state.editorContext.diagnosticsTotal ?? state.editorContext.diagnostics.length,
-  });
+  setState(
+    storePath('attachedDiagnostics', {
+      diagnostics: state.editorContext.diagnostics.map((diagnostic) => ({ ...diagnostic })),
+      total: state.editorContext.diagnosticsTotal ?? state.editorContext.diagnostics.length,
+    })
+  );
 }
 
 function postSessionModelSelection(
@@ -825,7 +871,7 @@ function isQueuedSessionHydrating(sessionId: string) {
 
 const pendingWorkspacePath = () => state.pendingWorkspaceSelectionPath;
 const setPendingWorkspacePath = (path: string | null) =>
-  setState('pendingWorkspaceSelectionPath', path);
+  setState(storePath('pendingWorkspaceSelectionPath', path));
 
 function detachBlankSessionForWorkspace(path: string | null) {
   const blankSessionId = getDiscardableActiveBlankSessionId();
@@ -894,16 +940,18 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     rootId: string;
     breakdown: SessionTokenBreakdown;
     nestedBreakdown: ReturnType<typeof estimateNestedContextBreakdown>;
+    models: SessionModelRoute[];
   } | null>(null);
   const [showProviderLimitPopup, setShowProviderLimitPopup] = createSignal(false);
   const [showMcpPicker, setShowMcpPicker] = createSignal(false);
   const [mcpPickerQuery, setMcpPickerQuery] = createSignal('');
   const [showLspPicker, setShowLspPicker] = createSignal(false);
   const [editSelectedModel, setEditSelectedModel] = createSignal<RalphSelectedModel | null>(null);
+  const [editSelectedAgent, setEditSelectedAgent] = createSignal<string | null>(null);
   const [workspaceSendPending, setWorkspaceSendPending] = createSignal(false);
   const authoritativeQueuedSessionStatuses = new Map<
     string,
-    { status: 'busy' | 'idle'; observedAt: number; revision: number }
+    { status: 'busy' | 'idle'; observedAt: number; revision: number; snapshotStartedAt?: number }
   >();
   let authoritativeQueuedStatusRevision = 0;
   const queuedStatusReconciliationOwner = Symbol();
@@ -911,18 +959,21 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   let queueDispatchTimer: ReturnType<typeof setTimeout> | 0 = 0;
   let queuedStatusReconciliationTimer: ReturnType<typeof setTimeout> | 0 = 0;
   let queueDispatchDisposed = false;
-  const composerSessionId = () => (props.newSession ? null : state.activeSessionId);
+  const composerSessionId = () => (props.newSession ? null : draftSessionId());
   let pdfAttachmentSessionId = untrack(composerSessionId);
   const invalidatePendingPdfAttachments = () => {
     pdfAttachmentEpoch += 1;
   };
-  createEffect(() => {
-    const sessionId = composerSessionId();
+  createEffect(composerSessionId, (sessionId) => {
     if (sessionId === pdfAttachmentSessionId) return;
     pdfAttachmentSessionId = sessionId;
     invalidatePendingPdfAttachments();
   });
   const composerEditingMessage = () => (props.newSession ? null : editingMessage());
+  const composerSelectedAgent = () =>
+    composerEditingMessage()
+      ? (editSelectedAgent() ?? composerEditingMessage()?.agent ?? state.selectedAgent)
+      : state.selectedAgent;
   const [submittingEdit, setSubmittingEdit] = createSignal<MessageEditRequest | null>(null);
   const editReconciliationPending = () => {
     const editing = composerEditingMessage();
@@ -959,30 +1010,6 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       !!state.terminalSelection ||
       !!state.attachedDiagnostics
   );
-
-  createEffect(() => {
-    const sendPending = workspaceSendPending();
-    const draftNonempty = hasSendableComposerContent();
-    if (sendPending) return;
-    if (!draftNonempty && previousDraftNonempty) setManualWorkspaceSelection(false);
-    previousDraftNonempty = draftNonempty;
-  });
-
-  createEffect(() => {
-    const activeWorkspacePath = state.editorContext.activeWorkspacePath;
-    if (
-      !activeWorkspacePath ||
-      !canSelectWorkspace() ||
-      hasSendableComposerContent() ||
-      manualWorkspaceSelection() ||
-      isSameWorkspacePath(activeWorkspacePath, state.editorContext.workspacePath) ||
-      isSameWorkspacePath(activeWorkspacePath, pendingWorkspacePath())
-    ) {
-      return;
-    }
-
-    requestWorkspaceSelection(activeWorkspacePath);
-  });
 
   async function attachNativePdfFiles(files: File[], sequences?: ReadonlyMap<File, number>) {
     const ownerSessionId = composerSessionId();
@@ -1061,18 +1088,24 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (restore) untrack(restore);
   };
   onCleanup(restoreCurrentDocumentAfterQueuedEdit);
-  createEffect(() => {
-    if (!queuedMessageEdit()) restoreCurrentDocumentAfterQueuedEdit();
+  createEffect(queuedMessageEdit, (edit) => {
+    if (!edit) restoreCurrentDocumentAfterQueuedEdit();
   });
 
-  createEffect(() => {
-    const queuedEdit = queuedMessageEdit();
-    if (!queuedEdit) return;
-    const queuedEditExists = state.queuedMessages.some((message) => message.id === queuedEdit.id);
-    if (!queuedEditExists || composerSessionId() !== queuedEdit.sessionId)
-      cancelQueuedMessageEdit();
-    else if (composerEditingMessage()) setQueuedMessageEdit(null);
-  });
+  createEffect(
+    () => {
+      const queuedEdit = queuedMessageEdit();
+      if (!queuedEdit) return;
+      const queuedEditExists = state.queuedMessages.some((message) => message.id === queuedEdit.id);
+      if (!queuedEditExists || composerSessionId() !== queuedEdit.sessionId) return 'cancel';
+      if (composerEditingMessage()) return 'clear';
+      return undefined;
+    },
+    (action) => {
+      if (action === 'cancel') untrack(cancelQueuedMessageEdit);
+      else if (action === 'clear') setQueuedMessageEdit(null);
+    }
+  );
 
   type PopupKind =
     | 'workspace'
@@ -1097,6 +1130,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (except !== 'providerLimit') setShowProviderLimitPopup(false);
     if (except !== 'busy') setShowBusyMenu(false);
   };
+  // Toggles one popup, closing every other popup first, and returns its new open state.
+  const togglePopup = (
+    kind: PopupKind,
+    shown: () => boolean,
+    setShown: (next: boolean) => void
+  ) => {
+    const next = !shown();
+    closePopups(next ? kind : undefined);
+    setShown(next);
+    return next;
+  };
   const anyComposerPopupOpen = () =>
     showWorkspacePicker() ||
     showAgentPicker() ||
@@ -1109,12 +1153,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     showProviderLimitPopup() ||
     showBusyMenu();
 
-  createEffect(() => {
-    const pending = pendingWorkspacePath();
-    if (pending && isSameWorkspacePath(state.editorContext.workspacePath, pending)) {
-      setPendingWorkspacePath(null);
+  createEffect(
+    () => {
+      const pending = pendingWorkspacePath();
+      return pending && isSameWorkspacePath(state.editorContext.workspacePath, pending);
+    },
+    (selected) => {
+      if (selected) {
+        setPendingWorkspacePath(null);
+      }
     }
-  });
+  );
 
   const [isFocused, setIsFocused] = createSignal(false);
   const [dictationRequested, setDictationRequested] = createSignal(false);
@@ -1185,16 +1234,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     pendingTableAttachments.clear();
     setPendingTableCount(0);
   };
-  createEffect(() => {
-    const sessionId = composerSessionId();
-    const scope = getFileSearchScopeKey();
-    for (const request of pendingTableAttachments.values()) {
-      if (request.sessionId !== sessionId || request.scope !== scope) {
-        clearPendingTableAttachments();
-        break;
+  createEffect(
+    () => [composerSessionId(), getFileSearchScopeKey()] as const,
+    ([sessionId, scope]) => {
+      for (const request of pendingTableAttachments.values()) {
+        if (request.sessionId !== sessionId || request.scope !== scope) {
+          clearPendingTableAttachments();
+          break;
+        }
       }
     }
-  });
+  );
   const pastedImageDecodeQueues = Array.from({ length: PASTED_IMAGE_DECODE_CONCURRENCY }, () =>
     Promise.resolve()
   );
@@ -1222,14 +1272,22 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   const [fileSearchResults, setFileSearchResults] = createSignal<DroppedFile[]>([]);
   const [tableSearchResults, setTableSearchResults] = createSignal<DatabaseTableReference[]>([]);
   const [sessionSearchResults, setSessionSearchResults] = createSignal<Session[]>([]);
-  const [sessionReferences, setSessionReferences] = createSignal<Record<string, Session>>({});
+  const [sessionReferences, setSessionReferences] = createSignal<
+    Record<string, Pick<Session, 'id' | 'title' | 'directory'>>
+  >({});
   const [showFileSearchHint, setShowFileSearchHint] = createSignal(false);
   const [suppressCompletion, setSuppressCompletion] = createSignal(false);
   const [toolbarCompactMode, setToolbarCompactMode] = createSignal<ToolbarCompactMode>('full');
-  const [sendComposerMinHeight, setSendComposerMinHeight] = createSignal(0);
+  const [sendComposerMinHeight, publishSendComposerMinHeight] = createSignal(0);
+  // Queueing holds and releases in one tick, before the signal publishes the held height.
+  let heldSendComposerMinHeight = 0;
+  const setSendComposerMinHeight = (height: number) => {
+    heldSendComposerMinHeight = height;
+    publishSendComposerMinHeight(height);
+  };
   let latestFileSearchRequestId = 0;
   let latestFileSearchQuery = '';
-  let latestFileSearchScope = getFileSearchScopeKey();
+  let latestFileSearchScope = untrack(getFileSearchScopeKey);
   let fileSearchTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionSearchTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionSearchAbortController: AbortController | undefined;
@@ -1305,13 +1363,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   }
 
   createEffect(
-    on(
-      composerSessionId,
-      (sessionId, previousSessionId) => {
-        if (previousSessionId || !sessionId) clearSendAnimation?.();
-      },
-      { defer: true }
-    )
+    composerSessionId,
+    (sessionId, previousSessionId) => {
+      if (previousSessionId || !sessionId) clearSendAnimation?.();
+    },
+    { defer: true }
   );
   onCleanup(() => clearSendAnimation?.());
 
@@ -1327,7 +1383,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   function releaseHeldComposerHeight(animate = false) {
     heldComposerSessionId = null;
     heldComposerMessageCount = 0;
-    if (animate && sendComposerMinHeight() > 0) {
+    if (animate && heldSendComposerMinHeight > 0) {
       if (composerCollapseFrame) return;
       // Wait for both the text and attachment clears to reach the DOM before measuring.
       composerCollapseFrame = requestAnimationFrame((startedAt) => {
@@ -1377,27 +1433,31 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   }
 
   createEffect(
-    on(
-      composerSessionId,
-      (sessionId, previousSessionId) => {
-        // Creating the first session keeps this composer mounted through the send.
-        releaseHeldComposerHeight(!previousSessionId && !!sessionId);
-      },
-      { defer: true }
-    )
+    composerSessionId,
+    (sessionId, previousSessionId) => {
+      // Creating the first session keeps this composer mounted through the send.
+      releaseHeldComposerHeight(!previousSessionId && !!sessionId);
+    },
+    { defer: true }
   );
   onCleanup(() => releaseHeldComposerHeight());
 
-  createEffect(() => {
-    if (sendComposerMinHeight() <= 0) return;
-    const heldSessionId = heldComposerSessionId;
-    if (!heldSessionId) return;
-    const activeSessionId = state.activeSessionId;
-    const messageCount = state.messages.length;
-    if (activeSessionId !== heldSessionId || messageCount > heldComposerMessageCount) {
-      releaseHeldComposerHeight(activeSessionId === heldSessionId);
+  createEffect(
+    () => {
+      if (sendComposerMinHeight() <= 0) return;
+      const heldSessionId = heldComposerSessionId;
+      if (!heldSessionId) return;
+      const activeSessionId = state.activeSessionId;
+      const messageCount = state.messages.length;
+      if (activeSessionId !== heldSessionId || messageCount > heldComposerMessageCount) {
+        return activeSessionId === heldSessionId;
+      }
+      return undefined;
+    },
+    (animate) => {
+      if (animate !== undefined) releaseHeldComposerHeight(animate);
     }
-  });
+  );
 
   // Keep the exact pasted text with history so undo restores partial-line selections too.
   const pastedFileChipText = new Map<string, { ranges: string | null; text: string }>();
@@ -1416,6 +1476,26 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       ? pending.insertion
       : undefined;
   };
+
+  /** Attaches generated text, such as a plan, within the same limits as a paste. */
+  function attachPlanText(name: string, text: string) {
+    const size = pastedTextBytes(text);
+    if (
+      size > MAX_PASTED_TEXT_BYTES ||
+      size +
+        composerFiles().reduce((sum, file) => sum + pastedTextBytes(file.pastedText ?? ''), 0) >
+        MAX_PASTED_TEXT_TOTAL_BYTES
+    ) {
+      showSessionActionFeedback(
+        'The plan is too large to attach. The linked session still holds it.',
+        'warning'
+      );
+      return null;
+    }
+    const file = { ...createPastedText(text), relativePath: name };
+    addContextFile(file);
+    return file;
+  }
 
   function attachLargePaste(text: string, insertion: RichComposerPasteInsertion) {
     if (!isLargeTextPaste(text)) return;
@@ -1440,27 +1520,52 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     const replacement = `${prefix}@${file.relativePath}${suffix}`;
     applyingComposerHistory = true;
     try {
-      batch(() => {
+      (() => {
         addContextFile(file);
         setInputText(`${before}${replacement}${after}`);
         setCaretPosition(before.length + replacement.length);
+      })();
+      setState((draft) => {
+        composerHistory.replaceCurrent(
+          captureComposerSnapshot(
+            `${before}${replacement}${after}`,
+            before.length + replacement.length,
+            draft
+          )
+        );
       });
-      composerHistory.replaceCurrent(captureComposerSnapshot());
     } finally {
       applyingComposerHistory = false;
     }
   }
 
-  function captureComposerSnapshot(): ComposerSnapshot {
+  function captureComposerSnapshot(
+    text = inputText(),
+    caret = caretPosition(),
+    source = state
+  ): ComposerSnapshot {
     return {
-      text: inputText(),
-      caret: caretPosition(),
-      files: state.droppedFiles.map((file) => ({ ...file })),
-      images: state.clipboardImages.map((image) => ({ ...image })),
-      pdfs: state.nativePdfs.map((pdf) => ({ ...pdf })),
-      problems: state.attachedDiagnostics,
-      inlineProblems: state.inlineProblems,
-      terminalSelection: state.terminalSelection,
+      text,
+      caret,
+      files: source.droppedFiles.map((file) => ({
+        ...file,
+        ...(file.lineRanges && { lineRanges: file.lineRanges.map((range) => ({ ...range })) }),
+      })),
+      images: source.clipboardImages.map((image) => ({ ...image })),
+      pdfs: source.nativePdfs.map((pdf) => ({
+        ...pdf,
+        ...(pdf.contextFile && { contextFile: { ...pdf.contextFile } }),
+      })),
+      problems: source.attachedDiagnostics
+        ? {
+            ...source.attachedDiagnostics,
+            diagnostics: source.attachedDiagnostics.diagnostics.map((diagnostic) => ({
+              ...diagnostic,
+            })),
+          }
+        : null,
+      inlineProblems: cloneInlineProblems(source.inlineProblems),
+      terminalSelection: source.terminalSelection ? { ...source.terminalSelection } : null,
       pastedFileChips: [...pastedFileChipText].map(([path, pasted]) => ({ path, ...pasted })),
     };
   }
@@ -1473,24 +1578,24 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (totalBytes > MAX_PASTED_TEXT_TOTAL_BYTES) {
       throw new Error('Annotations and pasted text are limited to 256 KB per draft.');
     }
-    batch(() => {
+    (() => {
       const text = inputText();
       const prefix = shouldPadInlineInsertion(text.at(-1)) ? ' ' : '';
       const nextText = `${text}${prefix}@${file.relativePath} `;
       addContextFile(file);
       setInputText(nextText);
       setCaretPosition(nextText.length);
-    });
+    })();
     queueMicrotask(() => richEditorRef?.focus({ preventScroll: true }));
   }
 
   const composerHistory = createComposerHistory();
-  createEffect(() => {
-    writeStored(
-      STORAGE_KEYS.inputDraftProblems,
-      state.inlineProblems.length ? cloneInlineProblems(state.inlineProblems) : null
-    );
-  });
+  createEffect(
+    () => (state.inlineProblems.length ? cloneInlineProblems(state.inlineProblems) : null),
+    (problems) => {
+      writeStored(STORAGE_KEYS.inputDraftProblems, problems);
+    }
+  );
   let applyingComposerHistory = false;
   composerHistory.reset(untrack(captureComposerSnapshot));
 
@@ -1509,7 +1614,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       for (const { path, ranges, text } of snapshot.pastedFileChips ?? []) {
         pastedFileChipText.set(path, { ranges, text });
       }
-      batch(() => {
+      (() => {
         setHistoryIndex(null);
         setHistoryDraft('');
         setInputText(snapshot.text);
@@ -1517,15 +1622,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         replaceContextFiles(snapshot.files);
         replaceClipboardImages(snapshot.images);
         replaceNativePdfs(snapshot.pdfs ?? []);
-        setState('attachedDiagnostics', snapshot.problems ?? null);
-        setState('inlineProblems', cloneInlineProblems(snapshot.inlineProblems));
+        setState(storePath('attachedDiagnostics', snapshot.problems ?? null));
+        setState(storePath('inlineProblems', cloneInlineProblems(snapshot.inlineProblems)));
         setState(
-          'terminalSelection',
-          snapshot.terminalSelection ? { ...snapshot.terminalSelection } : null
+          storePath(
+            'terminalSelection',
+            snapshot.terminalSelection ? { ...snapshot.terminalSelection } : null
+          )
         );
         setCompletionIndex(0);
         setSuppressCompletion(false);
-      });
+      })();
     } finally {
       applyingComposerHistory = false;
     }
@@ -1539,126 +1646,132 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   const explicitContextForActiveFile = () =>
     hasExplicitContextForPath(composerFiles(), composerActiveFile()?.path);
 
-  const currentModel = createMemo<CurrentComposerModel>((previous) => {
-    const editing = composerEditingMessage();
-    const editSelection = editing ? editSelectedModel() || editing.model : null;
-    const resolvedSelection = resolveSelectedModel(
-      state.selectedModel,
-      state.providers,
-      state.providerDefaults,
-      { allowHidden: true }
-    );
-    const selected =
-      editSelection?.providerID && editSelection.modelID
-        ? editSelection
-        : resolvedSelection || state.selectedModel;
-    if (selected) {
-      const provider = state.providers.find((item) => item.id === selected.providerID);
-      const model = provider?.models[selected.modelID];
-      const preservePresentation =
-        previous.providerID === selected.providerID && previous.modelID === selected.modelID;
-      return {
-        providerID: selected.providerID,
-        modelID: selected.modelID,
-        variant: selected.variant || null,
-        providerName:
-          provider?.name || (preservePresentation ? previous.providerName : selected.providerID),
-        modelName: model
-          ? getModelDisplayName(selected.providerID, selected.modelID, model.name)
-          : preservePresentation
-            ? previous.modelName
-            : getModelDisplayName(selected.providerID, selected.modelID, selected.modelID),
-        contextLimit: model?.limit?.context || null,
-      };
-    }
-
-    const latestAuto = getLatestAssistantMessageInfo(state.messages);
-    if (latestAuto) {
-      const provider = state.providers.find((item) => item.id === latestAuto.providerID);
-      const model = provider?.models[latestAuto.modelID];
-      return {
-        providerID: latestAuto.providerID,
-        modelID: latestAuto.modelID,
-        variant: latestAuto.variant || null,
-        providerName: provider?.name || latestAuto.providerID,
-        modelName: model
-          ? getModelDisplayName(latestAuto.providerID, latestAuto.modelID, model.name)
-          : latestAuto.modelID,
-        contextLimit: model?.limit?.context || null,
-      };
-    }
-
-    for (const provider of state.providers) {
-      const defaultModelID = state.providerDefaults[provider.id];
-      if (defaultModelID && provider.models[defaultModelID]) {
-        const model = provider.models[defaultModelID];
+  const currentModel = createMemo<CurrentComposerModel>(
+    (previous = EMPTY_CURRENT_COMPOSER_MODEL) => {
+      const editing = composerEditingMessage();
+      const editSelection = editing ? editSelectedModel() || editing.model : null;
+      const resolvedSelection = resolveSelectedModel(
+        state.selectedModel,
+        state.providers,
+        state.providerDefaults,
+        { allowHidden: true }
+      );
+      const selected =
+        editSelection?.providerID && editSelection.modelID
+          ? editSelection
+          : resolvedSelection || state.selectedModel;
+      if (selected) {
+        const provider = state.providers.find((item) => item.id === selected.providerID);
+        const model = provider?.models[selected.modelID];
+        const preservePresentation =
+          previous.providerID === selected.providerID && previous.modelID === selected.modelID;
         return {
-          providerID: provider.id,
-          modelID: model.id,
-          variant: null,
-          providerName: provider.name,
-          modelName: getModelDisplayName(provider.id, model.id, model.name),
-          contextLimit: model.limit?.context || null,
+          providerID: selected.providerID,
+          modelID: selected.modelID,
+          variant: selected.variant || null,
+          providerName:
+            provider?.name || (preservePresentation ? previous.providerName : selected.providerID),
+          modelName: model
+            ? getModelDisplayName(selected.providerID, selected.modelID, model.name)
+            : preservePresentation
+              ? previous.modelName
+              : getModelDisplayName(selected.providerID, selected.modelID, selected.modelID),
+          contextLimit: model?.limit?.context || null,
         };
       }
-    }
 
-    const firstProvider = state.providers[0];
-    if (firstProvider) {
-      const firstModel = Object.values(firstProvider.models)[0];
-      if (firstModel) {
+      const latestAuto = getLatestAssistantMessageInfo(state.messages);
+      if (latestAuto) {
+        const provider = state.providers.find((item) => item.id === latestAuto.providerID);
+        const model = provider?.models[latestAuto.modelID];
         return {
-          providerID: firstProvider.id,
-          modelID: firstModel.id,
-          variant: null,
-          providerName: firstProvider.name,
-          modelName: getModelDisplayName(firstProvider.id, firstModel.id, firstModel.name),
-          contextLimit: firstModel.limit?.context || null,
+          providerID: latestAuto.providerID,
+          modelID: latestAuto.modelID,
+          variant: latestAuto.variant || null,
+          providerName: provider?.name || latestAuto.providerID,
+          modelName: model
+            ? getModelDisplayName(latestAuto.providerID, latestAuto.modelID, model.name)
+            : latestAuto.modelID,
+          contextLimit: model?.limit?.context || null,
         };
       }
-    }
 
-    return EMPTY_CURRENT_COMPOSER_MODEL;
-  }, EMPTY_CURRENT_COMPOSER_MODEL);
+      for (const provider of state.providers) {
+        const defaultModelID = state.providerDefaults[provider.id];
+        if (defaultModelID && provider.models[defaultModelID]) {
+          const model = provider.models[defaultModelID];
+          return {
+            providerID: provider.id,
+            modelID: model.id,
+            variant: null,
+            providerName: provider.name,
+            modelName: getModelDisplayName(provider.id, model.id, model.name),
+            contextLimit: model.limit?.context || null,
+          };
+        }
+      }
+
+      const firstProvider = state.providers[0];
+      if (firstProvider) {
+        const firstModel = Object.values(firstProvider.models)[0];
+        if (firstModel) {
+          return {
+            providerID: firstProvider.id,
+            modelID: firstModel.id,
+            variant: null,
+            providerName: firstProvider.name,
+            modelName: getModelDisplayName(firstProvider.id, firstModel.id, firstModel.name),
+            contextLimit: firstModel.limit?.context || null,
+          };
+        }
+      }
+
+      return EMPTY_CURRENT_COMPOSER_MODEL;
+    }
+  );
 
   const hasMentions = () =>
     visibleFiles().length > 0 ||
     visibleClipboardImages().length > 0 ||
     visibleNativePdfs().length > 0;
 
-  function rememberSessionReference(session: Session) {
+  function rememberSessionReference(session: Pick<Session, 'id' | 'title' | 'directory'>) {
     setSessionReferences((current) =>
       current[session.id] === session ? current : { ...current, [session.id]: session }
     );
   }
 
-  createEffect(() => {
-    const ids = getSessionReferenceIds(inputText());
-    const references = sessionReferences();
-    for (const id of ids) {
-      if (references[id]) continue;
-      const loaded = state.sessions.find((session) => session.id === id);
-      if (loaded) {
-        rememberSessionReference(loaded);
-        continue;
+  createEffect(
+    () => {
+      const ids = getSessionReferenceIds(inputText());
+      const references = sessionReferences();
+      return ids
+        .filter((id) => !references[id])
+        .map((id) => ({
+          id,
+          loaded: state.sessions.find((session) => session.id === id),
+        }));
+    },
+    (missing) => {
+      for (const { id, loaded } of missing) {
+        if (loaded) {
+          rememberSessionReference(loaded);
+          continue;
+        }
+        if (pendingSessionReferenceIds.has(id)) continue;
+        pendingSessionReferenceIds.add(id);
+        // A one-time lookup with the current workspace scope; the compute above decides when.
+        void untrack(() => lookupSessionReference(id))
+          .then((session) => {
+            if (!session) return;
+            if (!getSessionReferenceIds(inputText()).includes(id)) return;
+            rememberSessionReference(session);
+          })
+          .catch(() => {})
+          .finally(() => pendingSessionReferenceIds.delete(id));
       }
-      if (pendingSessionReferenceIds.has(id)) continue;
-      pendingSessionReferenceIds.add(id);
-      void client.session
-        .list({ limit: 30, search: id, roots: true })
-        .then((page) => {
-          const session = (Array.isArray(page) ? page : page.items).find(
-            (candidate) => candidate.id === id
-          );
-          if (!session) return;
-          if (session.parentID || session.time.archived) return;
-          if (!getSessionReferenceIds(inputText()).includes(id)) return;
-          rememberSessionReference(session);
-        })
-        .catch(() => {})
-        .finally(() => pendingSessionReferenceIds.delete(id));
     }
-  });
+  );
 
   const explicitProblemAttachment = createMemo(() => {
     const attached = state.attachedDiagnostics;
@@ -1822,11 +1935,15 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     }
 
     for (const session of Object.values(sessionReferences())) {
-      const marker = `session:${session.id}`;
-      if (text.includes(marker)) {
+      const markers = new Set(
+        Array.from(text.matchAll(SESSION_ID_RE))
+          .filter((match) => (match[1] || match[2]) === session.id)
+          .map((match) => match[0])
+      );
+      for (const marker of markers) {
         const title = normalizeSessionTitle(session.title) || 'Untitled';
         chips.push({
-          id: `session:${session.id}`,
+          id: marker.startsWith('session:') ? marker : `session-raw:${session.id}`,
           type: 'mention-session',
           label: title,
           title,
@@ -1863,7 +1980,6 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       }
       return ids;
     },
-    new Set<string>(),
     { equals: equalStringSets }
   );
 
@@ -1873,19 +1989,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     terminal: typeof state.terminalSelection;
     diagnostics: typeof state.attachedDiagnostics;
   } | null>(null);
-  createEffect(
-    on(composerSessionId, (sessionId, previousSessionId) => {
-      const sending = sendingInlineAttachments();
-      if (!sending || sending.sessionId === sessionId) return;
-      // The first send acquires a session ID before its attachments are cleared.
-      // Keep that same submitted draft hidden through this ownership handoff.
-      if (previousSessionId === null && sending.sessionId === null && sessionId) {
-        setSendingInlineAttachments({ ...sending, sessionId });
-      } else {
-        setSendingInlineAttachments(null);
-      }
-    })
-  );
+  createEffect(composerSessionId, (sessionId, previousSessionId) => {
+    const sending = untrack(sendingInlineAttachments);
+    if (!sending || sending.sessionId === sessionId) return;
+    // The first send acquires a session ID before its attachments are cleared.
+    // Keep that same submitted draft hidden through this ownership handoff.
+    if (previousSessionId === null && sending.sessionId === null && sessionId) {
+      setSendingInlineAttachments({ ...sending, sessionId });
+    } else {
+      setSendingInlineAttachments(null);
+    }
+  });
   const sendingAttachments = () => {
     const sending = sendingInlineAttachments();
     return sending?.sessionId === composerSessionId() ? sending : null;
@@ -1965,8 +2079,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (restoreFocus) richEditorRef?.focus();
   }
 
-  createEffect(() => {
-    void compressionOwner();
+  createEffect(compressionOwner, () => {
     compressionEpoch += 1;
     cancelImageAnalyses();
     setOriginalImages(new Map());
@@ -1989,102 +2102,110 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return !!image && result?.url === image.url && result.error === null;
   }
 
-  createEffect(() => {
-    // Decode readiness belongs to image content, not the chat or compression owner.
-    const images = composerClipboardImages().map((image) => ({ id: image.id, url: image.url }));
-    const current = untrack(imageLoadResults);
-    setImageLoadResults(
-      new Map(
-        [...current].filter(([id, result]) =>
-          images.some((image) => image.id === id && image.url === result.url)
+  // Decode readiness belongs to image content, not the chat or compression owner.
+  createEffect(
+    () => composerClipboardImages().map((image) => ({ id: image.id, url: image.url })),
+    (images) => {
+      const current = untrack(imageLoadResults);
+      setImageLoadResults(
+        new Map(
+          [...current].filter(([id, result]) =>
+            images.some((image) => image.id === id && image.url === result.url)
+          )
         )
-      )
-    );
-    for (const [id, pending] of pendingImageLoads) {
-      if (!images.some((image) => image.id === id && image.url === pending.url)) {
-        pendingImageLoads.delete(id);
+      );
+      for (const [id, pending] of pendingImageLoads) {
+        if (!images.some((image) => image.id === id && image.url === pending.url)) {
+          pendingImageLoads.delete(id);
+        }
+      }
+      for (const image of images) {
+        if (
+          current.get(image.id)?.url === image.url ||
+          pendingImageLoads.get(image.id)?.url === image.url
+        )
+          continue;
+        const pending = { url: image.url };
+        pendingImageLoads.set(image.id, pending);
+        const complete = (error: string | null) => {
+          if (composerDisposed || pendingImageLoads.get(image.id) !== pending) return;
+          pendingImageLoads.delete(image.id);
+          setImageLoadResults((results) =>
+            new Map(results).set(image.id, { url: image.url, error })
+          );
+        };
+        void (async () => {
+          try {
+            await loadImage(image.url);
+            complete(null);
+          } catch (error) {
+            complete(error instanceof Error ? error.message : 'Could not decode the image');
+          }
+        })();
       }
     }
-    for (const image of images) {
-      if (
-        current.get(image.id)?.url === image.url ||
-        pendingImageLoads.get(image.id)?.url === image.url
-      )
-        continue;
-      const pending = { url: image.url };
-      pendingImageLoads.set(image.id, pending);
-      const complete = (error: string | null) => {
-        if (composerDisposed || pendingImageLoads.get(image.id) !== pending) return;
-        pendingImageLoads.delete(image.id);
-        setImageLoadResults((results) => new Map(results).set(image.id, { url: image.url, error }));
-      };
-      void (async () => {
-        try {
-          await loadImage(image.url);
-          complete(null);
-        } catch (error) {
-          complete(error instanceof Error ? error.message : 'Could not decode the image');
-        }
-      })();
-    }
-  });
+  );
 
-  createEffect(() => {
-    void compressionOwner();
-    const images = composerClipboardImages().map((image) => ({ ...image }));
-    const epoch = compressionEpoch;
-    const current = untrack(imageAnalyses);
-    setImageAnalyses(
-      new Map(
-        [...current].filter(([id, entry]) =>
-          images.some((image) => image.id === id && image.url === entry.url)
+  createEffect(
+    () => {
+      void compressionOwner();
+      return composerClipboardImages().map((image) => ({ ...image }));
+    },
+    (images) => {
+      const epoch = compressionEpoch;
+      const current = untrack(imageAnalyses);
+      setImageAnalyses(
+        new Map(
+          [...current].filter(([id, entry]) =>
+            images.some((image) => image.id === id && image.url === entry.url)
+          )
         )
-      )
-    );
-    const menu = untrack(compressionMenu);
-    if (menu && !images.some((image) => image.id === menu.id)) setCompressionMenu(null);
-    for (const [key, pending] of pendingImageAnalyses) {
-      if (images.some((image) => image.id === pending.id && image.url === pending.url)) continue;
-      pending.controller.abort();
-      pendingImageAnalyses.delete(key);
+      );
+      const menu = untrack(compressionMenu);
+      if (menu && !images.some((image) => image.id === menu.id)) setCompressionMenu(null);
+      for (const [key, pending] of pendingImageAnalyses) {
+        if (images.some((image) => image.id === pending.id && image.url === pending.url)) continue;
+        pending.controller.abort();
+        pendingImageAnalyses.delete(key);
+      }
+      for (const image of images) {
+        const key = `${epoch}:${image.id}`;
+        if (current.get(image.id)?.url === image.url || pendingImageAnalyses.has(key)) continue;
+        const controller = new AbortController();
+        pendingImageAnalyses.set(key, { id: image.id, url: image.url, controller });
+        imageAnalysisQueue = imageAnalysisQueue
+          .then(async () => {
+            if (
+              controller.signal.aborted ||
+              composerDisposed ||
+              compressionEpoch !== epoch ||
+              !state.clipboardImages.some((item) => item.id === image.id && item.url === image.url)
+            )
+              return;
+            let analysis: ImageCompressionAnalysis | null = null;
+            try {
+              analysis = await analyzeImageCompression(image, controller.signal);
+            } catch (error) {
+              if (!controller.signal.aborted) logError('chat-input:analyzeImageCompression', error);
+            }
+            if (
+              controller.signal.aborted ||
+              composerDisposed ||
+              compressionEpoch !== epoch ||
+              !state.clipboardImages.some((item) => item.id === image.id && item.url === image.url)
+            )
+              return;
+            setImageAnalyses((entries) =>
+              new Map(entries).set(image.id, { url: image.url, analysis })
+            );
+          })
+          .finally(() => {
+            if (pendingImageAnalyses.get(key)?.controller === controller)
+              pendingImageAnalyses.delete(key);
+          });
+      }
     }
-    for (const image of images) {
-      const key = `${epoch}:${image.id}`;
-      if (current.get(image.id)?.url === image.url || pendingImageAnalyses.has(key)) continue;
-      const controller = new AbortController();
-      pendingImageAnalyses.set(key, { id: image.id, url: image.url, controller });
-      imageAnalysisQueue = imageAnalysisQueue
-        .then(async () => {
-          if (
-            controller.signal.aborted ||
-            composerDisposed ||
-            compressionEpoch !== epoch ||
-            !state.clipboardImages.some((item) => item.id === image.id && item.url === image.url)
-          )
-            return;
-          let analysis: ImageCompressionAnalysis | null = null;
-          try {
-            analysis = await analyzeImageCompression(image, controller.signal);
-          } catch (error) {
-            if (!controller.signal.aborted) logError('chat-input:analyzeImageCompression', error);
-          }
-          if (
-            controller.signal.aborted ||
-            composerDisposed ||
-            compressionEpoch !== epoch ||
-            !state.clipboardImages.some((item) => item.id === image.id && item.url === image.url)
-          )
-            return;
-          setImageAnalyses((entries) =>
-            new Map(entries).set(image.id, { url: image.url, analysis })
-          );
-        })
-        .finally(() => {
-          if (pendingImageAnalyses.get(key)?.controller === controller)
-            pendingImageAnalyses.delete(key);
-        });
-    }
-  });
+  );
 
   function replaceCompressedImage(id: string, replacement: ClipboardImage) {
     const previous = state.clipboardImages.find((image) => image.id === id);
@@ -2416,7 +2537,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     () => waitingForSubagents() && workingSubagentIds().some((id) => !isSubagentCardVisible(id))
   );
   const [composerBusyDisplayHold, setComposerBusyDisplayHold] = createSignal(
-    !props.newSession && isActiveSessionWorking()
+    untrack(() => !props.newSession && isActiveSessionWorking())
   );
   let composerBusyDisplayTimer: ReturnType<typeof setTimeout> | 0 = 0;
   const clearComposerBusyDisplayTimer = () => {
@@ -2425,19 +2546,24 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     composerBusyDisplayTimer = 0;
   };
 
-  createEffect(() => {
-    const busy = isComposerBusy();
-    clearComposerBusyDisplayTimer();
-    if (busy) {
-      setComposerBusyDisplayHold(true);
-      return;
+  createEffect(
+    () => {
+      const busy = isComposerBusy();
+      return { busy, held: !busy && composerBusyDisplayHold() };
+    },
+    ({ busy, held }) => {
+      clearComposerBusyDisplayTimer();
+      if (busy) {
+        setComposerBusyDisplayHold(true);
+        return;
+      }
+      if (!held) return;
+      composerBusyDisplayTimer = setTimeout(() => {
+        composerBusyDisplayTimer = 0;
+        if (!isComposerBusy()) setComposerBusyDisplayHold(false);
+      }, COMPOSER_BUSY_DISPLAY_SETTLE_DELAY_MS);
     }
-    if (!composerBusyDisplayHold()) return;
-    composerBusyDisplayTimer = setTimeout(() => {
-      composerBusyDisplayTimer = 0;
-      if (!isComposerBusy()) setComposerBusyDisplayHold(false);
-    }, COMPOSER_BUSY_DISPLAY_SETTLE_DELAY_MS);
-  });
+  );
   onCleanup(clearComposerBusyDisplayTimer);
   const isComposerDisplayBusy = createMemo(
     () =>
@@ -2498,6 +2624,22 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       hints: (command.hints || []).map((hint) => hint.toLowerCase()),
     }))
   );
+  const recognizedSlashCommandNames = createMemo(
+    () =>
+      new Set([
+        // These commands also support direct submission without a completion entry.
+        'abort',
+        'stop',
+        'undo',
+        'revert',
+        'redo',
+        'fork',
+        'diagnostics',
+        'init',
+        ...slashCommands().flatMap((command) => [command.name, ...command.aliases]),
+        ...skillSlashCompletionEntries().map((entry) => entry.name),
+      ])
+  );
   const slashCompletionEntries = createMemo(() =>
     slashCommands()
       .filter((command) => command.source !== 'skill')
@@ -2512,6 +2654,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         description: command.description.toLowerCase(),
       }))
   );
+
+  const commandArgumentHint = createMemo(() => {
+    const match = /^[ \t]*\/(\S+)([ \t]*)$/.exec(inputText());
+    if (!match) return '';
+    const name = match[1]!.toLowerCase();
+    const selectedCommand = slashCommands().find(
+      (command) => command.name.toLowerCase() === name || command.aliases.includes(name)
+    );
+    const hint = selectedCommand?.argumentHint;
+    return hint ? `${match[2] ? '' : ' '}${hint}` : '';
+  });
 
   const activeCompletion = createMemo(() => {
     const fallbackCursor = caretPosition();
@@ -2531,116 +2684,126 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return completion;
   });
 
-  createEffect(() => {
-    const completion = activeCompletion();
-    const fileSearchScope = getFileSearchScopeKey();
-    if (fileSearchScope !== latestFileSearchScope) {
-      latestFileSearchScope = fileSearchScope;
+  createEffect(
+    () => [activeCompletion(), getFileSearchScopeKey()] as const,
+    ([completion, fileSearchScope]) => {
+      if (fileSearchScope !== latestFileSearchScope) {
+        latestFileSearchScope = fileSearchScope;
+        latestFileSearchRequestId += 1;
+        latestFileSearchQuery = '';
+        setFileSearchResults([]);
+        setTableSearchResults([]);
+      }
+      if (completion?.type !== 'mention') {
+        if (fileSearchTimer) {
+          clearTimeout(fileSearchTimer);
+          fileSearchTimer = null;
+        }
+        latestFileSearchQuery = '';
+        setFileSearchResults([]);
+        setShowFileSearchHint(false);
+        setTableSearchResults([]);
+        return;
+      }
+
+      const rawQuery = completion.query.trim();
+
+      setShowFileSearchHint(rawQuery.length === 0);
+
+      if (!rawQuery) {
+        if (fileSearchTimer) {
+          clearTimeout(fileSearchTimer);
+          fileSearchTimer = null;
+        }
+        latestFileSearchQuery = '';
+        setFileSearchResults([]);
+        setTableSearchResults([]);
+        return;
+      }
+
+      if (!shouldRequestMentionFileSearch(latestFileSearchQuery, rawQuery)) return;
+
       latestFileSearchRequestId += 1;
-      latestFileSearchQuery = '';
-      setFileSearchResults([]);
-      setTableSearchResults([]);
-    }
-    if (completion?.type !== 'mention') {
-      if (fileSearchTimer) {
-        clearTimeout(fileSearchTimer);
+      const requestId = latestFileSearchRequestId;
+      latestFileSearchQuery = rawQuery;
+      if (fileSearchTimer) clearTimeout(fileSearchTimer);
+      fileSearchTimer = setTimeout(() => {
         fileSearchTimer = null;
-      }
-      latestFileSearchQuery = '';
-      setFileSearchResults([]);
-      setShowFileSearchHint(false);
-      setTableSearchResults([]);
-      return;
-    }
-
-    const rawQuery = completion.query.trim();
-
-    setShowFileSearchHint(rawQuery.length === 0);
-
-    if (!rawQuery) {
-      if (fileSearchTimer) {
-        clearTimeout(fileSearchTimer);
-        fileSearchTimer = null;
-      }
-      latestFileSearchQuery = '';
-      setFileSearchResults([]);
-      setTableSearchResults([]);
-      return;
-    }
-
-    if (!shouldRequestMentionFileSearch(latestFileSearchQuery, rawQuery)) return;
-
-    latestFileSearchRequestId += 1;
-    const requestId = latestFileSearchRequestId;
-    latestFileSearchQuery = rawQuery;
-    if (fileSearchTimer) clearTimeout(fileSearchTimer);
-    fileSearchTimer = setTimeout(() => {
-      fileSearchTimer = null;
-      postMessage({
-        type: 'files/search',
-        payload: { requestId, query: rawQuery, limit: 12 },
-      });
-    }, 120);
-  });
-
-  createEffect(() => {
-    const completion = activeCompletion();
-    sessionSearchAbortController?.abort();
-    sessionSearchAbortController = undefined;
-    if (sessionSearchTimer) {
-      clearTimeout(sessionSearchTimer);
-      sessionSearchTimer = null;
-    }
-    if (completion?.type !== 'session') {
-      setSessionSearchResults([]);
-      return;
-    }
-
-    const query = normalizeSessionLookupQuery(completion.query);
-    const exactSessionId =
-      /^sessions?:/i.test(completion.query.trim()) || /^ses_[a-z0-9]+$/i.test(query) ? query : null;
-    const currentSessionId = composerSessionId();
-    const localResults = state.sessions.filter((session) => {
-      if (session.id === currentSessionId || session.parentID) return false;
-      if (!query) return true;
-      return (
-        session.id.toLowerCase().includes(query) || session.title.toLowerCase().includes(query)
-      );
-    });
-    setSessionSearchResults(localResults.slice(0, 30));
-
-    sessionSearchTimer = setTimeout(
-      () => {
-        sessionSearchTimer = null;
-        const controller = new AbortController();
-        sessionSearchAbortController = controller;
-        const listRequest = client.session
-          .list({
-            limit: 30,
-            search: query ? query : undefined,
-            roots: true,
-            signal: controller.signal,
-          })
-          .catch(() => null);
-        void listRequest.then((page) => {
-          if (controller.signal.aborted) return;
-          const sessions = page ? [...(Array.isArray(page) ? page : page.items)] : [];
-          const exactSession = exactSessionId
-            ? sessions.find((session) => session.id.toLowerCase() === exactSessionId)
-            : undefined;
-          if (exactSession) sessions.unshift(exactSession);
-          const seen = new Set<string>();
-          const results = sessions.filter((session) => {
-            if (session.id === currentSessionId || seen.has(session.id)) return false;
-            seen.add(session.id);
-            return true;
-          });
-          if (results.length > 0 || page) setSessionSearchResults(results.slice(0, 30));
+        postMessage({
+          type: 'files/search',
+          payload: { requestId, query: rawQuery, limit: 12 },
         });
-      },
-      query ? 120 : 0
-    );
-  });
+      }, 120);
+    }
+  );
+
+  createEffect(
+    () => {
+      const completion = activeCompletion();
+      if (completion?.type !== 'session') return;
+
+      const query = normalizeSessionLookupQuery(completion.query);
+      const exactSessionId =
+        /^sessions?:/i.test(completion.query.trim()) || /^ses_[a-z0-9]+$/i.test(query)
+          ? query
+          : null;
+      const currentSessionId = composerSessionId();
+      const localResults = state.sessions.filter((session) => {
+        if (session.id === currentSessionId || session.parentID) return false;
+        if (!query) return true;
+        return (
+          session.id.toLowerCase().includes(query) || session.title.toLowerCase().includes(query)
+        );
+      });
+      return { query, currentSessionId, exactSessionId, localResults };
+    },
+    (search) => {
+      sessionSearchAbortController?.abort();
+      sessionSearchAbortController = undefined;
+      if (sessionSearchTimer) {
+        clearTimeout(sessionSearchTimer);
+        sessionSearchTimer = null;
+      }
+      if (!search) {
+        setSessionSearchResults([]);
+        return;
+      }
+      const { query, currentSessionId, exactSessionId, localResults } = search;
+      setSessionSearchResults(localResults.slice(0, 30));
+
+      sessionSearchTimer = setTimeout(
+        () => {
+          sessionSearchTimer = null;
+          const controller = new AbortController();
+          sessionSearchAbortController = controller;
+          const listRequest = client.session
+            .list({
+              limit: 30,
+              search: query ? query : undefined,
+              roots: true,
+              signal: controller.signal,
+            })
+            .catch(() => null);
+          void listRequest.then((page) => {
+            if (controller.signal.aborted) return;
+            const sessions = page ? [...(Array.isArray(page) ? page : page.items)] : [];
+            const exactSession = exactSessionId
+              ? sessions.find((session) => session.id.toLowerCase() === exactSessionId)
+              : undefined;
+            if (exactSession) sessions.unshift(exactSession);
+            const seen = new Set<string>();
+            const results = sessions.filter((session) => {
+              if (session.id === currentSessionId || seen.has(session.id)) return false;
+              seen.add(session.id);
+              return true;
+            });
+            if (results.length > 0 || page) setSessionSearchResults(results.slice(0, 30));
+          });
+        },
+        query ? 120 : 0
+      );
+    }
+  );
 
   onCleanup(() => {
     if (sessionSearchTimer) clearTimeout(sessionSearchTimer);
@@ -2674,8 +2837,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       ? JSON.stringify([getFileSearchScopeKey(), composerSessionId(), getNewChatDraftGeneration()])
       : null;
   });
-  createEffect(() => {
-    const scope = problemsPickerScope();
+  createEffect(problemsPickerScope, (scope) => {
     problemsRequest?.abort();
     problemsRequest = undefined;
     setPendingProblems(false);
@@ -2800,16 +2962,21 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return slashCompletions().length === 0 ? 'No matching problems' : undefined;
   });
 
-  createEffect(() => {
-    const completion = activeCompletion();
-    if (!problemsPickerScope() || completion?.type !== 'slash') return;
-    const searching = completion.query.slice(PROBLEMS_COMMAND_NAME.length + 1).trim().length > 0;
-    const items = slashCompletions();
-    const match = searching
-      ? items.findIndex((item) => item.type === 'problems' && item.diagnostic !== null)
-      : 0;
-    setCompletionIndex(Math.max(0, match));
-  });
+  createEffect(
+    () => {
+      const completion = activeCompletion();
+      if (!problemsPickerScope() || completion?.type !== 'slash') return;
+      const searching = completion.query.slice(PROBLEMS_COMMAND_NAME.length + 1).trim().length > 0;
+      const items = slashCompletions();
+      const match = searching
+        ? items.findIndex((item) => item.type === 'problems' && item.diagnostic !== null)
+        : 0;
+      return Math.max(0, match);
+    },
+    (index) => {
+      if (index !== undefined) setCompletionIndex(index);
+    }
+  );
 
   const showCompletionMenu = () => {
     if (suppressCompletion()) return false;
@@ -2845,14 +3012,16 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       (isFocused() && showCompletionMenu())
   );
 
-  createEffect(() => {
-    const length = composerCompletions().length;
-    if (length === 0) {
-      setCompletionIndex(0);
-      return;
+  createEffect(
+    () => composerCompletions().length,
+    (length) => {
+      if (length === 0) {
+        setCompletionIndex(0);
+        return;
+      }
+      setCompletionIndex((current) => Math.max(0, Math.min(current, length - 1)));
     }
-    setCompletionIndex((current) => Math.max(0, Math.min(current, length - 1)));
-  });
+  );
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key.toLowerCase() === 's' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
@@ -2902,7 +3071,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         e.preventDefault();
         const agent = agents[agentFocusIndex()];
         if (agent) {
-          selectComposerAgent(agent);
+          selectComposerAgent(agent.name);
           setShowAgentPicker(false);
         }
         return;
@@ -2924,39 +3093,33 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
       if (e.key === 'Tab') {
         e.preventDefault();
-        const items = composerCompletions();
-        const item = items[Math.min(completionIndex(), items.length - 1)];
-        void applyActiveCompletion();
-        setSuppressCompletion(
-          item?.type !== 'slash' ||
-            (item.name !== SKILLS_COMMAND_NAME && item.name !== PROBLEMS_COMMAND_NAME)
-        );
+        acceptHighlightedCompletion();
         return;
       }
+    }
 
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setCompletionIndex(0);
-        if (activeCompletion()?.type === 'slash') {
-          if (activeCompletion()?.start === 0) setInputText('');
-          else setSuppressCompletion(true);
-        } else {
-          setSuppressCompletion(true);
-        }
-        return;
-      }
+    // Even an empty or loading completion menu owns Escape before session navigation.
+    if (
+      e.key === 'Escape' &&
+      !e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.isComposing &&
+      isFocused() &&
+      showCompletionMenu()
+    ) {
+      e.preventDefault();
+      setCompletionIndex(0);
+      const completion = activeCompletion();
+      if (completion?.type === 'slash' && completion.start === 0) setInputText('');
+      else setSuppressCompletion(true);
+      return;
     }
 
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       if (showingCompletions) {
         e.preventDefault();
-        const items = composerCompletions();
-        const item = items[Math.min(completionIndex(), items.length - 1)];
-        void applyActiveCompletion();
-        setSuppressCompletion(
-          item?.type !== 'slash' ||
-            (item.name !== SKILLS_COMMAND_NAME && item.name !== PROBLEMS_COMMAND_NAME)
-        );
+        acceptHighlightedCompletion();
         return;
       }
     }
@@ -2973,10 +3136,10 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       if (e.key === 'Tab') {
         e.preventDefault();
         const value = inputText() + promptCompletion.suggestion();
-        batch(() => {
+        (() => {
           setComposerValue(value);
-          promptCompletion.dismiss();
-        });
+          promptCompletion.dismiss(value);
+        })();
         return;
       }
       if (e.key === 'Escape') {
@@ -3010,7 +3173,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      if (!canSend()) {
+      if (!canSend(readLatestDraftText())) {
         reportBlockedSend();
         return;
       }
@@ -3060,6 +3223,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     });
   }
 
+  // Accepts the highlighted item; /skills and /problems keep completions open for sub-items.
+  function acceptHighlightedCompletion() {
+    const items = composerCompletions();
+    const item = items[Math.min(completionIndex(), items.length - 1)];
+    void applyActiveCompletion();
+    setSuppressCompletion(
+      item?.type !== 'slash' ||
+        (item.name !== SKILLS_COMMAND_NAME && item.name !== PROBLEMS_COMMAND_NAME)
+    );
+  }
+
   async function applyActiveCompletion() {
     const completion = activeCompletion();
     const items = composerCompletions();
@@ -3100,11 +3274,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     value: string
   ) {
     const result = applySlashCompletion(inputText(), completion, value);
-    batch(() => {
+    (() => {
       setInputText(result.value);
       setCaretPosition(result.cursor);
       setCompletionIndex(0);
-    });
+    })();
     queueMicrotask(() => richEditorRef?.focus());
   }
 
@@ -3125,7 +3299,8 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   }
 
   async function requestWorkspaceProblems(): Promise<boolean> {
-    if (!state.autoAttachProblems || pendingProblems()) return false;
+    // A scope change clears the request in the same tick, before pendingProblems() publishes.
+    if (!state.autoAttachProblems || problemsRequest) return false;
     const scope = getFileSearchScopeKey();
     const sessionId = composerSessionId();
     const generation = getNewChatDraftGeneration();
@@ -3181,12 +3356,12 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       const marker = problemReferenceMarker(reference);
       insertion = `${marker}${getMentionInsertionTrailingSpace(marker, text[completion.end])}`;
     }
-    batch(() => {
-      setState('inlineProblems', references);
+    (() => {
+      setState(storePath('inlineProblems', references));
       setInputText(text.slice(0, completion.start) + insertion + text.slice(completion.end));
       setCaretPosition(completion.start + insertion.length);
       setCompletionIndex(0);
-    });
+    })();
     if (added.length === 0) showSessionActionFeedback('Problems already added to context');
     queueMicrotask(() => richEditorRef?.focus());
   }
@@ -3204,7 +3379,9 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       return;
     }
     const diagnostics = [...existing, ...additions];
-    setState('attachedDiagnostics', { diagnostics, total: diagnostics.length, inline: false });
+    setState(
+      storePath('attachedDiagnostics', { diagnostics, total: diagnostics.length, inline: false })
+    );
     queueMicrotask(() => richEditorRef?.focus());
   }
 
@@ -3219,14 +3396,14 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     const trailingSpace = getMentionInsertionTrailingSpace(value, text[completion.end]);
     const nextValue = `${text.slice(0, completion.start)}${value}${trailingSpace}${text.slice(completion.end)}`;
     const nextCursor = completion.start + value.length + trailingSpace.length;
-    batch(() => {
+    (() => {
       setInputText(nextValue);
       setCaretPosition(nextCursor);
       setCompletionIndex(0);
       setFileSearchResults([]);
       setTableSearchResults([]);
       setSessionSearchResults([]);
-    });
+    })();
     latestFileSearchQuery = '';
 
     queueMicrotask(() => {
@@ -3313,7 +3490,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     }
     const parsed = getLeadingSlashCommand(raw);
     if (!parsed) return false;
-    const commandSessionId = composerSessionId();
+    const commandDraftKey = currentDraftKey();
 
     const { name, args } = parsed;
     if (isPauseSlashCommand(raw)) {
@@ -3379,7 +3556,8 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             (command) => command.source === 'skill' && command.name.toLowerCase() === name
           )
         : undefined;
-    if (builtInCommand === null && !fallbackCommand && !skillCommand) return false;
+    const serverCommandName = fallbackCommand?.serverCommand ?? skillCommand?.name;
+    if (builtInCommand === null && !fallbackCommand && !serverCommandName) return false;
     setHistoryIndex(null);
     setHistoryDraft('');
     invalidatePendingPdfAttachments();
@@ -3391,19 +3569,19 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       await builtInCommand;
       return true;
     }
-    if (skillCommand) {
+    if (serverCommandName) {
       setWorkspaceSendPending(true);
       let sent = false;
       try {
         sent = options
-          ? await runSlashCommandByName(skillCommand.name, args, options)
-          : await runSlashCommandByName(skillCommand.name, args);
+          ? await runSlashCommandByName(serverCommandName, args, options)
+          : await runSlashCommandByName(serverCommandName, args);
       } catch (error) {
         setError(error instanceof Error ? error.message : String(error));
       } finally {
         if (
           !sent &&
-          composerSessionId() === commandSessionId &&
+          currentDraftKey() === commandDraftKey &&
           inputTextMutationVersion() === clearedInputVersion &&
           inputText() === ''
         ) {
@@ -3450,6 +3628,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
   async function handleSend(mode?: 'queue' | 'queue-paused' | 'steer' | 'after-stop') {
     if (editReconciliationPending()) return;
+    const sendDraftKey = currentDraftKey();
     const savePaused = mode === 'queue-paused';
     if (savePaused) {
       if (!composerSessionId()) {
@@ -3461,7 +3640,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         return;
       }
     }
-    const text = inputText();
+    const text = readLatestDraftText();
     const command = getLeadingSlashCommand(text);
     if (
       !savePaused &&
@@ -3563,6 +3742,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
     const editing = composerEditingMessage();
     if (editing) {
+      const selectedAgent = composerSelectedAgent() ?? undefined;
       const model = currentModel();
       const selectedModel =
         model.providerID && model.modelID
@@ -3610,6 +3790,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
                 : [],
             },
             selectedModel,
+            selectedAgent,
             onOptimisticPublish: () => {
               optimisticPublished = true;
               setSubmittingEdit(null);
@@ -3619,6 +3800,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         } else {
           clearUsageLimitsForSessionTree(composerSessionId());
           sent = await sendMessage(text, {
+            agent: selectedAgent,
             queuedAttachments: {
               ...queuedAttachments,
               issuesAttachment: editing.context.issues ?? null,
@@ -3632,6 +3814,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         if (submittingEdit() === editing) setSubmittingEdit(null);
       }
       if (sent) {
+        if (selectedAgent) setSelectedAgent(selectedAgent, { sessionId: editing.sessionId });
         if (selectedModel) {
           setSelectedModel(selectedModel, {
             sessionId: editing.sessionId,
@@ -3652,7 +3835,8 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             editing.sessionId,
             text,
             submittedEdit,
-            selectedModel || null
+            selectedModel || null,
+            selectedAgent ?? null
           );
           if (previousDraft) setMessageEditDraftBackup(previousDraft);
         }
@@ -3775,6 +3959,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         queuedEdit?.sessionId === sessionId && replaceQueuedMessage(queuedEdit.id, message);
       holdComposerHeightUntilMessageAppend(sessionId);
       if (!replaced) enqueueMessage(message);
+      if (currentDraftKey() !== sendDraftKey) {
+        writeOwnedDraft(sendDraftKey, '');
+        releaseHeldComposerHeight(true);
+        return;
+      }
       setQueuedMessageEdit(null);
       setHistoryIndex(null);
       setHistoryDraft('');
@@ -3783,9 +3972,9 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       animateSubmittedContent();
       setInputText('');
       clearContextFiles();
-      setState('terminalSelection', null);
-      setState('attachedDiagnostics', null);
-      setState('inlineProblems', []);
+      setState(storePath('terminalSelection', null));
+      setState(storePath('attachedDiagnostics', null));
+      setState(storePath('inlineProblems', []));
       clearClipboardImages();
       clearNativePdfs();
       resetPastedImageIndex();
@@ -3803,7 +3992,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     invalidatePendingPdfAttachments();
     animateSubmittedContent();
     hideSubmittedAttachments(sendSessionId);
-    setInputText('');
+    writeOwnedDraft(sendDraftKey, '');
     const clearedInputVersion = inputTextMutationVersion();
     resetPastedImageIndex();
     clearUsageLimitsForSessionTree(sendSessionId);
@@ -3812,7 +4001,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       // Slash-command detection is async. Keep the send attached to the composer
       // where Enter was pressed if navigation changes the active session meanwhile.
       const capturedTarget =
-        props.newSession || composerSessionId() !== sendSessionId ? sendSessionId : undefined;
+        props.newSession ||
+        state.activeSessionId !== sendSessionId ||
+        currentDraftKey() !== sendDraftKey
+          ? sendSessionId
+          : undefined;
       const sendOptions: NonNullable<Parameters<typeof sendMessage>[1]> =
         mode === 'steer'
           ? { delivery: 'steer' }
@@ -3843,16 +4036,16 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     releaseHeldComposerHeight(sent);
     const shouldRestoreFailedInput =
       !sent &&
-      sendingAttachments() !== null &&
+      currentDraftKey() === sendDraftKey &&
       inputTextMutationVersion() === clearedInputVersion &&
       inputText() === '';
-    batch(() => {
+    (() => {
       if (!sent) clearSendAnimation?.();
       if (shouldRestoreFailedInput) setInputText(text);
       setSendingInlineAttachments(null);
       setWorkspaceSendPending(false);
-    });
-    if (shouldRestoreFailedInput) {
+    })();
+    if (shouldRestoreFailedInput && composerSessionId() === sendSessionId) {
       setErrorRetry(() => {
         setErrorRetry(null);
         void handleSend();
@@ -3880,11 +4073,16 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (!ownsQueuedMessage(item)) return;
     if (isQueuedSessionHydrating(item.sessionId)) return;
     if (isSessionAwaitingInput(item.sessionId)) return;
-    if (dispatchingQueuedMessageId()) return;
-    if (!retry && state.queuedMessages.find((queued) => queued.id === item.id)?.paused) return;
-    if (failedQueuedMessageIds().has(item.id) && !retry) return;
+    let claimed = false;
+    setState((draft) => {
+      const queued = draft.queuedMessages.find((entry) => entry.id === item.id);
+      if (!queued || draft.queuedMessageDispatchingId) return;
+      if (!retry && (queued.paused || draft.failedQueuedMessageIds.includes(item.id))) return;
+      draft.queuedMessageDispatchingId = item.id;
+      claimed = true;
+    });
+    if (!claimed) return;
     setQueuedMessageFailed(item.id, false);
-    setDispatchingQueuedMessageId(item.id);
     const priorAttemptId = item.messageId;
     const messageId = priorAttemptId ?? createOpenCodeMessageID();
     const workspaceDirectory = getQueuedMessageWorkspaceDirectory(item);
@@ -4006,39 +4204,64 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   const getAuthoritativeQueuedSessionStatus = (sessionId: string) => {
     const entry = authoritativeQueuedSessionStatuses.get(sessionId);
     if (!entry) return undefined;
-    if (Date.now() - entry.observedAt <= AUTHORITATIVE_QUEUED_STATUS_MAX_AGE_MS) {
+    if (
+      Date.now() - entry.observedAt <= AUTHORITATIVE_QUEUED_STATUS_MAX_AGE_MS &&
+      (entry.snapshotStartedAt === undefined ||
+        !sessionStore.isSessionStatusSnapshotStale(sessionId, entry.snapshotStartedAt))
+    ) {
       return entry.status;
     }
-    authoritativeQueuedSessionStatuses.delete(sessionId);
     return undefined;
   };
   const getQueuedSessionStatusType = (sessionId: string) =>
     sessionId !== state.activeSessionId
       ? (getAuthoritativeQueuedSessionStatus(sessionId) ?? state.sessionStatus[sessionId]?.type)
       : state.sessionStatus[sessionId]?.type;
+  const isOtherQueuedTreeSessionWorking = (sessionId: string) =>
+    getSessionTreeIdsForSession(sessionId).some((id) => {
+      if (id === sessionId) return false;
+      const reconciled = getAuthoritativeQueuedSessionStatus(id);
+      return (
+        sessionStore.isProviderRetryScheduled(id) ||
+        (reconciled === undefined
+          ? isSessionStatusWorking(state.sessionStatus[id])
+          : reconciled === 'busy')
+      );
+    });
   const isQueuedSessionTreeWorking = (sessionId: string) => {
-    const authoritativeStatus = getAuthoritativeQueuedSessionStatus(sessionId);
-    return authoritativeStatus
-      ? authoritativeStatus === 'busy'
-      : isSessionTreeStatusWorking(sessionId);
+    const status = getQueuedSessionStatusType(sessionId);
+    return (
+      status === 'busy' ||
+      status === 'retry' ||
+      sessionStore.isProviderRetryScheduled(sessionId) ||
+      isOtherQueuedTreeSessionWorking(sessionId)
+    );
   };
 
-  createEffect(() => {
-    const queuedStatusSessionIds = new Set(
-      state.queuedMessages.filter(ownsQueuedMessage).map((message) => message.sessionId)
-    );
-    for (const sessionId of authoritativeQueuedSessionStatuses.keys()) {
-      if (!queuedStatusSessionIds.has(sessionId)) {
-        authoritativeQueuedSessionStatuses.delete(sessionId);
+  createEffect(
+    () => {
+      const queuedStatusSessionIds = new Set(
+        state.queuedMessages.filter(ownsQueuedMessage).map((message) => message.sessionId)
+      );
+      const queuedTreeSessionIds = new Set(
+        [...queuedStatusSessionIds].flatMap(getSessionTreeIdsForSession)
+      );
+      return { queuedStatusSessionIds, queuedTreeSessionIds };
+    },
+    ({ queuedStatusSessionIds, queuedTreeSessionIds }) => {
+      for (const sessionId of authoritativeQueuedSessionStatuses.keys()) {
+        if (!queuedTreeSessionIds.has(sessionId)) {
+          authoritativeQueuedSessionStatuses.delete(sessionId);
+        }
       }
-    }
-    for (const sessionId of queuedSessionDispatchPhases.keys()) {
-      if (!queuedStatusSessionIds.has(sessionId)) {
-        queuedSessionDispatchPhases.delete(sessionId);
+      for (const sessionId of queuedSessionDispatchPhases.keys()) {
+        if (!queuedStatusSessionIds.has(sessionId)) {
+          queuedSessionDispatchPhases.delete(sessionId);
+        }
       }
+      scheduleQueuedStatusReconciliation();
     }
-    scheduleQueuedStatusReconciliation();
-  });
+  );
 
   function findNextQueuedMessageForDispatch() {
     const steeringIds = steeringQueuedMessageIds();
@@ -4098,34 +4321,47 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return undefined;
   }
 
-  createEffect(() => {
-    const initialized = connectionInitialized();
-    const dispatchingId = dispatchingQueuedMessageId();
-    const next = findNextQueuedMessageForDispatch();
-    if (queueDispatchTimer) {
-      clearTimeout(queueDispatchTimer);
-      queueDispatchTimer = 0;
+  createEffect(
+    () => {
+      const initialized = connectionInitialized();
+      const dispatchingId = dispatchingQueuedMessageId();
+      const next = findNextQueuedMessageForDispatch();
+      return initialized && !dispatchingId && !!next;
+    },
+    (ready) => {
+      if (queueDispatchTimer) {
+        clearTimeout(queueDispatchTimer);
+        queueDispatchTimer = 0;
+      }
+      if (!ready) return;
+      queueDispatchTimer = setTimeout(() => {
+        queueDispatchTimer = 0;
+        if (!connectionInitialized()) return;
+        if (dispatchingQueuedMessageId()) return;
+        const nextQueued = findNextQueuedMessageForDispatch();
+        if (!nextQueued) return;
+        void dispatchQueuedMessage(nextQueued);
+      }, 250);
     }
-    if (!initialized || dispatchingId || !next) return;
-    queueDispatchTimer = setTimeout(() => {
-      queueDispatchTimer = 0;
-      if (!connectionInitialized()) return;
-      if (dispatchingQueuedMessageId()) return;
-      const nextQueued = findNextQueuedMessageForDispatch();
-      if (!nextQueued) return;
-      void dispatchQueuedMessage(nextQueued);
-    }, 250);
-  });
+  );
   const observeQueuedSessionStatus = (
     sessionId: string,
     status: 'busy' | 'idle',
-    source: 'event' | 'reconciliation' = 'event'
+    snapshotStartedAt?: number
   ) => {
-    if (state.queuedMessages.some((message) => message.sessionId === sessionId)) {
+    if (
+      state.queuedMessages.some(
+        (message) =>
+          ownsQueuedMessage(message) &&
+          (message.sessionId === sessionId ||
+            getSessionTreeIdsForSession(message.sessionId).includes(sessionId))
+      )
+    ) {
       authoritativeQueuedSessionStatuses.set(sessionId, {
         status,
         observedAt: Date.now(),
         revision: ++authoritativeQueuedStatusRevision,
+        snapshotStartedAt,
       });
     } else {
       authoritativeQueuedSessionStatuses.delete(sessionId);
@@ -4135,6 +4371,14 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (status === 'busy') {
       dispatch.phase = 'running';
       dispatch.completedBeforeAdmission = false;
+      dispatch.statusCheckAfter = Date.now() + QUEUED_RUNNING_STATUS_RECONCILIATION_DELAY_MS;
+      scheduleQueuedStatusReconciliation();
+      return false;
+    }
+    if (
+      sessionStore.isProviderRetryScheduled(sessionId) ||
+      isOtherQueuedTreeSessionWorking(sessionId)
+    ) {
       scheduleQueuedStatusReconciliation();
       return false;
     }
@@ -4142,7 +4386,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       if (dispatch.phase === 'running') dispatch.completedBeforeAdmission = true;
       return false;
     }
-    if (dispatch.phase !== 'running' && source !== 'reconciliation') {
+    if (dispatch.phase !== 'running' && snapshotStartedAt === undefined) {
       scheduleQueuedStatusReconciliation();
       return false;
     }
@@ -4172,7 +4416,14 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     let candidate: { sessionId: string; dispatch: QueuedSessionDispatchPhase } | undefined;
     let reconcileAt = Number.POSITIVE_INFINITY;
     for (const [sessionId, dispatch] of queuedSessionDispatchPhases) {
-      if (dispatch.phase !== 'admitted' || dispatch.statusCheckInFlight) continue;
+      // A reconnect can restore idle through a snapshot without replaying its event.
+      // Keep checking running admissions too, or that lost event blocks the queue forever.
+      if (
+        dispatch.phase === 'dispatching' ||
+        dispatch.admittedAt === undefined ||
+        dispatch.statusCheckInFlight
+      )
+        continue;
       const nextCheckAt = dispatch.statusCheckAfter ?? now;
       if (nextCheckAt >= reconcileAt) continue;
       candidate = { sessionId, dispatch };
@@ -4194,11 +4445,12 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   ) {
     if (queueDispatchDisposed || queuedSessionDispatchPhases.get(sessionId) !== dispatch) return;
     if (dispatch.admittedAt === undefined) return;
-    const statusRevision = authoritativeQueuedSessionStatuses.get(sessionId)?.revision ?? 0;
+    const statusRevision = authoritativeQueuedStatusRevision;
+    const snapshotStartedAt = captureSessionStatusSnapshotTime();
     dispatch.statusCheckInFlight = true;
     dispatch.statusCheckOwner = queuedStatusReconciliationOwner;
     try {
-      const statuses = await client.session.status();
+      const statuses = await client.session.status({ fresh: true });
       if (
         queueDispatchDisposed ||
         queuedSessionDispatchPhases.get(sessionId) !== dispatch ||
@@ -4207,19 +4459,42 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         return;
       }
       const latestStatus = authoritativeQueuedSessionStatuses.get(sessionId);
-      if (latestStatus && latestStatus.revision > statusRevision) {
+      if (
+        (latestStatus && latestStatus.revision > statusRevision) ||
+        sessionStore.isSessionStatusSnapshotStale(sessionId, snapshotStartedAt)
+      ) {
         dispatch.statusCheckInFlight = false;
         dispatch.statusCheckOwner = undefined;
+        dispatch.statusCheckAfter = Date.now() + QUEUED_RUNNING_STATUS_RECONCILIATION_DELAY_MS;
         return;
       }
-      const status = statuses[sessionId];
-      if (status?.type === 'busy' || status?.type === 'retry') {
+      const tree = getSessionTreeIdsForSession(sessionId);
+      for (const id of tree) {
+        if (
+          id === sessionId ||
+          (authoritativeQueuedSessionStatuses.get(id)?.revision ?? 0) > statusRevision ||
+          sessionStore.isSessionStatusSnapshotStale(id, snapshotStartedAt)
+        )
+          continue;
+        // Reconcile only this queue's tree. An idle session can be absent from the snapshot.
+        authoritativeQueuedSessionStatuses.set(id, {
+          status: isSessionStatusWorking(statuses[id]) ? 'busy' : 'idle',
+          observedAt: Date.now(),
+          revision: ++authoritativeQueuedStatusRevision,
+          snapshotStartedAt,
+        });
+      }
+      if (
+        isSessionStatusWorking(statuses[sessionId]) ||
+        isOtherQueuedTreeSessionWorking(sessionId) ||
+        sessionStore.isProviderRetryScheduled(sessionId)
+      ) {
         dispatch.statusCheckInFlight = false;
         dispatch.statusCheckOwner = undefined;
-        observeQueuedSessionStatus(sessionId, 'busy', 'reconciliation');
+        observeQueuedSessionStatus(sessionId, 'busy', snapshotStartedAt);
         return;
       }
-      if (observeQueuedSessionStatus(sessionId, 'idle', 'reconciliation')) {
+      if (observeQueuedSessionStatus(sessionId, 'idle', snapshotStartedAt)) {
         dispatchAfterAuthoritativeIdle(sessionId);
       }
     } catch {
@@ -4241,7 +4516,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       const properties = event.properties;
       if (!isString(properties?.sessionID)) return;
       const status = properties.status?.type;
-      if (status === 'busy') {
+      if (status === 'busy' || status === 'retry') {
         observeQueuedSessionStatus(properties.sessionID, 'busy');
         return;
       }
@@ -4280,12 +4555,12 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   });
 
   function setComposerValue(value: string) {
-    batch(() => {
+    (() => {
       setInputText(value);
       setCaretPosition(value.length);
       if (value.trim().length === 0 && state.clipboardImages.length === 0) resetPastedImageIndex();
       setCompletionIndex(0);
-    });
+    })();
     queueMicrotask(() => {
       if (richEditorRef) {
         richEditorRef.focus();
@@ -4301,30 +4576,46 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   function applyComposerEditState(
     context: MessageEditContext,
     text: string,
-    mergeWholeFileIntoActiveContext = false
+    files = normalizeEditFiles(context.files, false)
   ) {
-    const droppedImages = applyEditContext(context, mergeWholeFileIntoActiveContext);
+    const droppedImages = applyEditContext(context, files);
     setComposerValue(stripClipboardImagePlaceholders(text, droppedImages));
   }
 
+  // Remount restores the owner once; editQueuedMessage records subsequent edits.
+  let queuedEditDraftKey: string | null = untrack(() =>
+    state.queuedMessageEdit?.sessionId === composerSessionId() ? currentDraftKey() : null
+  );
   function cancelQueuedMessageEdit() {
-    if (!queuedMessageEdit()) return;
-    batch(() => {
+    const edit = queuedMessageEdit();
+    if (!edit) return;
+    if (
+      (queuedEditDraftKey && queuedEditDraftKey !== currentDraftKey()) ||
+      edit.sessionId !== composerSessionId()
+    ) {
+      if (queuedEditDraftKey && queuedEditDraftKey !== currentDraftKey()) {
+        writeOwnedDraft(queuedEditDraftKey, '');
+      }
+      setQueuedMessageEdit(null);
+      queuedEditDraftKey = null;
+      return;
+    }
+    (() => {
       setQueuedMessageEdit(null);
       setHistoryIndex(null);
       setHistoryDraft('');
       setCompletionIndex(0);
       setSuppressCompletion(false);
       clearContextFiles();
-      setState('terminalSelection', null);
-      setState('attachedDiagnostics', null);
-      setState('inlineProblems', []);
+      setState(storePath('terminalSelection', null));
+      setState(storePath('attachedDiagnostics', null));
+      setState(storePath('inlineProblems', []));
       clearClipboardImages();
       clearNativePdfs();
       invalidatePendingPdfAttachments();
       resetPastedImageIndex();
       setComposerValue('');
-    });
+    })();
     postMessage({ type: 'files/clear' });
     postMessage({ type: 'terminal-selection/clear' });
   }
@@ -4342,7 +4633,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       return;
     }
 
-    batch(() => {
+    (() => {
       setHistoryIndex(null);
       setHistoryDraft('');
       setCompletionIndex(0);
@@ -4372,6 +4663,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
           JSON.stringify(file.lineRanges ?? []) !== JSON.stringify(ranges)
         );
       });
+      queuedEditDraftKey = currentDraftKey();
       applyComposerEditState(
         {
           files,
@@ -4382,9 +4674,9 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         },
         queued.text
       );
-      setState('attachedDiagnostics', queued.attachedDiagnostics ?? null);
+      setState(storePath('attachedDiagnostics', queued.attachedDiagnostics ?? null));
       setQueuedMessageEdit({ id: queued.id, sessionId: queued.sessionId });
-    });
+    })();
   }
 
   const messageHistory = createMemo(() => {
@@ -4650,7 +4942,8 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   function updatePasteTransactionOwners(
     sessionId: string | null,
     previousMutationVersion: number,
-    previousValue: string
+    previousValue: string,
+    nextValue = inputText()
   ) {
     for (const transaction of pendingPasteTransactions) {
       if (
@@ -4661,111 +4954,122 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         continue;
       }
       transaction.mutationVersion = inputTextMutationVersion();
-      transaction.value = inputText();
+      transaction.value = nextValue;
     }
   }
 
   function commitPasteTransaction(transaction: PasteTransaction) {
-    const mentions = transaction.mentions!;
-    const contextFiles = [...transaction.contextFiles, ...mentions.files];
-    const withdrawPastedMention =
-      !!transaction.insertion &&
-      mentions.mentionCount > 0 &&
-      mentions.resolvedCount === mentions.mentionCount &&
-      getPromptTextWithoutContextReferences(transaction.pastedText).length === 0;
-    const previousMutationVersion = transaction.mutationVersion;
-    const previousValue = transaction.value;
-    const committedImageIds: string[] = [];
-    const imageFilenames: string[] = [];
-    const pendingImages: ClipboardImage[] = [];
-    const availableSlots = Math.max(0, MAX_CLIPBOARD_IMAGES - state.clipboardImages.length);
-    const usedFilenames = new Set(state.clipboardImages.map((image) => image.filename));
-    const usedImageContentKeys = new Set(
-      state.clipboardImages.map((image) => image.contentKey ?? image.url)
-    );
-    let imageIndex = nextPastedImageIndex();
+    setState((draft) => {
+      const mentions = transaction.mentions!;
+      const contextFiles = [...transaction.contextFiles, ...mentions.files];
+      const withdrawPastedMention =
+        !!transaction.insertion &&
+        mentions.mentionCount > 0 &&
+        mentions.resolvedCount === mentions.mentionCount &&
+        getPromptTextWithoutContextReferences(transaction.pastedText).length === 0;
+      const previousMutationVersion = transaction.mutationVersion;
+      const previousValue = transaction.value;
+      const committedImageIds: string[] = [];
+      const imageFilenames: string[] = [];
+      const pendingImages: ClipboardImage[] = [];
+      const availableSlots = Math.max(0, MAX_CLIPBOARD_IMAGES - draft.clipboardImages.length);
+      const usedFilenames = new Set(draft.clipboardImages.map((image) => image.filename));
+      const usedImageContentKeys = new Set(
+        draft.clipboardImages.map((image) => image.contentKey ?? image.url)
+      );
+      let imageIndex = nextPastedImageIndex();
+      let committedText = transaction.value;
+      let committedCaret = caretPosition();
 
-    applyingComposerHistory = true;
-    try {
-      batch(() => {
-        for (const file of contextFiles) addContextFile(file);
-        for (const image of transaction.images!) {
-          if (!image) continue;
-          if (imageFilenames.length >= availableSlots) {
-            transaction.imageRejections.add('limit');
-            continue;
-          }
-          const duplicateKey = image.url;
-          if (usedImageContentKeys.has(duplicateKey)) {
-            transaction.imageRejections.add('duplicate');
-            continue;
-          }
+      applyingComposerHistory = true;
+      try {
+        (() => {
+          for (const file of contextFiles) addContextFile(file);
+          for (const image of transaction.images!) {
+            if (!image) continue;
+            if (imageFilenames.length >= availableSlots) {
+              transaction.imageRejections.add('limit');
+              continue;
+            }
+            const duplicateKey = image.url;
+            if (usedImageContentKeys.has(duplicateKey)) {
+              transaction.imageRejections.add('duplicate');
+              continue;
+            }
 
-          let filename = getPastedImageFilename(imageIndex);
-          while (usedFilenames.has(filename)) {
+            let filename = getPastedImageFilename(imageIndex);
+            while (usedFilenames.has(filename)) {
+              imageIndex += 1;
+              filename = getPastedImageFilename(imageIndex);
+            }
+
+            const id = createAttachmentID();
+            pendingImages.push({ id, ...image, filename });
+            imageFilenames.push(filename);
+            usedFilenames.add(filename);
+            usedImageContentKeys.add(duplicateKey);
             imageIndex += 1;
-            filename = getPastedImageFilename(imageIndex);
           }
+          const committedImages = addClipboardImages(pendingImages);
+          committedImageIds.push(...committedImages.map((image) => image.id));
+          if (committedImages.length > 0) setNextPastedImageIndex(imageIndex);
 
-          const id = createAttachmentID();
-          pendingImages.push({ id, ...image, filename });
-          imageFilenames.push(filename);
-          usedFilenames.add(filename);
-          usedImageContentKeys.add(duplicateKey);
-          imageIndex += 1;
-        }
-        const committedImages = addClipboardImages(pendingImages);
-        committedImageIds.push(...committedImages.map((image) => image.id));
-        if (committedImages.length > 0) setNextPastedImageIndex(imageIndex);
+          const next = applyPasteTransactionText(
+            captureComposerSnapshot(transaction.value, committedCaret, draft),
+            transaction,
+            withdrawPastedMention,
+            imageFilenames
+          );
+          setInputText(next.text);
+          setCaretPosition(next.caret);
+          committedText = next.text;
+          committedCaret = next.caret;
+        })();
 
-        const next = applyPasteTransactionText(
-          captureComposerSnapshot(),
-          transaction,
-          withdrawPastedMention,
-          imageFilenames
+        const committedFiles = draft.droppedFiles.filter((file) =>
+          contextFiles.some((candidate) => isSamePath(candidate.path, file.path))
         );
-        setInputText(next.text);
-        setCaretPosition(next.caret);
-      });
-
-      const committedFiles = state.droppedFiles.filter((file) =>
-        contextFiles.some((candidate) => isSamePath(candidate.path, file.path))
-      );
-      const committedImages = state.clipboardImages.filter((image) =>
-        committedImageIds.includes(image.id)
-      );
-      const rewrite = (snapshot: ComposerSnapshot) => {
-        const next = applyPasteTransactionText(
-          snapshot,
-          transaction,
-          withdrawPastedMention,
-          imageFilenames
+        const committedImages = draft.clipboardImages.filter((image) =>
+          committedImageIds.includes(image.id)
         );
-        return {
-          ...next,
-          files: mergeTransactionFiles(next.files, committedFiles),
-          images: mergeTransactionImages(next.images, committedImages),
+        const rewrite = (snapshot: ComposerSnapshot) => {
+          const next = applyPasteTransactionText(
+            snapshot,
+            transaction,
+            withdrawPastedMention,
+            imageFilenames
+          );
+          return {
+            ...next,
+            files: mergeTransactionFiles(next.files, committedFiles),
+            images: mergeTransactionImages(next.images, committedImages),
+          };
         };
-      };
-      if (transaction.historyEntry === null) {
-        composerHistory.record(captureComposerSnapshot());
-      } else {
-        composerHistory.rewriteFrom(transaction.historyEntry, rewrite);
+        if (transaction.historyEntry === null) {
+          composerHistory.record(captureComposerSnapshot(committedText, committedCaret, draft));
+        } else {
+          composerHistory.rewriteFrom(transaction.historyEntry, rewrite);
+        }
+      } finally {
+        applyingComposerHistory = false;
       }
-    } finally {
-      applyingComposerHistory = false;
-    }
-    notifyPastedImageRejections(transaction.imageRejections, containerRef);
+      notifyPastedImageRejections(transaction.imageRejections, containerRef);
 
-    const textDelta = inputText().length - previousValue.length;
-    if (textDelta !== 0) {
-      for (const pending of pendingPasteTransactions) {
-        if (pending === transaction || pending.start < transaction.end) continue;
-        pending.start += textDelta;
-        pending.end += textDelta;
+      const textDelta = committedText.length - previousValue.length;
+      if (textDelta !== 0) {
+        for (const pending of pendingPasteTransactions) {
+          if (pending === transaction || pending.start < transaction.end) continue;
+          pending.start += textDelta;
+          pending.end += textDelta;
+        }
       }
-    }
-    updatePasteTransactionOwners(transaction.sessionId, previousMutationVersion, previousValue);
+      updatePasteTransactionOwners(
+        transaction.sessionId,
+        previousMutationVersion,
+        previousValue,
+        committedText
+      );
+    });
   }
 
   function drainPasteTransactions() {
@@ -4796,6 +5100,9 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         continue;
       }
       commitPasteTransaction(transaction);
+      // Let the committed text/caret catch up before admitting the next paste.
+      queueMicrotask(drainPasteTransactions);
+      return;
     }
   }
 
@@ -4963,7 +5270,10 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       .then(drainPasteTransactions);
   }
 
-  function handlePasteInsertion(e: ClipboardEvent, insertion: RichComposerPasteInsertion | null) {
+  function handlePasteInsertion(
+    e: ClipboardEvent,
+    insertion: RichComposerPasteInsertion | null
+  ): RichComposerPasteInsertion | undefined {
     const transaction = pasteTransactionsByEvent.get(e);
     if (transaction) {
       pasteTransactionsByEvent.delete(e);
@@ -4980,8 +5290,15 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       if (resolvedInsertion) {
         transaction.start = resolvedInsertion.start;
         transaction.end = resolvedInsertion.end;
-        updatePasteTransactionOwners(transaction.sessionId, previousMutationVersion, previousValue);
-        transaction.historyEntry = composerHistory.record(captureComposerSnapshot());
+        updatePasteTransactionOwners(
+          transaction.sessionId,
+          previousMutationVersion,
+          previousValue,
+          resolvedInsertion.value
+        );
+        transaction.historyEntry = composerHistory.record(
+          captureComposerSnapshot(resolvedInsertion.value, resolvedInsertion.end)
+        );
       }
       drainPasteTransactions();
       return;
@@ -4994,8 +5311,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       const types = Array.from(e.clipboardData?.types ?? []);
       const plainTextOnly =
         types.length > 0 && types.every((type) => type.split(';')[0] === 'text/plain');
-      resolveCopiedSelection(pastedText, insertion, plainTextOnly);
-      return;
+      return resolveCopiedSelection(pastedText, insertion, plainTextOnly);
     }
     if (!insertion) return;
     // SAFETY: handlePaste assigns this optional marker on clipboard events containing context files.
@@ -5004,6 +5320,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (!pastedText) return;
 
     resolvePastedMentions(pastedText, insertion);
+    return undefined;
   }
 
   function resolveCopiedSelection(
@@ -5018,10 +5335,12 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     const owner = {
       sessionId: composerSessionId(),
       mutationVersion: inputTextMutationVersion(),
-      value: inputText(),
+      value: insertion.value,
       insertion,
     };
     setPendingCopiedSelectionPaste(owner);
+    let upgradedValue = insertion.value;
+    let upgradedCaret = insertion.end;
     let settled = false;
     const settle = (match: Awaited<ReturnType<typeof client.varro.matchCopiedSelection>>) => {
       if (settled) return;
@@ -5039,7 +5358,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       applyingComposerHistory = true;
       try {
         if (match && insertCopiedSelectionChip(match)) {
-          composerHistory.replaceCurrent(captureComposerSnapshot());
+          setState((draft) => {
+            composerHistory.replaceCurrent(
+              captureComposerSnapshot(upgradedValue, upgradedCaret, draft)
+            );
+          });
           return;
         }
       } finally {
@@ -5054,6 +5377,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       logError('chat-input:matchCopiedSelection', err);
       settle(null);
     });
+    return insertion;
 
     /** Returns false when the paste should stay plain text. */
     function insertCopiedSelectionChip(
@@ -5073,10 +5397,10 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         // its chip; a different one stays plain text instead of replacing it.
         if (current && !sameSelection) return false;
         if (sameSelection && rest.includes(marker)) {
-          batch(() => {
-            setInputText(rest);
-            setCaretPosition(before.length);
-          });
+          (() => {
+            upgradedValue = setInputText(rest);
+            upgradedCaret = setCaretPosition(before.length);
+          })();
           return true;
         }
       } else {
@@ -5089,18 +5413,18 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             !existing.lineRanges?.length ||
             (!!match.file.lineRanges?.length &&
               subtractContextLineRanges(match.file.lineRanges, existing.lineRanges).length === 0);
-          batch(() => {
+          (() => {
             if (!covered) addContextFile(match.file);
-            setInputText(rest);
-            setCaretPosition(before.length);
-          });
+            upgradedValue = setInputText(rest);
+            upgradedCaret = setCaretPosition(before.length);
+          })();
           return true;
         }
       }
       const prefix = shouldPadInlineInsertion(before.at(-1)) ? ' ' : '';
       const suffix = after ? getInlineInsertionSuffix(rest, before.length) : '';
       const replacement = `${prefix}${marker}${suffix}`;
-      batch(() => {
+      (() => {
         if (match.type === 'file') {
           addContextFile(match.file);
           pastedFileChipText.set(match.file.path, {
@@ -5108,11 +5432,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             text: pastedText,
           });
         } else {
-          setState('terminalSelection', { ...match.selection });
+          setState(storePath('terminalSelection', { ...match.selection }));
         }
-        setInputText(`${before}${replacement}${after}`);
-        setCaretPosition(before.length + replacement.length);
-      });
+        upgradedValue = setInputText(`${before}${replacement}${after}`);
+        upgradedCaret = setCaretPosition(before.length + replacement.length);
+      })();
       return true;
     }
   }
@@ -5155,7 +5479,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (chipId === 'terminal-selection' && terminal) {
       text = terminal.text;
       detach = () => {
-        setState('terminalSelection', null);
+        setState(storePath('terminalSelection', null));
         postMessage({ type: 'terminal-selection/clear' });
       };
     } else {
@@ -5187,11 +5511,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     }
     const [first = '', ...rest] = owner.value.split(chip.textMarker);
     const expanded = text;
-    batch(() => {
+    (() => {
       detach();
       setInputText([first, ...rest].join(expanded));
       setCaretPosition(first.length + expanded.length);
-    });
+    })();
   }
 
   function resolvePastedMentions(pastedText: string, insertion: RichComposerPasteInsertion | null) {
@@ -5216,16 +5540,18 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         if (mentions.mentionCount === 0 || mentions.resolvedCount < mentions.mentionCount) return;
         if (getPromptTextWithoutContextReferences(pastedText).length > 0) return;
         if (!ownsActiveComposer()) return;
-        batch(() => {
+        (() => {
           withdrawPastedText(insertion, setInputText, setCaretPosition);
-        });
+        })();
       })
       .catch((err) => {
         logError('chat-input:resolvePastedMentions', err);
       });
   }
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const disposeBridge = onMessage((msg: ExtensionMessage) => {
       if (msg.type === 'command/attach-problems') {
         attachProblemsFromEditor(msg.payload.diagnostics);
@@ -5432,7 +5758,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     document.addEventListener('drop', handleWindowDrop, true);
     document.addEventListener('dragleave', handleWindowDragLeave, true);
 
-    onCleanup(() => {
+    cleanups.push(() => {
       disposeBridge();
       window.removeEventListener('keydown', handlePopupEscape, true);
       window.removeEventListener('click', handleWindowClick, true);
@@ -5446,10 +5772,19 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       document.removeEventListener('drop', handleWindowDrop, true);
       document.removeEventListener('dragleave', handleWindowDragLeave, true);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  onMount(() => {
-    if (!toolbarRef) return;
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    if (!toolbarRef)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     let lastObservedToolbarWidth = toolbarRef.clientWidth;
     const observer = new ResizeObserver((entries) => {
       const entry = entries.find((candidate) => candidate.target === toolbarRef);
@@ -5470,14 +5805,17 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     });
     observer.observe(toolbarRef);
 
-    onCleanup(() => {
+    cleanups.push(() => {
       observer.disconnect();
       toolbarFitter.cancel();
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  createEffect(() => {
-    void composerSessionId();
+  createEffect(composerSessionId, () => {
     pastedFileChipText.clear();
     setHistoryIndex(null);
     setHistoryDraft('');
@@ -5485,28 +5823,66 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     composerHistory.reset(untrack(captureComposerSnapshot));
   });
 
-  createEffect(() => {
-    for (const [path, pasted] of pastedFileChipText) {
-      if (
-        !state.droppedFiles.some(
-          (file) => file.path === path && formatContextLineRanges(file.lineRanges) === pasted.ranges
-        )
-      )
-        pastedFileChipText.delete(path);
+  createEffect(
+    () => {
+      const snapshot = captureComposerSnapshot();
+      return {
+        snapshot,
+        stalePaths: [...pastedFileChipText].filter(
+          ([path, pasted]) =>
+            !snapshot.files.some(
+              (file) =>
+                file.path === path && formatContextLineRanges(file.lineRanges) === pasted.ranges
+            )
+        ),
+      };
+    },
+    ({ snapshot, stalePaths }) => {
+      for (const [path] of stalePaths) pastedFileChipText.delete(path);
+      snapshot.pastedFileChips = snapshot.pastedFileChips?.filter(({ path }) =>
+        pastedFileChipText.has(path)
+      );
+      if (applyingComposerHistory) return;
+      untrack(() => composerHistory.record(snapshot));
     }
-    const snapshot = captureComposerSnapshot();
-    if (applyingComposerHistory) return;
-    composerHistory.record(snapshot);
-  });
+  );
 
-  createEffect(() => {
-    if (inputText().trim().length === 0 && state.clipboardImages.length === 0) {
-      resetPastedImageIndex();
+  createEffect(
+    () => inputText().trim().length === 0 && state.clipboardImages.length === 0,
+    (empty) => {
+      if (empty) {
+        resetPastedImageIndex();
+      }
     }
-  });
+  );
 
-  createEffect(() => {
-    const focusKey = composerFocusKey();
+  // Plan menu actions: switch like the agent picker, then hold the prompt. A new-chat
+  // request targets the composer that appears after the switch to the draft.
+  createEffect(
+    () => [planImplementationDraftRequest(), composerSessionId()] as const,
+    ([request, sessionId]) => {
+      if (!request) return;
+      untrack(() => {
+        if (request.sessionId !== sessionId || composerEditingMessage()) return;
+        consumePlanImplementationDraft(request.id);
+        if (!isPlanImplementationDraftRequestCurrent(request)) return;
+        const buildAgent = getBuildAgentName(state.agents);
+        if (buildAgent && buildAgent !== state.selectedAgent) selectComposerAgent(buildAgent);
+        let prompt = request.prompt;
+        if (request.attachment) {
+          const attached = attachPlanText(request.attachment.name, request.attachment.text);
+          if (attached) prompt = `@${attached.relativePath} ${prompt}`;
+        }
+        const current = inputText().trimEnd();
+        const next = current ? `${current}\n\n${prompt}` : prompt;
+        setInputText(next);
+        setCaretPosition(next.length);
+        requestComposerFocus();
+      });
+    }
+  );
+
+  createEffect(composerFocusKey, (focusKey) => {
     if (focusKey === 0) return;
 
     queueMicrotask(() => {
@@ -5521,46 +5897,76 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   // Message editing reuses this composer: entering edit mode stashes the
   // current draft, loads the message text/context, and focuses the editor.
   let activeEditMessageId: string | null = null;
+  let inlineEditDraftKey: string | null = null;
 
-  createEffect(() => {
-    const editing = composerEditingMessage();
-    if (!editing) {
-      activeEditMessageId = null;
-      setEditSelectedModel(null);
-      return;
-    }
-    if (editing.messageId === activeEditMessageId) return;
-    if (activeEditMessageId === null && !getMessageEditDraftBackup()) {
-      setMessageEditDraftBackup(untrack(captureEditDraftBackup));
-    }
-    activeEditMessageId = editing.messageId;
-    setEditSelectedModel(editing.model ? { ...editing.model } : null);
-    applyComposerEditState(editing.context, editing.text, activeContextEnabled(editing.sessionId));
-    queueMicrotask(() => {
-      if (richEditorRef) {
-        richEditorRef.focus();
-        setIsFocused(true);
+  createEffect(
+    () => {
+      const editing = composerEditingMessage();
+      if (!editing || editing.messageId === activeEditMessageId) return { editing };
+      return {
+        editing,
+        sessionId: composerSessionId(),
+        files: normalizeEditFiles(editing.context.files, activeContextEnabled(editing.sessionId)),
+      };
+    },
+    ({ editing, sessionId, files }) => {
+      if (!editing) {
+        activeEditMessageId = null;
+        setEditSelectedModel(null);
+        setEditSelectedAgent(null);
+        return;
       }
-    });
-  });
+      if (editing.sessionId !== sessionId) return;
+      if (editing.messageId === activeEditMessageId) return;
+      if (activeEditMessageId === null && !getMessageEditDraftBackup()) {
+        setMessageEditDraftBackup(untrack(captureEditDraftBackup));
+      }
+      activeEditMessageId = editing.messageId;
+      inlineEditDraftKey = currentDraftKey();
+      setEditSelectedModel(editing.model ? { ...editing.model } : null);
+      setEditSelectedAgent(editing.agent);
+      applyComposerEditState(editing.context, editing.text, files);
+      queueMicrotask(() => {
+        if (richEditorRef) {
+          richEditorRef.focus();
+          setIsFocused(true);
+        }
+      });
+    }
+  );
 
   function cancelMessageEdit() {
     if (!untrack(editingMessage)) return;
     const draft = getMessageEditDraftBackup();
     resetMessageEditState();
+    if (inlineEditDraftKey && inlineEditDraftKey !== currentDraftKey()) {
+      writeOwnedDraft(inlineEditDraftKey, draft?.text ?? '');
+      return;
+    }
     if (draft) {
       applyComposerEditState(draft, draft.text);
     } else {
       setComposerValue('');
     }
   }
+  onCleanup(
+    onBeforeDraftSwitch(() => {
+      if (queuedMessageEdit()?.sessionId === composerSessionId()) cancelQueuedMessageEdit();
+      if (editingMessage()?.sessionId === composerSessionId()) cancelMessageEdit();
+    })
+  );
 
-  createEffect(() => {
-    const editing = composerEditingMessage();
-    if (editing && composerSessionId() !== editing.sessionId) {
-      cancelMessageEdit();
+  createEffect(
+    () => {
+      const editing = composerEditingMessage();
+      return editing && composerSessionId() !== editing.sessionId;
+    },
+    (changedSession) => {
+      if (changedSession) {
+        untrack(cancelMessageEdit);
+      }
     }
-  });
+  );
 
   function currentModelSupportsVision() {
     const current = currentModel();
@@ -5584,22 +5990,41 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     canDelegateVision(state.allAgents, state.providers)
   );
 
+  // Effect computations run during registration, so image capability memos must exist first.
+  createEffect(
+    () => [workspaceSendPending(), hasSendableComposerContent()] as const,
+    ([sendPending, draftNonempty]) => {
+      if (sendPending) return;
+      if (!draftNonempty && previousDraftNonempty) setManualWorkspaceSelection(false);
+      previousDraftNonempty = draftNonempty;
+    }
+  );
+
+  createEffect(
+    () => {
+      const activeWorkspacePath = state.editorContext.activeWorkspacePath;
+      if (
+        !activeWorkspacePath ||
+        !canSelectWorkspace() ||
+        hasSendableComposerContent() ||
+        manualWorkspaceSelection() ||
+        isSameWorkspacePath(activeWorkspacePath, state.editorContext.workspacePath) ||
+        isSameWorkspacePath(activeWorkspacePath, pendingWorkspacePath())
+      ) {
+        return;
+      }
+
+      return activeWorkspacePath;
+    },
+    (path) => {
+      if (path) requestWorkspaceSelection(path);
+    }
+  );
+
   function currentPromptCanHandleImages() {
     return (
       currentModelSupportsVision() || (currentModelSupportsTools() && canDelegateCurrentImages())
     );
-  }
-
-  function selectComposerAgent(agent: { name: string }) {
-    const sessionId = composerSessionId();
-    setSelectedAgent(agent.name, { sessionId });
-    const agentModel = resolveAgentModelDefault({
-      selectedAgent: agent.name,
-      agents: state.allAgents,
-      providers: state.providers,
-      providerDefaults: state.providerDefaults,
-    });
-    if (agentModel) setSelectedModel(agentModel, { sessionId, persistGlobal: false });
   }
 
   const pdfSendError = () => {
@@ -5640,36 +6065,35 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     currentModelSupportsTools() &&
     canDelegateCurrentImages();
 
-  createEffect(() => {
-    void imageStoreRevision();
-    const images = composerClipboardImages();
-    if (!images.some((image) => !image.contextFile)) return;
-    if (currentModelSupportsVision() || !currentModelSupportsTools()) return;
-    if (!canDelegateCurrentImages()) return;
-    for (const image of images) {
-      if (image.contextFile || pendingImageStores.has(image.id)) continue;
-      pendingImageStores.set(image.id, image.url);
-      postMessage({
-        type: 'images/store',
-        payload: {
-          id: image.id,
-          name: image.filename,
-          content: image.url.slice(image.url.indexOf(',') + 1),
-          size: image.size,
-        },
-      });
+  createEffect(
+    () => {
+      void imageStoreRevision();
+      const images = composerClipboardImages();
+      if (!images.some((image) => !image.contextFile)) return;
+      if (currentModelSupportsVision() || !currentModelSupportsTools()) return;
+      if (!canDelegateCurrentImages()) return;
+      return images
+        .filter((image) => !image.contextFile && !pendingImageStores.has(image.id))
+        .map(({ id, filename, url, size }) => ({ id, filename, url, size }));
+    },
+    (pending) => {
+      if (!pending) return;
+      for (const image of pending) {
+        pendingImageStores.set(image.id, image.url);
+        postMessage({
+          type: 'images/store',
+          payload: {
+            id: image.id,
+            name: image.filename,
+            content: image.url.slice(image.url.indexOf(',') + 1),
+            size: image.size,
+          },
+        });
+      }
     }
-  });
+  );
 
   const hasPendingApproval = () => composerHasActiveQuestion() || composerHasActivePermission();
-  const transferredDirectory = () => {
-    if (props.newSession || !state.activeSessionId) return undefined;
-    const session = state.sessions.find((entry) => entry.id === state.activeSessionId);
-    return (
-      state.transferredSessions[state.activeSessionId] ??
-      (session?.transfer?.available === false ? session.directory : undefined)
-    );
-  };
   const isSideQuestionDraft = createMemo(() => getSideQuestionText(inputText()) !== null);
   const canAskSideQuestion = () =>
     !props.newSession &&
@@ -5678,17 +6102,16 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     !queuedMessageEdit() &&
     state.serverStatus.state === 'running' &&
     state.serverStatus.apiVersion === 2;
-  createEffect(() => {
-    if (isSideQuestionDraft()) setShowBusyMenu(false);
+  createEffect(isSideQuestionDraft, (sideQuestion) => {
+    if (sideQuestion) setShowBusyMenu(false);
   });
-  const canSend = () =>
+  const canSend = (draft = inputText()) =>
     connectionInitialized() &&
-    !transferredDirectory() &&
     !state.messagesLoading &&
-    (isSideQuestionDraft()
-      ? !sideQuestionSendUnavailableReason()
-      : isAbortSlashCommand(inputText()) ||
-        isPauseSlashCommand(inputText()) ||
+    (getSideQuestionText(draft) !== null
+      ? !sideQuestionSendUnavailableReason(draft)
+      : isAbortSlashCommand(draft) ||
+        isPauseSlashCommand(draft) ||
         (!state.workspaceCatalogReloadPending &&
           !pendingWorkspacePath() &&
           !pdfSendError() &&
@@ -5696,7 +6119,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
           !pendingProblems() &&
           !hasPendingDelegatedImages() &&
           (!hasPendingApproval() || !composerEditingMessage()) &&
-          (getSendableInputText().trim().length > 0 ||
+          (getSendableInputText(draft).trim().length > 0 ||
             state.droppedFiles.length > 0 ||
             hasSendableClipboardImages() ||
             state.nativePdfs.length > 0 ||
@@ -5705,8 +6128,6 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   // A silently disabled send button is undebuggable in the field; when the user
   // tries to send actual content, name the global gate that is blocking it.
   const getSendBlockedReason = () => {
-    const directory = transferredDirectory();
-    if (directory) return `Conversation moved to ${directory}. Open its folder to continue.`;
     const hasContent =
       getSendableInputText().trim().length > 0 ||
       state.droppedFiles.length > 0 ||
@@ -5779,7 +6200,16 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
   const clipboardImagesNeedVision = () =>
     composerClipboardImages().length > 0 && !currentPromptCanHandleImages();
-  const messagesBySession = createMemo(() => getMessageLookup().bySessionId);
+  const composerMessageSnapshots = createRecordSnapshots(() => state.messages);
+  const messagesBySession = createMemo(() => {
+    const bySessionId = new Map<string, MessageEntry[]>();
+    for (const entry of composerMessageSnapshots()) {
+      const entries = bySessionId.get(entry.info.sessionID);
+      if (entries) entries.push(entry);
+      else bySessionId.set(entry.info.sessionID, [entry]);
+    }
+    return bySessionId;
+  });
   const sessionsById = createMemo(
     () => new Map(state.sessions.map((session) => [session.id, session]))
   );
@@ -5898,7 +6328,6 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       const rootId = tokenTreeRootId();
       return rootId ? getSessionTreeIds(rootId) : [];
     },
-    [],
     { equals: sameEntries }
   );
   const tokenHistory = createSettledHistoryRanges(() => state.messages);
@@ -5947,6 +6376,111 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return getSessionCost(messagesBySession().get(rootId) || [], sessionsById().get(rootId));
   });
 
+  // Root-session prompt cache only: subagents run their own requests and caches.
+  const promptCacheWarmingView = createMemo((): PromptCacheWarmingView | null => {
+    const warming = state.promptCacheWarming;
+    const sessionId = composerSessionId();
+    if (!warming?.available || !sessionId || warming.mode === 'off') return null;
+    if (warming.openCodeWarming || warming.mode === 'all') return { kind: 'opencode' };
+    const rootId = getSessionTreeRootId(sessionId) || sessionId;
+    const session = warming.sessions[rootId] ?? null;
+    // Before the extension resolves the lifetime, estimate it for the model the next reply uses.
+    const current = currentModel();
+    return {
+      kind: 'chosen',
+      enabled: session !== null,
+      session,
+      ttlMs:
+        session?.ttlMs ??
+        promptCacheLifetimeFor(
+          state.providers,
+          { providerID: current.providerID ?? '', modelID: current.modelID ?? '' },
+          warming.learned
+        ).ttlMs,
+      durationMs: warming.durationMs,
+    };
+  });
+
+  // Each session's history teaches the extension how long this user's caches last. It is sent once
+  // per webview; the extension also ignores samples it has already counted.
+  createEffect(
+    () => {
+      const sessionId = composerSessionId();
+      if (!sessionId || !state.promptCacheWarming) return null;
+      const rootId = getSessionTreeRootId(sessionId) || sessionId;
+      if (sentPromptCacheHistory.has(rootId)) return null;
+      const messages = messagesBySession().get(rootId);
+      return messages && messages.length > 1 ? { rootId, messages } : null;
+    },
+    (history) => {
+      if (!history) return;
+      sentPromptCacheHistory.add(history.rootId);
+      const samples = promptCacheHistorySamples(history.messages, state.providers);
+      if (samples.length > 0)
+        postMessage({ type: 'warming/samples', payload: { sessionId: history.rootId, samples } });
+    }
+  );
+
+  function togglePromptCacheWarming(enabled: boolean) {
+    const sessionId = composerSessionId();
+    if (!sessionId) return;
+    const rootId = getSessionTreeRootId(sessionId) || sessionId;
+    postMessage({ type: 'warming/set', payload: { sessionId: rootId, enabled } });
+  }
+
+  const promptCacheActivity = createMemo(
+    (): PromptCacheActivity | null => {
+      const sessionId = composerSessionId();
+      if (!sessionId) return null;
+      const rootId = getSessionTreeRootId(sessionId) || sessionId;
+      const messages = messagesBySession().get(rootId) || [];
+      // A keep-alive re-sends the context without adding a message, so it renews the cache too.
+      const warming = promptCacheWarmingView();
+      const pingedAt =
+        warming?.kind === 'chosen' && warming.session?.stopped !== 'cache-miss'
+          ? (warming.session?.sentAt ?? 0)
+          : 0;
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const entry = messages[index]!;
+        const info = entry.info;
+        if (info.role !== 'assistant' || !info.time.completed) continue;
+        const cache = info.tokens?.cache;
+        if (!cache || (cache.read <= 0 && cache.write <= 0)) return null;
+        const lifetime = promptCacheLifetimeFor(
+          state.providers,
+          { providerID: info.providerID, modelID: info.modelID },
+          state.promptCacheWarming?.learned
+        );
+        let steps = 0;
+        for (const part of entry.parts) if (part.type === 'step-finish') steps += 1;
+        const usedAt = promptCacheUsedAt(
+          { created: info.time.created, completed: info.time.completed },
+          steps,
+          lifetime
+        );
+        return {
+          lastUsedAt: Math.max(usedAt, pingedAt),
+          inUse: isComposerBusy(),
+          ttlMs: lifetime.ttlMs,
+          likelyMs: lifetime.likelyMs ?? lifetime.ttlMs,
+          description: lifetime.description,
+        };
+      }
+      return null;
+    },
+    {
+      equals: (previous, next) =>
+        previous === next ||
+        (!!previous &&
+          !!next &&
+          previous.lastUsedAt === next.lastUsedAt &&
+          previous.inUse === next.inUse &&
+          previous.ttlMs === next.ttlMs &&
+          previous.likelyMs === next.likelyMs &&
+          previous.description === next.description),
+    }
+  );
+
   let tokenBreakdownRequestId = 0;
   onCleanup(() => tokenBreakdownRequestId++);
   async function loadCompleteTokenBreakdown() {
@@ -5968,15 +6502,36 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         rootId,
         breakdown: summary.tokenBreakdown,
         nestedBreakdown: summary.nestedContextBreakdown ?? [],
+        models: summary.models ?? [],
       });
     } catch {}
   }
 
   function toggleContextPopup() {
-    const next = !showContextPopup();
-    closePopups(next ? 'context' : undefined);
-    setShowContextPopup(next);
-    if (next) void loadCompleteTokenBreakdown();
+    if (togglePopup('context', showContextPopup, setShowContextPopup))
+      void loadCompleteTokenBreakdown();
+  }
+
+  // Only scanned while the popup is open; the server summary adds unloaded nested sessions.
+  const sessionModels = createMemo(() => {
+    const rootId = tokenTreeRootId();
+    if (!showContextPopup() || !rootId) return [];
+    const complete = completeTokenBreakdown();
+    const lookup = messagesBySession();
+    return collectSessionModels(
+      tokenTreeSessionIds().map((id) => lookup.get(id) ?? []),
+      complete?.rootId === rootId ? complete.models : []
+    ).map((route) => getModelRouteNames(route));
+  });
+
+  function openSessionUsageReport() {
+    const rootId = tokenTreeRootId();
+    if (!rootId) return;
+    const directory = sessionsById().get(rootId)?.directory;
+    postMessage({
+      type: 'usage/session-report',
+      payload: directory ? { sessionId: rootId, directory } : { sessionId: rootId },
+    });
   }
 
   const activeUsageLimit = createMemo(() => {
@@ -5986,7 +6541,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     }
     return getActiveUsageLimitNotice(activeSessionId);
   });
-  const currentProviderLimit = createMemo(() => {
+  const currentProviderLimit = createProviderLimitDisplay(() => {
     const current = currentModel();
     if (!current.providerID) return null;
     return getProviderLimit(current.providerID, current.modelID);
@@ -5999,15 +6554,13 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       current.modelName
     );
   });
-  const showCurrentProviderLimit = createMemo(() =>
-    hasProviderLimitWindowWithinThreshold(currentCompactProviderLimit(), 100)
+  const currentProviderLimitBadges = createMemo(() =>
+    getProviderLimitCompactBadges(currentCompactProviderLimit())
   );
+  const showCurrentProviderLimit = createMemo(() => currentProviderLimitBadges().length > 0);
 
   const currentProviderLimitTitle = createMemo(() =>
     showCurrentProviderLimit() ? formatProviderLimitTitle(currentCompactProviderLimit()) : null
-  );
-  const currentProviderLimitBadges = createMemo(() =>
-    showCurrentProviderLimit() ? getProviderLimitCompactBadges(currentCompactProviderLimit()) : []
   );
   const availableMcpNames = createMemo(() => [
     ...new Set([
@@ -6027,11 +6580,14 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       .map((status) => status.name)
       .toSorted((left, right) => left.localeCompare(right))
   );
-  createEffect(() => {
-    if (!showCurrentProviderLimit() && showProviderLimitPopup()) {
-      setShowProviderLimitPopup(false);
+  createEffect(
+    () => !showCurrentProviderLimit() && showProviderLimitPopup(),
+    (close) => {
+      if (close) {
+        setShowProviderLimitPopup(false);
+      }
     }
-  });
+  );
   const visibleUsageLimit = createMemo(() => {
     const notice = activeUsageLimit();
     const hasActiveAssistantContext = getLatestAssistantMessageInfo(state.messages) !== null;
@@ -6048,6 +6604,26 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   const activeUsageLimitAction = createMemo(() =>
     getSafeUsageLimitAction(visibleUsageLimit()?.action)
   );
+  const activeUsageLimitModelLabel = createMemo(() => {
+    const notice = visibleUsageLimit();
+    if (!notice) return null;
+    const current = currentModel();
+    if (notice.providerID && current.providerID && notice.providerID !== current.providerID) {
+      return notice.modelID || notice.providerID;
+    }
+    if (notice.modelID && current.modelID && notice.modelID !== current.modelID) {
+      return notice.modelID;
+    }
+    return current.modelName || notice.modelID || null;
+  });
+  // A stopped turn's own retry hint is the reset time; otherwise fall back to polled quotas,
+  // which the quota warning would show if the banner did not replace it.
+  const activeUsageLimitResetAt = createMemo(() => {
+    const notice = visibleUsageLimit();
+    if (!notice) return null;
+    if (notice.source !== 'status' && notice.retryAt !== null) return notice.retryAt;
+    return getExhaustedQuotaResetAt(currentProviderLimit(), Date.now());
+  });
   const activeRalphManagerSessionId = createMemo(() =>
     ralphStore.isRalphSession(composerSessionId())
       ? composerSessionId()
@@ -6136,7 +6712,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
   const toolbarFitDependencies = createMemo(() => ({
     agents: state.agents.length,
-    selectedAgent: state.selectedAgent,
+    selectedAgent: composerSelectedAgent(),
     modelProvider: currentModel().providerID,
     modelId: currentModel().modelID,
     modelName: currentModel().modelName,
@@ -6170,7 +6746,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     if (!sessionId) return undefined;
     const sessionIds = getSessionTreeIdsForSession(sessionId);
     const rootSessionId = getSessionTreeRootId(sessionId) || sessionId;
-    const latestPromptCreatedAt = (getMessageLookup().bySessionId.get(rootSessionId) ?? []).reduce(
+    const latestPromptCreatedAt = (messagesBySession().get(rootSessionId) ?? []).reduce(
       (latest, entry) =>
         entry.info.role === 'user' && entry.info.sessionID === rootSessionId
           ? Math.max(latest, entry.info.time.created)
@@ -6187,26 +6763,32 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     return route ? getReviewerModelNames(route) : null;
   });
   let judgeModelRequestId = 0;
-  createEffect(() => {
-    if (activePermissionMode() !== 'auto') return;
-    const current = currentModel();
-    const fallback =
-      current.providerID && current.modelID
-        ? {
-            providerID: current.providerID,
-            modelID: current.modelID,
-            variant: effectiveVariant() ? effectiveVariant()! : undefined,
-          }
-        : undefined;
-    void state.providerRefreshPending;
-    const requestId = ++judgeModelRequestId;
-    void client.varro
-      .resolveJudgeModel(fallback)
-      .then((model) => {
-        if (requestId === judgeModelRequestId) setResolvedAutoApproveJudgeModel(model);
-      })
-      .catch(() => {});
-  });
+  createEffect(
+    () => {
+      if (activePermissionMode() !== 'auto') return;
+      const current = currentModel();
+      const fallback =
+        current.providerID && current.modelID
+          ? {
+              providerID: current.providerID,
+              modelID: current.modelID,
+              variant: effectiveVariant() ? effectiveVariant()! : undefined,
+            }
+          : undefined;
+      void state.providerRefreshPending;
+      return { fallback };
+    },
+    (route) => {
+      if (!route) return;
+      const requestId = ++judgeModelRequestId;
+      void client.varro
+        .resolveJudgeModel(route.fallback)
+        .then((model) => {
+          if (requestId === judgeModelRequestId) setResolvedAutoApproveJudgeModel(model);
+        })
+        .catch(() => {});
+    }
+  );
   onCleanup(() => judgeModelRequestId++);
 
   function syncActiveRalphModel(nextModel: RalphSelectedModel) {
@@ -6215,9 +6797,31 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     ralphStore.updateRunModel(managerSessionId, nextModel);
   }
 
+  function selectComposerAgent(agentName: string) {
+    const sessionId = composerSessionId();
+    const previousAgent = composerSelectedAgent();
+    const model = currentModel();
+    let current: RalphSelectedModel | null = null;
+    if (model.providerID && model.modelID) {
+      current = { providerID: model.providerID, modelID: model.modelID };
+      if (model.variant) current.variant = model.variant;
+    }
+    const nextModel = resolveAgentSwitchModel({
+      sessionId,
+      previousAgent,
+      nextAgent: agentName,
+      currentModel: current,
+    });
+    if (composerEditingMessage()) setEditSelectedAgent(agentName);
+    else setSelectedAgent(agentName, { sessionId });
+    // Like OpenCode, picking an agent also picks its model without making it the folder default.
+    if (nextModel) void handleSelectedModelChange(nextModel, undefined, { fromAgent: true });
+  }
+
   async function handleSelectedModelChange(
     nextModel: RalphSelectedModel,
-    rememberVariant?: string | null
+    rememberVariant?: string | null,
+    options?: { fromAgent?: boolean }
   ) {
     void refreshProviderLimit(nextModel.providerID, nextModel.modelID);
     if (composerEditingMessage()) {
@@ -6238,10 +6842,11 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     const selectionId = selectedSessionId ? crypto.randomUUID() : undefined;
     setSelectedModel(nextModel, {
       sessionId: selectedSessionId,
-      persistGlobal: true,
+      persistGlobal: !options?.fromAgent,
       rememberVariant,
       selectionId,
     });
+    if (!options?.fromAgent) rememberAgentModel(selectedSessionId, state.selectedAgent, nextModel);
     if (selectedSessionId) postSessionModelSelection(selectedSessionId, nextModel, selectionId);
     syncActiveRalphModel(nextModel);
 
@@ -6297,10 +6902,14 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     }
 
     if (retryingSessionIds.length > 0) {
-      setState('sessionStatus', (current) => ({
-        ...current,
-        ...Object.fromEntries(retryingSessionIds.map((sessionId) => [sessionId, { type: 'idle' }])),
-      }));
+      setState(
+        storePath('sessionStatus', (current) => ({
+          ...current,
+          ...Object.fromEntries(
+            retryingSessionIds.map((sessionId) => [sessionId, { type: 'idle' }])
+          ),
+        }))
+      );
     }
 
     for (const sessionId of treeSessionIds) {
@@ -6337,7 +6946,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       steering.length === 0
         ? new Set<string>()
         : new Set(
-            state.messages
+            composerMessageSnapshots()
               .filter((entry) => entry.info.role === 'user' && !entry.info.pendingDelivery)
               .map((entry) => entry.info.id)
           );
@@ -6346,7 +6955,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     const sessionId = composerSessionId();
     return [
       ...queued,
-      ...((sessionId && getMessageLookup().bySessionId.get(sessionId)) || [])
+      ...((sessionId && messagesBySession().get(sessionId)) || [])
         .filter(
           (entry) =>
             entry.info.sessionID === composerSessionId() &&
@@ -6405,7 +7014,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
   }
 
   const selectedAgentLabel = () => {
-    const name = state.selectedAgent;
+    const name = composerSelectedAgent();
     if (!name) return 'Agent';
     const agent = state.agents.find((a) => a.name === name);
     const label = formatAgentLabel(agent?.name || name);
@@ -6441,8 +7050,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       (!isDisplayBusyWithoutInterruption() || canSend() || isSideQuestionDraft())
   );
 
-  createEffect(() => {
-    const deps = toolbarFitDependencies();
+  createEffect(toolbarFitDependencies, (deps) => {
     if (
       deps.showAgentPicker ||
       deps.showVariantPicker ||
@@ -6457,10 +7065,126 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
     toolbarFitter.schedule({ contentChanged: true });
   });
 
+  // Refs and handlers the main and meta toolbars share; reactive values stay on each toolbar.
+  const sharedToolbarHandlers = {
+    permissionButtonRef: (el) => {
+      permissionPickerRef = el;
+    },
+    permissionPopoverRef: (el) => {
+      permissionPopoverRef = el;
+    },
+    onTogglePermissionPicker: () =>
+      void togglePopup('permission', showPermissionModePicker, setShowPermissionModePicker),
+    onSelectPermissionMode: (mode) => {
+      void updatePermissionModeForSession(mode, composerSessionId());
+      setShowPermissionModePicker(false);
+    },
+    onOpenPermissionSettings: () => {
+      setShowPermissionModePicker(false);
+      setShowPermissionSettings(true);
+    },
+    agentButtonRef: (el) => {
+      agentPickerRef = el;
+    },
+    agentPopoverRef: (el) => {
+      agentPopoverRef = el;
+    },
+    getAgentLabel: (agent) => formatAgentLabel(agent.name),
+    getAgentDetail: (agent) => agent.description || getAgentBadgeLine(agent),
+    getAgentModelLabel: (agent) => {
+      const configured = agent.model;
+      if (!configured?.providerID || !configured.modelID) return null;
+      const model = getAgentConfiguredModel(agent.name);
+      const info = model
+        ? state.providers.find((provider) => provider.id === model.providerID)?.models[
+            model.modelID
+          ]
+        : undefined;
+      return info
+        ? getModelDisplayName(configured.providerID, configured.modelID, info.name)
+        : `${configured.providerID}/${configured.modelID} (unavailable)`;
+    },
+    onToggleAgentPicker: () => {
+      if (togglePopup('agent', showAgentPicker, setShowAgentPicker)) setAgentFocusIndex(0);
+    },
+    onSelectAgent: (agent) => {
+      selectComposerAgent(agent.name);
+      setShowAgentPicker(false);
+    },
+    onAgentFocusIndex: setAgentFocusIndex,
+    modelButtonRef: (el) => {
+      modelPickerRef = el;
+    },
+    onToggleModelPicker: () => void togglePopup('model', showModelPicker, setShowModelPicker),
+    providerLimitButtonRef: (el) => {
+      providerLimitButtonRef = el;
+    },
+    providerLimitPopupRef: (el) => {
+      providerLimitPopupRef = el;
+    },
+    onToggleProviderLimitPopup: () => {
+      if (!showCurrentProviderLimit()) return;
+      togglePopup('providerLimit', showProviderLimitPopup, setShowProviderLimitPopup);
+    },
+    onCloseProviderLimitPopup: () => setShowProviderLimitPopup(false),
+    variantButtonRef: (el) => {
+      variantPickerRef = el;
+    },
+    variantPopoverRef: (el) => {
+      variantPopoverRef = el;
+    },
+    getVariantLabel: formatVariantLabel,
+    onToggleVariantPicker: () =>
+      void togglePopup('variant', showVariantPicker, setShowVariantPicker),
+    onSelectVariant: (variant) => {
+      const m = currentModel();
+      void handleSelectedModelChange(
+        {
+          providerID: m.providerID!,
+          modelID: m.modelID!,
+          variant: variant || undefined,
+        },
+        variant
+      );
+      setShowVariantPicker(false);
+    },
+    contextButtonRef: (el) => {
+      contextButtonRef = el;
+    },
+    contextPopupRef: (el) => {
+      contextPopupRef = el;
+    },
+    onToggleContextPopup: toggleContextPopup,
+    onCloseContextPopup: () => setShowContextPopup(false),
+    onCompactSession: () => {
+      void compactSession();
+    },
+    onOpenSessionUsageReport: openSessionUsageReport,
+    onAttach: () => postMessage({ type: 'files/pick' }),
+    onStop: requestAbortSession,
+    busyToggleRef: (el) => {
+      busyToggleRef = el;
+    },
+    onSend: () => sendFromUi(),
+    onToggleBusyMenu: () => void togglePopup('busy', showBusyMenu, setShowBusyMenu),
+    busyMenuRef: (el) => {
+      busyMenuRef = el;
+    },
+    onQueue: () => {
+      sendFromUi('queue');
+      setShowBusyMenu(false);
+    },
+    onSteer: () => {
+      sendFromUi('steer');
+      setShowBusyMenu(false);
+    },
+    onStopAndSend: () => void handleStopAndSend(),
+  } satisfies Partial<ToolbarSharedProps>;
+
   return (
     <div
       class={`interactive-input-part ${composerEditingMessage() ? ' editing-message' : ''}${editReconciliationPending() ? ' is-edit-reconciling' : ''} ${showModelPicker() ? 'model-picker-open' : ''} ${showMcpPicker() || showLspPicker() ? 'mcp-picker-open' : ''} ${showMentionCompletionMenu() ? 'mention-completion-open' : ''}`}
-      aria-busy={editReconciliationPending()}
+      aria-busy={ariaBoolean(editReconciliationPending())}
     >
       <Show when={!props.newSession}>
         <ChatTextAnnotation
@@ -6486,6 +7210,16 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       </Show>
 
       <Show when={!props.newSession && !hasExpandedDiffOverlay() && !composerEditingMessage()}>
+        <SessionRewindRow
+          sessionID={composerSessionId()}
+          directory={composerBackgroundServiceDirectory()}
+        />
+        <Show when={state.serverStatus.state === 'running' && state.serverStatus.apiVersion === 2}>
+          <SessionGoalRow
+            sessionID={composerSessionId()}
+            directory={composerBackgroundServiceDirectory()}
+          />
+        </Show>
         <BackgroundServices
           sessionID={composerSessionId()}
           directory={composerBackgroundServiceDirectory()}
@@ -6574,15 +7308,16 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
 
       <Show when={!hasExpandedDiffOverlay() && visibleUsageLimit()}>
         <UsageLimitBanner
+          kind={activeUsageLimitPresentation()!.kind}
           title={activeUsageLimitPresentation()!.title}
           message={visibleUsageLimit()!.action?.message.trim() || visibleUsageLimit()!.message}
-          meta={describeUsageLimit(
-            activeUsageLimitPresentation()!.summary,
-            visibleUsageLimit()!.retryAt,
-            visibleUsageLimit()!.attempt
-          )}
-          primaryActionLabel="Continue"
-          onPrimaryAction={() => void handleUsageLimitContinue()}
+          summary={activeUsageLimitPresentation()!.summary}
+          modelLabel={activeUsageLimitModelLabel()}
+          retrying={visibleUsageLimit()!.source === 'status'}
+          retryAt={visibleUsageLimit()!.retryAt}
+          attempt={visibleUsageLimit()!.attempt}
+          resetAt={activeUsageLimitResetAt()}
+          onContinue={() => void handleUsageLimitContinue()}
           externalAction={activeUsageLimitAction()}
           onExternalAction={(link) =>
             postMessage({ type: 'vscode/open-external', payload: { url: link } })
@@ -6595,7 +7330,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             !composerHasActivePermission()
           }
           onStopRetrying={requestAbortSession}
-          onSwitchProvider={() => {
+          onSwitchModel={() => {
             closePopups();
             setShowModelPicker(true);
           }}
@@ -6603,6 +7338,12 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       </Show>
 
       <Show when={!hasExpandedDiffOverlay() && !visibleUsageLimit() && !composerEditingMessage()}>
+        <PromptCacheWarning
+          sessionId={composerSessionId()}
+          activity={promptCacheActivity()}
+          contextTokens={contextUsage()?.used ?? 0}
+          thresholdTokens={state.promptCacheWarningTokens}
+        />
         <ProviderQuotaWarning
           limit={currentProviderLimit()}
           forceShow={state.debugShowQuotaWarning}
@@ -6625,7 +7366,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
         inert={editReconciliationPending()}
       >
         <Show when={showModelPicker()}>
-          <Suspense>
+          <Loading>
             <ModelPicker
               onSelect={(sel) => {
                 if (sel.providerID && sel.modelID) {
@@ -6641,7 +7382,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
               onClose={() => setShowModelPicker(false)}
               popoverRef={(el) => (modelPopoverRef = el)}
             />
-          </Suspense>
+          </Loading>
         </Show>
 
         <Show when={showMcpPicker()}>
@@ -6726,7 +7467,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
               onToggleActiveContext={() => toggleCurrentDocumentEnabled(composerSessionId())}
               onPinActiveContext={canPinActiveContext() ? pinActiveContext : undefined}
               onClearTerminalSelection={() => postMessage({ type: 'terminal-selection/clear' })}
-              onClearDiagnostics={() => setState('attachedDiagnostics', null)}
+              onClearDiagnostics={() => setState(storePath('attachedDiagnostics', null))}
               onRemoveFile={(path) => {
                 removeContextFile(path);
                 postMessage({ type: 'files/remove', payload: { path } });
@@ -6782,6 +7523,8 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
           </Show>
 
           <RichComposerArea
+            slashCommandNames={recognizedSlashCommandNames()}
+            commandArgumentHint={commandArgumentHint()}
             editorRef={(el) => {
               richEditorRef = el;
             }}
@@ -6813,16 +7556,20 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             completionHeader={completionHeader()}
             completionEmptyMessage={completionEmptyMessage()}
             onInput={(text, cursorOffset) => {
-              batch(() => {
-                setState('inlineProblems', (references) =>
-                  references.filter((reference) => text.includes(problemReferenceMarker(reference)))
+              (() => {
+                setState(
+                  storePath('inlineProblems', (references) =>
+                    references.filter((reference) =>
+                      text.includes(problemReferenceMarker(reference))
+                    )
+                  )
                 );
                 if (
                   state.attachedDiagnostics?.inline &&
                   inputText().includes(PROBLEMS_REFERENCE) &&
                   !text.includes(PROBLEMS_REFERENCE)
                 ) {
-                  setState('attachedDiagnostics', null);
+                  setState(storePath('attachedDiagnostics', null));
                 }
                 closePopups();
                 dismissComposerOverlays();
@@ -6833,7 +7580,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
                 setComposerSelectionCollapsed(true);
                 setCompletionIndex(0);
                 setSuppressCompletion(false);
-              });
+              })();
             }}
             onKeyDown={handleKeydown}
             onHistory={applyComposerHistoryAction}
@@ -6866,22 +7613,24 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             onExpandChip={(chipId) => void expandChip(chipId)}
             onRemoveChip={(chipId) => {
               if (chipId.startsWith('problem:')) {
-                setState('inlineProblems', (references) =>
-                  references.filter(
-                    (reference) =>
-                      reference.id !== chipId.slice(8) ||
-                      inputText().includes(problemReferenceMarker(reference))
+                setState(
+                  storePath('inlineProblems', (references) =>
+                    references.filter(
+                      (reference) =>
+                        reference.id !== chipId.slice(8) ||
+                        inputText().includes(problemReferenceMarker(reference))
+                    )
                   )
                 );
               }
               if (chipId === 'problems' && !inputText().includes(PROBLEMS_REFERENCE)) {
-                setState('attachedDiagnostics', null);
+                setState(storePath('attachedDiagnostics', null));
               }
               if (
                 chipId === 'terminal-selection' &&
                 !inputText().includes(TERMINAL_SELECTION_MARKER)
               ) {
-                setState('terminalSelection', null);
+                setState(storePath('terminalSelection', null));
                 postMessage({ type: 'terminal-selection/clear' });
               }
               if (chipId.startsWith('file:')) {
@@ -6987,6 +7736,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
           <div class="chat-input-toolbar-divider" aria-hidden="true" />
 
           <ChatInputMainToolbar
+            {...sharedToolbarHandlers}
             focusComposer={() => {
               closePopups();
               richEditorRef?.focus();
@@ -7006,85 +7756,26 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             compactTight={toolbarCompactMode() === 'tight'}
             showLeftPopupState={showAgentPicker() || showVariantPicker()}
             showPermissionControl={true}
-            permissionButtonRef={(el) => {
-              permissionPickerRef = el;
-            }}
-            permissionPopoverRef={(el) => {
-              permissionPopoverRef = el;
-            }}
             permissionMode={activePermissionMode()}
             autoPermissionActivity={autoPermissionActivity()}
             autoApproveJudgeModel={autoApproveJudgeModel()}
             showPermissionPicker={showPermissionModePicker()}
-            onTogglePermissionPicker={() => {
-              const next = !showPermissionModePicker();
-              closePopups(next ? 'permission' : undefined);
-              setShowPermissionModePicker(next);
-            }}
-            onSelectPermissionMode={(mode) => {
-              void updatePermissionModeForSession(mode, composerSessionId());
-              setShowPermissionModePicker(false);
-            }}
-            onOpenPermissionSettings={() => {
-              setShowPermissionModePicker(false);
-              setShowPermissionSettings(true);
-            }}
             agents={state.agents}
-            selectedAgent={state.selectedAgent}
+            selectedAgent={composerSelectedAgent()}
             selectedAgentLabel={selectedAgentLabel() ?? ''}
             agentCompacted={isToolbarControlCompacted(toolbarCompactMode(), 'agent')}
             agentFocusIndex={agentFocusIndex()}
             showAgentPicker={showAgentPicker()}
             showAgentControl={isToolbarControlVisible('agent')}
-            agentButtonRef={(el) => {
-              agentPickerRef = el;
-            }}
-            agentPopoverRef={(el) => {
-              agentPopoverRef = el;
-            }}
-            getAgentLabel={(agent) => formatAgentLabel(agent.name)}
-            getAgentDetail={(agent) => agent.description || getAgentBadgeLine(agent)}
-            onToggleAgentPicker={() => {
-              const next = !showAgentPicker();
-              closePopups(next ? 'agent' : undefined);
-              setShowAgentPicker(next);
-              if (next) setAgentFocusIndex(0);
-            }}
-            onSelectAgent={(agent) => {
-              selectComposerAgent(agent);
-              setShowAgentPicker(false);
-            }}
-            onAgentFocusIndex={setAgentFocusIndex}
-            modelButtonRef={(el) => {
-              modelPickerRef = el;
-            }}
             currentModel={currentModel()}
             providers={state.providers}
             modelCanEllipsize={modelCanEllipsize()}
             queueOnly={queueOnlySelection()}
             showModelPicker={showModelPicker()}
-            onToggleModelPicker={() => {
-              const next = !showModelPicker();
-              closePopups(next ? 'model' : undefined);
-              setShowModelPicker(next);
-            }}
             providerLimitBadges={currentProviderLimitBadges()}
             providerLimitTitle={currentProviderLimitTitle()}
             providerLimit={showCurrentProviderLimit() ? currentCompactProviderLimit() : null}
             showProviderLimitPopup={showCurrentProviderLimit() && showProviderLimitPopup()}
-            providerLimitButtonRef={(el) => {
-              providerLimitButtonRef = el;
-            }}
-            providerLimitPopupRef={(el) => {
-              providerLimitPopupRef = el;
-            }}
-            onToggleProviderLimitPopup={() => {
-              if (!showCurrentProviderLimit()) return;
-              const next = !showProviderLimitPopup();
-              closePopups(next ? 'providerLimit' : undefined);
-              setShowProviderLimitPopup(next);
-            }}
-            onCloseProviderLimitPopup={() => setShowProviderLimitPopup(false)}
             availableVariants={availableVariants()}
             selectedVariant={effectiveVariant() ?? null}
             selectedVariantLabel={selectedVariantLabel() ?? ''}
@@ -7096,87 +7787,34 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
                 ? `Prompt completion failed (${state.promptCompletionModel}): ${promptCompletion.error()}`
                 : ''
             }
-            variantButtonRef={(el) => {
-              variantPickerRef = el;
-            }}
-            variantPopoverRef={(el) => {
-              variantPopoverRef = el;
-            }}
-            getVariantLabel={formatVariantLabel}
-            onToggleVariantPicker={() => {
-              const next = !showVariantPicker();
-              closePopups(next ? 'variant' : undefined);
-              setShowVariantPicker(next);
-            }}
-            onSelectVariant={(variant) => {
-              const m = currentModel();
-              void handleSelectedModelChange(
-                {
-                  providerID: m.providerID!,
-                  modelID: m.modelID!,
-                  variant: variant || undefined,
-                },
-                variant
-              );
-              setShowVariantPicker(false);
-            }}
             contextUsage={contextUsage()}
             contextBreakdown={contextBreakdown()}
             nestedContextBreakdown={nestedContextBreakdown()}
             showContextControl={!!contextUsage()}
-            contextButtonRef={(el) => {
-              contextButtonRef = el;
-            }}
-            contextPopupRef={(el) => {
-              contextPopupRef = el;
-            }}
             showContextPopup={showContextPopup()}
             sessionTokens={sessionTokenBreakdown().session}
             sessionCost={sessionCost()}
             subagentTokens={sessionTokenBreakdown().subagents}
             subagentCount={sessionTokenBreakdown().subagentCount}
+            sessionModels={sessionModels()}
+            promptCache={promptCacheActivity()}
+            promptCacheWarming={promptCacheWarmingView()}
+            onTogglePromptCacheWarming={togglePromptCacheWarming}
             contextCompactDisabled={isComposerBusy() || isSessionCompacting()}
-            onToggleContextPopup={toggleContextPopup}
-            onCloseContextPopup={() => setShowContextPopup(false)}
-            onCompactSession={() => {
-              void compactSession();
-            }}
             showAttachmentsControl={isToolbarControlVisible('attachments')}
-            onAttach={() => postMessage({ type: 'files/pick' })}
             showStopButton={showStopButton()}
-            onStop={requestAbortSession}
             showSendControl={showSendControl()}
             showBusySendControls={showBusySendControls()}
             showBusySendOptions={showBusySendOptions()}
             canSend={canSend()}
-            busyToggleRef={(el) => {
-              busyToggleRef = el;
-            }}
             showBusyMenu={showBusyMenu()}
-            onSend={() => sendFromUi()}
-            onToggleBusyMenu={() => {
-              const next = !showBusyMenu();
-              closePopups(next ? 'busy' : undefined);
-              setShowBusyMenu(next);
-            }}
-            busyMenuRef={(el) => {
-              busyMenuRef = el;
-            }}
-            onQueue={() => {
-              sendFromUi('queue');
-              setShowBusyMenu(false);
-            }}
-            onSteer={() => {
-              sendFromUi('steer');
-              setShowBusyMenu(false);
-            }}
-            onStopAndSend={() => void handleStopAndSend()}
             onSideQuestion={canAskSideQuestion() ? askSideQuestionFromDraft : undefined}
             sideQuestionDisabledReason={sideQuestionSendUnavailableReason() ?? undefined}
           />
         </div>
 
         <ChatInputMetaToolbar
+          {...sharedToolbarHandlers}
           compactTight={toolbarCompactMode() === 'tight'}
           inputFrameRef={inputFrameRef}
           allowRepositoryLink={!composerEditingMessage()}
@@ -7191,11 +7829,9 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
           workspacePopoverRef={(el) => {
             workspacePopoverRef = el;
           }}
-          onToggleWorkspacePicker={() => {
-            const next = !showWorkspacePicker();
-            closePopups(next ? 'workspace' : undefined);
-            setShowWorkspacePicker(next);
-          }}
+          onToggleWorkspacePicker={() =>
+            void togglePopup('workspace', showWorkspacePicker, setShowWorkspacePicker)
+          }
           onSelectWorkspace={(path) => {
             if (!canSelectWorkspace()) return;
             detachBlankSessionForWorkspace(path);
@@ -7221,11 +7857,7 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
           lspButtonRef={(el) => {
             lspPickerRef = el;
           }}
-          onToggleLsps={() => {
-            const next = !showLspPicker();
-            closePopups(next ? 'lsp' : undefined);
-            setShowLspPicker(next);
-          }}
+          onToggleLsps={() => void togglePopup('lsp', showLspPicker, setShowLspPicker)}
           mcpButtonRef={(el) => {
             mcpPickerRef = el;
           }}
@@ -7236,161 +7868,48 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
             setShowMcpPicker(next);
           }}
           showPermissionControl={!composerEditingMessage()}
-          permissionButtonRef={(el) => {
-            permissionPickerRef = el;
-          }}
-          permissionPopoverRef={(el) => {
-            permissionPopoverRef = el;
-          }}
           permissionMode={activePermissionMode()}
           autoPermissionActivity={autoPermissionActivity()}
           autoApproveJudgeModel={autoApproveJudgeModel()}
           showPermissionPicker={showPermissionModePicker()}
-          onTogglePermissionPicker={() => {
-            const next = !showPermissionModePicker();
-            closePopups(next ? 'permission' : undefined);
-            setShowPermissionModePicker(next);
-          }}
-          onSelectPermissionMode={(mode) => {
-            void updatePermissionModeForSession(mode, composerSessionId());
-            setShowPermissionModePicker(false);
-          }}
-          onOpenPermissionSettings={() => {
-            setShowPermissionModePicker(false);
-            setShowPermissionSettings(true);
-          }}
           agents={state.agents}
-          selectedAgent={state.selectedAgent}
+          selectedAgent={composerSelectedAgent()}
           selectedAgentLabel={selectedAgentLabel() ?? ''}
           agentFocusIndex={agentFocusIndex()}
           showAgentPicker={showAgentPicker()}
           showAgentControl={isToolbarControlVisible('agent')}
-          agentButtonRef={(el) => {
-            agentPickerRef = el;
-          }}
-          agentPopoverRef={(el) => {
-            agentPopoverRef = el;
-          }}
-          getAgentLabel={(agent) => formatAgentLabel(agent.name)}
-          getAgentDetail={(agent) => agent.description || getAgentBadgeLine(agent)}
-          onToggleAgentPicker={() => {
-            const next = !showAgentPicker();
-            closePopups(next ? 'agent' : undefined);
-            setShowAgentPicker(next);
-            if (next) setAgentFocusIndex(0);
-          }}
-          onSelectAgent={(agent) => {
-            selectComposerAgent(agent);
-            setShowAgentPicker(false);
-          }}
-          onAgentFocusIndex={setAgentFocusIndex}
-          modelButtonRef={(el) => {
-            modelPickerRef = el;
-          }}
           currentModel={currentModel()}
           modelCanEllipsize={modelCanEllipsize()}
-          onToggleModelPicker={() => {
-            const next = !showModelPicker();
-            closePopups(next ? 'model' : undefined);
-            setShowModelPicker(next);
-          }}
           providerLimitBadges={composerEditingMessage() ? [] : currentProviderLimitBadges()}
           providerLimitTitle={currentProviderLimitTitle()}
           providerLimit={showCurrentProviderLimit() ? currentCompactProviderLimit() : null}
           showProviderLimitPopup={showCurrentProviderLimit() && showProviderLimitPopup()}
-          providerLimitButtonRef={(el) => {
-            providerLimitButtonRef = el;
-          }}
-          providerLimitPopupRef={(el) => {
-            providerLimitPopupRef = el;
-          }}
-          onToggleProviderLimitPopup={() => {
-            if (!showCurrentProviderLimit()) return;
-            const next = !showProviderLimitPopup();
-            closePopups(next ? 'providerLimit' : undefined);
-            setShowProviderLimitPopup(next);
-          }}
-          onCloseProviderLimitPopup={() => setShowProviderLimitPopup(false)}
           availableVariants={availableVariants()}
           selectedVariant={effectiveVariant() ?? null}
           selectedVariantLabel={selectedVariantLabel() ?? ''}
           showVariantPicker={showVariantPicker()}
           showReasoningControl={isToolbarControlVisible('reasoning')}
-          variantButtonRef={(el) => {
-            variantPickerRef = el;
-          }}
-          variantPopoverRef={(el) => {
-            variantPopoverRef = el;
-          }}
-          getVariantLabel={formatVariantLabel}
-          onToggleVariantPicker={() => {
-            const next = !showVariantPicker();
-            closePopups(next ? 'variant' : undefined);
-            setShowVariantPicker(next);
-          }}
-          onSelectVariant={(variant) => {
-            const m = currentModel();
-            void handleSelectedModelChange(
-              {
-                providerID: m.providerID!,
-                modelID: m.modelID!,
-                variant: variant || undefined,
-              },
-              variant
-            );
-            setShowVariantPicker(false);
-          }}
           contextUsage={contextUsage()}
           contextBreakdown={contextBreakdown()}
           nestedContextBreakdown={nestedContextBreakdown()}
           showContextControl={!!contextUsage() && !composerEditingMessage()}
-          contextButtonRef={(el) => {
-            contextButtonRef = el;
-          }}
-          contextPopupRef={(el) => {
-            contextPopupRef = el;
-          }}
           showContextPopup={showContextPopup()}
           sessionTokens={sessionTokenBreakdown().session}
           sessionCost={sessionCost()}
           subagentTokens={sessionTokenBreakdown().subagents}
           subagentCount={sessionTokenBreakdown().subagentCount}
+          sessionModels={sessionModels()}
+          promptCache={promptCacheActivity()}
+          promptCacheWarming={promptCacheWarmingView()}
+          onTogglePromptCacheWarming={togglePromptCacheWarming}
           contextCompactDisabled={isComposerBusy() || isSessionCompacting()}
-          onToggleContextPopup={toggleContextPopup}
-          onCloseContextPopup={() => setShowContextPopup(false)}
-          onCompactSession={() => {
-            void compactSession();
-          }}
           showAttachmentsControl={isToolbarControlVisible('attachments')}
-          onAttach={() => postMessage({ type: 'files/pick' })}
           showStopButton={showStopButton()}
-          onStop={requestAbortSession}
           showSendControl={showSendControl()}
           showBusySendControls={showBusySendControls()}
           showBusySendOptions={showBusySendOptions()}
           canSend={canSend()}
-          busyToggleRef={(el) => {
-            busyToggleRef = el;
-          }}
           showBusyMenu={showBusyMenu()}
-          onSend={() => sendFromUi()}
-          onToggleBusyMenu={() => {
-            const next = !showBusyMenu();
-            closePopups(next ? 'busy' : undefined);
-            setShowBusyMenu(next);
-          }}
-          busyMenuRef={(el) => {
-            busyMenuRef = el;
-          }}
-          onQueue={() => {
-            sendFromUi('queue');
-            setShowBusyMenu(false);
-          }}
-          onSteer={() => {
-            sendFromUi('steer');
-            setShowBusyMenu(false);
-          }}
-          onStopAndSend={() => void handleStopAndSend()}
           onSideQuestion={canAskSideQuestion() ? askSideQuestionFromDraft : undefined}
           sideQuestionDisabledReason={sideQuestionSendUnavailableReason() ?? undefined}
         />
@@ -7409,18 +7928,6 @@ export function ChatInput(props: { newSession?: boolean; onBeforeSend?: () => vo
       </Show>
     </div>
   );
-}
-
-function describeUsageLimit(summary: string, retryAt: number | null, attempt: number | null) {
-  const parts = [summary];
-  if (retryAt) {
-    const seconds = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
-    parts.push(`retry in ${seconds}s`);
-  }
-  if (attempt) {
-    parts.push(`attempt #${attempt}`);
-  }
-  return parts.join(' · ');
 }
 
 function getPastedImageFilename(index: number) {

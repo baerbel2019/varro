@@ -13,3 +13,4 @@ reports/
 logs/
 .vscode/
 .vitest/
+*.ts.swp

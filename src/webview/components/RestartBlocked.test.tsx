@@ -1,5 +1,7 @@
+import { flush as flushSolid } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { resetDefaultAppState, setState, state } from '../lib/state';
 
 const postMessageMock = vi.hoisted(() => vi.fn());
@@ -18,24 +20,50 @@ describe('RestartBlocked', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    flushSolid();
     resetDefaultAppState();
-    setState('restartBlocked', {
-      totalSessionCount: 3,
-      directories: [
-        { directory: '/repo-a', sessionCount: 2 },
-        { directory: '/repo-b', sessionCount: 1 },
-      ],
-    });
+    flushSolid();
+    setState(
+      storePath('restartBlocked', {
+        totalSessionCount: 3,
+        directories: [
+          { directory: '/repo-a', sessionCount: 2 },
+          { directory: '/repo-b', sessionCount: 1 },
+        ],
+      })
+    );
+    flushSolid();
     container = document.createElement('div');
     document.body.appendChild(container);
     cleanup = render(() => RestartBlocked(), container);
+    flushSolid();
   });
 
   afterEach(() => {
     cleanup?.();
+    flushSolid();
     container.remove();
+    flushSolid();
     resetDefaultAppState();
+    flushSolid();
     vi.useRealTimers();
+  });
+
+  it('wraps long directories between path segments without changing their text', () => {
+    setState(
+      storePath('restartBlocked', {
+        totalSessionCount: 1,
+        directories: [{ directory: '/Users/dev/very-long-project/packages/web', sessionCount: 1 }],
+      })
+    );
+    flushSolid();
+
+    const path = container.querySelector<HTMLElement>(
+      '[title="/Users/dev/very-long-project/packages/web"]'
+    );
+    expect(path?.textContent).toBe('/Users/dev/very-long-project/packages/web');
+    // One break opportunity after each separator: "/", "Users/", "dev/", ... "packages/".
+    expect(path?.querySelectorAll('wbr')).toHaveLength(5);
   });
 
   it('renders directory counts and periodically checks again', async () => {
@@ -44,6 +72,7 @@ describe('RestartBlocked', () => {
     expect(container.textContent).toContain('/repo-b');
 
     await vi.advanceTimersByTimeAsync(3000);
+    flushSolid();
 
     expect(postMessageMock).toHaveBeenCalledWith({
       type: 'server/restart/check',
@@ -56,6 +85,7 @@ describe('RestartBlocked', () => {
       (button) => button.textContent?.trim() === 'Force Restart'
     );
     forceButton?.click();
+    flushSolid();
 
     expect(postMessageMock).toHaveBeenCalledWith({
       type: 'server/restart',
@@ -68,6 +98,7 @@ describe('RestartBlocked', () => {
     expect(closeButton?.classList.contains('chat-image-preview-close')).toBe(true);
     expect(closeButton?.classList.contains('server-status-close')).toBe(true);
     closeButton?.click();
+    flushSolid();
     expect(state.restartBlocked).toBeNull();
   });
 
@@ -77,6 +108,7 @@ describe('RestartBlocked', () => {
     );
     expect(closeButton).toBeDefined();
     closeButton?.click();
+    flushSolid();
 
     expect(state.restartBlocked).toBeNull();
     expect(postMessageMock).not.toHaveBeenCalled();

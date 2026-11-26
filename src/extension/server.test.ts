@@ -6,6 +6,7 @@ import type * as vscode from 'vscode';
 import type * as FsModule from 'fs';
 import type * as FsPromisesModule from 'fs/promises';
 import type * as OsModule from 'os';
+import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { MINIMUM_SUPPORTED_OPENCODE_VERSION } from '../shared/opencode-compatibility';
 import type { ServerStatus } from '../shared/protocol';
@@ -388,10 +389,10 @@ describe('managed runtime Ask recovery', () => {
     state.processManager.managedProcess = true;
     vi.spyOn(state, 'readHealthInfo').mockResolvedValue({ healthy: true, version: '2.0.21' });
     const needed = vi
-      .spyOn(state.processManager, 'needsRuntimeConfigRecovery', 'get')
-      .mockReturnValue(true);
-    vi.spyOn(state.processManager, 'hasRuntimeConfigRecoveryCandidate', 'get').mockImplementation(
-      () => state.processManager.needsRuntimeConfigRecovery
+      .spyOn(state.processManager, 'needsRuntimeConfigRecovery')
+      .mockResolvedValue(true);
+    vi.spyOn(state.processManager, 'hasRuntimeConfigRecoveryCandidate').mockImplementation(() =>
+      state.processManager.needsRuntimeConfigRecovery()
     );
     const inject = vi
       .spyOn(state.processManager, 'shouldRestoreRuntimeAskAgent')
@@ -417,7 +418,7 @@ describe('managed runtime Ask recovery', () => {
     const launch = vi.spyOn(state, 'launchManagedServer').mockResolvedValue(server.url);
     const restart = vi.spyOn(state, 'runRestart').mockImplementation(async (stopServer) => {
       await stopServer();
-      needed.mockReturnValue(false);
+      needed.mockResolvedValue(false);
       wire.mockResolvedValue([{ name: 'build' }, { name: 'plan' }, { name: 'ask' }]);
       return server.url;
     });
@@ -471,7 +472,7 @@ describe('managed runtime Ask recovery', () => {
         .mockResolvedValue({ totalSessionCount: 1, directories: [] });
     if (scenario === 'configured') inject.mockResolvedValue(false);
     if (scenario === 'ask-present') wire.mockResolvedValue([{ name: 'Ask' }]);
-    if (scenario === 'healthy-runtime') needed.mockReturnValue(false);
+    if (scenario === 'healthy-runtime') needed.mockResolvedValue(false);
     if (scenario === 'external') vi.spyOn(server, 'isAttachOnly', 'get').mockReturnValue(true);
     if (scenario === 'cancelled') controller.abort(new Error('Cancelled'));
     const result = state.restoreManagedRuntimeConfigAtStartup(
@@ -490,6 +491,160 @@ describe('managed runtime Ask recovery', () => {
     expect(restart).toHaveBeenCalledOnce();
     expect(stop).toHaveBeenCalledOnce();
     expect(wire).toHaveBeenLastCalledWith('GET', '/agent', undefined, undefined);
+  });
+
+  it.each([
+    { flow: 'startup', ownerRemains: false },
+    { flow: 'startup', ownerRemains: true },
+    { flow: 'catalog', ownerRemains: false },
+    { flow: 'catalog', ownerRemains: true },
+    { flow: 'busy', ownerRemains: true },
+    { flow: 'ask-present', ownerRemains: true },
+    { flow: 'configured', ownerRemains: true },
+    { flow: 'foreign', ownerRemains: true },
+  ])(
+    'handles a recorded missing config during $flow with ownerRemains=$ownerRemains',
+    async ({ flow, ownerRemains }) => {
+      const { server, state, needed, inject, wire, idle, restart, claim, stop, launch } = fixture();
+      needed.mockRestore();
+      vi.mocked(state.processManager.hasRuntimeConfigRecoveryCandidate).mockRestore();
+      const fs = await vi.importActual<typeof FsPromisesModule>('fs/promises');
+      await fs.mkdir(tmpdir(), { recursive: true });
+      const directory = await fs.mkdtemp(join(tmpdir(), 'varro-opencode-config-'));
+      onTestFinished(() => fs.rm(directory, { recursive: true, force: true }));
+      const processState = state.processManager as unknown as {
+        hostOwner: string;
+        ownershipLease: ManagedServerOwnershipLease;
+      };
+      const lease: ManagedServerOwnershipLease = {
+        version: 1,
+        pid: 777,
+        port: 4096,
+        executable: 'fixture',
+        birthIdentity: 'fixture:1',
+        owner: 'missing-runtime-owner',
+        host: flow === 'foreign' ? 'another-host' : processState.hostOwner,
+        state: 'active',
+        createdAt: Date.now(),
+        configPath: join(directory, 'opencode.json'),
+      };
+      processState.ownershipLease = lease;
+      if (ownerRemains)
+        await fs.writeFile(
+          join(directory, 'owner.json'),
+          JSON.stringify({ pid: lease.pid, owner: lease.owner })
+        );
+      if (flow === 'busy') idle.mockResolvedValue({ totalSessionCount: 1, directories: [] });
+      if (flow === 'ask-present') wire.mockResolvedValue([{ name: 'build' }, { name: 'ask' }]);
+      if (flow === 'configured') inject.mockResolvedValue(false);
+
+      if (flow === 'startup') {
+        await expect(
+          state.restoreManagedRuntimeConfigAtStartup(
+            state.disposeGeneration,
+            new AbortController().signal
+          )
+        ).resolves.toBe(server.url);
+        expect(claim).toHaveBeenCalledOnce();
+        expect(stop).toHaveBeenCalledOnce();
+        expect(launch).toHaveBeenCalledOnce();
+        expect(restart).not.toHaveBeenCalled();
+      } else if (flow === 'catalog') {
+        await expect(server.request('GET', '/agent')).resolves.toContainEqual({ name: 'ask' });
+        expect(restart).toHaveBeenCalledOnce();
+        expect(stop).toHaveBeenCalledOnce();
+      } else {
+        await state.reconcileManagedAskAgent();
+        expect(restart).not.toHaveBeenCalled();
+        expect(claim).not.toHaveBeenCalled();
+        expect(stop).not.toHaveBeenCalled();
+        expect(launch).not.toHaveBeenCalled();
+        if (flow === 'busy') {
+          expect(state.runtimeAskRecoveryPending).toBe(true);
+          idle.mockResolvedValue({ totalSessionCount: 0, directories: [] });
+          await expect(server.request('GET', '/agent')).resolves.toContainEqual({ name: 'ask' });
+          expect(restart).toHaveBeenCalledOnce();
+          expect(state.runtimeAskRecoveryPending).toBe(false);
+        } else {
+          expect(state.runtimeAskRecoveryPending).toBe(false);
+          if (flow === 'configured' || flow === 'foreign') expect(wire).not.toHaveBeenCalled();
+        }
+      }
+    }
+  );
+
+  it.each(['config inspection', 'Ask catalog'])(
+    'attaches to the existing server when %s times out, without a late restart',
+    async (phase) => {
+      const { server, state, needed, wire, idle, claim, stop, launch } = fixture();
+      state._status = { state: 'stopped' };
+      vi.mocked(state.processManager.refreshStartupRegistration).mockResolvedValue(true);
+      const stream = vi.spyOn(state, 'startEventStream').mockResolvedValue(undefined);
+      const inspection = deferred<boolean>();
+      const catalog = deferred<Array<{ name: string }>>();
+      if (phase === 'config inspection') needed.mockReturnValue(inspection.promise);
+      else wire.mockReturnValueOnce(catalog.promise);
+
+      const operation = server.start();
+      const attached = expect(operation).resolves.toBe(server.url);
+      await vi.advanceTimersByTimeAsync(2000);
+      await attached;
+      expect(stream).toHaveBeenCalledOnce();
+      expect(server.status).toMatchObject({ state: 'running', url: server.url });
+      if (phase === 'Ask catalog') expect(wire.mock.calls[0]?.[3]?.signal?.aborted).toBe(true);
+
+      inspection.resolve(true);
+      catalog.resolve([{ name: 'build' }]);
+      await flushMicrotasks();
+      expect(state.runtimeAskRecoveryPending).toBe(false);
+      expect(idle).not.toHaveBeenCalled();
+      expect(claim).not.toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
+      expect(launch).not.toHaveBeenCalled();
+      await server.disconnect();
+    }
+  );
+
+  it('attaches to the existing server when the surviving runtime owner file cannot be read', async () => {
+    const { server, state, needed, wire, idle, claim, stop, launch } = fixture();
+    state._status = { state: 'stopped' };
+    vi.mocked(state.processManager.refreshStartupRegistration).mockResolvedValue(true);
+    const stream = vi.spyOn(state, 'startEventStream').mockResolvedValue(undefined);
+    needed.mockRejectedValueOnce(
+      Object.assign(new Error('EACCES: cannot read runtime owner.json'), { code: 'EACCES' })
+    );
+
+    try {
+      await expect(server.start()).resolves.toBe(server.url);
+      expect(server.status).toMatchObject({ state: 'running', url: server.url });
+      expect(stream).toHaveBeenCalledOnce();
+      expect(wire).not.toHaveBeenCalled();
+      expect(idle).not.toHaveBeenCalled();
+      expect(claim).not.toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
+      expect(launch).not.toHaveBeenCalled();
+    } finally {
+      await server.disconnect();
+    }
+  });
+
+  it('propagates caller cancellation during optional Ask catalog recovery', async () => {
+    const { state, wire, claim, stop, launch } = fixture();
+    const catalog = deferred<Array<{ name: string }>>();
+    wire.mockReturnValueOnce(catalog.promise);
+    const controller = new AbortController();
+    const rejected = expect(
+      state.restoreManagedRuntimeConfigAtStartup(state.disposeGeneration, controller.signal)
+    ).rejects.toThrow('Startup cancelled by caller');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wire).toHaveBeenCalledOnce();
+    controller.abort(new Error('Startup cancelled by caller'));
+    await rejected;
+    catalog.resolve([{ name: 'build' }]);
+    await flushMicrotasks();
+    expect(claim).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
   });
 
   it('lets a send continue after stalled Ask preparation without a late restart', async () => {
@@ -964,6 +1119,22 @@ const originalPlatform = process.platform;
 const originalOpenCodeConfig = process.env.OPENCODE_CONFIG;
 const originalOpenCodeConfigContent = process.env.OPENCODE_CONFIG_CONTENT;
 
+type CliUpdateRestartApi = {
+  process: Record<string, unknown> | null;
+  managedProcess: boolean;
+  readInstalledCliVersion: () => Promise<string | null>;
+  maybeSuggestCliUpdate: (version: string | null) => Promise<string | null>;
+  readHealthInfo: () => Promise<{ healthy: boolean; version?: string }>;
+  hasActiveSessions: () => Promise<boolean>;
+  restartServerForCliUpdate: (serverVersion: string, installedCliVersion: string) => Promise<void>;
+};
+
+function setAutoUpdate(enabled: boolean) {
+  getConfigurationMock.mockImplementation(() => ({
+    get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? enabled : fallback),
+  }));
+}
+
 function stubPlatform(platform: NodeJS.Platform) {
   Object.defineProperty(process, 'platform', {
     value: platform,
@@ -982,9 +1153,7 @@ beforeEach(() => {
     identity: 'fixture-listener',
   });
   vscodeMock.window.showWarningMessage.mockReset().mockResolvedValue(undefined);
-  getConfigurationMock.mockImplementation(() => ({
-    get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? false : fallback),
-  }));
+  setAutoUpdate(false);
   vscodeMock.workspace.getConfiguration = getConfigurationMock;
   spawnMock.mockReset();
   mkdirMock.mockReset();
@@ -1080,7 +1249,7 @@ describe('automatic-port migration and admission', () => {
       const { api, children } = configureManagedStartup(server);
       const { processManager } = server as unknown as { processManager: OpenCodeProcess };
       vi.mocked(processManager.refreshStartupRegistration).mockResolvedValue(true);
-      vi.mocked(api.readHealthInfo).mockResolvedValue({ healthy: true, version: '2.0.5' });
+      vi.mocked(api.readHealthInfo).mockResolvedValue({ healthy: true, version: '2.0.6' });
       vi.mocked(inspectLocalServerAccount).mockResolvedValue({ kind: 'unknown' });
       vi.spyOn(processManager, 'hasCredentialVerifiedConnection', 'get').mockReturnValue(true);
       vi.spyOn(processManager, 'verifyManagedServerAdmission').mockResolvedValue(true);
@@ -1446,17 +1615,22 @@ describe('automatic-port migration and admission', () => {
     await server.disconnect();
   });
 
-  it('leaves an unsupported registered server running without applying an update', async () => {
-    const server = new OpenCodeServer('auto', true);
-    const { api, children } = configureManagedStartup(server);
-    const { processManager } = server as unknown as { processManager: OpenCodeProcess };
-    vi.mocked(processManager.refreshStartupRegistration).mockResolvedValue(true);
-    vi.mocked(api.readHealthInfo).mockResolvedValue({ healthy: true, version: '1.15.13' });
-    const upgrade = vi.spyOn(processManager, 'upgradeCli');
-    await expect(server.start()).rejects.toThrow('left running');
-    expect(upgrade).not.toHaveBeenCalled();
-    expect(children).toHaveLength(0);
-  });
+  it.each(['1.15.13', '2.0.5'])(
+    'leaves an unsupported registered %s server running without applying an update',
+    async (version) => {
+      const server = new OpenCodeServer('auto', true);
+      const { api, children } = configureManagedStartup(server);
+      const { processManager } = server as unknown as { processManager: OpenCodeProcess };
+      vi.mocked(processManager.refreshStartupRegistration).mockResolvedValue(true);
+      vi.mocked(api.readHealthInfo).mockResolvedValue({ healthy: true, version });
+      const upgrade = vi.spyOn(processManager, 'upgradeCli');
+      const stop = vi.spyOn(processManager, 'stopServerForRestart');
+      await expect(server.start()).rejects.toThrow('left running');
+      expect(upgrade).not.toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
+      expect(children).toHaveLength(0);
+    }
+  );
 
   it('does not probe or adopt the old default endpoint on a fresh automatic launch', async () => {
     const server = new OpenCodeServer('auto', true);
@@ -2754,18 +2928,7 @@ describe('OpenCodeServer maintenance', () => {
   it('restarts a managed idle server when the installed CLI is newer', async () => {
     const server = new OpenCodeServer(4096, false);
     const restartServerForCliUpdate = vi.fn().mockResolvedValue(undefined);
-    const api = server as unknown as {
-      process: Record<string, unknown> | null;
-      managedProcess: boolean;
-      readInstalledCliVersion: () => Promise<string | null>;
-      maybeSuggestCliUpdate: (version: string | null) => Promise<string | null>;
-      readHealthInfo: () => Promise<{ healthy: boolean; version?: string }>;
-      hasActiveSessions: () => Promise<boolean>;
-      restartServerForCliUpdate: (
-        serverVersion: string,
-        installedCliVersion: string
-      ) => Promise<void>;
-    };
+    const api = server as unknown as CliUpdateRestartApi;
 
     setRunning(server);
     api.process = {};
@@ -2865,18 +3028,7 @@ describe('OpenCodeServer maintenance', () => {
   it('does not restart when there are active sessions', async () => {
     const server = new OpenCodeServer(4096, false);
     const restartServerForCliUpdate = vi.fn().mockResolvedValue(undefined);
-    const api = server as unknown as {
-      process: Record<string, unknown> | null;
-      managedProcess: boolean;
-      readInstalledCliVersion: () => Promise<string | null>;
-      maybeSuggestCliUpdate: (version: string | null) => Promise<string | null>;
-      readHealthInfo: () => Promise<{ healthy: boolean; version?: string }>;
-      hasActiveSessions: () => Promise<boolean>;
-      restartServerForCliUpdate: (
-        serverVersion: string,
-        installedCliVersion: string
-      ) => Promise<void>;
-    };
+    const api = server as unknown as CliUpdateRestartApi;
 
     setRunning(server);
     api.process = {};
@@ -2895,18 +3047,7 @@ describe('OpenCodeServer maintenance', () => {
   it('does not restart an unmanaged server when auto-start is disabled', async () => {
     const server = new OpenCodeServer(4096, false);
     const restartServerForCliUpdate = vi.fn().mockResolvedValue(undefined);
-    const api = server as unknown as {
-      process: Record<string, unknown> | null;
-      managedProcess: boolean;
-      readInstalledCliVersion: () => Promise<string | null>;
-      maybeSuggestCliUpdate: (version: string | null) => Promise<string | null>;
-      readHealthInfo: () => Promise<{ healthy: boolean; version?: string }>;
-      hasActiveSessions: () => Promise<boolean>;
-      restartServerForCliUpdate: (
-        serverVersion: string,
-        installedCliVersion: string
-      ) => Promise<void>;
-    };
+    const api = server as unknown as CliUpdateRestartApi;
 
     setRunning(server);
     api.process = null;
@@ -2984,9 +3125,7 @@ describe('OpenCodeServer maintenance', () => {
         ) => Promise<void>;
       };
 
-      getConfigurationMock.mockImplementation(() => ({
-        get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-      }));
+      setAutoUpdate(true);
       setRunning(server);
       api.process = {};
       api.managedProcess = true;
@@ -3027,9 +3166,7 @@ describe('OpenCodeServer maintenance', () => {
       restartServerForCliUpdate: (a: string, b: string) => Promise<void>;
     };
 
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     setRunning(server);
     api.process = {};
     api.managedProcess = true;
@@ -3065,9 +3202,7 @@ describe('OpenCodeServer maintenance', () => {
       hasActiveSessions: () => Promise<boolean>;
     };
 
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     setRunning(server);
     api.process = {};
     api.managedProcess = true;
@@ -3202,9 +3337,7 @@ describe('OpenCodeServer maintenance', () => {
       readLatestCliVersion: () => Promise<string | null>;
     };
 
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     api.readLatestCliVersion = readLatestCliVersion;
     stubCliSpawn({ version: '1.14.22' });
 
@@ -3226,9 +3359,7 @@ describe('OpenCodeServer maintenance', () => {
     const api = server as unknown as {
       readLatestCliVersion: () => Promise<string | null>;
     };
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     api.readLatestCliVersion = vi.fn().mockResolvedValue(nextVersion);
     stubCliSpawn({ version: nextVersion });
 
@@ -3252,9 +3383,7 @@ describe('OpenCodeServer maintenance', () => {
       readLatestCliVersion: () => Promise<string | null>;
       request: typeof request;
     };
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     api.readLatestCliVersion = vi.fn().mockResolvedValue('2.0.22');
     api.request = request;
     const prepare = vi.spyOn(server, 'prepareForWindowsCliUpgrade');
@@ -3279,9 +3408,7 @@ describe('OpenCodeServer maintenance', () => {
     const api = server as unknown as {
       readLatestCliVersion: () => Promise<string | null>;
     };
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     api.readLatestCliVersion = vi.fn().mockResolvedValue('2.0.22');
     stubCliSpawn({ version: '2.0.21', stderr: 'EPERM: binary is being used by another process' });
 
@@ -3335,9 +3462,7 @@ describe('OpenCodeServer maintenance', () => {
       request: typeof request;
     };
 
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     api.readLatestCliVersion = readLatestCliVersion;
     api.request = request;
     setRunning(server);
@@ -3368,9 +3493,7 @@ describe('OpenCodeServer maintenance', () => {
       request: typeof request;
     };
 
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     api.readLatestCliVersion = readLatestCliVersion;
     api.request = request;
     setRunning(server);
@@ -3856,7 +3979,7 @@ describe('OpenCodeServer compatibility gate', () => {
         prepareForHealthyExistingServer: typeof prepareForHealthyExistingServer;
       };
     };
-    api.readHealthInfo = vi.fn().mockResolvedValue({ healthy: true, version: '2.0.5' });
+    api.readHealthInfo = vi.fn().mockResolvedValue({ healthy: true, version: '2.0.6' });
     api.startEventStream = vi.fn(() => {
       expect(server.status.state).not.toBe('running');
       return Promise.resolve();
@@ -3909,9 +4032,7 @@ describe('OpenCodeServer compatibility gate', () => {
   }
 
   it('coordinates explicit remediation of a server leased by another extension host', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true);
     const hasActiveSessions = vi.fn().mockResolvedValue(false);
     const upgradeRunningServer = vi.fn().mockResolvedValue(true);
@@ -3972,9 +4093,7 @@ describe('OpenCodeServer compatibility gate', () => {
   });
 
   it('does not replace an outdated server while it has active sessions', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true);
     const stopServerForRestart = vi.fn().mockResolvedValue(undefined);
     const upgradeRunningServer = vi.fn().mockResolvedValue(true);
@@ -3999,9 +4118,7 @@ describe('OpenCodeServer compatibility gate', () => {
   });
 
   it('does not replace a server that becomes active while the upgrade is running', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true);
     const stopServerForRestart = vi.fn().mockResolvedValue(undefined);
     const upgradeRunningServer = vi.fn().mockResolvedValue(true);
@@ -4024,9 +4141,7 @@ describe('OpenCodeServer compatibility gate', () => {
   });
 
   it('updates and replaces an idle outdated server during explicit remediation', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true, 'opencode');
     const stopServerForRestart = vi.fn().mockResolvedValue(undefined);
     const upgradeRunningServer = vi.fn().mockResolvedValue(false);
@@ -4114,9 +4229,7 @@ describe('OpenCodeServer compatibility gate', () => {
   }
 
   it('recommends the install-specific command when the required update fails', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true);
     const api = stubIncompatibleServer(server, 'npm');
     api.processManager.upgradeCli = vi
@@ -4146,9 +4259,7 @@ describe('OpenCodeServer compatibility gate', () => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform');
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
     try {
-      getConfigurationMock.mockImplementation(() => ({
-        get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-      }));
+      setAutoUpdate(true);
       const server = new OpenCodeServer(4096, true);
       const api = stubIncompatibleServer(server, 'npm');
       api.processManager.upgradeCli = vi
@@ -4168,9 +4279,7 @@ describe('OpenCodeServer compatibility gate', () => {
   });
 
   it('falls back to reinstall guidance when the install method is unrecognized', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true);
     const api = stubIncompatibleServer(server, 'unknown');
     api.processManager.upgradeCli = vi
@@ -4191,9 +4300,7 @@ describe('OpenCodeServer compatibility gate', () => {
   });
 
   it('marks an update blocked by disabled auto-update with the setting to change', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? false : fallback),
-    }));
+    setAutoUpdate(false);
     const server = new OpenCodeServer(4096, true);
     stubIncompatibleServer(server);
 
@@ -4215,9 +4322,7 @@ describe('OpenCodeServer compatibility gate', () => {
   });
 
   it('marks an update deferred by active sessions as blocked, not failed', async () => {
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true);
     const api = stubIncompatibleServer(server);
     api.hasActiveSessions = vi.fn().mockResolvedValue(true);
@@ -5653,9 +5758,7 @@ describe('OpenCodeServer managed process lifecycle', () => {
   it('waits for cancelled CLI work to settle before stopping for restart', async () => {
     // Managed startup skips the CLI preflight on Windows.
     stubPlatform('linux');
-    getConfigurationMock.mockImplementation(() => ({
-      get: (key: string, fallback?: unknown) => (key === 'server.autoUpdate' ? true : fallback),
-    }));
+    setAutoUpdate(true);
     const server = new OpenCodeServer(4096, true);
     const { api, children } = configureManagedStartup(server);
     const upgradeWork = deferred<void>();

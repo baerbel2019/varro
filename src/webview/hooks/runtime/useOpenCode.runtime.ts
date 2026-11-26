@@ -1,12 +1,12 @@
-import { createOpenCodeRuntime, type OpenCodeRuntime } from './open-code-runtime-instance';
-import type {
-  QuestionAnswer,
-  PermissionMode,
-  QueuedContextSnapshot,
-  SessionWorkspaceTarget,
-} from '../../../shared/protocol';
-import type { SelectedModel, SessionSelectionOptions } from '../../lib/app-state-types';
-import type { QueuedAttachmentSnapshot } from '../session/session-send';
+import {
+  createOpenCodeRuntime,
+  type EditMessageOptions,
+  type ManualPermissionResponseOptions,
+  type OpenCodeRuntime,
+  type SendMessageOptions,
+} from './open-code-runtime-instance';
+import type { QuestionAnswer, PermissionMode } from '../../../shared/protocol';
+import type { SessionSelectionOptions } from '../../lib/app-state-types';
 import type { SessionCommandOptions } from '../session/session-actions';
 
 let currentOpenCodeRuntime = createOpenCodeRuntime();
@@ -121,26 +121,7 @@ export async function loadMoreSessions() {
   await getCurrentOpenCodeRuntime().loadMoreSessions();
 }
 
-export async function sendMessage(
-  text: string,
-  options?: {
-    messageId?: string;
-    agent?: string;
-    noReply?: boolean;
-    delivery?: 'steer' | 'queue';
-    queuedAttachments?: QueuedAttachmentSnapshot;
-    queuedContext?: QueuedContextSnapshot;
-    preserveComposer?: boolean;
-    omitContext?: boolean;
-    followupTitle?: string;
-    targetSessionId?: string | null;
-    workspaceDirectory?: string;
-    newSessionWorkspace?: SessionWorkspaceTarget;
-    queuedMessageDispatch?: { itemId: string; lease: number };
-    onOptimisticPublish?: () => void;
-    validateBeforeSend?: () => Promise<boolean>;
-  }
-): Promise<boolean> {
+export async function sendMessage(text: string, options?: SendMessageOptions): Promise<boolean> {
   return await getCurrentOpenCodeRuntime().sendMessage(text, options);
 }
 
@@ -148,16 +129,7 @@ export async function retryMessage(messageId: string, sessionId?: string | null)
   await getCurrentOpenCodeRuntime().retryMessage(messageId, sessionId);
 }
 
-export async function editMessage(
-  messageId: string,
-  text: string,
-  options?: {
-    allowEmptyText?: boolean;
-    queuedAttachments?: QueuedAttachmentSnapshot;
-    selectedModel?: SelectedModel;
-    onOptimisticPublish?: () => void;
-  }
-) {
+export async function editMessage(messageId: string, text: string, options?: EditMessageOptions) {
   return await getCurrentOpenCodeRuntime().editMessage(messageId, text, options);
 }
 
@@ -210,7 +182,7 @@ export async function respondPermission(
   sessionId: string,
   permissionId: string,
   response: 'once' | 'always' | 'reject',
-  options?: { rethrow?: boolean }
+  options?: ManualPermissionResponseOptions
 ) {
   await getCurrentOpenCodeRuntime().respondPermission(sessionId, permissionId, response, options);
 }

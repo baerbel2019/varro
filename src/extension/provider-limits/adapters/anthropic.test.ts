@@ -50,6 +50,9 @@ const provider: ProviderMetadata = {
   models: {},
 };
 
+const fetchStatus = (overrides: Partial<Parameters<typeof adapter.fetch>[0]> = {}) =>
+  adapter.fetch({ provider, authStore: {}, modelID: null, checkedAt: 1_000, ...overrides });
+
 const localProxyProvider: ProviderMetadata = {
   id: 'anthropic',
   options: {
@@ -110,6 +113,7 @@ describe('createAnthropicAdapter', () => {
       checkedAt: 1_000,
       coordinate: async (identity, poll, observation) => {
         expect(identity).toEqual([
+          'anthropic-usage-v2',
           'https://api.anthropic.com/api/oauth/usage',
           'claude-code-token',
         ]);
@@ -141,13 +145,99 @@ describe('createAnthropicAdapter', () => {
     expect(writeFile).not.toHaveBeenCalled();
   });
 
+  it('reads the weekly Fable limit from the usage endpoint limits list', async () => {
+    vi.mocked(readFile).mockResolvedValue(
+      JSON.stringify({ claudeAiOauth: { accessToken: 'claude-code-token' } })
+    );
+    vi.mocked(fetch).mockResolvedValue(
+      Response.json({
+        five_hour: { utilization: 20 },
+        seven_day: { utilization: 30 },
+        seven_day_overage_included: { utilization: 99 },
+        extra_usage: { is_enabled: true, utilization: 5, monthly_limit: 100, used_credits: 5 },
+        limits: [
+          { kind: 'session', group: 'session', percent: 20 },
+          {
+            kind: 'weekly_scoped',
+            group: 'weekly',
+            percent: 41.5,
+            resets_at: '2026-11-30T00:00:00Z',
+            scope: { model: { display_name: 'Fable' } },
+          },
+        ],
+      })
+    );
+
+    const status = await fetchStatus({ provider: { id: 'claude-agent', models: {} } });
+
+    expect(status).toMatchObject({
+      status: 'available',
+      windows: [
+        { id: 'five_hour' },
+        { id: 'seven_day' },
+        {
+          id: 'seven_day_fable',
+          label: 'Weekly Fable',
+          remaining: 58.5,
+          limit: 100,
+          percent: 41.5,
+          resetAt: Date.parse('2026-11-30T00:00:00Z'),
+        },
+        { id: 'extra_usage' },
+      ],
+    });
+  });
+
+  it.each([
+    ['max', 'default_claude_max_5x', 'Max 5x'],
+    ['max', 'default_claude_max_20x', 'Max 20x'],
+    ['max', undefined, 'Max'],
+    ['pro', 'default_claude_pro', 'Pro'],
+    ['constructor', undefined, undefined],
+  ])(
+    'reports the Claude Code %s subscription with tier %s as %s',
+    async (subscriptionType, rateLimitTier, planName) => {
+      vi.mocked(readFile).mockResolvedValue(
+        JSON.stringify({
+          claudeAiOauth: { accessToken: 'claude-code-token', subscriptionType, rateLimitTier },
+        })
+      );
+      vi.mocked(fetch).mockResolvedValue(Response.json({ five_hour: { utilization: 20 } }));
+
+      const status = await fetchStatus({ provider: { id: 'claude-agent', models: {} } });
+
+      expect(status).toMatchObject({ status: 'available' });
+      expect(status.status === 'available' ? status.planName : null).toBe(planName);
+    }
+  );
+
+  it('falls back to the legacy Fable weekly key without a limits list', async () => {
+    vi.mocked(readFile).mockResolvedValue(
+      JSON.stringify({ claudeAiOauth: { accessToken: 'claude-code-token' } })
+    );
+    vi.mocked(fetch).mockResolvedValue(
+      Response.json({
+        five_hour: { utilization: 20 },
+        seven_day_overage_included: { utilization: 12 },
+      })
+    );
+
+    const status = await fetchStatus({ provider: { id: 'claude-agent', models: {} } });
+
+    expect(status).toMatchObject({
+      status: 'available',
+      windows: [
+        { id: 'five_hour' },
+        { id: 'seven_day_fable', label: 'Weekly Fable', remaining: 88 },
+      ],
+    });
+  });
+
   it('does not substitute Anthropic credentials when Claude Agent has no Claude Code login', async () => {
     vi.mocked(readFile).mockRejectedValue(new Error('No credential file'));
-    const status = await adapter.fetch({
+    const status = await fetchStatus({
       provider: { id: 'claude-agent', models: {} },
       authStore: { anthropic: { type: 'oauth', access: 'other-account-token' } },
-      modelID: null,
-      checkedAt: 1_000,
     });
     expect(status).toMatchObject({ providerID: 'claude-agent', status: 'unsupported' });
     expect(fetch).not.toHaveBeenCalled();
@@ -166,12 +256,7 @@ describe('createAnthropicAdapter', () => {
       Response.json({ five_hour: { utilization: 20 }, seven_day: { utilization: 30 } })
     );
 
-    const status = await adapter.fetch({
-      provider: { id: 'claude-agent', models: {} },
-      authStore: {},
-      modelID: null,
-      checkedAt,
-    });
+    const status = await fetchStatus({ provider: { id: 'claude-agent', models: {} }, checkedAt });
 
     expect(status).toMatchObject({
       providerID: 'claude-agent',
@@ -197,11 +282,9 @@ describe('createAnthropicAdapter', () => {
   it('uses an explicit Claude Code OAuth token before saved credentials', async () => {
     vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', 'explicit-token');
     vi.mocked(fetch).mockResolvedValue(Response.json({ five_hour: { utilization: 10 } }));
-    const status = await adapter.fetch({
+    const status = await fetchStatus({
       provider: { id: 'claude-agent', models: {} },
-      authStore: {},
       modelID: 'sonnet',
-      checkedAt: 1_000,
     });
     expect(status).toMatchObject({ providerID: 'claude-agent', status: 'available' });
     expect(fetch).toHaveBeenCalledWith(
@@ -221,11 +304,9 @@ describe('createAnthropicAdapter', () => {
       })
     );
     vi.mocked(fetch).mockResolvedValue(new Response('{}', { status: 401 }));
-    const status = await adapter.fetch({
+    const status = await fetchStatus({
       provider: { id: 'claude-agent', models: {} },
-      authStore: {},
       modelID: 'opus',
-      checkedAt: 1_000,
       coordinate: async (_identity, poll) => poll(),
     });
     expect(status).toMatchObject({
@@ -252,11 +333,9 @@ describe('createAnthropicAdapter', () => {
           )
       );
       vi.mocked(fetch).mockResolvedValue(new Response('{}', { status: 401 }));
-      const status = await adapter.fetch({
+      const status = await fetchStatus({
         provider: { id: 'claude-agent', models: {} },
-        authStore: {},
         modelID: 'opus',
-        checkedAt: 1_000,
       });
       expect(execFileMock).toHaveBeenCalledWith(
         '/usr/bin/security',
@@ -291,11 +370,9 @@ describe('createAnthropicAdapter', () => {
         },
       })
     );
-    const status = await adapter.fetch({
+    const status = await fetchStatus({
       provider: { id: 'claude-agent', models: {} },
-      authStore: {},
       modelID: 'sonnet',
-      checkedAt: 1_000,
     });
     expect(status).toMatchObject({
       providerID: 'claude-agent',
@@ -337,7 +414,9 @@ describe('createAnthropicAdapter', () => {
       },
     });
     expect(status.status).toBe('unsupported');
-    expect(identities).toEqual([['https://api.anthropic.com/api/oauth/usage', 'original']]);
+    expect(identities).toEqual([
+      ['anthropic-usage-v2', 'https://api.anthropic.com/api/oauth/usage', 'original'],
+    ]);
     expect(fetch).not.toHaveBeenCalled();
     expect(writeFile).not.toHaveBeenCalled();
     expect(mkdir).not.toHaveBeenCalled();
@@ -359,13 +438,7 @@ describe('createAnthropicAdapter', () => {
       })
     );
 
-    const status = await adapter.fetch({
-      provider,
-      authStore: {},
-      modelID: 'claude-sonnet-4',
-      checkedAt: 1_000,
-      coordinate,
-    });
+    const status = await fetchStatus({ modelID: 'claude-sonnet-4', coordinate });
 
     expect(fetch).not.toHaveBeenCalled();
     expect(coordinate).not.toHaveBeenCalled();
@@ -426,11 +499,9 @@ describe('createAnthropicAdapter', () => {
       )
     );
 
-    const status = await adapter.fetch({
-      provider,
+    const status = await fetchStatus({
       authStore: { anthropic: { type: 'oauth', access: 'anthropic-auth-store-token' } },
       modelID: 'claude-sonnet-4',
-      checkedAt: 1_000,
     });
 
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -538,11 +609,9 @@ describe('createAnthropicAdapter', () => {
       )
     );
 
-    const status = await adapter.fetch({
+    const status = await fetchStatus({
       provider: localProxyProvider,
-      authStore: {},
       modelID: 'claude-sonnet-4',
-      checkedAt: 1_000,
       coordinate,
     });
 
@@ -600,12 +669,7 @@ describe('createAnthropicAdapter', () => {
     vi.mocked(stat).mockRejectedValue(new Error('missing statusline file'));
     vi.mocked(fetch).mockResolvedValue(new Response('{}', { status: 404 }));
 
-    const status = await adapter.fetch({
-      provider: localProxyProvider,
-      authStore: {},
-      modelID: null,
-      checkedAt: 1_000,
-    });
+    const status = await fetchStatus({ provider: localProxyProvider });
 
     expect(status).toEqual({
       providerID: 'anthropic',
@@ -650,11 +714,8 @@ describe('createAnthropicAdapter', () => {
         )
       );
 
-      const status = await adapter.fetch({
-        provider,
+      const status = await fetchStatus({
         authStore: access === undefined ? {} : { anthropic: { type: 'oauth', access } },
-        modelID: null,
-        checkedAt: 1_000,
       });
 
       expect(fetch).toHaveBeenCalledWith(
@@ -715,11 +776,9 @@ describe('createAnthropicAdapter', () => {
       )
     );
 
-    const status = await adapter.fetch({
-      provider,
+    const status = await fetchStatus({
       authStore: { anthropic: { type: 'oauth', access: 'anthropic-auth-store-token' } },
       modelID: 'claude-sonnet-4',
-      checkedAt: 1_000,
     });
 
     expect(status).toEqual({
@@ -747,11 +806,8 @@ describe('createAnthropicAdapter', () => {
     vi.mocked(stat).mockRejectedValue(new Error('missing statusline file'));
     vi.mocked(fetch).mockResolvedValue(new Response('{}', { status: 401 }));
 
-    const status = await adapter.fetch({
-      provider,
+    const status = await fetchStatus({
       authStore: { anthropic: { type: 'oauth', access: 'anthropic-auth-store-token' } },
-      modelID: null,
-      checkedAt: 1_000,
     });
 
     expect(status).toEqual({
@@ -778,12 +834,7 @@ describe('createAnthropicAdapter', () => {
     );
     vi.mocked(fetch).mockResolvedValueOnce(new Response('{}', { status: 429 }));
 
-    const status = await adapter.fetch({
-      provider,
-      authStore: {},
-      modelID: null,
-      checkedAt: 1_000,
-    });
+    const status = await fetchStatus();
 
     expect(fetch).toHaveBeenCalledWith(
       'https://api.anthropic.com/api/oauth/usage',
@@ -818,11 +869,8 @@ describe('createAnthropicAdapter', () => {
     );
     vi.mocked(fetch).mockResolvedValueOnce(new Response('{}', { status: 401 }));
 
-    const status = await adapter.fetch({
-      provider,
+    const status = await fetchStatus({
       authStore: { anthropic: { type: 'oauth', access: 'opencode-access-token' } },
-      modelID: null,
-      checkedAt: 1_000,
     });
 
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -872,11 +920,7 @@ describe('createAnthropicAdapter', () => {
           )
         );
 
-      const status = await adapter.fetch({
-        provider,
-        authStore: {},
-        modelID: null,
-        checkedAt: 1_000,
+      const status = await fetchStatus({
         coordinate: coordinated ? async (_identity, poll) => poll() : undefined,
       });
 
@@ -947,12 +991,7 @@ describe('createAnthropicAdapter', () => {
         })
       );
 
-    const status = await adapter.fetch({
-      provider,
-      authStore: {},
-      modelID: null,
-      checkedAt: 1_000,
-    });
+    const status = await fetchStatus();
 
     expect(status.status).toBe('available');
     expect(writeFile).not.toHaveBeenCalled();
@@ -1054,12 +1093,7 @@ describe('createAnthropicAdapter', () => {
         })
       );
 
-    const status = await adapter.fetch({
-      provider,
-      authStore: {},
-      modelID: null,
-      checkedAt: 1_000,
-    });
+    const status = await fetchStatus();
 
     expect(status).toMatchObject({
       status: 'error',
@@ -1109,12 +1143,7 @@ describe('createAnthropicAdapter', () => {
         })
       );
 
-    const status = await adapter.fetch({
-      provider,
-      authStore: {},
-      modelID: null,
-      checkedAt: 1_000,
-    });
+    const status = await fetchStatus();
 
     expect(status.status).toBe('available');
     expect(writeFile).toHaveBeenCalledTimes(2);
@@ -1153,12 +1182,7 @@ describe('createAnthropicAdapter', () => {
         })
       );
 
-    const status = await adapter.fetch({
-      provider,
-      authStore: {},
-      modelID: null,
-      checkedAt: 1_000,
-    });
+    const status = await fetchStatus();
 
     expect(status.status).toBe('available');
     expect(mkdir).toHaveBeenCalledTimes(2);
@@ -1190,12 +1214,7 @@ describe('createAnthropicAdapter', () => {
         )
       );
 
-    const status = await adapter.fetch({
-      provider,
-      authStore: {},
-      modelID: null,
-      checkedAt: 1_000,
-    });
+    const status = await fetchStatus();
 
     expect(writeFile).not.toHaveBeenCalled();
     expect(rename).not.toHaveBeenCalled();
@@ -1227,11 +1246,8 @@ describe('createAnthropicAdapter', () => {
       )
     );
 
-    const status = await adapter.fetch({
-      provider,
+    const status = await fetchStatus({
       authStore: { anthropic: { type: 'oauth', access: 'anthropic-auth-store-token' } },
-      modelID: null,
-      checkedAt: 1_000,
     });
 
     expect(fetch).toHaveBeenCalledTimes(1);

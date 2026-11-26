@@ -10,7 +10,12 @@ import {
   readSessionModelMetadata,
 } from '../shared/session-selection-metadata';
 import type { SessionSelectionMetadata } from '../shared/session-selection-metadata';
-import type { OpenCodeModelRouting, PermissionRule, Session } from '../shared/opencode-types';
+import type {
+  OpenCodeModelRouting,
+  PermissionRule,
+  Provider,
+  Session,
+} from '../shared/opencode-types';
 import {
   getSafeDefaultPermissionRules,
   getSessionPermissionRulesForMode,
@@ -23,6 +28,7 @@ import type {
   ExtensionMessage,
   QueuedMessageSnapshot,
   PermissionMode,
+  PromptCacheWarmingMode,
   ServerEvent,
   WebviewInstanceContext,
   WebviewMessage,
@@ -30,10 +36,13 @@ import type {
   SiblingWorkspaceAlert,
   TerminalSelection,
 } from '../shared/protocol';
+import { parseServerEvent } from '../shared/protocol';
 import { isPlaceholderSessionTitle } from '../shared/session-title';
 import { asRecord } from '../shared/type-utils';
 import { isSameWorkspacePath, normalizeWorkspaceIdentity } from '../shared/workspace-path';
 
+const CHAT_FOCUSED_CONTEXT = 'varro:chatFocused';
+const FOCUSED_CHAT_SURFACE_CONTEXT = 'varro:focusedChatSurface';
 const WORKSPACE_CATALOG_EVENT_TYPES = new Set<ServerEvent['type']>([
   'session.created',
   'session.updated',
@@ -53,6 +62,13 @@ const WORKSPACE_ATTENTION_EVENT_TYPES = new Set<ServerEvent['type']>([
   'question.v2.asked',
   'question.v2.replied',
   'question.v2.rejected',
+]);
+const ATTENTION_ASK_EVENT_TYPES = new Set<ServerEvent['type']>([
+  'permission.updated',
+  'permission.asked',
+  'permission.v2.asked',
+  'question.asked',
+  'question.v2.asked',
 ]);
 const WORKSPACE_INDEPENDENT_EVENT_TYPES = new Set<ServerEvent['type']>([
   'server.connected',
@@ -92,7 +108,11 @@ import { CommitMessageService } from './commit-message-service';
 import type { ContextProvider } from './context-provider';
 import { DroppedFilesService } from './dropped-files-service';
 import { DraftImageStore } from './draft-image-store';
-import { readExtensionConfigState } from './extension-config';
+import {
+  readExtensionConfigState,
+  readPromptCacheWarmingDurationMs,
+  readPromptCacheWarmingMode,
+} from './extension-config';
 import { readMaximumTestedOpenCodeVersion } from './extension-manifest';
 import { runWindowsCliUpdate } from './util/windows-cli-update';
 import { FileSearchService } from './file-search-service';
@@ -117,7 +137,11 @@ import type { ProviderSignatureFileSystem } from './provider-file-refresh-contro
 import { ProviderLimitService } from './provider-limit-service';
 import { ProviderLimitStatusBar } from './provider-limit-status-bar';
 import { PinnedSessionManager } from './pinned-session-manager';
+import { TodoSessionManager } from './todo-session-manager';
 import { QueuedMessageStore } from './queued-message-store';
+import { PromptCacheLearner } from './prompt-cache-learning';
+import { PromptCacheWarming } from './prompt-cache-warming';
+import { WalkthroughService } from './walkthrough-service';
 import { RalphHost } from './ralph-host';
 import { InternalHelperCleanupCoordinator, RestProxy } from './rest-proxy';
 import type { OpenCodeServer } from './server';
@@ -248,6 +272,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private nativeNotificationErrorShown = false;
   private readonly sessionTrash: SessionTrashManager;
   private readonly pinnedSessions: PinnedSessionManager;
+  private readonly todoSessions: TodoSessionManager;
   private readonly queuedMessages: QueuedMessageStore;
   private readonly sessionPermissionModes: SessionPermissionModeStore;
   private readonly sessionSelectedModels: SessionModelSelectionStore;
@@ -262,8 +287,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private readonly decisionProviders: DecisionProviders;
   private readonly jevDecisions: JevDecisions;
   private readonly commitMessageService: CommitMessageService;
+  private readonly walkthroughService: WalkthroughService;
   private readonly sessionTitleFallback: SessionTitleFallback;
   private readonly ralphHost: RalphHost;
+  private readonly promptCacheWarming: PromptCacheWarming;
+  private promptCacheWarmingMode: PromptCacheWarmingMode;
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Raw server events are parsed by parseServerEvent.
+  private readonly promptCacheWarmingEvents: (event: unknown) => void;
   private readonly messageRouter: MessageRouter;
   private readonly restProxy: RestProxy;
   public readonly sessionExportService: SessionExportService;
@@ -299,6 +329,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private readonly serverMemoryPermissions: ServerMemoryPermissionStore;
   private readonly editorPanels = new Map<string, EditorEndpoint>();
   private lastFocusedContextViewId: string | null = null;
+  private focusedChatSurface: WebviewInstanceContext['surface'] | null = null;
   private readonly permissionModeQueues = new Map<string, Promise<unknown>>();
   private readonly sessionSelectionUpdatedAt = new Map<string, number>();
   private readonly sessionTransfers = new Map<
@@ -315,6 +346,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private readonly permissionAutomationOwnerWorkspaces = new Map<string, string>();
   private readonly permissionAutomationLeases = new Map<string, number>();
   private nextPermissionAutomationLease = 0;
+  private readonly unownedPermissionActionables = new Set<string>();
   private interruptedRecoveryClaim: {
     claimId: number;
     sessionIds: string[];
@@ -397,7 +429,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     };
     this.bridge = new SidebarProviderBridge(extensionUri);
     this.sessionTrash = new SessionTrashManager(persistence);
-    this.pinnedSessions = new PinnedSessionManager(persistence);
+    this.pinnedSessions = new PinnedSessionManager(persistence, (sessionIds) => {
+      // A timed-out RPC can still finish persisting. Keep every view authoritative
+      // independently of whether its original response is still being awaited.
+      this.post({ type: 'pinned-sessions/sync', payload: { sessionIds } });
+    });
+    this.todoSessions = new TodoSessionManager(persistence, (sessionIds) => {
+      this.post({ type: 'todo-sessions/sync', payload: { sessionIds } });
+    });
     this.queuedMessages = new QueuedMessageStore(persistence);
     this.sessionPermissionModes = new SessionPermissionModeStore(persistence);
     this.sessionSelectedModels = new SessionModelSelectionStore(persistence);
@@ -457,13 +496,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           );
         },
         onSessionDirectoryChange: () => this.scheduleSessionDirectoryReconciliation(),
+        isCatalogSessionInWorkspace: (sessionID, workspacePath) =>
+          this.isCatalogSessionInWorkspace(sessionID, workspacePath),
       },
       {
         shouldShow: (sessionID) =>
-          this.sessionState.getSessionWorkspaceMatch(
+          (this.sessionState.getSessionWorkspaceMatch(
             sessionID,
             this.contextProvider.context.workspacePath
-          ) !== false && !this.isAnyChatVisible(),
+          ) !== false ||
+            this.isCatalogSessionInWorkspace(
+              sessionID,
+              this.contextProvider.context.workspacePath
+            )) &&
+          !this.isAnyChatVisible(),
       }
     );
     this.attentionNotifications = new AttentionNotifications(
@@ -506,10 +552,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             !this.sessionTrash.isHidden(rootID) &&
             !this.hiddenSessions.isHidden(sessionID) &&
             !this.hiddenSessions.isHidden(rootID) &&
-            this.sessionState.getSessionWorkspaceMatch(
+            (this.sessionState.getSessionWorkspaceMatch(
               sessionID,
               this.contextProvider.context.workspacePath
-            ) !== false
+            ) !== false ||
+              this.isCatalogSessionInWorkspace(
+                sessionID,
+                this.contextProvider.context.workspacePath
+              ))
           );
         },
         titleFor: (sessionID) => this.sessionState.titleFor(sessionID),
@@ -602,6 +652,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           .getConfiguration('varro', repository)
           .get<string>('commitMessage.rules', '')
     );
+    this.walkthroughService = new WalkthroughService(
+      server,
+      () => this.runtime.ensureServerStarted(),
+      () => this.contextProvider.context.workspacePath || undefined,
+      () => this.activeChatModel,
+      () => vscode.workspace.getConfiguration('varro').get<string>('review.model', ''),
+      async (content, title) => {
+        const uri = await this.openMarkdownDocument(content, title, false);
+        if (!uri) throw new Error('Could not open the generated walkthrough.');
+        return uri;
+      }
+    );
 
     this.serverEventBridge = new ServerEventBridge(
       server,
@@ -663,6 +725,56 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.restProxy = sidebarEndpoint.restProxy;
     this.messageRouter = sidebarEndpoint.messageRouter;
 
+    this.promptCacheWarmingMode = readPromptCacheWarmingMode();
+    this.promptCacheWarming = new PromptCacheWarming({
+      readMode: () => readPromptCacheWarmingMode(),
+      readDurationMs: () => readPromptCacheWarmingDurationMs(),
+      isAvailable: () => this.server.apiVersion === 2 && this.server.status.state === 'running',
+      isWarmable: (sessionID) =>
+        this.sessionState.rootSessionIdFor(sessionID) === sessionID &&
+        !this.hiddenSessions.isHidden(sessionID) &&
+        !this.sessionTrash.isHidden(sessionID),
+      isBusy: (sessionID) => this.sessionState.busy.has(sessionID),
+      directoryFor: (sessionID) => this.sessionState.directoryFor(sessionID),
+      generate: async (sessionID, directory, prompt, signal) => {
+        const response = await this.server.request(
+          'POST',
+          `/api/session/${encodeURIComponent(sessionID)}/generate`,
+          { prompt },
+          { directory, signal }
+        );
+        const tokens = asRecord(asRecord(asRecord(response)?.data)?.tokens);
+        const cache = asRecord(tokens?.cache);
+        return {
+          cacheRead: typeof cache?.read === 'number' ? cache.read : 0,
+          cacheWrite: typeof cache?.write === 'number' ? cache.write : 0,
+        };
+      },
+      readProviders: async (directory) => {
+        const catalog = asRecord(
+          await this.server.request('GET', '/config/providers', undefined, { directory })
+        );
+        if (!Array.isArray(catalog?.providers))
+          throw new Error('Invalid OpenCode provider catalog');
+        // SAFETY: The warming service reads only optional settings and IDs, each checked before use.
+        return catalog.providers as Provider[];
+      },
+      readOpenCodeWarming: async () => {
+        const config = asRecord(await this.server.request('GET', '/config'));
+        const warming = config?.warming;
+        return warming === true || asRecord(warming) !== null;
+      },
+      writeOpenCodeWarming: (value) => this.restProxy.updateGlobalWarming(value),
+      persistence,
+      learner: new PromptCacheLearner(globalPersistence),
+      post: (payload) => this.post({ type: 'warming/state', payload }),
+      logWarning: (message) => logger.warn(message),
+    });
+    this.promptCacheWarmingEvents = (event) => {
+      const parsed = parseServerEvent(event);
+      if (parsed) this.promptCacheWarming.handleServerEvent(parsed);
+    };
+
     this.windowStateDisposable = vscode.window.onDidChangeWindowState(() => {
       this.updateStatusBarItem();
       this.attentionNotifications.update();
@@ -686,6 +798,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (event.affectsConfiguration('varro.server.autoUpdate')) {
         this.updateStatusBarItem();
       }
+      if (
+        event.affectsConfiguration('varro.chat.promptCacheWarming') ||
+        event.affectsConfiguration('varro.chat.promptCacheWarmingMinutes')
+      ) {
+        const previousMode = this.promptCacheWarmingMode;
+        this.promptCacheWarmingMode = readPromptCacheWarmingMode();
+        // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Promise rejection boundary.
+        void this.promptCacheWarming.applySettings(previousMode).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          logger.warn(`Could not apply prompt cache warming settings: ${message}`);
+          void vscode.window.showWarningMessage(
+            `Could not update OpenCode's warming setting: ${message}`
+          );
+        });
+      }
       if (event.affectsConfiguration('varro.server.autoStart')) {
         // Activation's configuration listener applies launch settings after this listener.
         queueMicrotask(() => {
@@ -703,6 +830,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         event.affectsConfiguration('varro.chat.fontSize') ||
         event.affectsConfiguration('varro.chat.showChangedFiles') ||
         event.affectsConfiguration('varro.chat.showTurnTimer') ||
+        event.affectsConfiguration('varro.chat.promptCacheWarningTokens') ||
         event.affectsConfiguration('varro.chat.showEmptyStateHistogram') ||
         event.affectsConfiguration('varro.chat.remoteImages') ||
         event.affectsConfiguration('varro.chat.promptCompletionModel') ||
@@ -725,6 +853,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
 
     this.serverEventBridge.attach();
+    // After the bridge, so session state already reflects an event when warming reads it.
+    server.on('event', this.promptCacheWarmingEvents);
   }
 
   private createEndpoint(
@@ -760,6 +890,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const post = (message: ExtensionMessage) => bridge.post(message);
     const fileSearch =
       webviewContext.surface === 'sidebar' ? this.fileSearch : new FileSearchService();
+    const markEndpointNotReady = () => {
+      if (endpointRef.endpoint) {
+        endpointRef.endpoint.selectedProviderID = undefined;
+        this.setEndpointReady(endpointRef.endpoint, false);
+      }
+      this.updateProviderLimitExclusions();
+    };
 
     const webviewSession = new WebviewSession(
       bridge,
@@ -796,6 +933,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         sessionPlanState: () => this.sessionPlanState.list(),
         sessionReadState: () => this.sessionReadState.list(),
         sessionPlanAgents: () => this.sessionPlanState.listAgents(),
+        todoSessionIds: () => this.todoSessions.list(),
         sessionModelMigrationPending: () => this.sessionSelectedModels.needsMigration(),
         modelPreferences: () =>
           this.modelPreferences.needsMigration() ? undefined : this.modelPreferences.get(),
@@ -808,20 +946,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         flushPendingServerEvents: () => this.serverEventBridge.flushPendingEvents(),
         cancelApiRequestsBeforeGeneration: (generation) =>
           endpointRef.restProxy?.cancelRequestsBeforeGeneration(generation),
-        handleDisposedSideEffects: () => {
-          if (endpointRef.endpoint) {
-            endpointRef.endpoint.selectedProviderID = undefined;
-            this.setEndpointReady(endpointRef.endpoint, false);
-          }
-          this.updateProviderLimitExclusions();
-        },
-        handleUnavailableSideEffects: () => {
-          if (endpointRef.endpoint) {
-            endpointRef.endpoint.selectedProviderID = undefined;
-            this.setEndpointReady(endpointRef.endpoint, false);
-          }
-          this.updateProviderLimitExclusions();
-        },
+        handleDisposedSideEffects: markEndpointNotReady,
+        handleUnavailableSideEffects: markEndpointNotReady,
         editorContext: getEndpointContext,
       },
       webviewContext,
@@ -861,6 +987,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       sessionState: this.sessionState,
       sessionTrash: this.sessionTrash,
       pinnedSessions: this.pinnedSessions,
+      todoSessions: this.todoSessions,
       hiddenSessions: this.hiddenSessions,
       internalHelperCleanupCoordinator: this.internalHelperCleanupCoordinator,
       autoApproveJudge: this.autoApproveJudge,
@@ -944,9 +1071,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           return false;
         }
         const directory = sessionID ? this.sessionState.directoryFor(sessionID) : undefined;
-        const permissionWorkspace =
-          request.workspaceDirectory ??
-          (directory ? (this.getOpenSessionDirectory(directory) ?? undefined) : undefined);
+        // Same owning-root order as permissionAutomationOwnerForSession: an exact open root
+        // wins over a catalog root that also contains the session, as with nested roots.
+        const exactWorkspace = directory ? this.getOpenSessionDirectory(directory) : null;
+        const permissionWorkspace = exactWorkspace ?? request.workspaceDirectory;
         return normalizeWorkspaceIdentity(permissionWorkspace) === workspace;
       },
       beginQueuedMessageDispatchClaim: async (sessionId, itemId, lease, requestId, messageId) =>
@@ -1027,6 +1155,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           rules,
           directory ?? endpointServer.getWorkspaceCwd()
         ),
+      openReferencedSession: async (session) => {
+        if (this.disposing) return;
+        await vscode.commands.executeCommand(
+          'vscode.openFolder',
+          vscode.Uri.file(session.directory),
+          {
+            forceNewWindow: true,
+          }
+        );
+      },
       activateSession: async (sessionID, directory, catalogRoot, signal) => {
         const workspacePath = this.getOpenSessionDirectory(catalogRoot);
         if (!workspacePath) throw new Error('Session workspace folder is not open');
@@ -1046,9 +1184,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         ) {
           if (session?.id === sessionID && typeof session.directory === 'string') {
             await this.handleSessionTransfer(sessionID, session.directory);
-            throw new Error(
-              `Conversation moved to ${session.directory}. Open its folder to continue.`
-            );
+            throw new Error(`Conversation moved to ${session.directory}. Try again.`);
           }
           throw new Error('404 Session not found');
         }
@@ -1130,6 +1266,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
               if (endpoint !== endpointRef.endpoint) endpoint.focused = false;
             }
           }
+          this.syncChatFocusContext();
           this.attentionNotifications.update();
         },
         revealPermission: (permissionId) => this.revealPermission(permissionId),
@@ -1195,7 +1332,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             const ready = await webviewSession.handleReady(documentId);
             if (!ready) return;
             if (endpointRef.endpoint) {
-              this.setEndpointReady(endpointRef.endpoint, true);
+              this.setEndpointReady(
+                endpointRef.endpoint,
+                endpointRef.endpoint.surface !== 'editor' || bridge.isVisible()
+              );
               if (endpointRef.endpoint.surface === 'editor') {
                 const editorEndpoint = endpointRef.endpoint as EditorEndpoint;
                 editorEndpoint.restoringSessionId = undefined;
@@ -1295,6 +1435,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         openNewWindow: () => this.openNewWindow(),
         editorRouteChanged: (route) => this.editorRouteChanged(webviewContext.viewId, route),
         handleRalphMessage: (msg) => this.ralphHost.handleMessage(msg),
+        handleWarmingMessage: (msg) => {
+          if (msg.type === 'warming/set') {
+            this.promptCacheWarming.setSessionWarm(msg.payload.sessionId, msg.payload.enabled);
+          } else if (msg.type === 'warming/samples') {
+            this.promptCacheWarming.recordHistory(msg.payload.sessionId, msg.payload.samples);
+          } else this.promptCacheWarming.sync();
+        },
         updateQueuedMessages: ({ messages, mutationId }) =>
           this.updateQueuedMessages(webviewContext.viewId, messages, mutationId),
         claimQueuedMessage: (payload) => this.claimQueuedMessage(webviewContext.viewId, payload),
@@ -1483,6 +1630,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = '<p>Failed to load Varro webview. Please reload.</p>';
       }
     });
+  }
+
+  // Webview focus never reaches VS Code's focusedView or auxiliaryBarFocus keys, so keybindings
+  // need Varro's own keys to tell whether a chat has focus.
+  private syncChatFocusContext() {
+    const surface = [...this.endpoints].find((endpoint) => endpoint.focused)?.surface ?? null;
+    if (surface === this.focusedChatSurface) return;
+    this.focusedChatSurface = surface;
+    void vscode.commands.executeCommand('setContext', CHAT_FOCUSED_CONTEXT, surface !== null);
+    void vscode.commands.executeCommand(
+      'setContext',
+      FOCUSED_CHAT_SURFACE_CONTEXT,
+      surface ?? undefined
+    );
   }
 
   private async notificationWindowUrl(sessionID: string): Promise<string> {
@@ -1745,7 +1906,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       SidebarProvider.editorViewType,
       this.editorTitle(route),
       { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
-      { enableScripts: true, retainContextWhenHidden: false }
+      { enableScripts: true, retainContextWhenHidden: true }
     );
     await this.attachEditorPanel(panel, route, `editor-${Date.now()}-${++this.nextEditorId}`);
     return panel;
@@ -1797,12 +1958,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
     this.editorPanels.set(key, editorEndpoint);
     this.postEditorTabsState();
+    const retainsContext = panel.options.retainContextWhenHidden === true;
     let wasVisible = panel.visible;
     const viewStateDisposable = panel.onDidChangeViewState(({ webviewPanel }) => {
       if (this.disposing) return;
       if (webviewPanel.visible === wasVisible) return;
       wasVisible = webviewPanel.visible;
-      if (webviewPanel.visible) {
+      if (retainsContext) {
+        // Hidden editors retain their document and requests, but hand off automation and queues.
+        this.setEndpointReady(endpoint, webviewPanel.visible && endpoint.webviewSession.isReady);
+      } else if (webviewPanel.visible) {
+        // VS Code restores older tabs with their original, immutable panel options.
         endpoint.webviewSession.resume();
       } else {
         this.setEndpointReady(endpoint, false);
@@ -1820,6 +1986,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
       if (removed) this.postEditorTabsState();
       this.endpoints.delete(endpoint);
+      this.syncChatFocusContext();
       this.updateProviderLimitExclusions();
       this.setEndpointReady(endpoint, false);
       endpoint.contextFilesState.clearContextFiles();
@@ -1836,7 +2003,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
     editorEndpoint.panelDisposables.push(viewStateDisposable, disposeDisposable);
     await endpoint.webviewSession.resolve(panel);
-    if (!panel.visible) endpoint.webviewSession.suspend();
+    if (!retainsContext && !panel.visible) endpoint.webviewSession.suspend();
   }
 
   private editorRouteChanged(viewId: string, route: WebviewRoute) {
@@ -1998,6 +2165,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       void this.recoverPendingPermissionModeFallbacks();
     }
     if (msg.type === 'server/event') this.postQueuedSessionStatus(msg.payload);
+    if (msg.type === 'server/event') this.clearTodoSessionForEvent(msg.payload);
     if (msg.type === 'server/event') this.releaseDeletedEditorRestorations(msg.payload);
     if (msg.type === 'server/event') this.removeDeletedSessionPersistence(msg.payload);
     if (msg.type === 'server/event' && this.shouldDeferWorkspaceEvent(msg.payload)) {
@@ -2167,7 +2335,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     });
     for (const endpoint of affected) {
       if (!this.endpoints.has(endpoint)) continue;
-      endpoint.restProxy.invalidateSessionCatalog();
+      endpoint.restProxy.invalidateSessionCatalog({ movedSessionID: sessionId });
       const available = await endpoint.restProxy.authorizeSessionDirectory(sessionId, directory);
       if (
         this.disposing ||
@@ -2209,7 +2377,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     for (const endpoint of this.endpoints) {
       endpoint.restProxy.cancelRequestsOutsideDirectories(workspaceDirectories);
     }
-    this.sessionState.removeSessionsOutsideWorkspaceDirectories(workspaceDirectories);
+    this.sessionState.removeSessionsOutsideWorkspaceDirectories(workspaceDirectories, (sessionID) =>
+      [...this.endpoints].some((endpoint) => {
+        const catalogRoot = endpoint.restProxy.getAuthorizedSessionOwningRoot(sessionID);
+        return Boolean(
+          catalogRoot && workspaceDirectories.some((root) => isSameWorkspacePath(root, catalogRoot))
+        );
+      })
+    );
     const fallbackWorkspacePath = context.workspacePath
       ? this.contextProvider.getOpenWorkspaceRoot(context.workspacePath)
       : workspaceDirectories[0];
@@ -2245,7 +2420,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
       if (
         endpoint.surface === 'editor' &&
-        !endpoint.ready &&
+        !endpoint.webviewSession.isReady &&
         !endpoint.bridge.isVisible() &&
         (msg.type === 'server/event' || msg.type === 'context/update')
       ) {
@@ -2291,7 +2466,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       sessionIDs.length > 0 &&
       sessionIDs.every((sessionID) =>
         attentionEvent
-          ? endpoint.restProxy.isSessionCatalogInventoryAuthorized(sessionID, directory)
+          ? endpoint.restProxy.isSessionCatalogInventoryAuthorized(sessionID, directory) &&
+            // Attention follows the session's catalog root, as pending snapshots do; another
+            // root's view would show the prompt and then drop it on its next snapshot.
+            (!endpoint.workspacePath ||
+              isSameWorkspacePath(
+                endpoint.restProxy.getAuthorizedSessionOwningRoot(sessionID),
+                endpoint.workspacePath
+              ))
           : endpoint.restProxy.isSessionCatalogEventAuthorized(sessionID, directory)
       );
     if (
@@ -2326,10 +2508,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       .refreshSessionCatalogEventAuthorization(sessionIDs, directory)
       .then((authorized) => {
         if (!authorized || !this.endpoints.has(endpoint)) return;
+        // Authorization can finish after the request was answered; a late ask must not
+        // resurrect a prompt whose reply already reached this view.
+        if (this.isResolvedAttentionAsk(msg.payload)) return;
         const projected = this.projectEventForEndpoint(msg, endpoint);
         if (projected) endpoint.bridge.post(projected);
       })
       .catch(() => undefined);
+  }
+
+  private isResolvedAttentionAsk(event: ServerEvent) {
+    if (!ATTENTION_ASK_EVENT_TYPES.has(event.type)) return false;
+    const properties = asRecord(event.properties);
+    const props = asRecord(properties?.info) ?? properties;
+    const id = [props?.id, props?.requestID, props?.permissionID].find(
+      (value): value is string => typeof value === 'string' && value.length > 0
+    );
+    return Boolean(id && !this.sessionState.pending.has(id));
   }
 
   private getEventDirectory(event: ServerEvent, sessionIDs: readonly string[]) {
@@ -2394,6 +2589,42 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  /** A todo marker lasts until the next prompt reaches the session, or the session is deleted. */
+  private clearTodoSessionForEvent(event: ServerEvent) {
+    let pending: Promise<string[]> | undefined;
+    if (event.type === 'session.deleted') {
+      const sessionId = event.properties?.info?.id || event.properties?.sessionID;
+      if (sessionId) pending = this.todoSessions.remove(sessionId);
+    } else if (event.type === 'session.next.prompt.admitted') {
+      const sessionId = event.properties?.sessionID;
+      const timestamp = event.properties?.timestamp;
+      if (sessionId) {
+        pending = this.todoSessions.clearForPrompt(
+          sessionId,
+          typeof timestamp === 'number' ? timestamp : Date.now()
+        );
+      }
+    } else if (event.type === 'message.updated') {
+      const info = asRecord(event.properties?.info);
+      const created = asRecord(info?.time)?.created;
+      if (
+        info?.role === 'user' &&
+        typeof info.sessionID === 'string' &&
+        typeof created === 'number'
+      ) {
+        pending = this.todoSessions.clearForPrompt(info.sessionID, created);
+      }
+    }
+    void pending?.catch(
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Promise rejection reasons are normalized for logging at this boundary.
+      (error: unknown) => {
+        logger.warn(
+          `Failed to update todo session marker: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    );
+  }
+
   private postQueuedSessionStatus(event: ServerEvent) {
     let sessionId: string | undefined;
     let status: 'busy' | 'idle' | undefined;
@@ -2401,6 +2632,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       sessionId = event.properties?.sessionID;
       const statusType = event.properties?.status?.type;
       if (statusType === 'busy' || statusType === 'idle') status = statusType;
+      else if (statusType === 'retry') status = 'busy';
     } else if (event.type === 'session.idle') {
       sessionId = event.properties?.sessionID;
       status = 'idle';
@@ -2613,7 +2845,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this.permissionAutomationOwnerWorkspaces.set(viewId, workspace);
     }
     for (const endpoint of this.endpoints) {
-      if (!endpoint.ready) continue;
+      if (!endpoint.webviewSession.isReady) continue;
       endpoint.bridge.post({
         type: 'permission-automation/update',
         payload: this.permissionAutomationFor(endpoint.viewId),
@@ -2624,9 +2856,29 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private postPendingPermissionActionables() {
+    for (const permissionId of this.unownedPermissionActionables) {
+      if (!this.sessionState.pending.has(permissionId)) {
+        this.unownedPermissionActionables.delete(permissionId);
+      }
+    }
     for (const [permissionId, request] of this.sessionState.pending) {
       if (request.kind !== 'permission') continue;
-      this.permissionAutomationOwnerForSession(request.sessionID)?.bridge.post({
+      const owner = this.permissionAutomationOwnerForSession(request.sessionID);
+      if (!owner) {
+        const directory = this.sessionState.directoryFor(request.sessionID);
+        // Requests from other windows' folders have no owner here by design. Log
+        // each one once so a missing prompt stays diagnosable without log noise.
+        if (directory && !this.unownedPermissionActionables.has(permissionId)) {
+          this.unownedPermissionActionables.add(permissionId);
+          logger.info(
+            `Permission ${permissionId} for session ${request.sessionID} in ${directory} ` +
+              'has no permission owner view in this window'
+          );
+        }
+        continue;
+      }
+      this.unownedPermissionActionables.delete(permissionId);
+      owner.bridge.post({
         type: 'permission/actionable',
         payload: { permissionId },
       });
@@ -2635,11 +2887,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   private permissionAutomationOwnerForSession(sessionID: string) {
     const directory = this.sessionState.directoryFor(sessionID);
-    if (!directory) return undefined;
     const owners = [...this.endpoints].filter(
       (endpoint) => endpoint.ready && this.permissionAutomationOwnerViewIds.has(endpoint.viewId)
     );
-    return owners.find((endpoint) => isSameWorkspacePath(endpoint.workspacePath, directory));
+    // The lease check resolves the same owning root: an exact open root, else the catalog root.
+    // A session in an open root belongs only to that root, even while no view there is ready.
+    const exactRoot = directory ? this.getOpenSessionDirectory(directory) : null;
+    if (exactRoot) {
+      return owners.find((endpoint) => isSameWorkspacePath(endpoint.workspacePath, exactRoot));
+    }
+    // Nested folders, project worktrees, and moved conversations belong to the open root
+    // whose session catalog authorizes them.
+    return owners.find((endpoint) => {
+      const catalogRoot = endpoint.restProxy.getAuthorizedSessionOwningRoot(sessionID);
+      return Boolean(catalogRoot && isSameWorkspacePath(catalogRoot, endpoint.workspacePath));
+    });
   }
 
   private reconcileInterruptedRecoveryOwners(owners: WebviewEndpoint[]) {
@@ -2889,87 +3151,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private updateConfirmedPermissionMode(
-    sessionID: string,
-    mode: PermissionMode,
-    directory?: string,
-    recoverFallback = false,
-    defaultPermission?: PermissionRule[]
-  ) {
+  /** Serializes session permission writes; a failed predecessor does not block the next one. */
+  private enqueuePermissionModeOperation<T>(sessionID: string, run: () => Promise<T>): Promise<T> {
     const previous = this.permissionModeQueues.get(sessionID) ?? Promise.resolve();
-    const operation = previous
-      .catch(() => undefined)
-      .then(async () => {
-        if (
-          recoverFallback &&
-          !this.sessionPermissionModes.pendingSafeFallbackSessionIds().includes(sessionID)
-        ) {
-          return;
-        }
-        try {
-          await this.sessionPermissionModes.stageSafeFallback(sessionID);
-        } catch (err) {
-          this.postPermissionModes();
-          this.schedulePermissionModeFallbackRecovery();
-          throw err;
-        }
-        this.postPermissionModes();
-        let session: unknown;
-        try {
-          const permission =
-            mode === 'default'
-              ? (defaultPermission ?? getSafeDefaultPermissionRules())
-              : getSessionPermissionRulesForMode(mode, 'update');
-          session = await this.patchSessionPermissionMode(
-            sessionID,
-            mode,
-            directory,
-            permission,
-            recoverFallback
-          );
-        } catch (err) {
-          this.postPermissionModes();
-          this.schedulePermissionModeFallbackRecovery();
-          throw err;
-        }
-        try {
-          const modes = await this.sessionPermissionModes.set(
-            sessionID,
-            mode,
-            asRecord(session) ?? undefined
-          );
-          this.postPermissionModes(modes);
-        } catch (err) {
-          logger.warn(
-            `Failed to persist confirmed permission mode: ${err instanceof Error ? err.message : String(err)}`
-          );
-          this.postPermissionModes();
-          try {
-            const recovered = await this.patchSessionPermissionMode(
-              sessionID,
-              'default',
-              directory,
-              getSafeDefaultPermissionRules(),
-              recoverFallback
-            );
-            await this.sessionPermissionModes.set(
-              sessionID,
-              'default',
-              asRecord(recovered) ?? undefined
-            );
-            this.postPermissionModes();
-          } catch (recoveryError) {
-            logger.warn(
-              `Could not immediately restore safe permission rules: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`
-            );
-            this.schedulePermissionModeFallbackRecovery();
-          }
-          throw new Error('Permission mode was not saved; safe default recovery is in progress', {
-            cause: err,
-          });
-        }
-        return session;
-      });
+    const operation = previous.catch(() => undefined).then(run);
     this.permissionModeQueues.set(sessionID, operation);
     const clearQueue = () => {
       if (this.permissionModeQueues.get(sessionID) === operation) {
@@ -2978,6 +3163,86 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     };
     void operation.then(clearQueue, clearQueue);
     return operation;
+  }
+
+  private updateConfirmedPermissionMode(
+    sessionID: string,
+    mode: PermissionMode,
+    directory?: string,
+    recoverFallback = false,
+    defaultPermission?: PermissionRule[]
+  ) {
+    return this.enqueuePermissionModeOperation(sessionID, async () => {
+      if (
+        recoverFallback &&
+        !this.sessionPermissionModes.pendingSafeFallbackSessionIds().includes(sessionID)
+      ) {
+        return;
+      }
+      try {
+        await this.sessionPermissionModes.stageSafeFallback(sessionID);
+      } catch (err) {
+        this.postPermissionModes();
+        this.schedulePermissionModeFallbackRecovery();
+        throw err;
+      }
+      this.postPermissionModes();
+      let session: unknown;
+      try {
+        const permission =
+          mode === 'default'
+            ? (defaultPermission ?? getSafeDefaultPermissionRules())
+            : getSessionPermissionRulesForMode(mode, 'update');
+        session = await this.patchSessionPermissionMode(
+          sessionID,
+          mode,
+          directory,
+          permission,
+          recoverFallback
+        );
+      } catch (err) {
+        this.postPermissionModes();
+        this.schedulePermissionModeFallbackRecovery();
+        throw err;
+      }
+      try {
+        const modes = await this.sessionPermissionModes.set(
+          sessionID,
+          mode,
+          asRecord(session) ?? undefined
+        );
+        this.postPermissionModes(modes);
+      } catch (err) {
+        logger.warn(
+          `Failed to persist confirmed permission mode: ${err instanceof Error ? err.message : String(err)}`
+        );
+        this.postPermissionModes();
+        try {
+          const recovered = await this.patchSessionPermissionMode(
+            sessionID,
+            'default',
+            directory,
+            getSafeDefaultPermissionRules(),
+            recoverFallback
+          );
+          await this.sessionPermissionModes.set(
+            sessionID,
+            'default',
+            asRecord(recovered) ?? undefined
+          );
+          this.postPermissionModes();
+        } catch (recoveryError) {
+          logger.warn(
+            `Could not immediately restore safe permission rules: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`
+          );
+          this.schedulePermissionModeFallbackRecovery();
+        }
+        throw new Error('Permission mode was not saved; safe default recovery is in progress', {
+          cause: err,
+        });
+      }
+      return session;
+    });
   }
 
   private restoreSessionSelections(
@@ -3013,63 +3278,53 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     selectionId?: string
   ): Promise<void> {
     // Share the permission update queue so concurrent selections cannot overwrite each other's metadata.
-    const previous = this.permissionModeQueues.get(sessionId) ?? Promise.resolve();
-    const operation = previous
-      .catch(() => undefined)
-      .then(async () => {
-        const path = `/session/${encodeURIComponent(sessionId)}`;
-        const session = asRecord(await this.server.request('GET', path, undefined, { directory }));
-        if (session?.id !== sessionId) throw new Error('Cannot verify session selection metadata');
-        const metadata = mergeVarroSessionMetadata(session.metadata, selection);
-        const currentModel = readSessionModelMetadata(session.metadata);
-        const model = selection.model;
-        const modelChanged =
-          model &&
-          (currentModel?.providerID !== model.providerID ||
-            currentModel.modelID !== model.modelID ||
-            currentModel.variant !== model.variant);
-        const agentChanged =
-          selection.agent && readSessionAgentMetadata(session.metadata) !== selection.agent;
-        let updatedAt = asRecord(session.time)?.updated;
-        if (modelChanged || agentChanged) {
-          const updatedSession = asRecord(
-            await this.server.request('PATCH', path, { metadata }, { directory })
-          );
-          updatedAt = asRecord(updatedSession?.time)?.updated ?? updatedAt;
-        }
-        if (selection.model) {
-          await this.sessionSelectedModels.set(sessionId, selection.model);
-          this.post({
-            type: 'session-models/sync',
-            payload: {
-              models: this.sessionSelectedModels.list(),
-              acknowledgement: selectionId ? { sessionId, selectionId } : undefined,
-            },
-          });
-        }
-        if (selection.agent) {
-          await this.sessionPlanState.setAgent(sessionId, selection.agent);
-          this.sessionState.setSessionAgent(sessionId, selection.agent);
-          const update: Extract<ExtensionMessage, { type: 'session-plan-state/update' }> = {
-            type: 'session-plan-state/update',
-            payload: { sessionId, agent: selection.agent },
-          };
-          if (selectionId) update.payload.selectionId = selectionId;
-          this.post(update);
-        }
-        this.restoreSessionSelections(
-          sessionId,
-          metadata,
-          typeof updatedAt === 'number' ? updatedAt : undefined
+    return this.enqueuePermissionModeOperation(sessionId, async () => {
+      const path = `/session/${encodeURIComponent(sessionId)}`;
+      const session = asRecord(await this.server.request('GET', path, undefined, { directory }));
+      if (session?.id !== sessionId) throw new Error('Cannot verify session selection metadata');
+      const metadata = mergeVarroSessionMetadata(session.metadata, selection);
+      const currentModel = readSessionModelMetadata(session.metadata);
+      const model = selection.model;
+      const modelChanged =
+        model &&
+        (currentModel?.providerID !== model.providerID ||
+          currentModel.modelID !== model.modelID ||
+          currentModel.variant !== model.variant);
+      const agentChanged =
+        selection.agent && readSessionAgentMetadata(session.metadata) !== selection.agent;
+      let updatedAt = asRecord(session.time)?.updated;
+      if (modelChanged || agentChanged) {
+        const updatedSession = asRecord(
+          await this.server.request('PATCH', path, { metadata }, { directory })
         );
-      });
-    this.permissionModeQueues.set(sessionId, operation);
-    const clearQueue = () => {
-      if (this.permissionModeQueues.get(sessionId) === operation)
-        this.permissionModeQueues.delete(sessionId);
-    };
-    void operation.then(clearQueue, clearQueue);
-    return operation;
+        updatedAt = asRecord(updatedSession?.time)?.updated ?? updatedAt;
+      }
+      if (selection.model) {
+        await this.sessionSelectedModels.set(sessionId, selection.model);
+        this.post({
+          type: 'session-models/sync',
+          payload: {
+            models: this.sessionSelectedModels.list(),
+            acknowledgement: selectionId ? { sessionId, selectionId } : undefined,
+          },
+        });
+      }
+      if (selection.agent) {
+        await this.sessionPlanState.setAgent(sessionId, selection.agent);
+        this.sessionState.setSessionAgent(sessionId, selection.agent);
+        const update: Extract<ExtensionMessage, { type: 'session-plan-state/update' }> = {
+          type: 'session-plan-state/update',
+          payload: { sessionId, agent: selection.agent },
+        };
+        if (selectionId) update.payload.selectionId = selectionId;
+        this.post(update);
+      }
+      this.restoreSessionSelections(
+        sessionId,
+        metadata,
+        typeof updatedAt === 'number' ? updatedAt : undefined
+      );
+    });
   }
 
   private async patchSessionPermissionMode(
@@ -3115,45 +3370,34 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     patterns: string[],
     directory?: string
   ): Promise<void> {
-    const previous = this.permissionModeQueues.get(sessionID) ?? Promise.resolve();
-    const operation = previous
-      .catch(() => undefined)
-      .then(async () => {
-        const session = asRecord(
-          await this.server.request('GET', `/session/${encodeURIComponent(sessionID)}`, undefined, {
-            directory,
-          })
-        );
-        if (session?.id !== sessionID) throw new Error('404 Session not found');
-        const existing = Array.isArray(session.permission) ? session.permission : [];
-        const additions = patterns
-          .filter(
-            (pattern) =>
-              !existing.some((value) => {
-                const rule = asRecord(value);
-                return (
-                  rule?.permission === permission &&
-                  rule.pattern === pattern &&
-                  rule.action === 'allow'
-                );
-              })
-          )
-          .map((pattern) => ({ permission, pattern, action: 'allow' }));
-        await this.server.request(
-          'PATCH',
-          `/session/${encodeURIComponent(sessionID)}`,
-          { permission: [...existing, ...additions] },
-          { directory }
-        );
-      });
-    this.permissionModeQueues.set(sessionID, operation);
-    const clearQueue = () => {
-      if (this.permissionModeQueues.get(sessionID) === operation) {
-        this.permissionModeQueues.delete(sessionID);
-      }
-    };
-    void operation.then(clearQueue, clearQueue);
-    return operation;
+    return this.enqueuePermissionModeOperation(sessionID, async () => {
+      const session = asRecord(
+        await this.server.request('GET', `/session/${encodeURIComponent(sessionID)}`, undefined, {
+          directory,
+        })
+      );
+      if (session?.id !== sessionID) throw new Error('404 Session not found');
+      const existing = Array.isArray(session.permission) ? session.permission : [];
+      const additions = patterns
+        .filter(
+          (pattern) =>
+            !existing.some((value) => {
+              const rule = asRecord(value);
+              return (
+                rule?.permission === permission &&
+                rule.pattern === pattern &&
+                rule.action === 'allow'
+              );
+            })
+        )
+        .map((pattern) => ({ permission, pattern, action: 'allow' }));
+      await this.server.request(
+        'PATCH',
+        `/session/${encodeURIComponent(sessionID)}`,
+        { permission: [...existing, ...additions] },
+        { directory }
+      );
+    });
   }
 
   private updatePermissionRulesForSession(
@@ -3161,26 +3405,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     rules: PermissionRule[],
     directory?: string
   ): Promise<PermissionRule[]> {
-    const previous = this.permissionModeQueues.get(sessionID) ?? Promise.resolve();
-    const operation = previous
-      .catch(() => undefined)
-      .then(async () => {
-        await this.server.request(
-          'PATCH',
-          `/session/${encodeURIComponent(sessionID)}`,
-          { permission: rules },
-          { directory }
-        );
-        return rules;
-      });
-    this.permissionModeQueues.set(sessionID, operation);
-    const clearQueue = () => {
-      if (this.permissionModeQueues.get(sessionID) === operation) {
-        this.permissionModeQueues.delete(sessionID);
-      }
-    };
-    void operation.then(clearQueue, clearQueue);
-    return operation;
+    return this.enqueuePermissionModeOperation(sessionID, async () => {
+      await this.server.request(
+        'PATCH',
+        `/session/${encodeURIComponent(sessionID)}`,
+        { permission: rules },
+        { directory }
+      );
+      return rules;
+    });
   }
 
   private persistPreconfiguredPermissionMode(
@@ -3189,71 +3422,56 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     directory?: string,
     ifAbsent = false
   ): Promise<void> {
-    const previous = this.permissionModeQueues.get(sessionID) ?? Promise.resolve();
-    const operation = previous
-      .catch(() => undefined)
-      .then(async () => {
-        if (ifAbsent && Object.hasOwn(this.sessionPermissionModes.list(), sessionID)) return;
-        if (ifAbsent) {
-          const session = asRecord(
-            await this.server.request(
-              'GET',
-              `/session/${encodeURIComponent(sessionID)}`,
-              undefined,
-              { directory }
-            )
-          );
-          if (session?.id !== sessionID)
-            throw new Error('Cannot verify session permission metadata');
-          if (this.sessionPermissionModes.restoreSessionMetadata(session)) {
-            this.postPermissionModes();
-            return;
-          }
-        }
-        try {
-          await this.sessionPermissionModes.stageSafeFallback(sessionID);
-        } catch (err) {
+    return this.enqueuePermissionModeOperation(sessionID, async () => {
+      if (ifAbsent && Object.hasOwn(this.sessionPermissionModes.list(), sessionID)) return;
+      if (ifAbsent) {
+        const session = asRecord(
+          await this.server.request('GET', `/session/${encodeURIComponent(sessionID)}`, undefined, {
+            directory,
+          })
+        );
+        if (session?.id !== sessionID) throw new Error('Cannot verify session permission metadata');
+        if (this.sessionPermissionModes.restoreSessionMetadata(session)) {
           this.postPermissionModes();
-          try {
-            await this.patchSessionPermissionMode(
-              sessionID,
-              'default',
-              directory,
-              getSafeDefaultPermissionRules()
-            );
-          } catch (recoveryError) {
-            logger.warn(
-              `Could not restore safe rules after fallback persistence failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`
-            );
-          }
-          this.schedulePermissionModeFallbackRecovery();
-          throw err;
+          return;
         }
+      }
+      try {
+        await this.sessionPermissionModes.stageSafeFallback(sessionID);
+      } catch (err) {
         this.postPermissionModes();
         try {
-          const session = await this.patchSessionPermissionMode(sessionID, mode, directory);
-          const modes = await this.sessionPermissionModes.set(
+          await this.patchSessionPermissionMode(
             sessionID,
-            mode,
-            asRecord(session) ?? undefined
+            'default',
+            directory,
+            getSafeDefaultPermissionRules()
           );
-          this.postPermissionModes(modes);
-        } catch (err) {
-          this.postPermissionModes();
-          this.schedulePermissionModeFallbackRecovery();
-          throw new Error('Permission mode was not saved; safe default recovery is in progress', {
-            cause: err,
-          });
+        } catch (recoveryError) {
+          logger.warn(
+            `Could not restore safe rules after fallback persistence failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`
+          );
         }
-      });
-    this.permissionModeQueues.set(sessionID, operation);
-    const clearQueue = () => {
-      if (this.permissionModeQueues.get(sessionID) === operation) {
-        this.permissionModeQueues.delete(sessionID);
+        this.schedulePermissionModeFallbackRecovery();
+        throw err;
       }
-    };
-    void operation.then(clearQueue, clearQueue);
-    return operation;
+      this.postPermissionModes();
+      try {
+        const session = await this.patchSessionPermissionMode(sessionID, mode, directory);
+        const modes = await this.sessionPermissionModes.set(
+          sessionID,
+          mode,
+          asRecord(session) ?? undefined
+        );
+        this.postPermissionModes(modes);
+      } catch (err) {
+        this.postPermissionModes();
+        this.schedulePermissionModeFallbackRecovery();
+        throw new Error('Permission mode was not saved; safe default recovery is in progress', {
+          cause: err,
+        });
+      }
+    });
   }
 
   private updateEditorPanelTitles() {
@@ -3440,9 +3658,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  openSkillSettings() {
+    this.webviewSession.queueCommand({ type: 'command/open-skill-settings' });
+  }
+
+  openMcpSettings() {
+    this.webviewSession.queueCommand({ type: 'command/open-mcp-settings' });
+  }
+
   switchSession(direction: 'previous' | 'next') {
     this.webviewSession.queueCommand({
       type: 'command/switch-session',
+      payload: { direction },
+    });
+  }
+
+  navigateHistory(direction: 'back' | 'forward') {
+    this.webviewSession.queueCommand({
+      type: 'command/navigate-history',
       payload: { direction },
     });
   }
@@ -3453,6 +3686,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   searchSessions() {
     this.webviewSession.searchSessions();
+  }
+
+  async walkThroughChanges(sourceControl?: vscode.SourceControl) {
+    await this.walkthroughService.run(sourceControl);
   }
 
   async generateCommitMessage(sourceControl?: vscode.SourceControl) {
@@ -3532,7 +3769,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
     this.sessionState.dispose();
     this.providerFileRefresh.beginDispose();
-    for (const endpoint of this.endpoints) this.setEndpointReady(endpoint, false);
+    for (const endpoint of this.endpoints) {
+      this.setEndpointReady(endpoint, false);
+      endpoint.focused = false;
+    }
+    this.syncChatFocusContext();
     for (const endpoint of this.editorPanels.values()) {
       this.setEndpointReady(endpoint, false);
       for (const disposable of endpoint.panelDisposables) disposable.dispose();
@@ -3551,6 +3792,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
     await this.webviewSession.dispose();
     await this.ralphHost.dispose();
+    this.server.off('event', this.promptCacheWarmingEvents);
+    this.promptCacheWarming.dispose();
     await this.serverEventBridge.dispose();
     await this.queuedMessages.dispose();
     await this.draftImages.dispose();
@@ -3974,6 +4217,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.updateSessionReconcileTimer();
     this.refreshOpenCodeVersionStatus();
     this.renderOpenCodeStatusBarItem();
+    this.updateViewBadge();
     const next = this.getStatusBarState();
     const nextKey = JSON.stringify(next);
     if (nextKey === this.lastStatusBarStateKey) return;
@@ -4264,17 +4508,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return this.hiddenStatusBarState ?? current;
   }
 
-  private getCurrentStatusBarState(): StatusBarState {
-    const idleState = {
-      visible: false as const,
-      action: 'focus' as const,
-    };
-    const pendingRequests = [...this.sessionState.pendingForUser.values()].filter(
+  /** Workspace permissions and questions waiting for the user outside every visible chat. */
+  private getUnseenPendingRequests() {
+    return [...this.sessionState.pendingForUser.values()].filter(
       (request) =>
         !this.isSessionAttentionVisible(request.sessionID) &&
         !this.sessionTrash.isHidden(request.sessionID) &&
         !this.hiddenSessions.isHidden(request.sessionID) &&
-        this.sessionState.isSessionVisibleInWorkspace(
+        (this.sessionState.isSessionVisibleInWorkspace(
           request.sessionID,
           this.contextProvider.context.workspacePath,
           this.contextProvider.context.workspaceDirectory,
@@ -4284,8 +4525,48 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
               this.contextProvider.context.workspaceDirectory
             )
           )
-        )
+        ) ||
+          this.isCatalogSessionInWorkspace(
+            request.sessionID,
+            this.contextProvider.context.workspacePath
+          ))
     );
+  }
+
+  /** Nested folders, project worktrees, and moved conversations belong to their catalog root. */
+  private isCatalogSessionInWorkspace(sessionID: string, workspacePath: string | null | undefined) {
+    if (!normalizeWorkspaceIdentity(workspacePath)) return false;
+    return [...this.endpoints].some((endpoint) => {
+      const catalogRoot = endpoint.restProxy.getAuthorizedSessionOwningRoot(sessionID);
+      return Boolean(catalogRoot && isSameWorkspacePath(catalogRoot, workspacePath));
+    });
+  }
+
+  /**
+   * Badges the Varro view icon with waiting requests, so they stay discoverable while the
+   * sidebar is collapsed or shows another session. Editor panels have no badge API.
+   */
+  private updateViewBadge() {
+    const view = this.bridge.getView();
+    if (!view || !('badge' in view)) return;
+    const count = this.getUnseenPendingRequests().length;
+    const value = view.badge?.value ?? 0;
+    if (value === count) return;
+    view.badge =
+      count > 0
+        ? {
+            value: count,
+            tooltip: `${count} ${count === 1 ? 'request' : 'requests'} waiting for your input`,
+          }
+        : undefined;
+  }
+
+  private getCurrentStatusBarState(): StatusBarState {
+    const idleState = {
+      visible: false as const,
+      action: 'focus' as const,
+    };
+    const pendingRequests = this.getUnseenPendingRequests();
     if (pendingRequests.length > 0) {
       return {
         visible: true,

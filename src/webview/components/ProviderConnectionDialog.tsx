@@ -1,14 +1,15 @@
+import { ariaBoolean } from '../lib/aria';
 import {
   For,
   Show,
   createEffect,
   createMemo,
   createSignal,
-  on,
   onCleanup,
-  onMount,
+  onSettled,
+  untrack,
 } from 'solid-js';
-import { Portal } from 'solid-js/web';
+import { Portal } from '@solidjs/web';
 import type {
   ProviderAuthMethod,
   ProviderAuthAuthorization,
@@ -19,12 +20,13 @@ import type { Provider } from '../types';
 import { postMessage } from '../lib/bridge';
 import { client } from '../lib/client';
 import { codexLoginWarningDismissal } from '../lib/codex-login-warning';
-import { trapModalFocus } from '../lib/modal-focus';
+import { modalFocus } from '../lib/modal-focus';
 import { resolveProviderAuthFailure } from '../lib/provider-connection-state';
 import { openProviderSetup } from '../lib/provider-setup';
 import { state } from '../lib/state';
-import { arrowLeftIcon, checkIcon, lockIcon, navArrowDownIcon, xmarkIcon } from '../lib/ui-icons';
+import { arrowLeftIcon, checkIcon, lockIcon, navArrowDownIcon } from '../lib/ui-icons';
 import { CopyIconButton } from './CopyIconButton';
+import { DialogCloseButton } from './DialogCloseButton';
 import { UiIcon } from './UiIcon';
 
 export function ProviderConnectionDialog(props: {
@@ -37,8 +39,9 @@ export function ProviderConnectionDialog(props: {
   reauthentication?: boolean;
   onClose: () => void;
 }) {
+  // Initial selection only; the user edits it from here.
   const [providerID, setProviderID] = createSignal<string | null>(
-    props.lockProvider ? props.initialProviderID?.trim() || null : null
+    untrack(() => (props.lockProvider ? props.initialProviderID?.trim() || null : null))
   );
   const [providerQuery, setProviderQuery] = createSignal('');
   const [activeProviderIndex, setActiveProviderIndex] = createSignal(0);
@@ -120,14 +123,20 @@ export function ProviderConnectionDialog(props: {
     props.onClose();
   }
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
       close();
     };
     document.addEventListener('keydown', onKeyDown);
-    onCleanup(() => document.removeEventListener('keydown', onKeyDown));
+    cleanups.push(() => document.removeEventListener('keydown', onKeyDown));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   function chooseProvider(id: string) {
@@ -142,25 +151,33 @@ export function ProviderConnectionDialog(props: {
     setErrorMessage('');
   }
 
-  createEffect(() => {
-    if (initialProviderApplied || props.isLoadingProviders) return;
-    initialProviderApplied = true;
-    const id = props.initialProviderID?.trim();
-    if (id && providers().some((provider) => provider.id === id)) {
-      chooseProvider(id);
-      const initialMethodID = props.initialMethodID;
-      if (initialMethodID) {
-        const index = selectedProvider()?.methods.findIndex(
+  createEffect(
+    () => ({
+      loading: props.isLoadingProviders,
+      id: props.initialProviderID?.trim(),
+      methodID: props.initialMethodID,
+      providerOptions: providers(),
+    }),
+    ({ loading, id, methodID, providerOptions }) => {
+      if (initialProviderApplied || loading) return;
+      initialProviderApplied = true;
+      // Applied once when providers load; later changes belong to the user's own selection.
+      untrack(() => {
+        const provider = providerOptions.find((option) => option.id === id);
+        if (!id || !provider) return;
+        chooseProvider(id);
+        if (!methodID) return;
+        const index = provider.methods.findIndex(
           (method) =>
-            method.id === initialMethodID ||
+            method.id === methodID ||
             (!method.id &&
-              initialMethodID === 'chatgpt-browser' &&
+              methodID === 'chatgpt-browser' &&
               authMethodPresentation(id, method).label === 'ChatGPT via Codex')
         );
-        if (index !== undefined && index >= 0) chooseMethod(index);
-      }
+        if (index >= 0) chooseMethod(index, provider.methods[index]);
+      });
     }
-  });
+  );
 
   function handleProviderSearchKeyDown(event: KeyboardEvent) {
     const options = filteredProviders();
@@ -181,12 +198,12 @@ export function ProviderConnectionDialog(props: {
     }
   }
 
-  function chooseMethod(index: number) {
+  function chooseMethod(index: number, method = selectedProvider()?.methods[index]) {
     cancelAuthorization();
     setMethodIndex(index);
     setInputs(
       Object.fromEntries(
-        (selectedMethod()?.prompts ?? []).flatMap((prompt) =>
+        (method?.prompts ?? []).flatMap((prompt) =>
           !prompt.hidden && prompt.default !== undefined ? [[prompt.key, prompt.default]] : []
         )
       )
@@ -405,7 +422,7 @@ export function ProviderConnectionDialog(props: {
     <Portal>
       <div class="provider-connect-overlay">
         <div
-          ref={(element) => onCleanup(trapModalFocus(element))}
+          ref={modalFocus()}
           class="provider-connect-dialog"
           role="dialog"
           aria-modal="true"
@@ -420,12 +437,10 @@ export function ProviderConnectionDialog(props: {
                 {(provider) => <div class="provider-connect-subtitle">{provider().name}</div>}
               </Show>
             </div>
-            <button type="button" class="provider-connect-close" onClick={close} aria-label="Close">
-              <UiIcon source={xmarkIcon} width={16} height={16} aria-hidden="true" />
-            </button>
+            <DialogCloseButton onClick={close} />
           </div>
 
-          <div class="provider-connect-body" classList={{ 'is-provider-list': !providerID() }}>
+          <div class={['provider-connect-body', { 'is-provider-list': !providerID() }]}>
             <Show
               when={providerID()}
               fallback={
@@ -461,6 +476,7 @@ export function ProviderConnectionDialog(props: {
                         providers={filteredProviders()}
                         activeIndex={activeProviderIndex()}
                         selectedProviderID={providerID()}
+                        filtered={providerQuery().trim().length > 0}
                         onActivate={setActiveProviderIndex}
                         onSelect={chooseProvider}
                       />
@@ -495,8 +511,11 @@ export function ProviderConnectionDialog(props: {
                         {(entry) => (
                           <button
                             type="button"
-                            class="provider-connect-method"
-                            classList={{ 'has-description': Boolean(entry.description) }}
+
+                            class={[
+                              'provider-connect-method',
+                              { 'has-description': Boolean(entry.description) },
+                            ]}
                             onClick={() => chooseMethod(entry.index)}
                           >
                             <span class="provider-connect-method-copy">
@@ -648,7 +667,7 @@ export function ProviderConnectionDialog(props: {
                                     class="provider-connect-url-input"
                                     type="text"
                                     value={auth().url}
-                                    readOnly
+                                    readonly
                                     onFocus={(event) => event.currentTarget.select()}
                                   />
                                   <CopyIconButton text={auth().url} label="authorization URL" />
@@ -859,6 +878,7 @@ function ProviderOptions(props: {
   providers: Array<{ id: string; name: string; methods: ProviderAuthMethod[] }>;
   activeIndex: number;
   selectedProviderID: string | null;
+  filtered: boolean;
   onActivate: (index: number) => void;
   onSelect: (providerID: string) => void;
 }) {
@@ -874,19 +894,26 @@ function ProviderOptions(props: {
     setScrollHeight(optionsRef.scrollHeight);
   };
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     updateScrollMetrics();
-    if (!optionsRef) return;
+    if (!optionsRef)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     const observer = new ResizeObserver(updateScrollMetrics);
     observer.observe(optionsRef);
-    onCleanup(() => observer.disconnect());
+    cleanups.push(() => observer.disconnect());
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   createEffect(
-    on(
-      () => props.providers.length,
-      () => queueMicrotask(updateScrollMetrics)
-    )
+    () => props.providers.length,
+    () => queueMicrotask(updateScrollMetrics)
   );
 
   const thumbHeight = createMemo(() => {
@@ -915,7 +942,7 @@ function ProviderOptions(props: {
               type="button"
               class={`provider-connect-option ${index() === props.activeIndex ? 'is-active' : ''}`}
               role="option"
-              aria-selected={provider.id === props.selectedProviderID}
+              aria-selected={ariaBoolean(provider.id === props.selectedProviderID)}
               onPointerMove={() => props.onActivate(index())}
               onClick={() => props.onSelect(provider.id)}
             >
@@ -930,7 +957,9 @@ function ProviderOptions(props: {
           )}
         </For>
         <Show when={props.providers.length === 0}>
-          <div class="provider-connect-empty">No matching providers.</div>
+          <div class="provider-connect-empty">
+            {props.filtered ? 'No matching providers.' : 'No providers available.'}
+          </div>
         </Show>
       </div>
       <Show when={thumbHeight() > 0}>
@@ -967,7 +996,7 @@ function PromptSelect(props: {
   const [activeIndex, setActiveIndex] = createSignal(0);
   let rootRef: HTMLDivElement | undefined;
   let bodyRef: HTMLElement | null = null;
-  const listboxID = `provider-prompt-${props.prompt.key}-options`;
+  const listboxID = () => `provider-prompt-${props.prompt.key}-options`;
   const selectedIndex = () =>
     Math.max(
       0,
@@ -975,21 +1004,27 @@ function PromptSelect(props: {
     );
   const selectedOption = () => props.prompt.options.find((option) => option.value === props.value);
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     bodyRef = rootRef?.closest<HTMLElement>('.provider-connect-body') ?? null;
     const onPointerDown = (event: PointerEvent) => {
       // SAFETY: The surrounding shape or discriminator check establishes the Node contract used below.
       if (!rootRef?.contains(event.target as Node)) setOpen(false);
     };
     document.addEventListener('pointerdown', onPointerDown);
-    onCleanup(() => {
+    cleanups.push(() => {
       document.removeEventListener('pointerdown', onPointerDown);
       bodyRef?.classList.remove('has-open-select');
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  createEffect(() => {
-    bodyRef?.classList.toggle('has-open-select', open());
+  createEffect(open, (isOpen) => {
+    bodyRef?.classList.toggle('has-open-select', isOpen);
   });
 
   function openMenu() {
@@ -1044,9 +1079,9 @@ function PromptSelect(props: {
         class={`provider-connect-select-trigger ${open() ? 'is-open' : ''}`}
         role="combobox"
         aria-haspopup="listbox"
-        aria-expanded={open()}
-        aria-controls={listboxID}
-        aria-activedescendant={open() ? `${listboxID}-${activeIndex()}` : undefined}
+        aria-expanded={ariaBoolean(open())}
+        aria-controls={listboxID()}
+        aria-activedescendant={open() ? `${listboxID()}-${activeIndex()}` : undefined}
         disabled={props.disabled}
         onClick={() => (open() ? setOpen(false) : openMenu())}
         onKeyDown={handleKeyDown}
@@ -1057,15 +1092,15 @@ function PromptSelect(props: {
         <UiIcon source={navArrowDownIcon} width={14} height={14} aria-hidden="true" />
       </button>
       <Show when={open()}>
-        <div id={listboxID} class="provider-connect-select-options" role="listbox">
+        <div id={listboxID()} class="provider-connect-select-options" role="listbox">
           <For each={props.prompt.options}>
             {(option, index) => (
               <button
-                id={`${listboxID}-${index()}`}
+                id={`${listboxID()}-${index()}`}
                 type="button"
                 class={`provider-connect-select-option ${index() === activeIndex() ? 'is-active' : ''}`}
                 role="option"
-                aria-selected={option.value === props.value}
+                aria-selected={ariaBoolean(option.value === props.value)}
                 onPointerMove={() => setActiveIndex(index())}
                 onClick={() => choose(index())}
               >

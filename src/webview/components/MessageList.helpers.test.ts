@@ -1,6 +1,7 @@
+import { flush as flushSolid } from 'solid-js';
+import { storePath } from '@solidjs/signals';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render } from 'solid-js/web';
-import { reconcile } from 'solid-js/store';
+import { render } from '@solidjs/web';
 import { replaceMessages, setSessions, setState, skipPlanSession } from '../lib/state';
 import type { MessageEntry, Permission, QuestionRequest } from '../types';
 import {
@@ -39,6 +40,8 @@ import {
   textPart,
   toolPart,
   userMessage,
+  setStateRecord,
+  session,
 } from './MessageList.test-utils';
 
 let container: HTMLDivElement | null = null;
@@ -55,13 +58,22 @@ installMessageListTestEnvironment({
   },
 });
 
+/** Mounts MessageList into the test container and returns its scroll container. */
+function mountList(): HTMLDivElement {
+  cleanup = render(() => MessageList(), container!);
+  flushSolid();
+  // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
+  return container?.querySelector('.interactive-list') as HTMLDivElement;
+}
+
 describe('MessageList prompt numbers', () => {
   beforeEach(() => {
     vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('X11; Linux x86_64');
   });
 
   it('groups automatic completions with tools and restores their details on expansion', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     const command = toolPart('command', 'assistant-1');
     command.state = {
       status: 'completed',
@@ -84,8 +96,10 @@ describe('MessageList prompt numbers', () => {
       { info: assistantMessage('assistant-1'), parts: [command] },
       { info: userMessage('automatic'), parts: [completion] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     await Promise.resolve();
+    flushSolid();
     const summary = container!.querySelector<HTMLButtonElement>('.assistant-activity-summary')!;
     expect(container!.querySelectorAll('.assistant-activity-summary')).toHaveLength(1);
     expect(summary.textContent).toContain('1 command');
@@ -93,12 +107,15 @@ describe('MessageList prompt numbers', () => {
     const automatic = () => container!.querySelector('[data-msg-id="automatic"]')!;
     expect(automatic().classList.contains('interactive-item-render-empty')).toBe(true);
     summary.click();
+    flushSolid();
     expect(automatic().classList.contains('interactive-item-render-empty')).toBe(false);
     const header = automatic().querySelector<HTMLButtonElement>('.tool-invocation-header')!;
     expect(header.textContent).toContain('Background command failed: npm test');
     header.click();
+    flushSolid();
     expect(automatic().textContent).toContain('Test failure details');
     summary.click();
+    flushSolid();
     expect(automatic().classList.contains('interactive-item-render-empty')).toBe(true);
     expect(completion.type).toBe('text');
   });
@@ -205,7 +222,8 @@ describe('MessageList prompt numbers', () => {
   });
 
   it('shows prompt counters only while Alt is held', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-1'), parts: [textPart('user-text-1', 'First prompt')] },
       {
@@ -214,9 +232,11 @@ describe('MessageList prompt numbers', () => {
       },
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Second prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     await Promise.resolve();
+    flushSolid();
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
     expect(container?.querySelectorAll('.message-sent-time')).toHaveLength(2);
     expect(
@@ -226,6 +246,7 @@ describe('MessageList prompt numbers', () => {
     ).toBe(true);
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     expect(
       [...(container?.querySelectorAll('.message-sent-time') ?? [])].every((timestamp) =>
         timestamp.classList.contains('is-visible')
@@ -238,9 +259,12 @@ describe('MessageList prompt numbers', () => {
         )
       ).toEqual(['1', '2']);
     });
+    flushSolid();
 
     window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
     expect(
       [...(container?.querySelectorAll('.message-sent-time') ?? [])].every(
@@ -257,14 +281,17 @@ describe('MessageList prompt numbers', () => {
     'shows counters on repeated Alt holds on %s, suppressing the menu only on Windows',
     async (userAgent, suppressAltMenu) => {
       vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(userAgent);
-      setState('activeSessionId', 'session-1');
+      setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
       replaceMessages([
         { info: userMessage('user-1'), parts: [textPart('prompt', 'First prompt')] },
       ]);
-      cleanup = render(() => MessageList(), container!);
+      flushSolid();
+      mountList();
       const composer = document.createElement('textarea');
       container!.append(composer);
       composer.focus();
+      flushSolid();
       for (let press = 0; press < 3; press += 1) {
         const down = new KeyboardEvent('keydown', {
           key: 'Alt',
@@ -273,13 +300,16 @@ describe('MessageList prompt numbers', () => {
           cancelable: true,
         });
         composer.dispatchEvent(down);
+        flushSolid();
         expect(down.defaultPrevented).toBe(suppressAltMenu);
         expect(document.activeElement).toBe(composer);
         await vi.waitFor(() => {
           expect(container!.querySelector('.prompt-number-badge')?.textContent).toBe('1');
         });
+        flushSolid();
         const up = new KeyboardEvent('keyup', { key: 'Alt', bubbles: true, cancelable: true });
         composer.dispatchEvent(up);
+        flushSolid();
         expect(up.defaultPrevented).toBe(suppressAltMenu);
         expect(document.activeElement).toBe(composer);
         expect(container!.querySelector('.prompt-number-badge')).toBeNull();
@@ -289,34 +319,47 @@ describe('MessageList prompt numbers', () => {
 
   it('uses Alt mouse state and clears counters on blur on Windows, leaving Ctrl alone', async () => {
     vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Windows NT 10.0; Win64; x64');
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages([{ info: userMessage('user-1'), parts: [textPart('prompt', 'First prompt')] }]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     const ctrlDown = new KeyboardEvent('keydown', { key: 'Control', cancelable: true });
     window.dispatchEvent(ctrlDown);
+    flushSolid();
     expect(ctrlDown.defaultPrevented).toBe(false);
     window.dispatchEvent(new MouseEvent('mousemove', { ctrlKey: true }));
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(container!.querySelector('.prompt-number-badge')).toBeNull();
 
     window.dispatchEvent(new MouseEvent('mousemove', { altKey: true }));
+    flushSolid();
     await vi.waitFor(() => {
       expect(container!.querySelector('.prompt-number-badge')?.textContent).toBe('1');
     });
+    flushSolid();
     const ctrlUp = new KeyboardEvent('keyup', { key: 'Control', altKey: true, cancelable: true });
     window.dispatchEvent(ctrlUp);
+    flushSolid();
     expect(ctrlUp.defaultPrevented).toBe(false);
     expect(container!.querySelector('.prompt-number-badge')).not.toBeNull();
     window.dispatchEvent(new MouseEvent('mousemove', { ctrlKey: true }));
+    flushSolid();
     expect(container!.querySelector('.prompt-number-badge')).toBeNull();
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     expect(container!.querySelector('.prompt-number-badge')).not.toBeNull();
     window.dispatchEvent(new Event('blur'));
+    flushSolid();
     expect(container!.querySelector('.prompt-number-badge')).toBeNull();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     expect(container!.querySelector('.prompt-number-badge')).not.toBeNull();
     window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+    flushSolid();
     expect(container!.querySelector('.prompt-number-badge')).toBeNull();
   });
 
@@ -332,27 +375,33 @@ describe('MessageList prompt numbers', () => {
     { key: 'a', altKey: true },
   ])('does not cancel modifier combinations or Ctrl shortcuts on Windows: %j', (init) => {
     vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Windows NT 10.0; Win64; x64');
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     for (const type of ['keydown', 'keyup']) {
       const event = new KeyboardEvent(type, { ...init, bubbles: true, cancelable: true });
       container!.dispatchEvent(event);
+      flushSolid();
       expect(event.defaultPrevented).toBe(false);
     }
   });
 
   it('cancels Windows bare Alt before host listeners and removes capture listeners on cleanup', async () => {
     vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Windows NT 10.0; Win64; x64');
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages([{ info: userMessage('user-1'), parts: [textPart('prompt', 'First prompt')] }]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     const composer = document.createElement('textarea');
     container!.append(composer);
     composer.focus();
+    flushSolid();
     const hostListener = vi.fn((event: KeyboardEvent) => {
       if (!event.defaultPrevented) composer.blur();
     });
     document.addEventListener('keydown', hostListener);
+    flushSolid();
     document.addEventListener('keyup', hostListener);
+    flushSolid();
     try {
       for (let press = 0; press < 3; press += 1) {
         composer.dispatchEvent(
@@ -363,9 +412,11 @@ describe('MessageList prompt numbers', () => {
             cancelable: true,
           })
         );
+        flushSolid();
         await vi.waitFor(() => {
           expect(container!.querySelector('.prompt-number-badge')?.textContent).toBe('1');
         });
+        flushSolid();
         composer.dispatchEvent(
           new KeyboardEvent('keyup', {
             key: 'Alt',
@@ -373,34 +424,42 @@ describe('MessageList prompt numbers', () => {
             cancelable: true,
           })
         );
+        flushSolid();
         expect(document.activeElement).toBe(composer);
         expect(container!.querySelector('.prompt-number-badge')).toBeNull();
       }
       expect(hostListener).toHaveBeenCalledTimes(6);
-      cleanup();
+      cleanup!();
+      flushSolid();
       cleanup = undefined;
       container!.append(composer);
       for (const type of ['keydown', 'keyup']) {
         const event = new KeyboardEvent(type, { key: 'Alt', bubbles: true, cancelable: true });
         composer.dispatchEvent(event);
+        flushSolid();
         expect(event.defaultPrevented).toBe(false);
       }
     } finally {
       document.removeEventListener('keydown', hostListener);
+      flushSolid();
       document.removeEventListener('keyup', hostListener);
+      flushSolid();
     }
   });
 
   it('shares numbers and one navigation target across consecutive user bubbles', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-1'), parts: [textPart('first', 'First prompt')] },
       { info: userMessage('steer-1'), parts: [textPart('steer', 'Also do this')] },
       { info: assistantMessage('assistant-1'), parts: [textPart('answer', 'Response')] },
       { info: userMessage('user-2'), parts: [textPart('second', 'Next prompt')] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => {
       const badges = [...container!.querySelectorAll('.user-message-card .prompt-number-badge')];
       expect(badges.map((badge) => badge.textContent)).toEqual(['1', '1.1', '2']);
@@ -410,6 +469,7 @@ describe('MessageList prompt numbers', () => {
         false,
       ]);
     });
+    flushSolid();
     expect(
       [...container!.querySelectorAll('.turn-navigation-marker')].map((dot) =>
         dot.getAttribute('aria-label')
@@ -417,6 +477,7 @@ describe('MessageList prompt numbers', () => {
     ).toEqual(['Go to turn 1: First prompt', 'Go to turn 2: Next prompt']);
     const firstDot = container!.querySelector<HTMLButtonElement>('.turn-navigation-marker')!;
     firstDot.dispatchEvent(new MouseEvent('mouseenter'));
+    flushSolid();
     expect(container!.querySelector('[data-msg-id="user-1"]')!.classList).toContain(
       'interactive-item-turn-hovered'
     );
@@ -427,31 +488,40 @@ describe('MessageList prompt numbers', () => {
     container!
       .querySelector('[data-msg-id="user-1"] .user-message-card')!
       .dispatchEvent(new MouseEvent('mouseleave'));
+    flushSolid();
     expect(container!.querySelector('[data-msg-id="user-1"]')!.classList).toContain(
       'interactive-item-turn-hovered'
     );
     firstDot.dispatchEvent(new MouseEvent('mouseleave'));
+    flushSolid();
     expect(container!.querySelector('.interactive-item-turn-hovered')).toBeNull();
     const steer = container!.querySelector('[data-msg-id="steer-1"]')!;
     steer.dispatchEvent(new MouseEvent('mouseenter'));
+    flushSolid();
     expect(firstDot.classList.contains('is-hovered')).toBe(false);
     steer.dispatchEvent(new MouseEvent('mouseleave'));
+    flushSolid();
     const response = container!.querySelector('[data-msg-id="assistant-1"] .chat-turn-content')!;
     response.dispatchEvent(new MouseEvent('mouseenter'));
+    flushSolid();
     expect(firstDot.classList).toContain('is-hovered');
     expect(container!.querySelector('.interactive-item-turn-hovered')).toBeNull();
     response.dispatchEvent(new MouseEvent('mouseleave'));
+    flushSolid();
     expect(firstDot.classList.contains('is-hovered')).toBe(false);
     const bubble = steer.querySelector('.user-message-card')!;
     bubble.dispatchEvent(new MouseEvent('mouseenter'));
+    flushSolid();
     expect(firstDot.classList.contains('is-hovered')).toBe(false);
     expect(container!.querySelector('.interactive-item-turn-hovered')).toBeNull();
     bubble.dispatchEvent(new MouseEvent('mouseleave'));
+    flushSolid();
     expect(firstDot.classList.contains('is-hovered')).toBe(false);
   });
 
   it('marks steering after assistant activity as gray and read-only, not the next queued turn', () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     const user = (id: string, created: number) => ({
       info: { ...userMessage(id), time: { created } },
       parts: [textPart(`${id}-text`, 'Check the duration')],
@@ -475,7 +545,8 @@ describe('MessageList prompt numbers', () => {
       },
       user('queued-next-turn', 7),
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     const steer = container!.querySelector<HTMLElement>(
       '[data-msg-id="steer"] .user-message-card'
     )!;
@@ -491,7 +562,8 @@ describe('MessageList prompt numbers', () => {
   it.each([false, true])(
     'numbers steering within each turn without extra dots, explicit delivery=%s',
     async (explicitDelivery) => {
-      setState('activeSessionId', 'session-1');
+      setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
       const user = (id: string, created: number, steering = false) => ({
         info: {
           ...userMessage(id),
@@ -516,8 +588,10 @@ describe('MessageList prompt numbers', () => {
         assistant('answer-2', 12, 'stop'),
         user('prompt-3', 14),
       ]);
-      cleanup = render(() => MessageList(), container!);
+      flushSolid();
+      mountList();
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+      flushSolid();
       await vi.waitFor(() => {
         expect(
           [...container!.querySelectorAll('.user-message-card .prompt-number-badge')].map(
@@ -525,18 +599,21 @@ describe('MessageList prompt numbers', () => {
           )
         ).toEqual(['1', '1.1', '1.2', '2', '2.1', '3']);
       });
+      flushSolid();
       expect(
         [...container!.querySelectorAll('.turn-navigation-marker')].map((dot) =>
           dot.getAttribute('aria-label')
         )
       ).toEqual(['Go to turn 1: prompt-1', 'Go to turn 2: prompt-2', 'Go to turn 3: prompt-3']);
       window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+      flushSolid();
       expect(container!.querySelector('.prompt-number-badge')).toBeNull();
     }
   );
 
   it('continues steering ordinals from prefetched history across assistant activity', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     const user = (id: string, created: number) => ({
       info: { ...userMessage(id), time: { created } },
       parts: [textPart(`${id}-text`, id)],
@@ -554,6 +631,7 @@ describe('MessageList prompt numbers', () => {
       user('steer-1', 4),
       activity('activity-2', 5),
     ]);
+    flushSolid();
     replaceMessages([
       user('steer-2', 7),
       {
@@ -565,8 +643,10 @@ describe('MessageList prompt numbers', () => {
       },
       user('next-turn', 10),
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => {
       expect(
         [...container!.querySelectorAll('.user-message-card .prompt-number-badge')].map(
@@ -574,6 +654,7 @@ describe('MessageList prompt numbers', () => {
         )
       ).toEqual(['1.2', '2']);
     });
+    flushSolid();
     expect(
       [...container!.querySelectorAll('.turn-navigation-marker')].map((dot) =>
         dot.getAttribute('aria-label')
@@ -582,7 +663,8 @@ describe('MessageList prompt numbers', () => {
   });
 
   it('includes prefetched prompts outside the loaded message window', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPrompts(
       'session-1',
       Array.from({ length: 12 }, (_, index) => [
@@ -593,6 +675,7 @@ describe('MessageList prompt numbers', () => {
         { info: assistantMessage(`assistant-${index + 1}`), parts: [] },
       ]).flat()
     );
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-13'), parts: [textPart('user-text-13', 'Prompt 13')] },
       {
@@ -601,9 +684,11 @@ describe('MessageList prompt numbers', () => {
       },
       { info: userMessage('user-14'), parts: [textPart('user-text-14', 'Prompt 14')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => {
       expect(
         [...(container?.querySelectorAll('.user-message-card .prompt-number-badge') ?? [])].map(
@@ -611,22 +696,27 @@ describe('MessageList prompt numbers', () => {
         )
       ).toEqual(['13', '14']);
     });
+    flushSolid();
   });
 
   it('keeps a group open across the prefetched history boundary', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPrompts('session-1', [
       { info: userMessage('user-1'), parts: [textPart('first', 'First prompt')] },
       { info: assistantMessage('assistant-1'), parts: [] },
       { info: userMessage('user-2'), parts: [textPart('second', 'Second prompt')] },
     ]);
+    flushSolid();
     replaceMessages([
       { info: userMessage('steer-2'), parts: [textPart('steer', 'Also do this')] },
       { info: assistantMessage('assistant-2'), parts: [] },
       { info: userMessage('user-3'), parts: [textPart('third', 'Third prompt')] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => {
       expect(
         [...container!.querySelectorAll('.user-message-card .prompt-number-badge')].map(
@@ -634,6 +724,7 @@ describe('MessageList prompt numbers', () => {
         )
       ).toEqual(['2.1', '3']);
     });
+    flushSolid();
     expect(
       container!.querySelector('[data-msg-id="steer-2"] .user-message-continuation')
     ).not.toBeNull();
@@ -665,8 +756,10 @@ describe('MessageList prompt numbers', () => {
       return page;
     };
 
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-12');
+    flushSolid();
     const messagesSpy = vi
       .spyOn(client.session, 'messages')
       .mockResolvedValueOnce(promptPage(7, 12, 'cursor-6'))
@@ -679,9 +772,11 @@ describe('MessageList prompt numbers', () => {
       },
       { info: userMessage('user-14'), parts: [textPart('user-text-14', 'Prompt 14')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
 
     await vi.waitFor(() => {
@@ -691,6 +786,7 @@ describe('MessageList prompt numbers', () => {
         )
       ).toEqual(['13', '14']);
     });
+    flushSolid();
     expect(messagesSpy).toHaveBeenNthCalledWith(1, 'session-1', {
       limit: 200,
       before: 'cursor-12',
@@ -716,18 +812,26 @@ describe('MessageList prompt numbers', () => {
         resolveFirstPage = resolve;
       })
     );
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-2');
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-3'), parts: [textPart('user-text-3', 'Current prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledOnce());
+    flushSolid();
     window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+    flushSolid();
     resolveFirstPage(firstPage);
+    flushSolid();
     await vi.advanceTimersByTimeAsync(1);
+    flushSolid();
 
     expect(messagesSpy).toHaveBeenCalledOnce();
   });
@@ -743,18 +847,26 @@ describe('MessageList prompt numbers', () => {
         resolvePage = resolve;
       })
     );
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-older');
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Current prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledOnce());
+    flushSolid();
     window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+    flushSolid();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     resolvePage(olderPage);
+    flushSolid();
 
     await vi.waitFor(() => {
       expect(
@@ -763,6 +875,7 @@ describe('MessageList prompt numbers', () => {
         )
       ).toEqual(['1.1']);
     });
+    flushSolid();
     expect(messagesSpy).toHaveBeenCalledOnce();
   });
 
@@ -777,42 +890,58 @@ describe('MessageList prompt numbers', () => {
         resolvePage = resolve;
       })
     );
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-older');
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Current prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledOnce());
+    flushSolid();
     for (let index = 0; index < 100; index += 1) {
       window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+      flushSolid();
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+      flushSolid();
     }
     resolvePage(olderPage);
+    flushSolid();
 
     await vi.waitFor(() =>
       expect(container?.querySelector('.prompt-number-badge')?.textContent).toBe('1.1')
     );
+    flushSolid();
     expect(messagesSpy).toHaveBeenCalledOnce();
   });
 
   it('keeps partial prompt numbers hidden after a failed page and retries on the next Alt hold', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-older');
+    flushSolid();
     const messagesSpy = vi
       .spyOn(client.session, 'messages')
       .mockRejectedValueOnce(new Error('Prompt history failed'));
     replaceMessages([
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Current prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(1));
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
 
@@ -822,9 +951,12 @@ describe('MessageList prompt numbers', () => {
     ] as Awaited<ReturnType<typeof client.session.messages>>;
     messagesSpy.mockResolvedValueOnce(olderPage);
     window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+    flushSolid();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
 
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(2));
+    flushSolid();
     await vi.waitFor(() => {
       expect(
         [...(container?.querySelectorAll('.user-message-card .prompt-number-badge') ?? [])].map(
@@ -832,28 +964,38 @@ describe('MessageList prompt numbers', () => {
         )
       ).toEqual(['1.1']);
     });
+    flushSolid();
   });
 
   it('reloads absolute prompt numbers after the active session window is reset', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPrompts('session-1', [
       { info: userMessage('user-1'), parts: [textPart('user-text-1', 'Older prompt 1')] },
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Older prompt 2')] },
     ]);
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-3'), parts: [textPart('user-text-3', 'Current prompt')] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => {
       expect(container?.querySelector('.prompt-number-badge')?.textContent).toBe('1.2');
     });
+    flushSolid();
     window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+    flushSolid();
 
     resetSessionMessageWindowForRefetch('session-1');
+    flushSolid();
     clearSessionMessageWindowState('session-1');
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-reloaded');
+    flushSolid();
     // SAFETY: The fixture provides the complete domain shape read by this statement.
     const reloadedPage = [
       { info: userMessage('user-1'), parts: [textPart('user-text-1', 'Older prompt 1')] },
@@ -862,6 +1004,7 @@ describe('MessageList prompt numbers', () => {
     const messagesSpy = vi.spyOn(client.session, 'messages').mockResolvedValue(reloadedPage);
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
     await vi.waitFor(() => {
       expect(messagesSpy).toHaveBeenCalledWith('session-1', {
@@ -870,25 +1013,32 @@ describe('MessageList prompt numbers', () => {
       });
       expect(container?.querySelector('.prompt-number-badge')?.textContent).toBe('1.2');
     });
+    flushSolid();
   });
 
   it('keeps prompt numbers hidden while a reset window is awaiting its replacement fetch', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPrompts('session-1', [
       { info: userMessage('user-1'), parts: [textPart('user-text-1', 'Older prompt 1')] },
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Older prompt 2')] },
     ]);
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-3'), parts: [textPart('user-text-3', 'Current prompt')] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => {
       expect(container?.querySelector('.prompt-number-badge')?.textContent).toBe('1.2');
     });
+    flushSolid();
 
     resetSessionMessageWindowForRefetch('session-1');
+    flushSolid();
     for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
 
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
@@ -910,26 +1060,35 @@ describe('MessageList prompt numbers', () => {
       if (options?.before === 'cursor-current') return Promise.resolve(currentPage);
       throw new Error(`Unexpected cursor ${options?.before}`);
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-stale');
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Current prompt')] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
 
     try {
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+      flushSolid();
       await vi.waitFor(() => {
         expect(messagesSpy).toHaveBeenCalledWith('session-1', {
           limit: 200,
           before: 'cursor-stale',
         });
       });
+      flushSolid();
       window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt' }));
+      flushSolid();
 
       resetSessionMessageWindowForRefetch('session-1');
+      flushSolid();
       setSessionHistoryPromptCursor('session-1', 'cursor-current');
+      flushSolid();
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+      flushSolid();
 
       await vi.waitFor(() => {
         expect(messagesSpy).toHaveBeenCalledWith('session-1', {
@@ -937,9 +1096,11 @@ describe('MessageList prompt numbers', () => {
           before: 'cursor-current',
         });
       });
+      flushSolid();
     } finally {
       releaseStalePage?.(stalePage);
       await vi.advanceTimersByTimeAsync(0);
+      flushSolid();
     }
   });
 
@@ -956,39 +1117,54 @@ describe('MessageList prompt numbers', () => {
           releaseFirstPage = resolve;
         })
     );
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryPromptCursor('session-1', 'cursor-older');
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-2'), parts: [textPart('user-text-2', 'Current prompt')] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
 
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(1));
-    setState('activeSessionId', null);
+    flushSolid();
+    setState(storePath('activeSessionId', null));
+    flushSolid();
     replaceMessages([]);
+    flushSolid();
     releaseFirstPage?.(firstPage);
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     expect(messagesSpy).toHaveBeenCalledTimes(1);
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
   });
 
   it('hides prompt counters when the window loses focus', async () => {
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages([
       { info: userMessage('user-1'), parts: [textPart('user-text-1', 'First prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
+    mountList();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    flushSolid();
     await vi.waitFor(() => {
       expect(container?.querySelector('.prompt-number-badge')?.textContent).toBe('1');
     });
+    flushSolid();
 
     window.dispatchEvent(new Event('blur'));
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(container?.querySelector('.prompt-number-badge')).toBeNull();
   });
 });
@@ -1108,7 +1284,8 @@ describe('getLatestPlanImplementationMessageId', () => {
   });
 
   it('ignores the currently selected plan agent for older non-plan responses', () => {
-    setState('sessionSelectedAgents', reconcile({ 'session-1': 'plan' }));
+    setStateRecord('sessionSelectedAgents', { 'session-1': 'plan' });
+    flushSolid();
 
     expect(
       getLatestPlanImplementationMessageId([
@@ -1137,18 +1314,12 @@ describe('shouldShowPlanImplementationAction', () => {
 
   it('hides the action after the plan session is skipped', () => {
     const message = assistantMessage('assistant-1', { agent: 'plan' });
-    setState('skippedPlanSessions', reconcile({}));
-    setSessions([
-      {
-        id: 'session-1',
-        projectID: 'project-1',
-        directory: '/workspace',
-        title: 'session-1',
-        version: '1',
-        time: { created: 100, updated: 200 },
-      },
-    ]);
+    setStateRecord('skippedPlanSessions', {});
+    flushSolid();
+    setSessions([session('session-1', { time: { created: 100, updated: 200 } })]);
+    flushSolid();
     skipPlanSession('session-1', 200);
+    flushSolid();
 
     expect(
       shouldShowPlanImplementationAction({
@@ -1161,17 +1332,10 @@ describe('shouldShowPlanImplementationAction', () => {
 
   it('shows the action for the latest unskipped plan response', () => {
     const message = assistantMessage('assistant-1', { agent: 'plan' });
-    setState('skippedPlanSessions', reconcile({}));
-    setSessions([
-      {
-        id: 'session-1',
-        projectID: 'project-1',
-        directory: '/workspace',
-        title: 'session-1',
-        version: '1',
-        time: { created: 100, updated: 200 },
-      },
-    ]);
+    setStateRecord('skippedPlanSessions', {});
+    flushSolid();
+    setSessions([session('session-1', { time: { created: 100, updated: 200 } })]);
+    flushSolid();
 
     expect(
       shouldShowPlanImplementationAction({
@@ -1184,6 +1348,21 @@ describe('shouldShowPlanImplementationAction', () => {
 });
 
 describe('standalone action prompts', () => {
+  /** Builds root `session-1` and its child `child-1` as fresh records for each test. */
+  const rootAndChildSessions = () => [
+    session('session-1', {
+      directory: '/',
+      title: 'Session 1',
+      time: { created: 0, updated: 10 },
+    }),
+    session('child-1', {
+      directory: '/',
+      title: 'Child 1',
+      parentID: 'session-1',
+      time: { created: 0, updated: 20 },
+    }),
+  ];
+
   it('matches every pending tool while activating only the front permission', () => {
     const permissions: Permission[] = [
       {
@@ -1537,25 +1716,8 @@ describe('standalone action prompts', () => {
   });
 
   it('keeps child-session permissions visible for the active root session', () => {
-    setSessions([
-      {
-        id: 'session-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Session 1',
-        version: '1',
-        time: { created: 0, updated: 10 },
-      },
-      {
-        id: 'child-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Child 1',
-        version: '1',
-        parentID: 'session-1',
-        time: { created: 0, updated: 20 },
-      },
-    ]);
+    setSessions(rootAndChildSessions());
+    flushSolid();
 
     const permissions: Permission[] = [
       {
@@ -1574,15 +1736,13 @@ describe('standalone action prompts', () => {
 
   it('keeps unresolved-session permissions visible from the active session', () => {
     setSessions([
-      {
-        id: 'session-1',
-        projectID: 'project-1',
+      session('session-1', {
         directory: '/',
         title: 'Session 1',
-        version: '1',
         time: { created: 0, updated: 10 },
-      },
+      }),
     ]);
+    flushSolid();
 
     const permissions: Permission[] = [
       {
@@ -1603,25 +1763,8 @@ describe('standalone action prompts', () => {
   });
 
   it('keeps child-session questions visible for the active root session', () => {
-    setSessions([
-      {
-        id: 'session-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Session 1',
-        version: '1',
-        time: { created: 0, updated: 10 },
-      },
-      {
-        id: 'child-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Child 1',
-        version: '1',
-        parentID: 'session-1',
-        time: { created: 0, updated: 20 },
-      },
-    ]);
+    setSessions(rootAndChildSessions());
+    flushSolid();
 
     const questions: QuestionRequest[] = [
       {
@@ -1635,25 +1778,8 @@ describe('standalone action prompts', () => {
   });
 
   it('keeps root-session permissions visible while viewing a child session', () => {
-    setSessions([
-      {
-        id: 'session-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Session 1',
-        version: '1',
-        time: { created: 0, updated: 10 },
-      },
-      {
-        id: 'child-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Child 1',
-        version: '1',
-        parentID: 'session-1',
-        time: { created: 0, updated: 20 },
-      },
-    ]);
+    setSessions(rootAndChildSessions());
+    flushSolid();
 
     const permissions: Permission[] = [
       {
@@ -1671,25 +1797,8 @@ describe('standalone action prompts', () => {
   });
 
   it('keeps root-session questions visible while viewing a child session', () => {
-    setSessions([
-      {
-        id: 'session-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Session 1',
-        version: '1',
-        time: { created: 0, updated: 10 },
-      },
-      {
-        id: 'child-1',
-        projectID: 'project-1',
-        directory: '/',
-        title: 'Child 1',
-        version: '1',
-        parentID: 'session-1',
-        time: { created: 0, updated: 20 },
-      },
-    ]);
+    setSessions(rootAndChildSessions());
+    flushSolid();
 
     const questions: QuestionRequest[] = [
       {

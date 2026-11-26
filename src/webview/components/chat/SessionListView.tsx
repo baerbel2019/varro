@@ -1,9 +1,25 @@
+import { ariaBoolean } from '../../lib/aria';
+import {
+  Show,
+  For,
+  createSignal,
+  onCleanup,
+  onSettled,
+  createEffect,
+  untrack,
+  createMemo,
+  createUniqueId,
+  mapArray,
+} from 'solid-js';
+import { storePath } from '@solidjs/signals';
+import { createRecordSnapshots } from '../../lib/record-snapshots';
 import {
   getModelDisplayName,
   getSelectedAgentForSession,
   getSelectedModelForSession,
   getSessionTreeIds,
   getSessionTreeRootId,
+  getPinnedSessionsSyncRevision,
   getSessionTreeUpdated,
   hasActiveUsageLimit,
   isLoading,
@@ -23,19 +39,6 @@ import {
 } from '../../lib/state';
 import { WindowedSessionItems } from './WindowedSessionItems';
 import { setHostDragImage } from '../../host/extensions';
-import {
-  Show,
-  For,
-  createSignal,
-  onCleanup,
-  onMount,
-  createEffect,
-  createMemo,
-  createUniqueId,
-  on,
-  untrack,
-  batch,
-} from 'solid-js';
 import {
   selectSession,
   deleteSession,
@@ -69,7 +72,10 @@ import { getProviderIcon } from '../../lib/provider-icons';
 import { compareSessionsByActivity, compareSessionsForDisplay } from '../../lib/session-order';
 import {
   archiveIcon,
+  clipboardCheckIcon,
   forwardMessageIcon,
+  pasteClipboardIcon,
+  squareIcon,
   navArrowRightIcon,
   cableTagIcon,
   compressIcon,
@@ -100,7 +106,13 @@ import {
 import { Tooltip } from '../Tooltip';
 import { sessionDiffSummaries } from './session-diff-summaries';
 import { sessionStore } from '../../lib/stores/session-store';
+import { sessionGoalStore } from '../../lib/stores/session-goal-store';
 import { isSessionTransferHidden } from '../../lib/session-transfer';
+import {
+  reportNestedSubagents,
+  subagentListView,
+  type SubagentListView,
+} from '../../lib/subagent-list-view';
 
 const {
   cache: sessionDiffSummaryCache,
@@ -173,32 +185,37 @@ function SessionHistoryScopePicker(props: {
     SESSION_HISTORY_SCOPE_OPTIONS.find((option) => option.scope === scope())!
   );
 
-  createEffect(() => {
-    const directory = props.directory;
-    const key = ++requestKey;
-    saveKey += 1;
-    setOpen(false);
-    setScope('directory');
-    props.onScopeChange('directory');
-    void (async () => {
-      try {
-        const result = await client.varro.sessionHistoryScope.get(directory);
-        if (key !== requestKey || directory !== props.directory) return;
-        setScope(result.scope);
-        props.onScopeChange(result.scope);
-        setIsGit(result.git);
-        if (result.scope !== 'directory') await reloadSessions();
-      } catch (error: unknown) {
-        if (key === requestKey && directory === props.directory) {
-          setError(error instanceof Error ? error.message : String(error));
+  createEffect(
+    () => props.directory,
+    (directory) => {
+      const key = ++requestKey;
+      saveKey += 1;
+      setOpen(false);
+      setScope('directory');
+      props.onScopeChange('directory');
+      void (async () => {
+        try {
+          const result = await client.varro.sessionHistoryScope.get(directory);
+          if (key !== requestKey || directory !== props.directory) return;
+          setScope(result.scope);
+          props.onScopeChange(result.scope);
+          setIsGit(result.git);
+          if (result.scope !== 'directory') await reloadSessions();
+        } catch (error: unknown) {
+          if (key === requestKey && directory === props.directory) {
+            setError(error instanceof Error ? error.message : String(error));
+          }
         }
-      }
-    })();
-  });
+      })();
+    }
+  );
 
-  createEffect(() => {
-    if (props.hidden) setOpen(false);
-  });
+  createEffect(
+    () => props.hidden,
+    (hidden) => {
+      if (hidden) setOpen(false);
+    }
+  );
 
   const dismiss = (event: PointerEvent) => {
     if (!(event.target instanceof Node) || !root?.contains(event.target)) setOpen(false);
@@ -254,7 +271,7 @@ function SessionHistoryScopePicker(props: {
             class="session-history-scope-trigger"
             aria-label={`Session history: ${selected().label}`}
             aria-haspopup="menu"
-            aria-expanded={open()}
+            aria-expanded={ariaBoolean(open())}
             onClick={() => setOpen((value) => !value)}
           >
             <UiIcon source={selected().icon} width={14} height={14} />
@@ -270,7 +287,7 @@ function SessionHistoryScopePicker(props: {
                   <button
                     type="button"
                     role="menuitemradio"
-                    aria-checked={scope() === option.scope}
+                    aria-checked={ariaBoolean(scope() === option.scope)}
                     class="session-history-scope-option"
                     onClick={() => void selectScope(option.scope)}
                   >
@@ -300,7 +317,7 @@ export type SessionIndicatorSets = {
   newlyCompletedIds: Set<string>;
 };
 
-export const SESSION_STATUS_INDICATOR_SETTLE_DELAY_MS = 1200;
+const SESSION_STATUS_INDICATOR_SETTLE_DELAY_MS = 1200;
 
 export function createStableSessionIndicators(
   getIndicators: () => SessionIndicatorSets,
@@ -309,41 +326,43 @@ export function createStableSessionIndicators(
   const [lingeringRunningIds, setLingeringRunningIds] = createSignal(new Set<string>());
   const settleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  createEffect(() => {
-    const runningIds = getIndicators().runningIds;
-    const lingeringIds = untrack(lingeringRunningIds);
-    const nextLingeringIds = new Set(lingeringIds);
-    let changed = false;
+  createEffect(
+    () => getIndicators().runningIds,
+    (runningIds) => {
+      const lingeringIds = untrack(lingeringRunningIds);
+      const nextLingeringIds = new Set(lingeringIds);
+      let changed = false;
 
-    for (const sessionId of runningIds) {
-      const timer = settleTimers.get(sessionId);
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        settleTimers.delete(sessionId);
+      for (const sessionId of runningIds) {
+        const timer = settleTimers.get(sessionId);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          settleTimers.delete(sessionId);
+        }
+        if (!nextLingeringIds.has(sessionId)) {
+          nextLingeringIds.add(sessionId);
+          changed = true;
+        }
       }
-      if (!nextLingeringIds.has(sessionId)) {
-        nextLingeringIds.add(sessionId);
-        changed = true;
+
+      for (const sessionId of nextLingeringIds) {
+        if (runningIds.has(sessionId) || settleTimers.has(sessionId)) continue;
+        const timer = setTimeout(() => {
+          settleTimers.delete(sessionId);
+          if (getIndicators().runningIds.has(sessionId)) return;
+          setLingeringRunningIds((current) => {
+            if (!current.has(sessionId)) return current;
+            const next = new Set(current);
+            next.delete(sessionId);
+            return next;
+          });
+        }, settleDelayMs);
+        settleTimers.set(sessionId, timer);
       }
-    }
 
-    for (const sessionId of nextLingeringIds) {
-      if (runningIds.has(sessionId) || settleTimers.has(sessionId)) continue;
-      const timer = setTimeout(() => {
-        settleTimers.delete(sessionId);
-        if (getIndicators().runningIds.has(sessionId)) return;
-        setLingeringRunningIds((current) => {
-          if (!current.has(sessionId)) return current;
-          const next = new Set(current);
-          next.delete(sessionId);
-          return next;
-        });
-      }, settleDelayMs);
-      settleTimers.set(sessionId, timer);
+      if (changed) setLingeringRunningIds(nextLingeringIds);
     }
-
-    if (changed) setLingeringRunningIds(nextLingeringIds);
-  });
+  );
 
   onCleanup(() => {
     for (const timer of settleTimers.values()) clearTimeout(timer);
@@ -435,6 +454,8 @@ const MIN_RECENT_SESSIONS = 50;
 const SESSION_ARCHIVE_PRELOAD_TARGET = 50;
 const SUBAGENT_SESSION_PAGE_SIZE = 100;
 const MAX_SUBAGENT_SESSION_LIMIT = 1_000_000;
+// Deeper sub-agent levels share the last indent so titles keep usable width.
+const MAX_SESSION_TREE_INDENT = 6;
 const SESSION_SEARCH_LIMIT = 30;
 const SESSION_SEARCH_DEBOUNCE_MS = 200;
 const PARTIAL_SESSION_LIST_ATTEMPTS = 2;
@@ -461,11 +482,7 @@ async function listCompleteSessionPage(
 function getSessionTreeFailedUpdated(sessionId: string): number | undefined {
   let updated: number | undefined;
   for (const treeSessionId of getSessionTreeIds(sessionId)) {
-    const failedAt =
-      Math.max(
-        state.failedSessionUpdatedAt[treeSessionId] ?? 0,
-        state.interruptedSessionResponses[treeSessionId] ?? 0
-      ) || undefined;
+    const failedAt = state.failedSessionUpdatedAt[treeSessionId];
     if (failedAt !== undefined) updated = Math.max(updated ?? 0, failedAt);
   }
   return updated;
@@ -547,6 +564,92 @@ export function getSubagentSessionsForParent(
   return sessions.filter((session) => descendantIds.has(session.id));
 }
 
+/**
+ * One connector column of a nested row: `through` continues an ancestor's branch past this
+ * row, `branch` joins a sibling that has later siblings, and `last` closes its branch.
+ */
+export type SessionTreeGuide = 'none' | 'through' | 'branch' | 'last';
+type ArrangedSubagentSessions = {
+  sessions: typeof state.sessions;
+  /** Connector columns of nested rows; top-level rows have no entry. */
+  guides: Map<string, SessionTreeGuide[]>;
+};
+
+/**
+ * Orders sub-agent sessions newest first. Flat sorts every session by its own update; tree
+ * keeps each session above its descendants and sorts siblings by their branch's newest update,
+ * so active branches rise. Sessions whose parent is not listed start their own branch.
+ */
+export function arrangeSubagentSessions(
+  sessions: typeof state.sessions,
+  view: SubagentListView,
+  now: number
+): ArrangedSubagentSessions {
+  const guides = new Map<string, SessionTreeGuide[]>();
+  if (view === 'flat') {
+    return {
+      sessions: sessions.toSorted((a, b) => compareSessionsByActivity(a, b, now)),
+      guides,
+    };
+  }
+
+  const listedIds = new Set(sessions.map((session) => session.id));
+  const childrenByParent = new Map<string, Session[]>();
+  const roots: Session[] = [];
+  for (const session of sessions) {
+    const parentID = session.parentID;
+    if (!parentID || parentID === session.id || !listedIds.has(parentID)) {
+      roots.push(session);
+      continue;
+    }
+    const siblings = childrenByParent.get(parentID);
+    if (siblings) siblings.push(session);
+    else childrenByParent.set(parentID, [session]);
+  }
+
+  const branchUpdated = new Map<string, number>();
+  const getBranchUpdated = (session: Session, visiting: Set<string>): number => {
+    const cached = branchUpdated.get(session.id);
+    if (cached !== undefined) return cached;
+    visiting.add(session.id);
+    let updated = session.time.updated;
+    for (const child of childrenByParent.get(session.id) ?? []) {
+      if (!visiting.has(child.id)) updated = Math.max(updated, getBranchUpdated(child, visiting));
+    }
+    branchUpdated.set(session.id, updated);
+    return updated;
+  };
+  const branchActivity = (session: Session) => ({
+    time: { created: session.time.created, updated: getBranchUpdated(session, new Set()) },
+  });
+  const sortSiblings = (siblings: Session[]) =>
+    siblings.toSorted((a, b) =>
+      compareSessionsByActivity(branchActivity(a), branchActivity(b), now)
+    );
+
+  const ordered: Session[] = [];
+  const visited = new Set<string>();
+  const visit = (session: Session, sessionGuides: SessionTreeGuide[]) => {
+    if (visited.has(session.id)) return;
+    visited.add(session.id);
+    ordered.push(session);
+    if (sessionGuides.length > 0) guides.set(session.id, sessionGuides);
+    // A child inherits its parent's columns; the parent's own connector becomes a line
+    // through the child when the parent has later siblings, or blank space when it closed.
+    const inherited = sessionGuides.map((guide): SessionTreeGuide =>
+      guide === 'branch' || guide === 'through' ? 'through' : 'none'
+    );
+    const children = sortSiblings(childrenByParent.get(session.id) ?? []);
+    children.forEach((child, index) =>
+      visit(child, [...inherited, index === children.length - 1 ? 'last' : 'branch'])
+    );
+  };
+  for (const root of sortSiblings(roots)) visit(root, []);
+  // Cyclic parent links never reach a root; keep them visible at the end.
+  for (const session of sessions) if (!visited.has(session.id)) ordered.push(session);
+  return { sessions: ordered, guides };
+}
+
 export function shouldShowSessionHeaderBadge(
   activeFilter: SessionListFilter | null,
   badgeFilter: SessionListFilter
@@ -573,7 +676,7 @@ export function getSessionStatusIndicatorKind(input: {
   return null;
 }
 
-export function getSessionStatusIndicatorClass(kind: SessionStatusIndicatorKind) {
+function getSessionStatusIndicatorClass(kind: SessionStatusIndicatorKind) {
   switch (kind) {
     case 'failed':
       return 'is-failed';
@@ -592,7 +695,7 @@ export function getSessionStatusIndicatorClass(kind: SessionStatusIndicatorKind)
   }
 }
 
-export function getSessionStatusIndicatorTitle(
+function getSessionStatusIndicatorTitle(
   kind: SessionStatusIndicatorKind,
   options?: { retrying?: boolean }
 ) {
@@ -808,6 +911,7 @@ function sortSessionsForDisplay(sessions: typeof state.sessions, now: number) {
 async function reorderPinnedSession(sourceSessionId: string, targetSessionId: string) {
   if (sourceSessionId === targetSessionId) return;
   const previous = [...state.pinnedSessionIds];
+  const syncRevision = getPinnedSessionsSyncRevision();
   const sourceIndex = previous.indexOf(sourceSessionId);
   const targetIndex = previous.indexOf(targetSessionId);
   if (sourceIndex < 0 || targetIndex < 0) return;
@@ -815,7 +919,7 @@ async function reorderPinnedSession(sourceSessionId: string, targetSessionId: st
   const next = [...previous];
   const [sourceId] = next.splice(sourceIndex, 1);
   next.splice(targetIndex, 0, sourceId!);
-  setState('pinnedSessionIds', next);
+  setState(storePath('pinnedSessionIds', next));
 
   const sourceSession = state.sessions.find((session) => session.id === sourceSessionId);
   const targetSession = state.sessions.find((session) => session.id === targetSessionId);
@@ -828,9 +932,12 @@ async function reorderPinnedSession(sourceSessionId: string, targetSessionId: st
         targetDirectory: targetSession?.directory,
       }
     );
-    setState('pinnedSessionIds', pinnedSessionIds);
+    // A host snapshot received meanwhile is newer than this response.
+    if (getPinnedSessionsSyncRevision() === syncRevision)
+      setState(storePath('pinnedSessionIds', pinnedSessionIds));
   } catch (error) {
-    setState('pinnedSessionIds', previous);
+    if (getPinnedSessionsSyncRevision() === syncRevision)
+      setState(storePath('pinnedSessionIds', previous));
     setError(error instanceof Error ? error.message : String(error));
   }
 }
@@ -990,10 +1097,12 @@ function SessionListContinuation() {
     observer.observe(element);
   };
 
-  createEffect(() => {
-    if (state.sessionsHasMore || state.sessionsPaginationError) return;
-    disconnectObserver();
-  });
+  createEffect(
+    () => state.sessionsHasMore || state.sessionsPaginationError,
+    (hasContinuation) => {
+      if (!hasContinuation) disconnectObserver();
+    }
+  );
   onCleanup(disconnectObserver);
 
   return (
@@ -1030,8 +1139,8 @@ function SessionListWorkspaceSelector(props: {
   let buttonRef: HTMLButtonElement | undefined;
   let popoverRef: HTMLDivElement | undefined;
 
-  createEffect(() => {
-    if (!showPicker()) return;
+  createEffect(showPicker, (open) => {
+    if (!open) return;
     const closeIfOutside = (event: Event) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
@@ -1045,10 +1154,10 @@ function SessionListWorkspaceSelector(props: {
     };
     window.addEventListener('pointerdown', closeIfOutside, true);
     window.addEventListener('keydown', closeOnEscape, true);
-    onCleanup(() => {
+    return () => {
       window.removeEventListener('pointerdown', closeIfOutside, true);
       window.removeEventListener('keydown', closeOnEscape, true);
-    });
+    };
   });
 
   return (
@@ -1098,10 +1207,16 @@ export function SessionListView(props: {
 }) {
   const diffSummaryOwner = Symbol('session-list');
   const [visible, setVisible] = createSignal(!document.hidden);
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const update = () => setVisible(!document.hidden);
     document.addEventListener('visibilitychange', update);
-    onCleanup(() => document.removeEventListener('visibilitychange', update));
+    cleanups.push(() => document.removeEventListener('visibilitychange', update));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
   const ageNow = useMinuteClock(visible);
 
@@ -1202,94 +1317,100 @@ export function SessionListView(props: {
   let resolutionRequestKey = 0;
   let resolutionRequestActive = false;
   let resolutionAbortController: AbortController | undefined;
-  createEffect(() => {
-    const resolutionActive = Boolean(props.subagentParentId);
-    if (!resolutionActive) {
-      resolutionRequestActive = false;
-      resolutionAbortController?.abort();
-      resolutionAbortController = undefined;
-      resolutionRequestKey += 1;
-      setAllSessionsForSubagent(null);
-      setIsResolvingSubagents(false);
-      return;
-    }
-    if (resolutionRequestActive) return;
-
-    resolutionRequestActive = true;
-    const requestKey = ++resolutionRequestKey;
-    const controller = new AbortController();
-    resolutionAbortController = controller;
-    setIsResolvingSubagents(true);
-    void (async () => {
-      let limit = SUBAGENT_SESSION_PAGE_SIZE;
-      while (true) {
-        if (requestKey !== resolutionRequestKey) return;
-        const page = await listCompleteSessionPage({ limit, signal: controller.signal });
-        if (requestKey !== resolutionRequestKey) return;
-        setAllSessionsForSubagent(page.items);
-        if (!page.hasMore) return;
-
-        const nextLimit = Math.min(limit * 2, MAX_SUBAGENT_SESSION_LIMIT);
-        if (nextLimit === limit) throw new Error('Session lookup exceeded the supported limit');
-        limit = nextLimit;
+  createEffect(
+    () => Boolean(props.subagentParentId),
+    (resolutionActive) => {
+      if (!resolutionActive) {
+        resolutionRequestActive = false;
+        resolutionAbortController?.abort();
+        resolutionAbortController = undefined;
+        resolutionRequestKey += 1;
+        setAllSessionsForSubagent(null);
+        setIsResolvingSubagents(false);
+        return;
       }
-    })()
-      .catch((error) => {
-        if (requestKey !== resolutionRequestKey || controller.signal.aborted) return;
-        setError(error instanceof Error ? error.message : String(error));
-      })
-      .finally(() => {
-        if (requestKey === resolutionRequestKey) {
-          resolutionAbortController = undefined;
-          setIsResolvingSubagents(false);
+      if (resolutionRequestActive) return;
+
+      resolutionRequestActive = true;
+      const requestKey = ++resolutionRequestKey;
+      const controller = new AbortController();
+      resolutionAbortController = controller;
+      setIsResolvingSubagents(true);
+      void (async () => {
+        let limit = SUBAGENT_SESSION_PAGE_SIZE;
+        while (true) {
+          if (requestKey !== resolutionRequestKey) return;
+          const page = await listCompleteSessionPage({ limit, signal: controller.signal });
+          if (requestKey !== resolutionRequestKey) return;
+          setAllSessionsForSubagent(page.items);
+          if (!page.hasMore) return;
+
+          const nextLimit = Math.min(limit * 2, MAX_SUBAGENT_SESSION_LIMIT);
+          if (nextLimit === limit) throw new Error('Session lookup exceeded the supported limit');
+          limit = nextLimit;
         }
-      });
-  });
+      })()
+        .catch((error) => {
+          if (requestKey !== resolutionRequestKey || controller.signal.aborted) return;
+          setError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          if (requestKey === resolutionRequestKey) {
+            resolutionAbortController = undefined;
+            setIsResolvingSubagents(false);
+          }
+        });
+    }
+  );
 
   let searchRequestKey = 0;
   let searchAbortController: AbortController | undefined;
   let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
-  createEffect(() => {
-    const query = trimmedSearchQuery();
-    const searchActive = shouldShowSearch() && query.length > 0;
-    const directory = folderFilter() ?? undefined;
-    if (searchDebounceTimer !== undefined) clearTimeout(searchDebounceTimer);
-    searchDebounceTimer = undefined;
-    searchAbortController?.abort();
-    searchAbortController = undefined;
-    searchRequestKey += 1;
-    setNativeSearchResults(null);
-    if (!searchActive) {
-      setIsSearchingAllSessions(false);
-      return;
-    }
-
-    const requestKey = searchRequestKey;
-    const controller = new AbortController();
-    searchAbortController = controller;
-    setIsSearchingAllSessions(true);
-    searchDebounceTimer = setTimeout(() => {
+  createEffect(
+    () => ({
+      query: trimmedSearchQuery(),
+      showSearch: shouldShowSearch(),
+      directory: folderFilter() ?? undefined,
+    }),
+    ({ query, showSearch, directory }) => {
+      if (searchDebounceTimer !== undefined) clearTimeout(searchDebounceTimer);
       searchDebounceTimer = undefined;
-      void listCompleteSessionPage({
-        limit: SESSION_SEARCH_LIMIT,
-        search: query,
-        roots: true,
-        directory,
-        signal: controller.signal,
-      })
-        .then((page) => {
-          if (requestKey !== searchRequestKey || controller.signal.aborted) return;
-          setNativeSearchResults(page.items);
+      searchAbortController?.abort();
+      searchAbortController = undefined;
+      searchRequestKey += 1;
+      setNativeSearchResults(null);
+      if (!showSearch || !query) {
+        setIsSearchingAllSessions(false);
+        return;
+      }
+
+      const requestKey = searchRequestKey;
+      const controller = new AbortController();
+      searchAbortController = controller;
+      setIsSearchingAllSessions(true);
+      searchDebounceTimer = setTimeout(() => {
+        searchDebounceTimer = undefined;
+        void listCompleteSessionPage({
+          limit: SESSION_SEARCH_LIMIT,
+          search: query,
+          roots: true,
+          directory,
+          signal: controller.signal,
         })
-        .catch((error) => {
-          if (requestKey !== searchRequestKey || controller.signal.aborted) return;
-          setError(error instanceof Error ? error.message : String(error));
-        })
-        .finally(() => {
-          if (requestKey === searchRequestKey) setIsSearchingAllSessions(false);
-        });
-    }, SESSION_SEARCH_DEBOUNCE_MS);
-  });
+          .then((page) => {
+            if (requestKey !== searchRequestKey || controller.signal.aborted) return;
+            setNativeSearchResults(page.items);
+          })
+          .catch((error) => {
+            if (requestKey !== searchRequestKey || controller.signal.aborted) return;
+            setError(error instanceof Error ? error.message : String(error));
+          })
+          .finally(() => {
+            if (requestKey === searchRequestKey) setIsSearchingAllSessions(false);
+          });
+      }, SESSION_SEARCH_DEBOUNCE_MS);
+    }
+  );
   onCleanup(() => {
     resolutionRequestKey += 1;
     resolutionAbortController?.abort();
@@ -1301,9 +1422,17 @@ export function SessionListView(props: {
   const pendingBackgroundIds = createPendingBackgroundSessionIds(() =>
     props.rawSessionIndicators ? {} : state.sessionStatus
   );
+  const indicatorSessions = createRecordSnapshots(() => state.sessions);
+  const indicatorReads = mapArray(
+    () => state.sessions,
+    (session) => createMemo(() => [session.id, readSessionIndicatorState(session.id)] as const),
+    { keyed: true }
+  );
+  const indicatorReadState = createMemo(() => new Map(indicatorReads().map((read) => read())));
   const rawSessionIndicators = createMemo(
     () =>
-      props.rawSessionIndicators ?? deriveSessionIndicators(state.sessions, pendingBackgroundIds())
+      props.rawSessionIndicators ??
+      deriveSessionIndicators(indicatorSessions(), pendingBackgroundIds(), indicatorReadState())
   );
   const sessionIndicators = createStableSessionIndicators(rawSessionIndicators);
   const queuedMessageCounts = createMemo(() => {
@@ -1352,9 +1481,18 @@ export function SessionListView(props: {
         )
     )
   );
-  createEffect(() => {
-    props.onPrimarySessionsCountChange?.(visibleSessionsForList().filter(isPrimarySession).length);
-  });
+  createEffect(
+    () =>
+      props.onPrimarySessionsCountChange
+        ? {
+            notify: props.onPrimarySessionsCountChange,
+            count: visibleSessionsForList().filter(isPrimarySession).length,
+          }
+        : null,
+    (result) => {
+      result?.notify(result.count);
+    }
+  );
   const groupedSessions = createMemo(() =>
     groupSessions(
       visibleSessionsForList(),
@@ -1388,6 +1526,27 @@ export function SessionListView(props: {
   const subagentSessions = createMemo(() =>
     getSubagentSessionsForParent(resolvedSubagentSessions(), props.subagentParentId ?? null)
   );
+  const arrangedSubagentSessions = createMemo(() =>
+    arrangeSubagentSessions(subagentSessions(), subagentListView(), ageNow())
+  );
+  // The header offers the tree/flat toggle only when some sub-agent has its own sub-agents.
+  const hasNestedSubagentSessions = createMemo(() => {
+    const parentId = props.subagentParentId;
+    const sessions = subagentSessions();
+    const ids = new Set(sessions.map((session) => session.id));
+    return sessions.some(
+      (session) => !!session.parentID && session.parentID !== parentId && ids.has(session.parentID)
+    );
+  });
+  createEffect(
+    () => (hasNestedSubagentSessions() ? (props.subagentParentId ?? null) : null),
+    (parentId) => (parentId ? reportNestedSubagents(parentId) : undefined)
+  );
+  const NO_TREE_GUIDES: SessionTreeGuide[] = [];
+  const getTreeGuides = (sessionId: string) =>
+    props.subagentParentId
+      ? (arrangedSubagentSessions().guides.get(sessionId) ?? NO_TREE_GUIDES)
+      : NO_TREE_GUIDES;
   const searchResultSessions = createMemo(() => {
     const results = nativeSearchResults();
     if (!results) return [];
@@ -1417,45 +1576,50 @@ export function SessionListView(props: {
         )
       : []
   );
-  createEffect(() => {
-    const filter = props.sessionFilter;
-    const unreadSessions = props.subagentParentId
-      ? []
-      : filteredSessions().filter((session) => {
-          switch (filter) {
-            case 'completed':
-              return isSessionCompletedResponseUnread(session.id);
-            case 'plan-ready':
-              return isSessionUnread(
-                session.id,
-                getSessionPlanUpdatedAt(session.id, session.time.updated)
-              );
-            case 'failed':
-              return isSessionFailureUnread(session.id);
-            default:
-              return false;
-          }
-        });
-    props.onMarkAllReadChange?.(
-      unreadSessions.length >= 2
-        ? () => {
-            batch(() => {
-              for (const session of unreadSessions) {
-                markSessionSeen(
+  createEffect(
+    () => {
+      const filter = props.sessionFilter;
+      const unreadSessions = props.subagentParentId
+        ? []
+        : filteredSessions().filter((session) => {
+            switch (filter) {
+              case 'completed':
+                return isSessionCompletedResponseUnread(session.id);
+              case 'plan-ready':
+                return isSessionUnread(
                   session.id,
-                  Math.max(
-                    Date.now(),
-                    session.time.updated,
-                    state.completedSessionResponses[session.id] ?? 0,
-                    getSessionTreeFailedUpdated(session.id) ?? getSessionTreeUpdated(session.id)
-                  )
+                  getSessionPlanUpdatedAt(session.id, session.time.updated)
                 );
-              }
-            });
-          }
-        : null
-    );
-  });
+              case 'failed':
+                return isSessionFailureUnread(session.id);
+              default:
+                return false;
+            }
+          });
+      return unreadSessions;
+    },
+    (unreadSessions) => {
+      props.onMarkAllReadChange?.(
+        unreadSessions.length >= 2
+          ? () => {
+              (() => {
+                for (const session of unreadSessions) {
+                  markSessionSeen(
+                    session.id,
+                    Math.max(
+                      Date.now(),
+                      session.time.updated,
+                      state.completedSessionResponses[session.id] ?? 0,
+                      getSessionTreeFailedUpdated(session.id) ?? getSessionTreeUpdated(session.id)
+                    )
+                  );
+                }
+              })();
+            }
+          : null
+      );
+    }
+  );
   const defaultSurfacedSessions = createMemo(() =>
     sortSessionsForDisplay(recentSessions(), ageNow())
   );
@@ -1485,20 +1649,19 @@ export function SessionListView(props: {
     () =>
       isDefaultGroupedView() && availableGroupedSections().some((section) => section !== 'recent')
   );
-  createEffect(() => {
-    if (
-      !isDefaultGroupedView() ||
-      overflowOtherSessions().length >= SESSION_ARCHIVE_PRELOAD_TARGET ||
-      !state.sessionsHasMore ||
-      state.sessionsLoadingMore ||
-      state.sessionsPaginationError
-    ) {
-      return;
-    }
-    void loadMoreSessions();
+  const shouldPreloadArchive = createMemo(
+    () =>
+      isDefaultGroupedView() &&
+      overflowOtherSessions().length < SESSION_ARCHIVE_PRELOAD_TARGET &&
+      state.sessionsHasMore &&
+      !state.sessionsLoadingMore &&
+      !state.sessionsPaginationError
+  );
+  createEffect(shouldPreloadArchive, (shouldPreload) => {
+    if (shouldPreload) void loadMoreSessions();
   });
   const directSessions = createMemo(() => {
-    if (props.subagentParentId) return subagentSessions();
+    if (props.subagentParentId) return arrangedSubagentSessions().sessions;
     if (props.sessionFilter) return filteredSessions();
     return [];
   });
@@ -1575,14 +1738,14 @@ export function SessionListView(props: {
     });
   };
 
-  createEffect(() => {
-    visibleSessions();
-    expandedGroupedSection();
-    sessionDiffSummaryCache();
-    scheduleScrollableContentUpdate();
-  });
+  createEffect(
+    () => [visibleSessions(), expandedGroupedSection(), sessionDiffSummaryCache()],
+    scheduleScrollableContentUpdate
+  );
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const observer =
       globalThis.ResizeObserver === undefined
         ? null
@@ -1590,73 +1753,82 @@ export function SessionListView(props: {
     if (containerRef) observer?.observe(containerRef);
     window.addEventListener('resize', scheduleScrollableContentUpdate);
     scheduleScrollableContentUpdate();
-    onCleanup(() => {
+    cleanups.push(() => {
       scrollabilityUpdateDisposed = true;
       observer?.disconnect();
       window.removeEventListener('resize', scheduleScrollableContentUpdate);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  createEffect(() => {
-    const sessions = visibleSessions();
-    updateRelevantDiffSummarySessions(
-      diffSummaryOwner,
-      new Set(sessions.map((session) => session.id))
-    );
-  });
+  createEffect(
+    () => new Set(visibleSessions().map((session) => session.id)),
+    (ids) => updateRelevantDiffSummarySessions(diffSummaryOwner, ids)
+  );
   onCleanup(() => updateRelevantDiffSummarySessions(diffSummaryOwner, null));
 
   createEffect(
-    on(
-      () => [props.sessionFilter, props.subagentParentId],
-      () => {
-        setActiveGroupedSection(null);
-        setSearchQuery('');
-        setFocusedIndex(-1);
-      }
-    )
+    () => [props.sessionFilter, props.subagentParentId],
+    () => {
+      setActiveGroupedSection(null);
+      setSearchQuery('');
+      setFocusedIndex(-1);
+    }
+  );
+
+  createEffect(folderFilter, () => {
+    setActiveGroupedSection(null);
+    setFocusedIndex(-1);
+  });
+
+  createEffect(
+    () => {
+      const selected = folderFilter();
+      return (
+        selected &&
+        !(state.editorContext.workspaceFolders ?? []).some((folder) =>
+          isSameWorkspacePath(folder.path, selected)
+        )
+      );
+    },
+    (missing) => {
+      if (missing) setFolderFilter(null);
+    }
   );
 
   createEffect(
-    on(folderFilter, () => {
-      setActiveGroupedSection(null);
-      setFocusedIndex(-1);
-    })
+    () => {
+      const activeSection = activeGroupedSection();
+      return activeSection && !availableGroupedSections().includes(activeSection);
+    },
+    (missing) => {
+      if (missing) setActiveGroupedSection(null);
+    }
   );
 
-  createEffect(() => {
-    const selected = folderFilter();
-    if (
-      selected &&
-      !(state.editorContext.workspaceFolders ?? []).some((folder) =>
-        isSameWorkspacePath(folder.path, selected)
-      )
-    ) {
-      setFolderFilter(null);
+  createEffect(
+    () => {
+      const sessionId = sessionActions.sessionId();
+      return sessionId && !state.sessions.some((session) => session.id === sessionId);
+    },
+    (missing) => {
+      if (missing) sessionActions.close();
     }
-  });
+  );
 
-  createEffect(() => {
-    const activeSection = activeGroupedSection();
-    if (!activeSection) return;
-    if (!availableGroupedSections().includes(activeSection)) setActiveGroupedSection(null);
-  });
-
-  createEffect(() => {
-    const sessionId = sessionActions.sessionId();
-    if (sessionId && !state.sessions.some((session) => session.id === sessionId)) {
-      sessionActions.close();
+  createEffect(
+    () => visibleSessions().length,
+    (length) => {
+      setFocusedIndex((current) => {
+        if (length === 0) return -1;
+        if (current < 0) return current;
+        return Math.min(current, length - 1);
+      });
     }
-  });
-
-  createEffect(() => {
-    const sessions = visibleSessions();
-    setFocusedIndex((current) => {
-      if (sessions.length === 0) return -1;
-      if (current < 0) return current;
-      return Math.min(current, sessions.length - 1);
-    });
-  });
+  );
 
   const toggleGroupedSection = (section: SessionListGroupedSection) => {
     if (section === 'recent') {
@@ -1720,7 +1892,6 @@ export function SessionListView(props: {
               observe={observe}
               session={session()}
               summaryUpdated={sessionDiffSummaries.getRevision(sessionId)}
-              onRequestSummary={(updated) => enqueueDiffSummaryRequest(session(), updated)}
               diffSummary={diffSummary()?.stats ?? null}
               isSummaryLoading={
                 diffSummary()?.status === 'loading' && diffSummary()?.stats === null
@@ -1748,6 +1919,7 @@ export function SessionListView(props: {
               activeNow={activeNow}
               queuedMessageCount={queuedMessageCounts().get(sessionId) ?? 0}
               subagentCount={sessionIndicators().subagentCounts.get(sessionId) || 0}
+              treeGuides={getTreeGuides(sessionId)}
               hasPermissionRequest={sessionIndicators().permissionIds.has(sessionId)}
               hasQuestionRequest={sessionIndicators().questionIds.has(sessionId)}
               isRunning={sessionIndicators().runningIds.has(sessionId)}
@@ -1797,10 +1969,10 @@ export function SessionListView(props: {
                             },
                           };
                         };
-                        batch(() => {
-                          setState('sessions', (items) => items.map(hideLink));
+                        (() => {
+                          setState(storePath('sessions', (items) => items.map(hideLink)));
                           setNativeSearchResults((results) => results?.map(hideLink) ?? null);
-                        });
+                        })();
                         await reloadSessions();
                       } catch (error) {
                         setError(error instanceof Error ? error.message : String(error));
@@ -1815,7 +1987,7 @@ export function SessionListView(props: {
                     !state.pinnedSessionIds.includes(sessionId),
                     { directory: session().directory }
                   );
-                  setState('pinnedSessionIds', pinnedSessionIds);
+                  setState(storePath('pinnedSessionIds', pinnedSessionIds));
                 } catch (error) {
                   setError(error instanceof Error ? error.message : String(error));
                 }
@@ -1986,8 +2158,13 @@ export function SessionListView(props: {
     }
   }
 
-  onMount(() => {
-    if (props.embedded) return;
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    if (props.embedded)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     const focusFrame = requestAnimationFrame(() => {
       if (hasPointerInteraction) return;
       if (shouldShowSearch()) {
@@ -1996,20 +2173,22 @@ export function SessionListView(props: {
       }
       containerRef?.focus();
     });
-    onCleanup(() => cancelAnimationFrame(focusFrame));
+    cleanups.push(() => cancelAnimationFrame(focusFrame));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   createEffect(
-    on(
-      sessionSearchFocusKey,
-      (key) => {
-        if (key === 0) return;
-        queueMicrotask(() => {
-          if (shouldShowSearch()) searchInputRef?.focus();
-        });
-      },
-      { defer: true }
-    )
+    sessionSearchFocusKey,
+    (key) => {
+      if (key === 0) return;
+      queueMicrotask(() => {
+        if (shouldShowSearch()) searchInputRef?.focus();
+      });
+    },
+    { defer: true }
   );
 
   const emptyMessage = () => {
@@ -2071,11 +2250,14 @@ export function SessionListView(props: {
               searchInputRef = el;
             }}
             type="text"
-            class="session-list-search-input"
-            classList={{
-              'session-list-search-input-with-scope':
-                searchQuery().length === 0 && Boolean(sessionHistoryDirectory()),
-            }}
+
+            class={[
+              'session-list-search-input',
+              {
+                'session-list-search-input-with-scope':
+                  searchQuery().length === 0 && Boolean(sessionHistoryDirectory()),
+              },
+            ]}
             value={searchQuery()}
             onInput={(e) => setSearchQuery(e.currentTarget.value)}
             onFocus={() => setFocusedIndex(-1)}
@@ -2272,7 +2454,6 @@ function SessionListItem(props: {
   observe: (element: HTMLElement) => void;
   session: (typeof state.sessions)[number];
   summaryUpdated: number;
-  onRequestSummary: (updated: number) => void;
   diffSummary: SessionDiffSummary | null;
   isSummaryLoading: boolean;
   tokens: number | null;
@@ -2286,6 +2467,8 @@ function SessionListItem(props: {
   activeNow: () => number;
   queuedMessageCount: number;
   subagentCount: number;
+  /** Tree connector columns, one per nesting level; empty outside the sub-agent tree. */
+  treeGuides: readonly SessionTreeGuide[];
   hasPermissionRequest: boolean;
   hasQuestionRequest: boolean;
   isRunning: boolean;
@@ -2404,13 +2587,14 @@ function SessionListItem(props: {
       isPlanReady: props.isCompletedPlanSession && hasUnreadCompletion(),
       isCompleted: hasUnreadCompletion(),
     });
+  const isTodo = () => state.todoSessionIds.includes(props.session.id);
+  const goalStatus = () => sessionGoalStore.status(props.session.id);
+  const goalLabel = () => {
+    const goal = goalStatus();
+    if (goal === 'complete') return 'Goal complete';
+    return goal === 'paused' ? 'Goal paused' : 'Goal active';
+  };
   const indicatorTitle = (kind: SessionStatusIndicatorKind) => {
-    if (
-      kind === 'failed' &&
-      getSessionTreeIds(props.session.id).some(isSessionInterruptedResponseUnread)
-    ) {
-      return 'Interrupted';
-    }
     if (kind === 'attention') {
       if (props.hasPermissionRequest && props.hasQuestionRequest) return 'Attention needed';
       if (props.hasPermissionRequest) return 'Permission request pending';
@@ -2488,26 +2672,56 @@ function SessionListItem(props: {
     pointerClickTimer = undefined;
   };
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     if (!rowRef || globalThis.IntersectionObserver === undefined) {
       setShouldLoadSummary(true);
-      return;
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     }
 
-    onCleanup(observeSessionSummary(rowRef, () => setShouldLoadSummary(true)));
+    cleanups.push(observeSessionSummary(rowRef, () => setShouldLoadSummary(true)));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  createEffect(() => {
-    if (!shouldLoadSummary()) return;
-    props.onRequestSummary(props.summaryUpdated);
-  });
+  createEffect(
+    () =>
+      shouldLoadSummary()
+        ? {
+            sessionId: props.session.id,
+            directory: props.session.directory,
+            updated: props.summaryUpdated,
+          }
+        : null,
+    (request) => {
+      if (request) enqueueDiffSummaryRequest(request);
+    }
+  );
+
+  createEffect(
+    () =>
+      shouldLoadSummary() &&
+      !props.session.parentID &&
+      state.serverStatus.state === 'running' &&
+      state.serverStatus.apiVersion === 2
+        ? { sessionId: props.session.id, directory: props.session.directory }
+        : null,
+    (request) => {
+      if (request) sessionGoalStore.request(request.sessionId, request.directory);
+    }
+  );
 
   onCleanup(() => {
     if (pointerClickTimer !== undefined) clearTimeout(pointerClickTimer);
   });
 
-  createEffect(() => {
-    if (!showActions()) return;
+  createEffect(showActions, (open) => {
+    if (!open) return;
     let dismissOnSessionClick = false;
     const closeIfOutside = (event: Event) => {
       const target = event.target;
@@ -2546,12 +2760,12 @@ function SessionListItem(props: {
     window.addEventListener('pointerdown', closeIfOutside, true);
     window.addEventListener('focusin', closeIfOutside);
     window.addEventListener('click', dismissSessionClick, true);
-    onCleanup(() => {
+    return () => {
       window.removeEventListener('contextmenu', closeIfOutside, true);
       window.removeEventListener('pointerdown', closeIfOutside, true);
       window.removeEventListener('focusin', closeIfOutside);
       window.removeEventListener('click', dismissSessionClick, true);
-    });
+    };
   });
 
   return (
@@ -2562,6 +2776,7 @@ function SessionListItem(props: {
       }}
       class={`session-item ${isActive() ? 'active' : ''} ${props.isPinned ? 'is-pinned' : ''} ${props.isDraggingPinned ? 'is-dragging-pinned' : ''} ${props.isDragOverPinned ? 'is-drag-over-pinned' : ''} ${props.startsUnpinnedGroup ? 'starts-unpinned-group' : ''} ${showActions() ? 'is-context-selected' : ''} ${props.actions.sessionId() && !showActions() ? 'is-context-obscured' : ''} ${isFocused() ? 'keyboard-focus' : ''} ${modelDetails() ? 'has-model-details' : ''}`}
       data-session-id={props.session.id}
+      data-tree-depth={props.treeGuides.length > 0 ? props.treeGuides.length : undefined}
       inert={props.actions.sessionId() ? true : undefined}
       onMouseMove={() => {
         if (!props.actions.sessionId()) props.setFocusedIndex(props.itemIndex());
@@ -2588,10 +2803,25 @@ function SessionListItem(props: {
       onDrop={props.onPinnedDrop}
     >
       <span
-        class={`session-item-leading ${indicatorKind() ? 'has-status' : ''}`}
-        classList={{ 'can-reorder': props.canReorderPinned }}
+        class={[
+          `session-item-leading ${indicatorKind() || isTodo() ? 'has-status' : ''}`,
+          { 'can-reorder': props.canReorderPinned },
+        ]}
       >
-        <Show when={indicatorKind()}>
+        <Show
+          when={indicatorKind()}
+          fallback={
+            <Show when={isTodo()}>
+              <span
+                class="session-item-indicator session-status-indicator is-todo"
+                title="ToDo: the next prompt clears this mark"
+                aria-label="ToDo"
+              >
+                <UiIcon source={squareIcon} width={12} height={12} />
+              </span>
+            </Show>
+          }
+        >
           {(kind) => (
             <span
               class={`session-item-indicator session-status-indicator ${getSessionStatusIndicatorClass(kind())}`}
@@ -2611,7 +2841,7 @@ function SessionListItem(props: {
           <button
             type="button"
             class="session-item-drag-handle"
-            draggable={true}
+            draggable="true"
             title="Drag to reorder pinned session"
             aria-label={`Reorder pinned session: ${normalizeSessionTitle(props.session.title) || 'Untitled'}`}
             onDragStart={props.onPinnedDragStart}
@@ -2646,6 +2876,14 @@ function SessionListItem(props: {
           if (!props.actions.sessionId()) props.setFocusedIndex(props.itemIndex());
         }}
       >
+        <Show when={props.treeGuides.length > 0}>
+          <span class="session-item-tree-guides" aria-hidden="true">
+            {/* Deep branches keep their innermost columns so titles keep usable width. */}
+            {props.treeGuides.slice(-MAX_SESSION_TREE_INDENT).map((guide) => (
+              <span class={`session-item-tree-guide is-${guide}`} />
+            ))}
+          </span>
+        </Show>
         <div class="session-item-content">
           <span class="session-item-title">
             <span class="session-item-title-text">
@@ -2782,6 +3020,23 @@ function SessionListItem(props: {
             Plan
           </span>
         </Show>
+        <Show when={goalStatus()}>
+          {(goal) => (
+            <span
+              class={`session-item-queued-counter session-item-goal is-${goal()}`}
+              data-goal-status={goal()}
+              title={goalLabel()}
+              aria-label={goalLabel()}
+            >
+              <UiIcon
+                source={goal() === 'complete' ? clipboardCheckIcon : pasteClipboardIcon}
+                class="session-item-queued-icon"
+                width={16}
+                height={16}
+              />
+            </span>
+          )}
+        </Show>
         <Show when={props.queuedMessageCount > 0}>
           <span
             id={queuedMessageDescriptionId}
@@ -2875,9 +3130,18 @@ function rootSessionId(sessionId: string) {
   return getSessionTreeRootId(sessionId) || sessionId;
 }
 
+function readSessionIndicatorState(sessionId: string) {
+  return {
+    selectedAgent: getSelectedAgentForSession(sessionId),
+    completedUnread: isSessionCompletedResponseUnread(sessionId),
+    interruptedUnread: isSessionInterruptedResponseUnread(sessionId),
+  };
+}
+
 export function deriveSessionIndicators(
   sessions: typeof state.sessions,
-  pendingBackgroundIds: ReadonlySet<string> = new Set()
+  pendingBackgroundIds: ReadonlySet<string> = new Set(),
+  readState?: ReadonlyMap<string, ReturnType<typeof readSessionIndicatorState>>
 ): SessionIndicatorSets {
   const subagentCounts = new Map<string, number>();
   const failedSessionIds = new Set(state.failedSessionIds);
@@ -2921,13 +3185,7 @@ export function deriveSessionIndicators(
     return (
       state.sessionStatus[sessionId]?.type !== 'busy' &&
       !compactingSessionIds.has(sessionId) &&
-      (failedSessionIds.has(sessionId) ||
-        (state.sessionStatus[sessionId]?.type !== 'retry' &&
-          !permissionIds.has(rootSessionId(sessionId)) &&
-          !questionIds.has(rootSessionId(sessionId)) &&
-          !questionResponsePendingIds.has(rootSessionId(sessionId)) &&
-          !editorSessionIds.has(rootSessionId(sessionId)) &&
-          isSessionInterruptedResponseUnread(sessionId)))
+      failedSessionIds.has(sessionId)
     );
   };
   const isRunning = (sessionId: string, rootId: string) => {
@@ -2984,7 +3242,13 @@ export function deriveSessionIndicators(
       }
       continue;
     }
-    if (isSessionInterruptedResponseUnread(sessionId) && !running && !needsAttention) continue;
+    const sessionReadState = readState?.get(sessionId);
+    if (
+      (sessionReadState?.interruptedUnread ?? isSessionInterruptedResponseUnread(sessionId)) &&
+      !running &&
+      !needsAttention
+    )
+      continue;
     if (needsAttention) {
       attentionIds.add(displaySessionId);
       attentionIds.add(sessionId);
@@ -3011,7 +3275,9 @@ export function deriveSessionIndicators(
       continue;
     }
     if (editorSessionIds.has(displaySessionId)) continue;
-    const selectedAgent = getSelectedAgentForSession(sessionId);
+    const selectedAgent = sessionReadState
+      ? sessionReadState.selectedAgent
+      : getSelectedAgentForSession(sessionId);
     if (selectedAgent === 'plan') {
       // An empty session cannot contain a plan; the plan agent may have been
       // registered for it merely by selecting the session in the list.
@@ -3023,7 +3289,7 @@ export function deriveSessionIndicators(
       }
       continue;
     }
-    if (!isSessionCompletedResponseUnread(sessionId)) {
+    if (!(sessionReadState?.completedUnread ?? isSessionCompletedResponseUnread(sessionId))) {
       continue;
     }
     newlyCompletedIds.add(sessionId);

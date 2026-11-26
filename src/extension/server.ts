@@ -1006,7 +1006,7 @@ export class OpenCodeServer extends EventEmitter {
   private async hasMissingRuntimeAskAgent(signal?: AbortSignal): Promise<boolean> {
     if (
       this.isAttachOnly ||
-      !this.processManager.needsRuntimeConfigRecovery ||
+      !(await this.processManager.needsRuntimeConfigRecovery()) ||
       !(await this.processManager.shouldRestoreRuntimeAskAgent())
     ) {
       signal?.throwIfAborted();
@@ -1040,14 +1040,36 @@ export class OpenCodeServer extends EventEmitter {
     disposeGeneration: number,
     signal: AbortSignal
   ): Promise<string | undefined> {
-    // A service replacement can retain our credentials but lose OPENCODE_CONFIG.
+    // A service replacement or temp cleanup can remove our runtime config.
     // Restore the runtime before publishing running state and routing catalogs.
     // Ordinary reuse keeps the background ownership-preparation fast path.
-    if (!this.processManager.hasRuntimeConfigRecoveryCandidate || this.isAttachOnly) return;
-    this.startExistingServerPreparation(disposeGeneration, signal);
-    await this.existingServerPreparationOperation;
-    this.throwIfStartCancelled(disposeGeneration, signal);
-    if (!(await this.hasMissingRuntimeAskAgent())) return;
+    if (this.isAttachOnly) return;
+    try {
+      const candidate = await withStartupDeadline(
+        () => this.processManager.hasRuntimeConfigRecoveryCandidate(),
+        2000,
+        'OpenCode runtime config inspection',
+        signal
+      );
+      this.throwIfStartCancelled(disposeGeneration, signal);
+      if (!candidate) return;
+      this.startExistingServerPreparation(disposeGeneration, signal);
+      await this.existingServerPreparationOperation;
+      this.throwIfStartCancelled(disposeGeneration, signal);
+      const missingAsk = await withStartupDeadline(
+        (recoverySignal) => this.hasMissingRuntimeAskAgent(recoverySignal),
+        2000,
+        'OpenCode Ask agent preparation',
+        signal
+      );
+      if (!missingAsk) return;
+    } catch (error) {
+      this.throwIfStartCancelled(disposeGeneration, signal);
+      logger.warn(
+        `Deferring optional OpenCode runtime config recovery: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return;
+    }
     this.throwIfStartCancelled(disposeGeneration, signal);
     if ((await this.readRestartBlockers()).totalSessionCount > 0) return;
     this.throwIfStartCancelled(disposeGeneration, signal);
@@ -1057,7 +1079,7 @@ export class OpenCodeServer extends EventEmitter {
       // The claim protects ownership, not work submitted by other clients.
       if ((await this.readRestartBlockers()).totalSessionCount > 0) return;
       this.throwIfStartCancelled(disposeGeneration, signal);
-      logger.info('Restoring Varro runtime Ask agent on the replaced managed OpenCode server');
+      logger.info('Restoring Varro runtime Ask agent on the managed OpenCode server');
       await this.stopServerForRestart(true);
     } finally {
       await release();
@@ -1705,13 +1727,17 @@ export class OpenCodeServer extends EventEmitter {
       this.processManager.confirmManagedServerConnection(undefined, signal),
     deadline = performance.now() + STARTUP_HEALTH_TIMEOUT_MS
   ) {
-    if (
-      signal?.aborted ||
-      !this.lifecycle.isCurrentStartAttempt(startAttemptId, disposeGeneration)
-    ) {
+    const rejectIfCancelled = () => {
+      if (
+        !signal?.aborted &&
+        this.lifecycle.isCurrentStartAttempt(startAttemptId, disposeGeneration)
+      ) {
+        return false;
+      }
       reject(this.getCancellationError(signal));
-      return;
-    }
+      return true;
+    };
+    if (rejectIfCancelled()) return;
     if (performance.now() >= deadline) {
       this.cancelPollHealth();
       this.setStatus({ state: 'error', message: 'Server failed to start within timeout' });
@@ -1721,13 +1747,7 @@ export class OpenCodeServer extends EventEmitter {
 
     const pollOnce = async () => {
       this.pollHealthTimer = null;
-      if (
-        signal?.aborted ||
-        !this.lifecycle.isCurrentStartAttempt(startAttemptId, disposeGeneration)
-      ) {
-        reject(this.getCancellationError(signal));
-        return;
-      }
+      if (rejectIfCancelled()) return;
       if (performance.now() >= deadline) {
         reject(new Error(`Server health check timed out after ${STARTUP_HEALTH_TIMEOUT_MS}ms`));
         return;
@@ -1744,13 +1764,7 @@ export class OpenCodeServer extends EventEmitter {
         reject(err instanceof Error ? err : new Error(String(err)));
         return;
       }
-      if (
-        signal?.aborted ||
-        !this.lifecycle.isCurrentStartAttempt(startAttemptId, disposeGeneration)
-      ) {
-        reject(this.getCancellationError(signal));
-        return;
-      }
+      if (rejectIfCancelled()) return;
       if (health.healthy && !isSupportedOpenCodeVersion(health.version)) {
         this.cancelPollHealth();
         const { message, detail } = createUpdateRequiredError({
@@ -1771,25 +1785,13 @@ export class OpenCodeServer extends EventEmitter {
           reject(err instanceof Error ? err : new Error(String(err)));
           return;
         }
-        if (
-          signal?.aborted ||
-          !this.lifecycle.isCurrentStartAttempt(startAttemptId, disposeGeneration)
-        ) {
-          reject(this.getCancellationError(signal));
-          return;
-        }
+        if (rejectIfCancelled()) return;
         if (!ownershipConfirmed) {
           reject(new Error(OpenCodeServer.OWNERSHIP_CONFIRMATION_FAILED_MESSAGE));
           return;
         }
         await this.admitManagedServer(signal);
-        if (
-          signal?.aborted ||
-          !this.lifecycle.isCurrentStartAttempt(startAttemptId, disposeGeneration)
-        ) {
-          reject(this.getCancellationError(signal));
-          return;
-        }
+        if (rejectIfCancelled()) return;
         this.processManager.resetPortRetryState();
         this.beginRunningEventStream();
         resolve(this.url);
@@ -2175,7 +2177,7 @@ export class OpenCodeServer extends EventEmitter {
     // runRestart reserves the lifecycle, drains requests, rechecks global work
     // and acquires verified ownership before stopping. Never force this repair.
     await this.runRestart(async () => {
-      logger.info('Restoring Varro runtime Ask agent on the replaced managed OpenCode server');
+      logger.info('Restoring Varro runtime Ask agent on the managed OpenCode server');
       await this.processManager.stopServerForRestart();
     });
     this.runtimeAskRecoveryPending = false;
@@ -2951,6 +2953,11 @@ export class OpenCodeServer extends EventEmitter {
 
   updateLaunchSettings(options: { autoStart: boolean; command: string }) {
     this.processManager.updateLaunchSettings(options);
+  }
+
+  /** Which host runs the connected server: this window, another Varro window, or neither. */
+  get serverOwnership(): OpenCodeServerOwnership {
+    return this.processManager.serverOwnership;
   }
 
   /** Attach-only endpoints may be Docker ports or tunnels, even on loopback. */

@@ -1,5 +1,7 @@
-import { $RAW } from 'solid-js/store';
+import { $TARGET } from '@solidjs/signals';
+import { snapshot } from 'solid-js';
 import { isObject, isString } from './runtime-values';
+import type { UnknownRecord } from '../../shared/type-utils';
 import type { MessageEntry } from '../types';
 
 const MAX_HISTORY_CACHE_BYTES = 24 * 1024 * 1024;
@@ -11,20 +13,27 @@ function estimateBytes(value: readonly MessageEntry[]): number {
   const seen = new Set<object>();
   let bytes = 0;
   while (pending.length && bytes <= MAX_HISTORY_CACHE_BYTES) {
-    const candidate = pending.pop();
-    // Counting a store snapshot must not create proxies and reactive nodes for every
-    // historical field. Read its backing object without changing the cached entries.
-    // SAFETY: isObject narrows to an object; Solid's optional $RAW value remains unknown.
-    const item = isObject(candidate)
-      ? ((candidate as { [$RAW]?: unknown })[$RAW] ?? candidate)
-      : candidate;
+    const item = pending.pop();
     if (isString(item)) bytes += item.length * 2;
     else if (isObject(item) && !seen.has(item)) {
       seen.add(item);
+      // Cached rows are store records. Read each one through its current plain snapshot, including
+      // pending writes of the enclosing transaction, instead of walking every field through proxies.
+      const record: object = $TARGET in item ? snapshot(item) : item;
+      if (record !== item) {
+        if (seen.has(record)) {
+          bytes += 8;
+          continue;
+        }
+        seen.add(record);
+      }
       bytes += 64;
-      for (const [key, child] of Object.entries(item)) {
+      // SAFETY: Object.keys lists only own string keys of this plain object or array.
+      const fields = record as UnknownRecord;
+      // Avoid Object.entries' per-field pair arrays; each prepend walks every retained record.
+      for (const key of Object.keys(fields)) {
         bytes += key.length * 2 + 16;
-        pending.push(child);
+        pending.push(fields[key]);
       }
     } else bytes += 8;
   }

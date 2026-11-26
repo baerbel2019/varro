@@ -1,11 +1,13 @@
+import { flush as flushSolid } from 'solid-js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockedObject } from 'vitest';
 import type * as StateModule from '../lib/state';
 import type { AssistantMessage, NormalizedTodo, Part, UserMessage } from '../types';
 
 // SAFETY: The fixture provides the complete domain shape read by this statement.
-const { setState, state } = vi.hoisted(() => ({
-  setState: vi.fn(),
+const { setState, state, todoChanges } = vi.hoisted(() => ({
+  setState: vi.fn<(update: (draft: { todos: NormalizedTodo[] }) => void) => void>(),
+  todoChanges: vi.fn<(todos: NormalizedTodo[]) => void>(),
   state: {
     todos: [] as NormalizedTodo[],
     messages: [] as Array<{ info: UserMessage | AssistantMessage; parts: Part[] }>,
@@ -35,7 +37,13 @@ import {
 } from './todo-sync';
 
 beforeEach(() => {
-  setState.mockClear();
+  setState.mockReset();
+  todoChanges.mockClear();
+  setState.mockImplementation((update) => {
+    const previous = state.todos;
+    update(state);
+    if (state.todos !== previous) todoChanges(state.todos);
+  });
   state.todos = [];
   state.messages = [];
   state.activeSessionId = 'session-1';
@@ -265,6 +273,7 @@ describe('todo-sync', () => {
     ];
 
     syncTodosFromMessages(setTodos, messages);
+    flushSolid();
     expect(setTodos).toHaveBeenCalledWith([
       { id: 'todo-1', content: 'sync', status: 'pending', priority: 'medium' },
     ]);
@@ -291,13 +300,16 @@ describe('todo-sync', () => {
     ];
 
     const sync = operations.syncTodosForSession('session-1', messages);
+    flushSolid();
 
-    expect(setState).toHaveBeenCalledWith('todos', [
+    expect(state.todos).toEqual([
       { id: 'todo-1', content: 'sync', status: 'completed', priority: 'medium' },
     ]);
 
     resolveNativeTodos([]);
+    flushSolid();
     await sync;
+    flushSolid();
   });
 
   it('bounds optional native hydration and ignores a late snapshot', async () => {
@@ -312,17 +324,111 @@ describe('todo-sync', () => {
     const operations = createTodoSyncOperations({ loadSessionTodos });
     try {
       const sync = operations.syncTodosForSession('session-1', []);
+      flushSolid();
       await vi.advanceTimersByTimeAsync(1_000);
+      flushSolid();
       await sync;
+      flushSolid();
       expect(loadSessionTodos.mock.calls[0]?.[1].aborted).toBe(true);
-      setState.mockClear();
+      todoChanges.mockClear();
       finish([{ id: 'late', content: 'late', status: 'pending', priority: 'high' }]);
       await Promise.resolve();
-      expect(setState).not.toHaveBeenCalled();
+      flushSolid();
+      expect(todoChanges).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('reuses a prefetched native read and bounds it only after messages arrive', async () => {
+    vi.useFakeTimers();
+    let finish!: (todos: NormalizedTodo[]) => void;
+    const loadSessionTodos = vi.fn(
+      (_sessionId: string, _signal: AbortSignal, _directory?: string) =>
+        new Promise<NormalizedTodo[]>((resolve) => {
+          finish = resolve;
+        })
+    );
+    const operations = createTodoSyncOperations({
+      loadSessionTodos,
+      resolveSessionDirectory: () => '/workspace',
+    });
+    try {
+      operations.resetTodoSync();
+      operations.prefetchTodosForSession('session-1', '/workspace');
+      expect(loadSessionTodos).toHaveBeenCalledTimes(1);
+      expect(loadSessionTodos.mock.calls[0]?.[2]).toBe('/workspace');
+
+      // A slow transcript load must not spend the native read's deadline.
+      await vi.advanceTimersByTimeAsync(5_000);
+      const sync = operations.syncTodosForSession('session-1', []);
+      finish([{ id: 'native', content: 'native', status: 'pending', priority: 'high' }]);
+      await sync;
+      flushSolid();
+
+      expect(loadSessionTodos).toHaveBeenCalledTimes(1);
+      expect(loadSessionTodos.mock.calls[0]?.[1].aborted).toBe(false);
+      expect(state.todos).toEqual([
+        { id: 'native', content: 'native', status: 'pending', priority: 'high' },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts a prefetched read when the deadline expires after messages arrive', async () => {
+    vi.useFakeTimers();
+    const loadSessionTodos = vi.fn(
+      (_sessionId: string, _signal: AbortSignal, _directory?: string) =>
+        new Promise<NormalizedTodo[]>(() => {})
+    );
+    const operations = createTodoSyncOperations({ loadSessionTodos });
+    try {
+      operations.prefetchTodosForSession('session-1');
+      const sync = operations.syncTodosForSession('session-1', []);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await sync;
+      expect(loadSessionTodos).toHaveBeenCalledTimes(1);
+      expect(loadSessionTodos.mock.calls[0]?.[1].aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    [
+      'todo state was reset',
+      (operations: ReturnType<typeof createTodoSyncOperations>) => operations.resetTodoSync(),
+    ],
+    [
+      'the session directory changed',
+      (_operations: ReturnType<typeof createTodoSyncOperations>, setDirectory: () => void) =>
+        setDirectory(),
+    ],
+  ])('discards a prefetched read when %s', async (_label, invalidate) => {
+    let directory = '/workspace';
+    const loadSessionTodos = vi
+      .fn<(_sessionId: string, _signal: AbortSignal, _directory?: string) => Promise<unknown[]>>()
+      .mockReturnValueOnce(new Promise(() => {}))
+      .mockResolvedValue([{ content: 'fresh', status: 'pending', priority: 'high' }]);
+    const operations = createTodoSyncOperations({
+      loadSessionTodos,
+      resolveSessionDirectory: () => directory,
+    });
+
+    operations.prefetchTodosForSession('session-1');
+    invalidate(operations, () => {
+      directory = '/moved';
+    });
+    await operations.syncTodosForSession('session-1', []);
+    flushSolid();
+
+    expect(loadSessionTodos).toHaveBeenCalledTimes(2);
+    expect(loadSessionTodos.mock.calls[0]?.[1].aborted).toBe(true);
+    expect(state.todos).toEqual([
+      { id: 'fresh', content: 'fresh', status: 'pending', priority: 'high' },
+    ]);
   });
 
   it('does not let a same-session reselection apply an older native response', async () => {
@@ -336,13 +442,18 @@ describe('todo-sync', () => {
       .mockResolvedValue([{ id: 'new', content: 'new', status: 'completed', priority: 'high' }]);
     const operations = createTodoSyncOperations({ loadSessionTodos });
     const old = operations.syncTodosForSession('session-1', []);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     operations.resetTodoSync();
+    flushSolid();
     await operations.syncTodosForSession('session-1', []);
-    setState.mockClear();
+    flushSolid();
+    todoChanges.mockClear();
     finish([{ id: 'old', content: 'old', status: 'pending', priority: 'high' }]);
     await old;
-    expect(setState).not.toHaveBeenCalled();
+    flushSolid();
+    expect(todoChanges).not.toHaveBeenCalled();
   });
 
   it('keeps native event state when an older native read fails', async () => {
@@ -358,21 +469,25 @@ describe('todo-sync', () => {
       );
     const operations = createTodoSyncOperations({ loadSessionTodos });
     await operations.syncTodosForSession('session-1', []);
+    flushSolid();
     const old = operations.syncTodosForSession('session-1', []);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     operations.syncTodosFromMessages([], {
       todos: [{ content: 'event', status: 'completed', priority: 'high' }],
     });
-    setState.mockClear();
+    flushSolid();
+    todoChanges.mockClear();
     fail(new Error('older failed read'));
     await old;
-    expect(setState).not.toHaveBeenCalled();
+    flushSolid();
+    expect(todoChanges).not.toHaveBeenCalled();
     operations.syncTodosFromMessages([], {
       todos: [{ content: 'later event', status: 'completed', priority: 'high' }],
     });
-    expect(setState).toHaveBeenCalledWith('todos', [
-      expect.objectContaining({ content: 'later event' }),
-    ]);
+    flushSolid();
+    expect(state.todos).toEqual([expect.objectContaining({ content: 'later event' })]);
   });
 
   it('does not replay old message-derived todos after a transcript refresh', async () => {
@@ -394,7 +509,9 @@ describe('todo-sync', () => {
       },
     ];
     const read = operations.syncTodosForSession('session-1', messages);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     operations.handoffTodosToMessages([
       {
         info: assistantMessage('assistant-1'),
@@ -405,10 +522,11 @@ describe('todo-sync', () => {
         ],
       },
     ]);
-    setState.mockClear();
+    todoChanges.mockClear();
     fail(new Error('older failed read'));
     await read;
-    expect(setState).not.toHaveBeenCalled();
+    flushSolid();
+    expect(todoChanges).not.toHaveBeenCalled();
   });
 
   it('uses native todo events after the native endpoint is available', async () => {
@@ -428,12 +546,14 @@ describe('todo-sync', () => {
     });
 
     await operations.syncTodosForSession('session-1', messages);
-    setState.mockClear();
+    flushSolid();
+    todoChanges.mockClear();
     operations.syncTodosFromMessages(messages, {
       todos: [{ content: 'native', status: 'completed', priority: 'high' }],
     });
+    flushSolid();
 
-    expect(setState).toHaveBeenCalledWith('todos', [
+    expect(state.todos).toEqual([
       { id: 'native', content: 'native', status: 'completed', priority: 'high' },
     ]);
   });
@@ -447,24 +567,29 @@ describe('todo-sync', () => {
     });
 
     await operations.syncTodosForSession('session-1', []);
+    flushSolid();
 
-    expect(setState).not.toHaveBeenCalled();
+    expect(todoChanges).not.toHaveBeenCalled();
   });
 
   it('does not let native todo update events downgrade matching completed todos', async () => {
     state.todos = [{ id: 'todo-1', content: 'sync', status: 'completed', priority: 'medium' }];
     const operations = createTodoSyncOperations({
-      loadSessionTodos: vi.fn(async () => []),
+      loadSessionTodos: vi.fn(async () => [
+        { id: 'todo-1', content: 'sync', status: 'completed', priority: 'medium' },
+      ]),
     });
 
     await operations.syncTodosForSession('session-1', []);
-    setState.mockClear();
+    flushSolid();
+    todoChanges.mockClear();
 
     operations.syncTodosFromMessages([], {
       todos: [{ id: 'todo-1', content: 'sync', status: 'in_progress', priority: 'medium' }],
     });
+    flushSolid();
 
-    expect(setState).not.toHaveBeenCalled();
+    expect(todoChanges).not.toHaveBeenCalled();
   });
 
   it('does not let id-less native events downgrade completed snapshots', async () => {
@@ -475,17 +600,19 @@ describe('todo-sync', () => {
     });
 
     await operations.syncTodosForSession('session-1', []);
-    expect(setState).toHaveBeenCalledWith('todos', [
+    flushSolid();
+    expect(state.todos).toEqual([
       { id: 'sync', content: 'sync', status: 'completed', priority: 'medium' },
     ]);
 
     state.todos = [{ id: 'sync', content: 'sync', status: 'completed', priority: 'medium' }];
-    setState.mockClear();
+    todoChanges.mockClear();
     operations.syncTodosFromMessages([], {
       todos: [{ content: 'sync', status: 'in_progress', priority: 'medium' }],
     });
+    flushSolid();
 
-    expect(setState).not.toHaveBeenCalled();
+    expect(todoChanges).not.toHaveBeenCalled();
   });
 
   it('uses message todos to advance stale native session todos', async () => {
@@ -506,8 +633,9 @@ describe('todo-sync', () => {
         ],
       },
     ]);
+    flushSolid();
 
-    expect(setState).toHaveBeenLastCalledWith('todos', [
+    expect(state.todos).toEqual([
       { id: 'todo-1', content: 'sync', status: 'completed', priority: 'medium' },
     ]);
   });
@@ -524,8 +652,9 @@ describe('todo-sync', () => {
       { info: userMessage('user-1'), parts: [] },
       { info: assistantMessage('assistant-1', { time: { created: 1, completed: 2 } }), parts: [] },
     ]);
+    flushSolid();
 
-    expect(setState).toHaveBeenCalledWith('todos', []);
+    expect(state.todos).toEqual([]);
   });
 
   it('keeps completed native todos after a completed session settles', async () => {
@@ -539,8 +668,9 @@ describe('todo-sync', () => {
       { info: userMessage('user-1'), parts: [] },
       { info: assistantMessage('assistant-1', { time: { created: 1, completed: 2 } }), parts: [] },
     ]);
+    flushSolid();
 
-    expect(setState).toHaveBeenCalledWith('todos', [
+    expect(state.todos).toEqual([
       { id: 'todo-1', content: 'sync', status: 'completed', priority: 'medium' },
     ]);
   });
@@ -575,7 +705,7 @@ describe('todo-sync', () => {
     ).toEqual(messageTodos);
   });
 
-  it('creates bound todo-sync operations from shared state dependencies', () => {
+  it('creates bound todo-sync operations from shared state dependencies', async () => {
     const messages = [
       { info: userMessage('user-1'), parts: [] },
       {
@@ -592,21 +722,25 @@ describe('todo-sync', () => {
     const operations = createTodoSyncOperations();
 
     operations.syncTodosFromMessages();
-    expect(setState).toHaveBeenCalledWith('todos', [
+    // The default transcript is read after the store's queued flush.
+    await Promise.resolve();
+    flushSolid();
+    expect(state.todos).toEqual([
       { id: 'todo-1', content: 'sync', status: 'pending', priority: 'medium' },
     ]);
 
-    setState.mockClear();
+    todoChanges.mockClear();
     state.todos = [{ id: 'todo-1', content: 'event', status: 'pending', priority: 'medium' }];
     state.messages = [{ info: assistantMessage('assistant-1'), parts: [] }];
     state.sessionStatus = { 'session-1': { type: 'busy' } };
 
     const handedOff = operations.handoffTodosToMessages();
     expect(handedOff).toBe(false);
-    expect(setState).not.toHaveBeenCalled();
+    expect(todoChanges).not.toHaveBeenCalled();
 
     operations.resetTodoSync();
-    expect(setState).toHaveBeenCalledWith('todos', []);
+    flushSolid();
+    expect(state.todos).toEqual([]);
   });
 
   it('loads native session todos and falls back to message parsing on older servers', async () => {
@@ -628,12 +762,13 @@ describe('todo-sync', () => {
     });
 
     await nativeOperations.syncTodosForSession('session-1', messages);
+    flushSolid();
 
-    expect(setState).toHaveBeenCalledWith('todos', [
+    expect(state.todos).toEqual([
       { id: 'native', content: 'native', status: 'completed', priority: 'high' },
     ]);
 
-    setState.mockClear();
+    todoChanges.mockClear();
     const fallbackOperations = createTodoSyncOperations({
       loadSessionTodos: vi.fn(async () => {
         throw new Error('404 Not Found');
@@ -641,8 +776,9 @@ describe('todo-sync', () => {
     });
 
     await fallbackOperations.syncTodosForSession('session-1', messages);
+    flushSolid();
 
-    expect(setState).toHaveBeenCalledWith('todos', [
+    expect(state.todos).toEqual([
       { id: 'todo-1', content: 'fallback', status: 'pending', priority: 'medium' },
     ]);
   });

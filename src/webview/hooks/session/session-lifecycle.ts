@@ -1,6 +1,6 @@
-import { batch } from 'solid-js';
-import { reconcile } from 'solid-js/store';
-import { normalizeSessionTitle } from '../../../shared/session-title';
+import { storePath } from '@solidjs/signals';
+
+import { isPlaceholderSessionTitle } from '../../../shared/session-title';
 import { appStore } from '../../lib/stores/app-store';
 import { composerStore } from '../../lib/stores/composer-store';
 import { isSameWorkspacePath } from '../../../shared/workspace-path';
@@ -15,6 +15,7 @@ import { clearSessionMessageWindowState } from '../../lib/message-window';
 import type { Session } from '../../types';
 import type { SelectedModel } from '../../lib/app-state-types';
 import { isNumber } from '../../lib/runtime-values';
+import { reconcileStoreField } from '../../lib/store-reconcile';
 
 type LifecycleState = {
   activeSessionId: string | null;
@@ -92,7 +93,9 @@ export class SessionLifecycleOperations {
           ([id, directory]) => !isSameWorkspacePath(available.get(id), directory)
         );
         if (pending.length !== entries.length) {
-          appStore.setState('transferredSessions', reconcile(Object.fromEntries(pending)));
+          appStore.setState((draft) =>
+            reconcileStoreField(draft, 'transferredSessions', Object.fromEntries(pending))
+          );
         }
       },
       clearSessionStatusEntry: sessionStore.clearSessionStatusEntry,
@@ -110,12 +113,12 @@ export class SessionLifecycleOperations {
       setSessionFailed: sessionStore.setSessionFailed,
       clearQueuedMessagesForSession,
       filterQuestions: (predicate: (sessionId: string) => boolean) =>
-        appStore.setState('questions', (items) =>
-          items.filter((item) => predicate(item.sessionID))
+        appStore.setState(
+          storePath('questions', (items) => items.filter((item) => predicate(item.sessionID)))
         ),
       filterPermissions: (predicate: (sessionId: string) => boolean) =>
-        appStore.setState('permissions', (items) =>
-          items.filter((item) => predicate(item.sessionID))
+        appStore.setState(
+          storePath('permissions', (items) => items.filter((item) => predicate(item.sessionID)))
         ),
       clearActiveSessionState: this.clearActiveSessionState,
       markSessionSeen: sessionStore.markSessionSeen,
@@ -123,15 +126,13 @@ export class SessionLifecycleOperations {
   }
 
   readonly clearActiveSessionState = () => {
-    batch(() => {
-      this.deps.resetTodoSync();
-      this.deps.resetToolCallExpansionState();
-      sessionStore.setActiveSessionId(null);
-      sessionStore.persistActiveSessionId(null);
-      sessionStore.clearMessages();
-      appStore.setState('messagesLoading', false);
-      uiStore.stopLoading();
-    });
+    this.deps.resetTodoSync();
+    this.deps.resetToolCallExpansionState();
+    sessionStore.setActiveSessionId(null);
+    sessionStore.persistActiveSessionId(null);
+    sessionStore.clearMessages();
+    appStore.setState(storePath('messagesLoading', false));
+    uiStore.stopLoading();
   };
 
   readonly applySessions = (sessions: Session[], complete = false) =>
@@ -180,19 +181,18 @@ export function sortSessions(sessions: Session[], now = Date.now()) {
   return [...sessions].toSorted((a, b) => compareSessionsByActivity(a, b, now));
 }
 
-function isPlaceholderSessionTitle(title: string | null | undefined) {
-  const normalized = normalizeSessionTitle(title).toLowerCase();
-  return !normalized || normalized === 'new chat';
-}
-
 function mergeFreshSession(existing: Session | undefined, incoming: Session) {
   if (!existing) return incoming;
   if (
-    incoming.isGitWorktree === undefined &&
-    existing.isGitWorktree !== undefined &&
+    existing.projectID === incoming.projectID &&
     isSameWorkspacePath(existing.directory, incoming.directory)
   ) {
-    incoming = { ...incoming, isGitWorktree: existing.isGitWorktree };
+    // Location metadata is verified separately from the conversation timestamp.
+    if (incoming.isGitWorktree !== undefined) {
+      existing = { ...existing, isGitWorktree: incoming.isGitWorktree };
+    } else if (existing.isGitWorktree !== undefined) {
+      incoming = { ...incoming, isGitWorktree: existing.isGitWorktree };
+    }
   }
   let transfer = incoming.transfer ?? existing.transfer;
   if (transfer && existing.transfer?.hiddenOrigins?.length && incoming.transfer) {
@@ -250,43 +250,39 @@ export function applySessions(deps: LifecycleDependencies, sessions: Session[], 
       .filter((session) => !isNumber(session.time.archived))
       .map((session) => mergeFreshSession(existingById.get(session.id), session))
   );
-  batch(() => {
-    deps.setSessions(nextSessions, complete);
-    deps.reconcileTransferredSessions?.(nextSessions);
+  deps.setSessions(nextSessions, complete);
+  deps.reconcileTransferredSessions?.(nextSessions);
 
-    if (
-      activeSessionId &&
-      !deps.isSessionTransferred?.(activeSessionId) &&
-      !nextSessions.some((session) => session.id === activeSessionId)
-    ) {
-      deps.clearActiveSessionState();
-    }
-  });
+  if (
+    activeSessionId &&
+    !deps.isSessionTransferred?.(activeSessionId) &&
+    !nextSessions.some((session) => session.id === activeSessionId)
+  ) {
+    deps.clearActiveSessionState();
+  }
 }
 
 export function clearDeletedSessionState(deps: LifecycleDependencies, id: string) {
-  batch(() => {
-    deps.clearPendingAbort(id);
-    deps.removePermissionModeForSession(id);
-    deps.clearCurrentDocumentStateForSession(id);
-    deps.clearSelectedAgentForSession(id);
-    deps.clearSelectedMcpsForSession(id);
-    deps.clearSkippedPlanSession(id);
-    deps.clearSelectedModelForSession(id);
-    deps.publishSessionModel(id, null);
-    deps.clearSessionSeen(id);
-    deps.clearSessionStatusEntry(id);
-    deps.setSessionUsageLimit(id, null);
-    deps.setSessionFailed(id, false);
-    deps.clearQueuedMessagesForSession(id);
-    clearSessionMessageWindowState(id);
-    deps.filterQuestions((sessionId) => sessionId !== id);
-    deps.filterPermissions((sessionId) => sessionId !== id);
+  deps.clearPendingAbort(id);
+  deps.removePermissionModeForSession(id);
+  deps.clearCurrentDocumentStateForSession(id);
+  deps.clearSelectedAgentForSession(id);
+  deps.clearSelectedMcpsForSession(id);
+  deps.clearSkippedPlanSession(id);
+  deps.clearSelectedModelForSession(id);
+  deps.publishSessionModel(id, null);
+  deps.clearSessionSeen(id);
+  deps.clearSessionStatusEntry(id);
+  deps.setSessionUsageLimit(id, null);
+  deps.setSessionFailed(id, false);
+  deps.clearQueuedMessagesForSession(id);
+  clearSessionMessageWindowState(id);
+  deps.filterQuestions((sessionId) => sessionId !== id);
+  deps.filterPermissions((sessionId) => sessionId !== id);
 
-    if (deps.getState().activeSessionId === id) {
-      deps.clearActiveSessionState();
-    }
-  });
+  if (deps.getState().activeSessionId === id) {
+    deps.clearActiveSessionState();
+  }
 }
 
 export function hideDeletedSessionTree(
@@ -296,12 +292,10 @@ export function hideDeletedSessionTree(
 ) {
   const deletedIds = getDeletedSessionTreeIds(id, sessions);
 
-  batch(() => {
-    for (const deletedId of deletedIds) {
-      clearDeletedSessionState(deps, deletedId);
-    }
-    deps.setSessions(sessions.filter((session) => !deletedIds.has(session.id)));
-  });
+  for (const deletedId of deletedIds) {
+    clearDeletedSessionState(deps, deletedId);
+  }
+  deps.setSessions(sessions.filter((session) => !deletedIds.has(session.id)));
 
   return deletedIds;
 }
@@ -314,22 +308,7 @@ export function getNextSessionIdAfterDeletion(sessions: Session[]) {
   return sessions.find((session) => !session.parentID)?.id || sessions[0]?.id || null;
 }
 
-export function removeDeletedSessionTree(
-  deps: LifecycleDependencies,
-  id: string,
-  sessions = deps.getState().sessions
-) {
-  const deletedIds = getDeletedSessionTreeIds(id, sessions);
-
-  batch(() => {
-    for (const deletedId of deletedIds) {
-      clearDeletedSessionState(deps, deletedId);
-    }
-    deps.setSessions(sessions.filter((session) => !deletedIds.has(session.id)));
-  });
-
-  return deletedIds;
-}
+export const removeDeletedSessionTree = hideDeletedSessionTree;
 
 export function upsertSession(deps: LifecycleDependencies, session: Session) {
   const { activeSessionId, sessions, showSessionPicker } = deps.getState();
@@ -347,11 +326,9 @@ export function upsertSession(deps: LifecycleDependencies, session: Session) {
     return;
   }
 
-  batch(() => {
-    applySessions(deps, [session, ...sessions.filter((item) => item.id !== session.id)]);
+  applySessions(deps, [session, ...sessions.filter((item) => item.id !== session.id)]);
 
-    if (session.id === activeSessionId && !showSessionPicker) {
-      deps.markSessionSeen(session.id, session.time.updated);
-    }
-  });
+  if (session.id === activeSessionId && !showSessionPicker) {
+    deps.markSessionSeen(session.id, session.time.updated);
+  }
 }

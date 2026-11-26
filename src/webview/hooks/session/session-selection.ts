@@ -1,4 +1,3 @@
-import { batch } from 'solid-js';
 import {
   isMissingWorkspaceDirectoryMessage,
   workspaceDirectoryRecoveryMessage,
@@ -42,11 +41,13 @@ type SessionSelectionDeps = {
   setSelectedMcpsForSession(sessionId: string, names: string[]): void;
   syncSessionMcps(sessionId: string): Promise<void>;
   resetTodoSync(): void;
+  prefetchTodosForSession?(sessionId: string, directory?: string): void;
   clearMessages(): void;
   setMessagesLoading?(loading: boolean): void;
   loadSession(
     id: string,
-    isCurrent?: () => boolean
+    isCurrent?: () => boolean,
+    directory?: string
   ): Promise<{ session: Session; messages: MessageEntry[] }>;
   isCurrentSelectionGeneration(generation: number): boolean;
   upsertSession(session: Session): void;
@@ -97,43 +98,42 @@ export async function selectSessionWithDependencies(
     options?.preserveTranscript === true && deps.getActiveSessionId() === id;
   let persistedAgent: string | null = null;
   let persistedModel: SelectedModel | null = null;
-  batch(() => {
-    if (!preserveTranscript && (options?.markSeen ?? true)) deps.captureFollowupOpening?.(id);
-    if (!preserveTranscript) {
-      deps.clearDraftCurrentDocumentState();
-      deps.resetToolCallExpansionState();
+  if (!preserveTranscript && (options?.markSeen ?? true)) deps.captureFollowupOpening?.(id);
+  if (!preserveTranscript) {
+    deps.clearDraftCurrentDocumentState();
+    deps.resetToolCallExpansionState();
+  }
+  deps.setActiveSessionId(id);
+  deps.clearPendingAbort(id);
+
+  const resolvedAgent = deps.resolvePersistedAgent(id);
+  persistedAgent = resolvedAgent.persistedAgent;
+  if (resolvedAgent.persistedAgent) {
+    deps.applySelectedAgent(resolvedAgent.persistedAgent, id);
+  } else if (resolvedAgent.fallbackAgent) {
+    deps.applySelectedAgent(resolvedAgent.fallbackAgent, id);
+  }
+
+  persistedModel = deps.resolvePersistedModel(id);
+  const knownSession = deps.getSession(id);
+  const sessionModel =
+    options?.selectedModel ??
+    persistedModel ??
+    (knownSession ? deps.resolveSessionModel(knownSession) : null);
+  if (sessionModel) {
+    deps.applySelectedModel(sessionModel, id);
+  } else {
+    const fallbackModel = deps.resolveFallbackModel();
+    if (fallbackModel) {
+      deps.applySelectedModel(fallbackModel, null);
     }
-    deps.setActiveSessionId(id);
-    deps.clearPendingAbort(id);
+  }
 
-    const resolvedAgent = deps.resolvePersistedAgent(id);
-    persistedAgent = resolvedAgent.persistedAgent;
-    if (resolvedAgent.persistedAgent) {
-      deps.applySelectedAgent(resolvedAgent.persistedAgent, id);
-    } else if (resolvedAgent.fallbackAgent) {
-      deps.applySelectedAgent(resolvedAgent.fallbackAgent, id);
-    }
+  deps.resetTodoSync();
+  if (!preserveTranscript) deps.clearMessages();
+  deps.setMessagesLoading?.(true);
 
-    persistedModel = deps.resolvePersistedModel(id);
-    const knownSession = deps.getSession(id);
-    const sessionModel =
-      options?.selectedModel ??
-      persistedModel ??
-      (knownSession ? deps.resolveSessionModel(knownSession) : null);
-    if (sessionModel) {
-      deps.applySelectedModel(sessionModel, id);
-    } else {
-      const fallbackModel = deps.resolveFallbackModel();
-      if (fallbackModel) {
-        deps.applySelectedModel(fallbackModel, null);
-      }
-    }
-
-    deps.resetTodoSync();
-    if (!preserveTranscript) deps.clearMessages();
-    deps.setMessagesLoading?.(true);
-  });
-
+  deps.prefetchTodosForSession?.(id, options?.directory);
   const mcpSync = deps.syncSessionMcps(id).catch(() => {});
   const statusSnapshotStartedAt = captureSessionStatusSnapshotTime();
   const statusSync = deps.loadSessionStatuses().catch(() => null);
@@ -148,7 +148,7 @@ export async function selectSessionWithDependencies(
 
   let loaded: { session: Session; messages: MessageEntry[] };
   try {
-    loaded = await deps.loadSession(id, isCurrentSelection);
+    loaded = await deps.loadSession(id, isCurrentSelection, options?.directory);
   } catch (error) {
     if (!isCurrentSelection()) {
       clearMessagesLoadingIfOwned();
@@ -190,10 +190,10 @@ export async function selectSessionWithDependencies(
   if (options?.markSeen ?? true) {
     deps.markSessionSeen(id);
   }
-  const todoSync = batch(() => {
+  const todoSync = (() => {
     deps.setMessagesIncremental(messages);
     return deps.syncTodosForSession(id, messages).catch(() => {});
-  });
+  })();
   deps.syncFailedSessionsFromMessages(messages);
 
   const inferredAgent = deps.deriveSelectedAgentFromMessages(messages);

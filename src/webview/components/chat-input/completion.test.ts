@@ -171,6 +171,24 @@ describe('getMentionCompletionItems', () => {
     );
   });
 
+  it('shows only the agent role when permission data is missing', () => {
+    // SAFETY: The server can omit permission despite the declared catalog type.
+    const review = { name: 'review', mode: 'subagent' } as Agent;
+    const completions = getMentionCompletionItems({
+      rawQuery: '',
+      agents: [
+        review,
+        { name: 'build', mode: 'all', permission: { edit: 'allow', bash: { '*': 'deny' } } },
+      ],
+      files,
+    });
+
+    expect(completions).toMatchObject([
+      { type: 'agent', label: 'review', detail: 'Subagent', value: '@review ' },
+      { type: 'agent', label: 'build', detail: 'Primary · Can edit · No bash' },
+    ]);
+  });
+
   it.each(['', 'vis', 'inspect'])('hides the automatic vision helper for query %j', (rawQuery) => {
     const mentionAgents: Agent[] = [
       ...agents,
@@ -514,6 +532,11 @@ describe('normalizeSessionLookupQuery', () => {
 });
 
 describe('getSessionReferenceIds', () => {
+  it('recognizes bare IDs, preserves case, and deduplicates canonical references', () => {
+    expect(
+      getSessionReferenceIds('Check (ses_otherProject), then session:ses_otherProject.')
+    ).toEqual(['ses_otherProject']);
+  });
   it('extracts canonical session markers from composer text', () => {
     expect(getSessionReferenceIds('Compare session:ses_first with session:ses-second.')).toEqual([
       'ses_first',

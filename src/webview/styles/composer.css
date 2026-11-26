@@ -304,6 +304,50 @@
   outline-offset: 1px;
 }
 
+.context-popup-prompt-cache .context-popup-row-value {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--font-sans);
+}
+
+.context-popup-prompt-cache-countdown {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.context-popup-prompt-cache[data-tone='cold'] .context-popup-row-value {
+  color: var(--color-vscode-muted);
+}
+
+.context-popup-prompt-cache-warming {
+  flex-wrap: wrap;
+}
+
+/* The 16px checkbox would otherwise sit on the label's text baseline, above the row's center. */
+.context-popup-prompt-cache-warming .context-popup-row-label {
+  display: inline-flex;
+  align-items: center;
+}
+
+.context-popup-warming-toggle {
+  height: auto;
+  color: inherit;
+  font-size: inherit;
+  white-space: nowrap;
+}
+
+.context-popup-warming-status {
+  font-family: var(--font-sans);
+  white-space: nowrap;
+}
+
+.context-popup-warming-detail {
+  flex-basis: 100%;
+  color: var(--color-vscode-muted);
+  font-size: 10.5px;
+}
+
 .context-popup-row-total {
   margin-top: 2px;
   padding-top: 4px;
@@ -331,15 +375,80 @@
   color: color-mix(in srgb, var(--color-vscode-accent) 72%, var(--color-vscode-fg));
 }
 
-.context-popup-model {
+.context-popup-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 18px;
   margin-top: 8px;
   padding-top: 6px;
   border-top: 1px solid var(--color-vscode-border-soft);
+}
+
+.context-popup-model {
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: 10px;
   color: var(--color-vscode-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.context-popup-models-mixed {
+  border-radius: var(--radius-xs);
+  text-decoration: underline dotted;
+  text-decoration-color: color-mix(in srgb, var(--color-vscode-muted) 60%, transparent);
+  text-underline-offset: 2px;
+  cursor: help;
+}
+
+.context-popup-models-tooltip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.context-popup-report-button {
+  appearance: none;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  margin: -2px 0 -2px auto;
+  padding: 0 6px;
+  border: 1px solid var(--color-vscode-border-default);
+  border-radius: var(--radius-chip);
+  background: var(--color-vscode-input-surface);
+  color: var(--color-vscode-fg);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 0.12s,
+    border-color 0.12s;
+}
+
+.context-popup-report-button .ui-icon {
+  color: var(--color-vscode-muted);
+}
+
+.context-popup-report-button:hover {
+  background: var(--color-vscode-input-surface-hover);
+  border-color: var(--color-vscode-border-strong);
+}
+
+.context-popup-report-button:hover .ui-icon {
+  color: var(--color-vscode-fg);
+}
+
+.context-popup-models-mixed:focus-visible,
+.context-popup-report-button:focus-visible {
+  outline: 1px solid var(--color-vscode-focus-border);
+  outline-offset: 1px;
 }
 
 .context-popup-actions {
@@ -397,25 +506,37 @@
   color: var(--color-vscode-input-placeholder);
 }
 
-.composer-completion-menu {
-  --composer-completion-scrollbar-inset: 0px;
+.composer-completion-popup {
   position: absolute;
   left: -6px;
   right: -6px;
   bottom: calc(100% + 2px);
   z-index: var(--z-popup);
-  max-height: 220px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  --scrollbar-thumb-color: color-mix(in srgb, var(--color-vscode-fg) 14%, transparent);
-  border-radius: var(--chat-radius-popover);
-  border: 1px solid color-mix(in srgb, var(--color-vscode-border-strong) 82%, transparent);
-  background: var(--color-vscode-surface-raised);
-  box-shadow: var(--chat-shadow-popover);
-  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
   animation: fade-in 0.1s ease-out;
   user-select: none;
   -webkit-user-select: none;
+}
+
+.composer-completion-menu,
+.composer-completion-help {
+  min-height: 0;
+  border: 1px solid color-mix(in srgb, var(--color-vscode-border-strong) 82%, transparent);
+  background: var(--color-vscode-surface-raised);
+  box-shadow: var(--chat-shadow-popover);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  --scrollbar-thumb-color: color-mix(in srgb, var(--color-vscode-fg) 14%, transparent);
+}
+
+.composer-completion-menu {
+  --composer-completion-scrollbar-inset: 0px;
+  position: relative;
+  max-height: 220px;
+  border-radius: var(--chat-radius-popover);
+  padding: 4px;
 }
 
 .composer-completion-header {
@@ -458,11 +579,14 @@
 }
 
 .composer-completion-help {
-  padding: 7px 8px;
-  border-top: 1px solid color-mix(in srgb, var(--color-vscode-border) 20%, transparent);
+  flex-shrink: 0;
+  max-height: 140px;
+  padding: 9px 10px;
+  border-radius: var(--radius-card);
   color: var(--color-vscode-fg-muted);
   font-size: 11px;
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .composer-completion-item:hover {
@@ -482,10 +606,12 @@
 }
 
 .composer-completion-icon {
+  --file-icon-size: 14px;
+
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
+  width: 18px;
   height: 15px;
   flex-shrink: 0;
   color: var(--color-vscode-muted);
@@ -495,7 +621,7 @@
   display: block;
 }
 
-.composer-completion-icon img {
+.composer-completion-icon img:not(.file-type-icon) {
   display: block;
   width: 14px;
   height: 14px;
@@ -1921,30 +2047,6 @@
   background: var(--color-vscode-button-hover);
 }
 
-.chat-stop-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--radius-control);
-  border: none;
-  cursor: pointer;
-  color: var(--color-vscode-error);
-  background: color-mix(in srgb, var(--color-vscode-error) 12%, transparent);
-  transition:
-    background-color 0.12s,
-    transform 0.1s;
-}
-
-.chat-stop-button:hover {
-  background: color-mix(in srgb, var(--color-vscode-error) 22%, transparent);
-}
-
-.chat-stop-button:active {
-  transform: scale(0.92);
-}
-
 .todo-block {
   margin: 0 0 4px;
   padding: var(--space-3) var(--space-5);
@@ -2059,6 +2161,11 @@
   transition:
     width 0.25s ease,
     background-color 0.2s ease;
+}
+
+/* Native todo hydration can replace message-derived progress before the session is shown. */
+.todo-block.is-hydrating :is(.todo-block-progress-fill, .todo-block-chevron) {
+  transition: none;
 }
 
 .todo-block-progress-fill.is-complete {
@@ -2222,8 +2329,8 @@
 }
 
 .changed-files-file-icon {
-  width: 16px;
-  height: 16px;
+  --file-icon-size: 16px;
+
   flex-shrink: 0;
 }
 
@@ -2366,6 +2473,41 @@
   flex-shrink: 0;
   font-size: 11px;
   color: var(--color-vscode-muted);
+}
+
+.chat-goal-controls,
+.chat-session-row-controls {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.chat-session-goal .chat-queue-item,
+.chat-session-rewind .chat-queue-item {
+  padding-inline-start: 8px;
+}
+
+.chat-session-goal .chat-queue-body,
+.chat-session-rewind .chat-queue-body {
+  gap: 6px;
+}
+
+.chat-goal-icon,
+.chat-session-row-icon {
+  flex-shrink: 0;
+  color: var(--color-vscode-muted);
+}
+
+.chat-goal-tooltip-objective + .chat-goal-tooltip-reason {
+  margin-top: 6px;
+}
+
+.chat-goal-error,
+.chat-session-row-error {
+  padding: 2px 4px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  color: var(--color-vscode-error);
 }
 
 .chat-queue-item.is-drag-over {
@@ -2663,6 +2805,9 @@
 
 .chat-quota-warning-row {
   color: color-mix(in srgb, var(--quota-warning-color) 70%, var(--color-vscode-fg));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-quota-warning-reset {
@@ -2700,13 +2845,15 @@
   text-align: left;
 }
 
-.chat-quota-warning-close {
+.chat-quota-warning-close,
+.chat-goal-close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 20px;
   height: 20px;
   border-radius: 50%;
+  color: var(--color-vscode-fg-soft);
 }
 
 .chat-quota-warning-usage:hover,
@@ -2714,7 +2861,9 @@
   color: var(--color-vscode-fg);
 }
 
-.chat-quota-warning-close:hover {
+.chat-quota-warning-close:hover,
+.chat-goal-close:hover:not(:disabled) {
+  color: var(--color-vscode-fg);
   background: var(--color-vscode-hover);
 }
 
@@ -2764,6 +2913,36 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+.chat-provider-setup-banner {
+  align-items: center;
+  border-color: color-mix(in srgb, var(--color-vscode-accent) 24%, var(--color-vscode-border));
+  background: color-mix(in srgb, var(--color-vscode-accent) 7%, var(--color-vscode-surface-softer));
+}
+
+.chat-provider-setup-banner .chat-transport-copy {
+  flex: 1;
+}
+
+.chat-provider-setup-banner .chat-transport-title {
+  color: var(--color-vscode-fg);
+}
+
+.chat-provider-setup-action {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: var(--color-vscode-button-bg);
+  color: var(--color-vscode-button-fg);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chat-provider-setup-action:hover {
+  background: var(--color-vscode-button-hover);
 }
 
 .message-history-banner {
@@ -2897,8 +3076,36 @@
   border-color: var(--color-vscode-border-strong);
 }
 
+.chat-usage-limit-action.primary {
+  border-color: color-mix(in srgb, var(--color-vscode-button-fg) 16%, transparent);
+  background: var(--color-vscode-button-bg);
+  color: var(--color-vscode-button-fg);
+}
+
+.chat-usage-limit-action.primary:hover {
+  background: var(--color-vscode-button-hover);
+}
+
 .chat-usage-limit-action.danger {
   color: var(--color-vscode-error);
+}
+
+/* Throttling, overload, and automatic retries are transient, so they use the warning tone. */
+.chat-usage-limit-banner[data-tone='warning'] {
+  border-color: color-mix(in srgb, var(--color-vscode-warning) 26%, var(--color-vscode-border));
+  background: color-mix(
+    in srgb,
+    var(--color-vscode-warning) 9%,
+    var(--color-vscode-surface-softer)
+  );
+}
+
+.chat-usage-limit-banner[data-tone='warning'] .chat-usage-limit-title {
+  color: var(--color-vscode-warning);
+}
+
+.chat-usage-limit-banner[data-tone='warning'] .chat-usage-limit-meta {
+  color: var(--color-vscode-fg-soft);
 }
 
 .chat-retry-notice.usage-limit {
@@ -3051,7 +3258,7 @@
   border-radius: calc(var(--chat-radius-popover) - 4px);
 }
 
-.chat-attachment-chip .chip-icon {
+.chat-attachment-chip .chip-icon:not(.file-type-icon) {
   width: 12px;
   height: 12px;
   font-size: 12px;
@@ -3060,7 +3267,7 @@
   object-fit: contain;
 }
 
-.chat-attachment-chip .chip-label {
+:is(.chat-attachment-chip, .inline-chip) .chip-label {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3070,6 +3277,7 @@
 
 .problems-icon,
 .chat-attachment-chip .problems-icon,
+.chat-attachment-chip .problems-icon[data-severity='warning'],
 .inline-chip .problems-icon[data-severity='warning'] {
   color: var(
     --vscode-problemsWarningIcon-foreground,
@@ -3078,11 +3286,13 @@
 }
 
 .problems-icon[data-severity='error'],
+.chat-attachment-chip .problems-icon[data-severity='error'],
 .inline-chip .problems-icon[data-severity='error'] {
   color: var(--vscode-problemsErrorIcon-foreground, var(--vscode-editorError-foreground, #f14c4c));
 }
 
 .problems-icon[data-severity='info'],
+.chat-attachment-chip .problems-icon[data-severity='info'],
 .inline-chip .problems-icon[data-severity='info'] {
   color: var(--vscode-problemsInfoIcon-foreground, var(--vscode-editorInfo-foreground, #3794ff));
 }
@@ -3092,18 +3302,18 @@
   color: var(--color-vscode-fg-muted);
 }
 
-.chat-attachment-chip .chip-label-with-extension {
+:is(.chat-attachment-chip, .inline-chip) .chip-label-with-extension {
   display: flex;
   text-overflow: clip;
 }
 
-.chat-attachment-chip .chip-label-stem {
+:is(.chat-attachment-chip, .inline-chip) .chip-label-stem {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.chat-attachment-chip .chip-label-extension {
+:is(.chat-attachment-chip, .inline-chip) .chip-label-extension {
   flex-shrink: 0;
 }
 

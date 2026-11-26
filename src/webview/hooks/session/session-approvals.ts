@@ -1,11 +1,13 @@
-import { batch } from 'solid-js';
 import type { QuestionAnswer, PermissionMode } from '../../../shared/protocol';
 import type { Permission, QuestionRequest, Session } from '../../types';
 
 type PermissionResponse = 'once' | 'always' | 'reject';
 type PermissionResponseTarget = { id: string; sessionID: string };
+type PermissionReplyOptions = { message?: string };
 type PermissionResponseOptions = {
   rethrow?: boolean;
+  /** Rejection feedback for the agent; only manual rejections carry it. */
+  message?: string;
   groupMembers?: PermissionResponseTarget[];
   automatic?: boolean;
   permissionAutomationLease?: number;
@@ -15,7 +17,7 @@ type PermissionModeFreshness = {
   isDraftCurrent(): boolean;
   applyOptimistic?: boolean;
   getConfirmedMode?(): PermissionMode;
-  onConfirmed?(session: Session): void;
+  onConfirmed?(session: Session): boolean | void;
 };
 
 function isMissingPermissionRequestError<T>(error: T): boolean {
@@ -31,11 +33,9 @@ function applyPermissionModeSelection(
   sessionId: string | null | undefined,
   mode: PermissionMode
 ) {
-  batch(() => {
-    deps.setPermissionModeForSession(sessionId, mode);
-    deps.setDraftPermissionMode(mode);
-    deps.saveProjectPermissionMode(mode);
-  });
+  deps.setPermissionModeForSession(sessionId, mode);
+  deps.setDraftPermissionMode(mode);
+  deps.saveProjectPermissionMode(mode);
 }
 
 export async function respondPermissionWithDependencies(
@@ -43,7 +43,8 @@ export async function respondPermissionWithDependencies(
     respondPermission(
       sessionId: string,
       permissionId: string,
-      response: PermissionResponse
+      response: PermissionResponse,
+      options?: PermissionReplyOptions
     ): Promise<void | boolean | object>;
     removePermission(permissionId: string, options?: { removeGroup?: boolean }): void;
     setError(message: string): void;
@@ -58,10 +59,13 @@ export async function respondPermissionWithDependencies(
       response === 'reject' && options?.groupMembers?.length
         ? options.groupMembers
         : [{ id: permissionId, sessionID: sessionId }];
+    const message = response === 'reject' ? options?.message?.trim() : undefined;
     await Promise.all(
       targets.map(async (target) => {
         try {
-          await deps.respondPermission(target.sessionID, target.id, response);
+          await (message
+            ? deps.respondPermission(target.sessionID, target.id, response, { message })
+            : deps.respondPermission(target.sessionID, target.id, response));
         } catch (err) {
           if (!isMissingPermissionRequestError(err)) throw err;
         }
@@ -182,7 +186,7 @@ export async function updatePermissionModeForSessionWithDependencies(
     const session = await deps.updateSessionPermission(sessionId, mode, {
       permission: permissionRules,
     });
-    freshness.onConfirmed?.(session);
+    if (freshness.onConfirmed?.(session) === false) return;
     if (!freshness.isSessionCurrent()) return;
     deps.upsertSession(session);
   } catch (err) {
@@ -190,16 +194,14 @@ export async function updatePermissionModeForSessionWithDependencies(
     const draftCurrent = freshness.isDraftCurrent();
     if (!sessionCurrent && !draftCurrent) return;
     const confirmedMode = freshness.getConfirmedMode?.();
-    batch(() => {
-      if (sessionCurrent) {
-        deps.setPermissionModeForSession(sessionId, confirmedMode ?? previousMode);
-      }
-      if (draftCurrent) {
-        const rollbackMode = confirmedMode ?? previousDraft;
-        deps.setDraftPermissionMode(rollbackMode);
-        deps.saveProjectPermissionMode(rollbackMode);
-      }
-    });
+    if (sessionCurrent) {
+      deps.setPermissionModeForSession(sessionId, confirmedMode ?? previousMode);
+    }
+    if (draftCurrent) {
+      const rollbackMode = confirmedMode ?? previousDraft;
+      deps.setDraftPermissionMode(rollbackMode);
+      deps.saveProjectPermissionMode(rollbackMode);
+    }
     deps.setError(err instanceof Error ? err.message : 'Failed to update permissions');
     return;
   }
@@ -225,7 +227,8 @@ type SessionApprovalDependencies = {
   respondRemotePermission(
     sessionId: string,
     permissionId: string,
-    response: PermissionResponse
+    response: PermissionResponse,
+    options?: PermissionReplyOptions
   ): Promise<void | boolean | object>;
   respondAutomaticPermission?(
     sessionId: string,
@@ -257,7 +260,8 @@ type SessionApprovalDependencies = {
   setPendingSessionPermissionMode?(
     sessionId: string,
     mode: PermissionMode | null,
-    generation?: number
+    generation?: number,
+    outcome?: 'confirmed'
   ): number | null;
 };
 
@@ -285,12 +289,18 @@ export class SessionApprovalOperations {
       {
         respondPermission: options?.automatic
           ? (targetSessionId, targetPermissionId, targetResponse) =>
-              (this.deps.respondAutomaticPermission ?? this.deps.respondRemotePermission)(
-                targetSessionId,
-                targetPermissionId,
-                targetResponse,
-                options.permissionAutomationLease
-              )
+              this.deps.respondAutomaticPermission
+                ? this.deps.respondAutomaticPermission(
+                    targetSessionId,
+                    targetPermissionId,
+                    targetResponse,
+                    options.permissionAutomationLease
+                  )
+                : this.deps.respondRemotePermission(
+                    targetSessionId,
+                    targetPermissionId,
+                    targetResponse
+                  )
           : this.deps.respondRemotePermission,
         removePermission: this.deps.removePermission,
         setError: this.deps.setError,
@@ -307,28 +317,14 @@ export class SessionApprovalOperations {
     answers: QuestionAnswer,
     options?: { rethrow?: boolean }
   ) => {
-    await respondQuestionWithDependencies(
-      {
-        replyQuestion: this.deps.replyQuestion,
-        beginQuestionResponse: this.deps.beginQuestionResponse,
-        cancelQuestionResponse: this.deps.cancelQuestionResponse,
-        removeResolvedQuestion: this.deps.removeResolvedQuestion,
-        setError: this.deps.setError,
-      },
-      requestId,
-      answers,
-      options
-    );
+    await respondQuestionWithDependencies(this.deps, requestId, answers, options);
   };
 
   readonly rejectQuestion = async (requestId: string, options?: { rethrow?: boolean }) => {
     await rejectQuestionWithDependencies(
       {
+        ...this.deps,
         rejectQuestion: this.deps.rejectRemoteQuestion,
-        beginQuestionResponse: this.deps.beginQuestionResponse,
-        cancelQuestionResponse: this.deps.cancelQuestionResponse,
-        removeResolvedQuestion: this.deps.removeResolvedQuestion,
-        setError: this.deps.setError,
       },
       requestId,
       options
@@ -377,17 +373,8 @@ export class SessionApprovalOperations {
     const request = queue.tail.then(() =>
       updatePermissionModeForSessionWithDependencies(
         {
-          getPermissionModeForSession: this.deps.getPermissionModeForSession,
-          getDraftPermissionMode: this.deps.getDraftPermissionMode,
-          setPermissionModeForSession: this.deps.setPermissionModeForSession,
-          setDraftPermissionMode: this.deps.setDraftPermissionMode,
-          saveProjectPermissionMode: this.deps.saveProjectPermissionMode,
-          updateSessionPermission: this.deps.updateSessionPermission,
-          upsertSession: this.deps.upsertSession,
-          setError: this.deps.setError,
-          getPermissionsForSession: this.deps.getPermissionsForSession,
+          ...this.deps,
           autoApprovePermissionsForSession: this.autoApprovePermissionsForSession,
-          syncPendingPermissions: this.deps.syncPendingPermissions,
         },
         mode,
         permissionRules,
@@ -400,15 +387,20 @@ export class SessionApprovalOperations {
           getConfirmedMode: () => queue.confirmedMode,
           onConfirmed: () => {
             queue.confirmedMode = mode;
-            if (this.permissionModeGenerationBySession.get(sessionKey) === generation) {
-              this.deps.setPendingSessionPermissionMode?.(
-                sessionId,
-                null,
-                pendingGeneration ?? undefined
+            if (this.permissionModeGenerationBySession.get(sessionKey) !== generation) return false;
+            pendingCleared = true;
+            if (pendingGeneration != null) {
+              return (
+                this.deps.setPendingSessionPermissionMode?.(
+                  sessionId,
+                  null,
+                  pendingGeneration,
+                  'confirmed'
+                ) === pendingGeneration
               );
-              this.deps.setPermissionModeForSession(sessionId, mode);
-              pendingCleared = true;
             }
+            this.deps.setPermissionModeForSession(sessionId, mode);
+            return true;
           },
         }
       )

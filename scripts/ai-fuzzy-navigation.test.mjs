@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { goToLatest } from './ai-fuzzy-navigation.mjs';
+import { goToLatest, runAi01 } from './ai-fuzzy-navigation.mjs';
 
 function fixture(geometry, route = 'session') {
   let time = 0;
@@ -17,7 +17,10 @@ function fixture(geometry, route = 'session') {
         return true;
       },
       snapshot: async () => ({ routeSessionId: route }),
-      evaluate: async () => geometry(time),
+      evaluate: async () => {
+        const value = geometry(time);
+        return value ? { painted: true, ...value } : null;
+      },
     },
     options: {
       sessionId: 'session',
@@ -75,7 +78,7 @@ test('streaming arrival tracks a growing bottom without requiring stationary hei
   }));
   const result = await goToLatest(streaming.cdp, { ...streaming.options, streaming: true });
   assert.ok(result.samples.at(-1).at >= 150);
-  assert.deepEqual(streaming.inputs, ['click']);
+  assert.deepEqual(streaming.inputs, []);
 });
 
 test('streaming arrival rejects a detached viewport even when the large latest row is visible', async () => {
@@ -89,4 +92,76 @@ test('streaming arrival rejects a detached viewport even when the large latest r
     goToLatest(f.cdp, { ...f.options, streaming: true }),
     /did not become visible/
   );
+});
+
+test('waits for painted transcript readiness before dispatching one input', async () => {
+  const f = fixture((time) =>
+    time < 500
+      ? null
+      : {
+          top: time < 900 ? 100 : 2400,
+          height: 3000,
+          client: 600,
+          visibleIds: time < 900 ? ['older'] : ['last'],
+          painted: time >= 700,
+        }
+  );
+  f.cdp.click = async () => {
+    assert.ok(f.options.now() >= 700);
+    f.inputs.push('click');
+    return true;
+  };
+  await goToLatest(f.cdp, f.options);
+  assert.deepEqual(f.inputs, ['click']);
+});
+
+test('accepts an already settled latest message without targeting hidden navigation controls', async () => {
+  const f = fixture(() => ({ top: 2400, height: 3000, client: 600, visibleIds: ['last'] }));
+  f.cdp.click = f.cdp.key = async () => {
+    throw new Error('No input expected');
+  };
+  await goToLatest(f.cdp, f.options);
+});
+
+test('never dispatches an input into another route or an unpainted transcript', async () => {
+  for (const route of ['session', 'other']) {
+    const f = fixture(
+      () => ({
+        top: 100,
+        height: 3000,
+        client: 600,
+        visibleIds: ['older'],
+        painted: false,
+      }),
+      route
+    );
+    await assert.rejects(goToLatest(f.cdp, f.options), /did not become visible/);
+    assert.deepEqual(f.inputs, []);
+  }
+});
+
+test('AI-01 retains structured drag evidence and rejects a dispatched but unowned grab', async () => {
+  const f = fixture(() => ({ top: 2400, height: 3000, client: 600, visibleIds: ['last'] }));
+  f.cdp.snapshot = async () => ({ routeSessionId: 'session', transcript: { scrollTop: 100 } });
+  f.cdp.wheel = async () => true;
+  f.cdp.evaluate = async (expression) =>
+    expression.includes('new Promise')
+      ? null
+      : {
+          painted: true,
+          top: 2400,
+          height: 3000,
+          client: 600,
+          visibleIds: ['last'],
+        };
+  const drag = { dispatched: true, held: false, attempts: [{ reached: false }] };
+  f.cdp.dragTranscriptScrollbar = async () => drag;
+  const result = await runAi01(f.cdp, {
+    sessionId: 'session',
+    messageId: 'last',
+    seed: 'ownership',
+  });
+  assert.equal(result.result, 'FAIL');
+  assert.match(result.error, /pointer ownership/);
+  assert.deepEqual(result.actions.at(-1).drag, drag);
 });

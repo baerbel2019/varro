@@ -1,16 +1,18 @@
 import {
+  createEffect,
   Show,
   For,
-  createEffect,
   createMemo,
   createRenderEffect,
   createSignal,
   createUniqueId,
   onCleanup,
-  onMount,
+  onSettled,
+  untrack,
 } from 'solid-js';
-import type { JSX } from 'solid-js';
-import { Portal } from 'solid-js/web';
+import { type JSX, Portal } from '@solidjs/web';
+import { ariaBoolean } from '../lib/aria';
+
 import {
   isAbortedToolError,
   isPermissionRejectedToolError,
@@ -34,13 +36,31 @@ import {
 import { formatDisplayPath, getLeafPathName, normalizePath } from '../lib/path-display';
 import { useSecondClock } from '../lib/clock';
 import { formatCommandDisplay } from '../lib/command-display';
-import { formatCost, formatDuration, formatNumber } from '../lib/message-metrics';
+import { formatCost, formatDuration, formatNumber, formatTokenCount } from '../lib/message-metrics';
 import { getToolFileChanges, getToolReadPath, isToolFileRead } from '../lib/tool-file-change';
-import { prepareForMessageBlockRemoval, trackInlineDiffLoad } from '../lib/message-list-layout';
+import {
+  notifyInlineDiffMount,
+  prepareForMessageBlockRemoval,
+  trackInlineDiffLoad,
+} from '../lib/message-list-layout';
 import type { FileChange } from '../lib/tool-file-change';
-import { getToolCallExpanded, setToolCallExpanded } from '../lib/tool-call-expansion-state';
+import {
+  getToolCallExpanded,
+  hasObservedTaskWork,
+  setToolCallExpanded,
+} from '../lib/tool-call-expansion-state';
 import type { ToolCallPermissionMatch } from '../lib/tool-call-matching';
-import { resolveTaskSessionId } from '../lib/task-session';
+import {
+  getExplicitTaskSessionId,
+  nextTaskLaunchStart,
+  resolveTaskSessionId,
+} from '../lib/task-session';
+import {
+  displayUsageTokens,
+  followupUsage,
+  resolveFollowupUsage,
+  type FollowupUsageView,
+} from '../lib/followup-usage';
 import { observeSubagentCard } from '../lib/subagent-visibility';
 import { getToolKind, isApplyPatchTool, normalizeToolName } from '../lib/tool-normalization';
 import type { ToolKind } from '../lib/tool-normalization';
@@ -52,6 +72,7 @@ import { DiffView } from './DiffView';
 import type { DiffViewFile } from './DiffView';
 import { ClampedToolText } from './ClampedToolText';
 import { CopyIconButton } from './CopyIconButton';
+import { OpenTextIconButton } from './OpenTextIconButton';
 import { FileTypeIcon } from './FileTypeIcon';
 import { FolderTypeIcon, hasRecognizedFolderType } from './FolderTypeIcon';
 import { isBoolean, isNumber, isString } from '../lib/runtime-values';
@@ -59,6 +80,7 @@ import {
   bookIcon,
   cableTagIcon,
   checkCircleIcon,
+  codeIcon,
   editPencilIcon,
   eyeIcon,
   helpCircleIcon,
@@ -70,51 +92,18 @@ import {
   terminalIcon,
   toolsIcon,
 } from '../lib/ui-icons';
+import { createAltKeyTracker } from './alt-key-tracker';
 import { UiIcon } from './UiIcon';
+import { getAgentIcon } from '../lib/agent-icons';
 import { ChildTaskControls } from './chat/ChildTaskControls';
 
 export { resetToolCallExpansionState } from '../lib/tool-call-expansion-state';
 
 const isPathKey = (key: string) => key === 'file_path' || key === 'path';
 const MIN_VISIBLE_TOOL_DURATION_MS = 1000;
-const [taskActivityAltPressed, setTaskActivityAltPressed] = createSignal(false);
-let taskActivityAltListenerCount = 0;
-
-function handleTaskActivityAltKeydown(event: KeyboardEvent) {
-  if (event.key === 'Alt') setTaskActivityAltPressed(true);
-}
-
-function handleTaskActivityAltKeyup(event: KeyboardEvent) {
-  if (event.key === 'Alt') setTaskActivityAltPressed(false);
-}
-
-function handleTaskActivityAltMousemove(event: MouseEvent) {
-  setTaskActivityAltPressed(event.altKey);
-}
-
-function handleTaskActivityAltBlur() {
-  setTaskActivityAltPressed(false);
-}
-
-function retainTaskActivityAltListener() {
-  if (taskActivityAltListenerCount === 0) {
-    window.addEventListener('keydown', handleTaskActivityAltKeydown);
-    window.addEventListener('keyup', handleTaskActivityAltKeyup);
-    window.addEventListener('mousemove', handleTaskActivityAltMousemove);
-    window.addEventListener('blur', handleTaskActivityAltBlur);
-  }
-  taskActivityAltListenerCount += 1;
-
-  return () => {
-    taskActivityAltListenerCount -= 1;
-    if (taskActivityAltListenerCount > 0) return;
-    window.removeEventListener('keydown', handleTaskActivityAltKeydown);
-    window.removeEventListener('keyup', handleTaskActivityAltKeyup);
-    window.removeEventListener('mousemove', handleTaskActivityAltMousemove);
-    window.removeEventListener('blur', handleTaskActivityAltBlur);
-    setTaskActivityAltPressed(false);
-  };
-}
+const DEFAULT_TASK_AGENT = 'general';
+const { pressed: taskActivityAltPressed, retain: retainTaskActivityAltListener } =
+  createAltKeyTracker();
 
 export function getToolCallExpansionKey(part: ToolPart) {
   return `${part.sessionID}\u0000${part.messageID}\u0000${part.callID}`;
@@ -140,6 +129,7 @@ function ToolCallIcon(props: {
   const iconSize = () => props.size ?? (isWaiting() || kind() === 'task' ? 16 : 12);
   const source = () => {
     if (isWaiting()) return hourglassIcon;
+    if (!props.kind && isCodeModeTool(props.toolName || '')) return codeIcon;
     switch (kind()) {
       case 'terminal':
         return terminalIcon;
@@ -177,7 +167,7 @@ function ToolCallIcon(props: {
           aria-label={props.statusLabel}
           aria-live={props.statusLabel ? 'polite' : undefined}
           aria-atomic={props.statusLabel ? 'true' : undefined}
-          aria-hidden={props.statusLabel ? undefined : 'true'}
+          aria-hidden={ariaBoolean(props.statusLabel ? undefined : 'true')}
           title={props.statusLabel}
         />
       }
@@ -188,7 +178,7 @@ function ToolCallIcon(props: {
         aria-label={props.statusLabel}
         aria-live={props.statusLabel ? 'polite' : undefined}
         aria-atomic={props.statusLabel ? 'true' : undefined}
-        aria-hidden={props.statusLabel ? undefined : 'true'}
+        aria-hidden={ariaBoolean(props.statusLabel ? undefined : 'true')}
         title={props.statusLabel}
       />
     </Show>
@@ -285,6 +275,82 @@ function getRunningToolOutput(state: ToolPart['state']) {
   return '';
 }
 
+type CodeModeToolCall = {
+  tool: string;
+  status: 'running' | 'completed' | 'error';
+  input: UnknownRecord;
+};
+
+/** Calls past this are summarized; the full list opens in an editor tab. */
+const CODE_MODE_VISIBLE_CALLS = 12;
+/** Results larger than this stay as raw text rather than being parsed and re-indented. */
+const CODE_MODE_JSON_RESULT_MAX_CHARS = 256 * 1024;
+
+function isCodeModeTool(toolName: string) {
+  return normalizeToolName(toolName) === 'execute';
+}
+
+/** A Code Mode run is an `execute` call whose input is a script. */
+function isCodeModeRun(toolName: string, state: ToolPart['state']) {
+  return isCodeModeTool(toolName) && isString(asRecord(state.input)?.code);
+}
+
+function getCodeModeToolCalls(toolName: string, state: ToolPart['state']): CodeModeToolCall[] {
+  if (!isCodeModeTool(toolName) || state.status === 'pending') return [];
+  const calls = state.metadata?.toolCalls;
+  if (!Array.isArray(calls)) return [];
+  return calls.flatMap((value) => {
+    const call = asRecord(value);
+    if (
+      !isString(call?.tool) ||
+      !call.tool.trim() ||
+      (call.status !== 'running' && call.status !== 'completed' && call.status !== 'error')
+    )
+      return [];
+    return [{ tool: call.tool, status: call.status, input: asRecord(call.input) ?? {} }];
+  });
+}
+
+function isCodeModeFailure(toolName: string, state: ToolPart['state']): boolean {
+  return isCodeModeTool(toolName) && state.status === 'completed' && state.metadata.error === true;
+}
+
+/** Names each distinct nested tool once, in first-call order. */
+function formatCodeModeTitle(state: ToolPart['state']) {
+  const names = [...new Set(getCodeModeToolCalls('execute', state).map((call) => call.tool))];
+  return names.length ? `Code Mode: ${names.join(', ')}` : 'Code Mode';
+}
+
+function formatCodeModeCallValue<T>(value: T): string {
+  if (isString(value)) return value.replace(/\s+/g, ' ').trim();
+  if (isNumber(value) || isBoolean(value) || value === null) return String(value);
+  return JSON.stringify(value) ?? '';
+}
+
+/** One line per call, like a function signature: `node: vm, id: job-1`. */
+function formatCodeModeCallArgs(input: UnknownRecord): string {
+  return getVisibleInputEntries(input)
+    .map(([key, value]) => `${key}: ${formatCodeModeCallValue(value)}`)
+    .join(', ');
+}
+
+/** Re-indents a JSON object or array result so it reads as data, not one wrapped line. */
+export function formatCodeModeResult(output: string) {
+  const trimmed = output.trim();
+  if (
+    trimmed.length > CODE_MODE_JSON_RESULT_MAX_CHARS ||
+    !/^[[{]/.test(trimmed) ||
+    !/[\]}]$/.test(trimmed)
+  )
+    return { value: output };
+  try {
+    return { value: JSON.stringify(JSON.parse(trimmed), null, 2), language: 'json' as const };
+  } catch {
+    // Not JSON after all, e.g. a truncated payload: show it as written.
+    return { value: output };
+  }
+}
+
 export function getVisibleInputEntries(input: UnknownRecord) {
   return Object.entries(input).filter(([, value]) => hasVisibleInputValue(value));
 }
@@ -332,6 +398,8 @@ export function formatToolTitle(toolName: string, state: ToolPart['state']) {
     const url = input.url;
     if (isString(url) && url.trim()) return url.trim();
   }
+
+  if (isCodeModeRun(toolName, state)) return formatCodeModeTitle(state);
 
   // Running calls can carry the tool name as a placeholder title before output arrives.
   if (normalizedToolName === 'bash' && (!title || normalizeToolName(title) === 'bash')) {
@@ -433,7 +501,7 @@ export function ToolCall(props: {
   diffPreviewStateKey?: string;
 }) {
   const expansionKey = () => getToolCallExpansionKey(props.part);
-  const [expanded, setExpanded] = createSignal(getToolCallExpanded(expansionKey()));
+  const [expanded, setExpanded] = createSignal(untrack(() => getToolCallExpanded(expansionKey())));
   const detail = createDeferredPart(
     () => props.part,
     () =>
@@ -444,17 +512,21 @@ export function ToolCall(props: {
   );
   // Overscan rows keep their diff geometry. Dropping details outside the core collapses
   // their height, which can move them back into the core and repeatedly reload the diff.
-  createRenderEffect(() => {
-    if (
-      !props.compactFileChanges &&
-      showFileDiffs() &&
-      getToolFileChanges(props.part.tool, props.part.state).length > 0 &&
-      detail.loading()
-    ) {
-      const finish = trackInlineDiffLoad(props.part.sessionID, props.part.messageID);
-      if (finish) onCleanup(finish);
+  createRenderEffect(
+    () => ({
+      loading:
+        !props.compactFileChanges &&
+        showFileDiffs() &&
+        getToolFileChanges(props.part.tool, props.part.state).length > 0 &&
+        detail.loading(),
+      sessionID: props.part.sessionID,
+      messageID: props.part.messageID,
+    }),
+    ({ loading, sessionID, messageID }) => {
+      if (loading) return trackInlineDiffLoad(sessionID, messageID);
+      return undefined;
     }
-  });
+  );
   const tool = detail.part;
   const state = () => tool().state;
   const toolSessionRootId = createMemo(
@@ -569,7 +641,9 @@ export function ToolCall(props: {
       case 'running':
         return 'tool-status-running';
       case 'completed':
-        return 'tool-status-completed';
+        return isCodeModeFailure(tool().tool, state())
+          ? 'tool-status-error'
+          : 'tool-status-completed';
       case 'error':
         return isAbortedToolError(state()) ? 'tool-status-aborted' : 'tool-status-error';
     }
@@ -604,8 +678,8 @@ export function ToolCall(props: {
   });
   const runningOutput = createMemo(() => getRunningToolOutput(state()));
 
-  createEffect(() => {
-    setExpanded(getToolCallExpanded(expansionKey()));
+  createEffect(expansionKey, (key) => {
+    setExpanded(getToolCallExpanded(key));
   });
 
   const toggleExpand = () => {
@@ -661,6 +735,7 @@ export function ToolCall(props: {
     if (kind === 'file-change') {
       return (
         <FileChangeCard
+          messageID={props.part.messageID}
           toolState={state()}
           changes={fileChanges()}
           animatePending={isApplyPatchTool(tool().tool)}
@@ -907,6 +982,7 @@ function ReadToolCard(props: {
 }
 
 function FileChangeCard(props: {
+  messageID: string;
   toolState: ToolPart['state'];
   changes: FileChange[];
   animatePending: boolean;
@@ -971,12 +1047,20 @@ function FileChangeCard(props: {
     }))
   );
 
-  createEffect(() => {
-    if (!showCompactCard() || hiddenMultiFileCount() === 0) setMoreMenuOpen(false);
-  });
+  createEffect(
+    () => !showCompactCard() || hiddenMultiFileCount() === 0,
+    (hidden) => {
+      if (hidden) setMoreMenuOpen(false);
+    }
+  );
 
-  createEffect(() => {
-    if (!moreMenuOpen()) return;
+  createEffect(moreMenuOpen, (open) => {
+    const cleanups: Array<() => void> = [];
+
+    if (!open)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
 
     const positionMenu = () => {
       if (!moreButtonRef || !moreMenuRef) return;
@@ -1029,13 +1113,17 @@ function FileChangeCard(props: {
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('resize', positionMenu);
     window.addEventListener('scroll', positionMenu, true);
-    onCleanup(() => {
+    cleanups.push(() => {
       window.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('focusin', onFocusIn);
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('resize', positionMenu);
       window.removeEventListener('scroll', positionMenu, true);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   const action = () => {
@@ -1142,6 +1230,16 @@ function FileChangeCard(props: {
       </span>
     </>
   );
+  const reservePreviewBeforeRemoval = () => {
+    let element: HTMLDivElement | undefined;
+    onCleanup(() => {
+      if (element?.isConnected && isCompleted() && showInlinePreview())
+        prepareForMessageBlockRemoval(element);
+    });
+    return (target: HTMLDivElement) => {
+      element = target;
+    };
+  };
   const fileContent = () => (
     <>
       <Show when={!isMultiFile() && change()}>
@@ -1209,15 +1307,7 @@ function FileChangeCard(props: {
   return (
     <>
       <Show when={showCompactCard() && !splitCompletedChanges()}>
-        <div
-          class="chat-tool-invocation-part file-change-card"
-          ref={(element) =>
-            onCleanup(() => {
-              if (element.isConnected && isCompleted() && showInlinePreview())
-                prepareForMessageBlockRemoval(element);
-            })
-          }
-        >
+        <div class="chat-tool-invocation-part file-change-card" ref={reservePreviewBeforeRemoval()}>
           <div
             class={`file-change-card-header${props.compact ? '' : ' is-standalone'}${canExpandError() ? ' is-expandable' : ''}`}
             onClick={() => {
@@ -1251,7 +1341,7 @@ function FileChangeCard(props: {
                       type="button"
                       class="file-edit-more-count"
                       aria-haspopup="menu"
-                      aria-expanded={moreMenuOpen()}
+                      aria-expanded={ariaBoolean(moreMenuOpen())}
                       aria-controls={moreMenuId}
                       onClick={(event) => {
                         event.preventDefault();
@@ -1376,7 +1466,7 @@ function FileChangeCard(props: {
                   event.stopPropagation();
                   props.toggleExpand();
                 }}
-                aria-expanded={isErrorExpanded()}
+                aria-expanded={ariaBoolean(isErrorExpanded())}
                 aria-controls={errorBodyId}
                 aria-label={
                   isErrorExpanded() ? 'Collapse file change error' : 'Expand file change error'
@@ -1410,6 +1500,7 @@ function FileChangeCard(props: {
           <For each={changes()}>
             {(item) => (
               <FileChangeCard
+                messageID={props.messageID}
                 toolState={props.toolState}
                 changes={[item]}
                 animatePending={props.animatePending}
@@ -1431,7 +1522,10 @@ function FileChangeCard(props: {
         )}
       </For>
       <Show when={showInlinePreview()}>
-        <div class="file-change-inline-diffs file-change-inline-diffs-unwrapped">
+        <div
+          class="file-change-inline-diffs file-change-inline-diffs-unwrapped"
+          ref={(element) => untrack(() => notifyInlineDiffMount(element, props.messageID))}
+        >
           <DiffView diffs={inlineDiffs()} showChanges stateKey={props.previewStateKey} />
         </div>
       </Show>
@@ -1449,7 +1543,32 @@ type StructuredToolResult = {
   label: string;
   value: string;
   status?: 'error' | 'aborted';
+  /** Highlights the value and names the editor language when it is opened. */
+  language?: string;
 };
+
+type TaskUsageDisplay = {
+  tokens?: { input: number; output: number };
+  label?: string;
+  title: string;
+};
+
+// Usage views are small plain records rebuilt on every shared cache write.
+// Mirrors OpenCode's Model.Ref.parse for subagent `model` input: "providerID/modelID#variant".
+function parseTaskModelRef(value: string) {
+  const input = value.trim();
+  const providerEnd = input.indexOf('/');
+  if (providerEnd <= 0) return null;
+  const variantStart = input.indexOf('#', providerEnd + 1);
+  const modelID = input.slice(providerEnd + 1, variantStart === -1 ? undefined : variantStart);
+  const variant = variantStart === -1 ? undefined : input.slice(variantStart + 1);
+  if (!modelID || (variant !== undefined && (!variant || variant.includes('#')))) return null;
+  return { providerID: input.slice(0, providerEnd), modelID, variant };
+}
+
+function sameJson<T extends FollowupUsageView | TaskUsageDisplay | null>(a: T, b: T) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
 
 function GenericToolCall(props: {
   detailLoading?: boolean;
@@ -1468,6 +1587,18 @@ function GenericToolCall(props: {
   lightweight?: boolean;
 }) {
   const toolName = () => normalizeToolName(props.tool.tool);
+  const codeModeCalls = createMemo(() => getCodeModeToolCalls(props.tool.tool, props.state));
+  const codeModeFailure = () => isCodeModeFailure(props.tool.tool, props.state);
+  const isCodeMode = () => isCodeModeRun(props.tool.tool, props.state);
+  // The script is what a running call is doing, so it reads in full until the result lands.
+  const isCodeModeActive = () =>
+    isCodeMode() && (props.state.status === 'pending' || props.state.status === 'running');
+  const codeModeResult = createMemo(() =>
+    isCodeMode() && props.state.status === 'completed'
+      ? formatCodeModeResult(props.fullOutput)
+      : { value: props.fullOutput }
+  );
+  const isFailed = () => props.state.status === 'error' || codeModeFailure();
   const isAborted = () => isAbortedToolError(props.state);
   const isPermissionRejected = () => isPermissionRejectedToolError(props.state);
   const isQuestionSkipped = () => isQuestionSkippedToolError(props.state);
@@ -1481,7 +1612,16 @@ function GenericToolCall(props: {
     const label = type.trim();
     return `${label.charAt(0).toUpperCase()}${label.slice(1)} subagent`;
   };
-  const taskSessionId = () => {
+  // The default `general` subagent stays unlabeled; any other type is named in the header.
+  const taskAgentBadge = createMemo(() => {
+    if (!isTask()) return null;
+    const type = taskAgent();
+    const name = isString(type) ? type.trim() : '';
+    if (!name || name.toLowerCase() === DEFAULT_TASK_AGENT) return null;
+    const agent = appState.allAgents.find((candidate) => candidate.name === name);
+    return { name, icon: getAgentIcon(agent ?? { name, options: {} }) };
+  });
+  const taskSessionId = createMemo(() => {
     if (!isTask()) return null;
     if (
       props.state.status !== 'running' &&
@@ -1494,18 +1634,100 @@ function GenericToolCall(props: {
     // Only the tool's first matching parent message is read from the transcript.
     const parent = getMessageLookup().byId.get(props.tool.messageID);
     return resolveTaskSessionId(props.tool, parent ? [parent] : [], appState.sessions);
+  });
+  const taskChildStatus = () => {
+    const sessionId = taskSessionId();
+    return sessionId ? appState.sessionStatus[sessionId] : undefined;
   };
+  const isBackgroundLaunch = createMemo(() => {
+    const state = props.state;
+    return (
+      isTask() &&
+      state.status === 'completed' &&
+      (state.metadata.status === 'running' ||
+        state.input.background === true ||
+        props.fullOutput.startsWith('The subagent is working in the background'))
+    );
+  });
+  const isNativeBackgroundLaunch = () => {
+    const state = props.state;
+    return (
+      isBackgroundLaunch() && state.status === 'completed' && state.metadata.status === 'running'
+    );
+  };
+  const nextLaunch = createMemo(() => {
+    const childID = taskSessionId();
+    if (!childID || props.state.status !== 'completed') return Infinity;
+    return nextTaskLaunchStart(
+      props.tool,
+      childID,
+      getMessageLookup().bySessionId.get(props.tool.sessionID) ?? []
+    );
+  });
+  const childWorking = createMemo(() => {
+    if (nextLaunch() !== Infinity) return false;
+    if (isSessionStatusWorking(taskChildStatus())) return true;
+    const sessionId = taskSessionId();
+    return (
+      isBackgroundLaunch() &&
+      !!sessionId &&
+      getSessionTreeIds(sessionId).some((id) => isSessionStatusWorking(appState.sessionStatus[id]))
+    );
+  });
+  const observedChildWork = createMemo(() => {
+    const sessionId = taskSessionId();
+    const state = props.state;
+    if (!sessionId || (state.status !== 'running' && state.status !== 'completed')) return null;
+    const server = appState.serverStatus;
+    const run = `${server.state === 'running' ? server.url : ''}\u0000${getToolCallExpansionKey(props.tool)}\u0000${sessionId}:${state.time.start}`;
+    return hasObservedTaskWork(run, childWorking());
+  });
+  const taskResultNotice = createMemo(() => {
+    if (!isBackgroundLaunch() || childWorking()) return undefined;
+    const state = props.state;
+    if (state.status !== 'completed') return undefined;
+    const sessionId = taskSessionId();
+    if (!sessionId) return undefined;
+    const entries = getMessageLookup().bySessionId.get(props.tool.sessionID) ?? [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const { info, parts } = entries[i]!;
+      if (
+        info.role !== 'user' ||
+        info.time.created < state.time.start ||
+        info.time.created >= nextLaunch()
+      )
+        continue;
+      for (const part of parts) {
+        if (part.type === 'text' && part.synthetic && part.subagentResult?.sessionID === sessionId)
+          return part.subagentResult;
+      }
+    }
+    return undefined;
+  });
   const isRunning = createMemo(() => {
     if (props.state.status === 'running') return true;
     if (!isTask() || props.state.status !== 'completed') return false;
-    // A background launch completes before its child does, including native
-    // foreground calls handed off to the background after launch.
-    const sessionId = taskSessionId();
-    return !!sessionId && isSessionStatusWorking(appState.sessionStatus[sessionId]);
+    // Follow-ups can arrive before a result. Only the newest launch owns the
+    // child's remaining work, even when an older launch has no final notice.
+    if (nextLaunch() !== Infinity) return false;
+    if (childWorking()) return true;
+    const notice = taskResultNotice();
+    // Native idle only ends an execution period. Wait for the child result,
+    // which can itself report that background work is still pending.
+    return (
+      !!notice?.backgroundPending ||
+      (isBackgroundLaunch() &&
+        !notice &&
+        (isNativeBackgroundLaunch() || taskChildStatus()?.type !== 'idle' || !observedChildWork()))
+    );
   });
   const taskExecutionEntries = createMemo<Array<[string, unknown]>>(() => {
     const sessionId = taskSessionId();
+    const state = props.state;
+    const launchStart = 'time' in state ? state.time.start : undefined;
+    const launchEnd = nextLaunch();
     let latest: AssistantMessage | null = null;
+    let launchLatest: AssistantMessage | null = null;
     if (sessionId) {
       for (const entry of getMessageLookup().bySessionId.get(sessionId) ?? []) {
         const info = entry.info;
@@ -1517,8 +1739,27 @@ function GenericToolCall(props: {
         )
           continue;
         if (!latest || info.time.created >= latest.time.created) latest = info;
+        if (
+          launchStart !== undefined &&
+          info.time.created >= launchStart &&
+          info.time.created < launchEnd &&
+          (!launchLatest || info.time.created >= launchLatest.time.created)
+        )
+          launchLatest = info;
       }
     }
+    // A follow-up can switch the child's model. Its earlier messages describe the previous
+    // launch, so an explicit model input wins until this launch produces its own message.
+    const requestedModel = state.input?.model;
+    const requested =
+      !launchLatest && isString(requestedModel) ? parseTaskModelRef(requestedModel) : null;
+    if (requested) {
+      return [
+        ['model', `${requested.providerID}/${requested.modelID}`],
+        ['reasoning', requested.variant || 'default'],
+      ];
+    }
+    if (launchLatest) latest = launchLatest;
 
     const type = taskAgent();
     const agent =
@@ -1563,40 +1804,215 @@ function GenericToolCall(props: {
       ['reasoning', reasoning || 'default'],
     ];
   });
-  const taskTokenUsage = createMemo(() => {
-    const sessionId = taskSessionId();
+  // Session totals need an explicit child link: a title- or position-inferred child is not
+  // authoritative enough to attribute usage to this call.
+  const explicitTaskSessionId = createMemo(() =>
+    isTask() && taskSessionId() ? getExplicitTaskSessionId(props.tool) : null
+  );
+  const taskSessionIndex = createMemo(() => {
+    const sessionId = explicitTaskSessionId();
+    const session = appState.sessions.find((candidate) => candidate.id === sessionId);
+    if (!session) return null;
+    // Index child sessions, not calls: follow-ups keep their child's number regardless of
+    // transcript pagination, card mounting order, or session-list activity sorting.
+    let index = 1;
+    for (const sibling of appState.sessions) {
+      if (sibling.parentID !== session.parentID || sibling.id === session.id) continue;
+      if (
+        sibling.time.created < session.time.created ||
+        (sibling.time.created === session.time.created && sibling.id < session.id)
+      )
+        index += 1;
+    }
+    return index;
+  });
+  // Only the server's session aggregate is a session total. Loaded messages can be a partial
+  // window, and projected rows report missing usage as zero.
+  const taskSessionAggregate = createMemo(() => {
+    const sessionId = explicitTaskSessionId();
     if (!sessionId) return null;
-
-    const sessionTokens = appState.sessions.find((session) => session.id === sessionId)?.tokens;
-    if (sessionTokens) {
-      return {
-        input: (sessionTokens.input || 0) + (sessionTokens.cache.write || 0),
-        output: (sessionTokens.output || 0) + (sessionTokens.reasoning || 0),
-      };
-    }
-
-    let input = 0;
-    let output = 0;
-    for (const entry of getMessageLookup().bySessionId.get(sessionId) ?? []) {
-      const info = entry.info;
-      if (info.role !== 'assistant' || info.sessionID !== sessionId) continue;
-      input += (info.tokens.input || 0) + (info.tokens.cache?.write || 0);
-      output += (info.tokens.output || 0) + (info.tokens.reasoning || 0);
-    }
-
-    return { input, output };
+    const session = appState.sessions.find((candidate) => candidate.id === sessionId);
+    return session?.tokens ? { tokens: session.tokens, cost: session.cost } : null;
+  });
+  const taskTokenUsage = createMemo(() => {
+    const tokens = taskSessionAggregate()?.tokens;
+    if (!tokens) return null;
+    return {
+      input: (tokens.input || 0) + (tokens.cache.write || 0),
+      output: (tokens.output || 0) + (tokens.reasoning || 0),
+    };
   });
   const taskCost = createMemo(() => {
-    const sessionId = taskSessionId();
-    if (!sessionId) return '';
-    let messageCost = 0;
-    for (const entry of getMessageLookup().bySessionId.get(sessionId) ?? []) {
-      const info = entry.info;
-      if (info.role !== 'assistant' || info.sessionID !== sessionId) continue;
-      if (Number.isFinite(info.cost) && info.cost > 0) messageCost += info.cost;
+    const cost = taskSessionAggregate()?.cost;
+    return cost !== undefined && Number.isFinite(cost) ? formatCost(cost) : '';
+  });
+  // Native calls name the child prompt they admitted; its interval is this call's usage.
+  const taskChildPromptID = createMemo(() => {
+    if (!explicitTaskSessionId()) return null;
+    const state = props.state;
+    if (state.status === 'pending') return null;
+    const promptID = asRecord(state.metadata)?.childPromptID;
+    return isString(promptID) && promptID ? promptID : null;
+  });
+  // The child's own directory scopes the read; children share their parent's directory.
+  const followupUsageDirectory = createMemo(() => {
+    const sessionId = explicitTaskSessionId();
+    if (!sessionId) return undefined;
+    const sessions = appState.sessions;
+    return (
+      sessions.find((session) => session.id === sessionId)?.directory ??
+      sessions.find((session) => session.id === props.tool.sessionID)?.directory
+    );
+  });
+  const followupUsageKey = createMemo(() => {
+    const sessionId = explicitTaskSessionId();
+    if (!sessionId || !taskChildPromptID()) return null;
+    const server = appState.serverStatus;
+    return `${server.state === 'running' ? server.url : ''}\u0000${followupUsageDirectory() ?? ''}\u0000${sessionId}`;
+  });
+  createEffect(
+    () => ({ key: followupUsageKey(), sessionID: explicitTaskSessionId() }),
+    (next) => {
+      if (!next.key || !next.sessionID) return;
+      return followupUsage.subscribe(next.key, next.sessionID);
     }
-    const sessionCost = appState.sessions.find((session) => session.id === sessionId)?.cost ?? 0;
-    return formatCost(Math.max(messageCost, Number.isFinite(sessionCost) ? sessionCost : 0));
+  );
+  // Child delivery and step events, totals, and status changes can each move intervals.
+  // A reconnect advances the connection even when all of them look unchanged.
+  const followupUsageRevision = createMemo(() => {
+    const sessionId = explicitTaskSessionId();
+    if (!sessionId || !taskChildPromptID()) return '';
+    const session = appState.sessions.find((candidate) => candidate.id === sessionId);
+    const tokens = session?.tokens;
+    const status = appState.sessionStatus[sessionId];
+    return [
+      followupUsage.connection(),
+      followupUsage.eventRevision(sessionId),
+      tokens
+        ? [tokens.input, tokens.output, tokens.reasoning, tokens.cache.read, tokens.cache.write]
+        : '',
+      session?.cost ?? '',
+      status?.type ?? '',
+      status?.type === 'retry' ? status.attempt : '',
+    ].join(':');
+  });
+  createEffect(
+    () => ({
+      key: followupUsageKey(),
+      sessionID: explicitTaskSessionId(),
+      directory: followupUsageDirectory(),
+      promptID: taskChildPromptID(),
+      revision: followupUsageRevision(),
+    }),
+    (next) => {
+      if (!next.key || !next.sessionID || !next.promptID) return;
+      followupUsage.request({
+        key: next.key,
+        sessionID: next.sessionID,
+        directory: next.directory,
+        promptID: next.promptID,
+        revision: next.revision,
+      });
+    }
+  );
+  const followupUsageView = createMemo(
+    () => {
+      const key = followupUsageKey();
+      const promptID = taskChildPromptID();
+      if (!key || !promptID) return null;
+      return resolveFollowupUsage(followupUsage.cache()[key], promptID);
+    },
+    { equals: sameJson }
+  );
+  const taskUsageDisplay = createMemo(
+    (): TaskUsageDisplay | null => {
+      const view = followupUsageView();
+      if (!view) {
+        if (!explicitTaskSessionId()) return null;
+        const tokens = taskTokenUsage();
+        return tokens
+          ? {
+              tokens,
+              label: `Σ${taskSessionIndex() ?? ''}`,
+              title: `Session ${taskSessionIndex()} total: all recorded usage in this subagent session, including work after later follow-ups. Session ID: ${explicitTaskSessionId()}. Input includes cache writes; output includes reasoning.`,
+            }
+          : null;
+      }
+      if (view.kind === 'loading')
+        return { label: 'Loading usage', title: 'Loading usage for this subagent prompt.' };
+      if (view.kind === 'pending')
+        return {
+          label: 'Usage pending',
+          title: 'This prompt has not been delivered to the subagent yet.',
+        };
+      if (view.kind === 'unavailable') return null;
+      const usage = view.interval.usage;
+      // Without a recorded step the counters are unknown, so never show them as zero.
+      if (!view.recorded) {
+        const missingOnly = usage.missing > 0 && usage.active === 0;
+        return {
+          label: missingOnly
+            ? view.shared
+              ? 'Shared, partial usage'
+              : 'Partial usage'
+            : 'Usage pending',
+          title: [
+            missingOnly
+              ? 'No model step after this prompt recorded usage.'
+              : 'No model step after this prompt has recorded usage yet.',
+            ...view.reasons,
+          ].join(' '),
+        };
+      }
+      const label =
+        view.shared && view.partial
+          ? 'Shared, partial usage'
+          : view.shared
+            ? 'Shared usage'
+            : view.partial
+              ? 'Partial usage'
+              : undefined;
+      return {
+        tokens: displayUsageTokens(usage),
+        label,
+        title: [
+          view.shared
+            ? `Shared response usage: ${view.interval.promptIDs.length} prompts were delivered before the same model step, so this usage is not split between them.`
+            : 'Usage after this prompt until the next prompt was delivered to the subagent.',
+          ...view.reasons,
+          view.running ? 'Still running; usage so far.' : '',
+          'Later steps continue earlier context, so this is not the cost of the instruction alone. Input includes cache writes; output includes reasoning.',
+          usage.cacheRead > 0 ? `Cache reads: ${formatNumber(usage.cacheRead)}.` : '',
+        ]
+          .filter(Boolean)
+          .join(' '),
+      };
+    },
+    { equals: sameJson }
+  );
+  // Detail usage rows use the same scope as the header.
+  const taskUsageEntries = createMemo((): Array<[string, unknown]> => {
+    const view = followupUsageView();
+    if (!view) {
+      const cost = taskCost();
+      return cost ? [['cost', cost]] : [];
+    }
+    if (view.kind !== 'interval') return [];
+    const usage = view.interval.usage;
+    const entries: Array<[string, unknown]> = [];
+    const cost = view.recorded ? formatCost(usage.cost) : '';
+    if (cost) entries.push(['cost', cost]);
+    if (view.recorded && usage.cacheRead > 0)
+      entries.push(['cache read', formatNumber(usage.cacheRead)]);
+    const totals = taskTokenUsage();
+    if (totals) {
+      const sessionCost = taskCost();
+      entries.push([
+        'session total',
+        `↑ ${formatNumber(totals.input)} ↓ ${formatNumber(totals.output)}${sessionCost ? ` · ${sessionCost}` : ''}`,
+      ]);
+    }
+    return entries;
   });
   const detailInputEntries = createMemo(() => {
     if (!isTask()) return props.inputEntries;
@@ -1608,22 +2024,22 @@ function GenericToolCall(props: {
       ...visibleEntries,
       ...taskExecutionEntries().filter(([key]) => !keys.has(key)),
     ];
-    const cost = taskCost();
-    if (cost) {
+    const usageEntries = taskUsageEntries();
+    if (usageEntries.length) {
       const reasoningIndex = entries.findIndex(([key]) => key === 'reasoning');
-      entries.splice(reasoningIndex < 0 ? entries.length : reasoningIndex + 1, 0, ['cost', cost]);
+      entries.splice(reasoningIndex < 0 ? entries.length : reasoningIndex + 1, 0, ...usageEntries);
     }
     return entries;
   });
   const taskRetryStatus = () => {
-    if (!isRunning()) return null;
+    if (!isRunning() || nextLaunch() !== Infinity) return null;
     const sessionId = taskSessionId();
     if (!sessionId) return null;
     const status = appState.sessionStatus[sessionId];
     return status?.type === 'retry' ? status : null;
   };
   const taskPermissionPending = createMemo(() => {
-    if (!isRunning()) return false;
+    if (!isRunning() || nextLaunch() !== Infinity) return false;
     const sessionId = taskSessionId();
     if (!sessionId) return false;
     const sessionIds = new Set(getSessionTreeIds(sessionId));
@@ -1636,7 +2052,11 @@ function GenericToolCall(props: {
       ? 'tool-status-pending'
       : isRunning()
         ? 'tool-status-running'
-        : props.statusClass;
+        : taskResultNotice()?.state === 'error'
+          ? 'tool-status-error'
+          : taskResultNotice()?.state === 'cancelled'
+            ? 'tool-status-aborted'
+            : props.statusClass;
   const openTaskSession = () => {
     const sessionId = taskSessionId();
     if (!sessionId) return;
@@ -1674,7 +2094,18 @@ function GenericToolCall(props: {
       };
     }
     if (props.state.status !== 'completed') return null;
+    if (codeModeFailure()) {
+      return {
+        label: 'error',
+        value: isBlank(props.fullOutput) ? '(no output)' : props.fullOutput,
+        status: 'error',
+      };
+    }
     if (isTask()) return taskResult();
+    if (isCodeMode()) {
+      if (isBlank(props.fullOutput)) return { label: 'result', value: '(no output)' };
+      return { label: 'result', ...codeModeResult() };
+    }
     if (isSearchTool()) {
       return {
         label: 'results',
@@ -1701,8 +2132,14 @@ function GenericToolCall(props: {
     }
     return null;
   };
-  onMount(() => {
-    if (isTask()) onCleanup(retainTaskActivityAltListener());
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    if (isTask()) cleanups.push(retainTaskActivityAltListener());
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
   const now = useSecondClock(() => durationStartedAt() !== null);
   const runningDurationLabel = () => {
@@ -1718,7 +2155,7 @@ function GenericToolCall(props: {
     if (updated === undefined) return null;
     return formatDuration(Math.max(0, now() - updated)) || '0ms';
   };
-  const visibleTaskTokenUsage = () => (taskActivityAgeDuration() ? null : taskTokenUsage());
+  const visibleTaskUsage = () => (taskActivityAgeDuration() ? null : taskUsageDisplay());
   const visibleRunningDurationLabel = () =>
     taskActivityAgeDuration() ? null : runningDurationLabel();
   const commandMatchesTitle = () =>
@@ -1731,7 +2168,7 @@ function GenericToolCall(props: {
   const hasExpandableContent = () => {
     if (props.lightweight) return false;
     if (props.tool.deferred) return true;
-    if (props.state.status === 'error') return true;
+    if (isFailed() || codeModeCalls().length > 0) return true;
     if (taskSessionId()) return true;
     if (hasOnlyHeaderCommand()) return false;
     if (detailInputEntries().length > 0) return true;
@@ -1754,9 +2191,14 @@ function GenericToolCall(props: {
   const bodyId = createUniqueId();
   let taskHeader: HTMLButtonElement | undefined;
   const observedTaskSessionId = createMemo(() => (isRunning() ? taskSessionId() : null));
-  createEffect(() => {
-    const sessionId = observedTaskSessionId();
-    if (sessionId && taskHeader) onCleanup(observeSubagentCard(taskHeader, sessionId));
+  createEffect(observedTaskSessionId, (sessionId) => {
+    const cleanups: Array<() => void> = [];
+
+    if (sessionId && taskHeader) cleanups.push(observeSubagentCard(taskHeader, sessionId));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
   return (
     <div class={`chat-tool-invocation-part${isTask() ? ' tool-invocation-task' : ''}`}>
@@ -1771,25 +2213,65 @@ function GenericToolCall(props: {
           }}
           onClick={props.toggleExpand}
           disabled={!hasExpandableContent()}
-          aria-expanded={hasExpandableContent() ? isExpanded() : undefined}
+          aria-expanded={ariaBoolean(hasExpandableContent() ? isExpanded() : undefined)}
           aria-controls={hasExpandableContent() ? bodyId : undefined}
         >
           <ToolCallIcon
             toolName={props.tool.tool}
             statusClass={statusClass()}
-            statusLabel={waitingForPermission() ? 'Waiting for permission' : undefined}
+            statusLabel={
+              waitingForPermission()
+                ? 'Waiting for permission'
+                : isBackgroundLaunch() && isRunning() && !taskRetryStatus()
+                  ? 'Running'
+                  : isBackgroundLaunch() && statusClass() === 'tool-status-completed'
+                    ? 'Completed'
+                    : undefined
+            }
             waiting={waitingForPermission()}
           />
           <span
             class={`tool-invocation-title${statusClass() === 'tool-status-running' && !isTask() ? ' shimmer-progress' : ''}`}
           >
             {props.title}
+            {/* Inline in the title so both truncate as one run with a single ellipsis. */}
+            <Show when={taskAgentBadge()}>
+              {(badge) => (
+                <span class="tool-invocation-agent" title={taskAgentLabel()}>
+                  <UiIcon
+                    source={badge().icon}
+                    class="tool-invocation-agent-icon"
+                    width={12}
+                    height={12}
+                  />
+                  {badge().name}
+                </span>
+              )}
+            </Show>
           </span>
-          <Show when={visibleTaskTokenUsage()}>
-            {(tokens) => (
-              <span class="tool-invocation-token-stats" title="Subagent tokens">
-                ↑ {formatNumber(tokens().input)} ↓ {formatNumber(tokens().output)}
-              </span>
+          <Show when={isBackgroundLaunch() && waitingForPermission() && !taskRetryStatus()}>
+            <span class="tool-invocation-task-status" role="status">
+              Waiting for permission
+            </span>
+          </Show>
+          <Show when={visibleTaskUsage()}>
+            {(usage) => (
+              <>
+                <Show when={usage().label}>
+                  {(label) => (
+                    <span class="tool-invocation-token-label" title={usage().title}>
+                      {label()}
+                    </span>
+                  )}
+                </Show>
+                <Show when={usage().tokens}>
+                  {(tokens) => (
+                    <span class="tool-invocation-token-stats" title={usage().title}>
+                      ↑ {formatTokenCount(tokens().input)} ↓ {formatTokenCount(tokens().output)}
+                    </span>
+                  )}
+                </Show>
+              </>
             )}
           </Show>
           <Show when={searchResultCount()}>
@@ -1823,10 +2305,12 @@ function GenericToolCall(props: {
           </Show>
           <Show when={taskRetryStatus()}>
             {(retry) => (
-              <span class="tool-invocation-retry-label">retrying #{retry().attempt}</span>
+              <span class="tool-invocation-retry-label" role="status">
+                retrying #{retry().attempt}
+              </span>
             )}
           </Show>
-          <Show when={props.state.status === 'error' && !isExpanded()}>
+          <Show when={isFailed() && !isExpanded()}>
             <span
               class={`tool-invocation-error-label${isAborted() ? ' is-aborted' : ''}${isPermissionRejected() || isQuestionSkipped() ? ' is-rejected' : ''}`}
             >
@@ -1847,6 +2331,12 @@ function GenericToolCall(props: {
           </Show>
         </button>
         <Show when={showHeaderCommandCopy()}>
+          <OpenTextIconButton
+            content={bashCommand()}
+            title={`${props.title} (command)`}
+            label="command"
+            language="shellscript"
+          />
           <CopyIconButton text={bashCommand()} label="command" />
         </Show>
       </div>
@@ -1885,6 +2375,13 @@ function GenericToolCall(props: {
                     </Show>
                   }
                   inputEntries={detailInputEntries()}
+                  valueLanguages={isCodeMode() ? CODE_MODE_VALUE_LANGUAGES : undefined}
+                  unclampCode={isCodeModeActive()}
+                  details={
+                    <Show when={codeModeCalls().length > 0}>
+                      <CodeModeToolCalls calls={codeModeCalls()} toolTitle={props.title} />
+                    </Show>
+                  }
                   result={structuredResult()}
                   onOpenPath={openGenericToolFile}
                   toolTitle={props.title}
@@ -1894,7 +2391,7 @@ function GenericToolCall(props: {
             >
               <div class="terminal-command-card">
                 <Show when={showBashCommandRow()}>
-                  <TerminalCommandRow command={bashCommand()} />
+                  <TerminalCommandRow command={bashCommand()} title={props.title} />
                 </Show>
                 <Show when={props.state.status === 'completed'}>
                   <div class="terminal-command-row terminal-command-row-output">
@@ -1962,7 +2459,11 @@ function GenericToolCall(props: {
                         when={taskRetryStatus()}
                         fallback="Results will appear here when ready."
                       >
-                        {(retry) => `Attempt ${retry().attempt} · ${retry().message}`}
+                        {(retry) => (
+                          <>
+                            Attempt {retry().attempt} · {retry().message}
+                          </>
+                        )}
                       </Show>
                     </span>
                   </span>
@@ -1994,13 +2495,19 @@ function GenericToolCall(props: {
  * below it, not something to read in full here. Copy is the escape hatch, so
  * an ellipsized command is still recoverable in one click.
  */
-function TerminalCommandRow(props: { command: string }) {
+function TerminalCommandRow(props: { command: string; title: string }) {
   return (
     <div class="terminal-command-row terminal-command-row-input">
       <span class="terminal-command-prompt" aria-hidden="true">
         $
       </span>
       <pre class="terminal-command-text terminal-command-single-line">{props.command}</pre>
+      <OpenTextIconButton
+        content={props.command}
+        title={`${props.title} (command)`}
+        label="command"
+        language="shellscript"
+      />
       <CopyIconButton text={props.command} label="command" />
     </div>
   );
@@ -2017,16 +2524,27 @@ function LiveTerminalOutput(props: { content: string }) {
     viewportRef.scrollTop = bottom;
   };
 
-  createEffect(() => {
-    void props.content;
-    queueMicrotask(scrollToBottom);
-  });
+  createEffect(
+    () => props.content,
+    () => {
+      queueMicrotask(scrollToBottom);
+    }
+  );
 
-  onMount(() => {
-    if (!contentRef || globalThis.ResizeObserver === undefined) return;
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    if (!contentRef || globalThis.ResizeObserver === undefined)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
     const observer = new ResizeObserver(scrollToBottom);
     observer.observe(contentRef);
-    onCleanup(() => observer.disconnect());
+    cleanups.push(() => observer.disconnect());
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   return (
@@ -2044,9 +2562,92 @@ function LiveTerminalOutput(props: { content: string }) {
   );
 }
 
+const CODE_MODE_VALUE_LANGUAGES = { code: 'javascript' } as const;
+
+const CODE_MODE_CALL_STATUS_LABELS: Record<CodeModeToolCall['status'], string> = {
+  running: 'Running',
+  completed: 'Completed',
+  error: 'Failed',
+};
+
+/**
+ * Nested calls read like a call log: one line each, `tool(args)`, so a script
+ * that makes several calls stays scannable. Full arguments open in an editor
+ * tab rather than expanding in place.
+ */
+function CodeModeToolCalls(props: { calls: CodeModeToolCall[]; toolTitle: string }) {
+  const visibleCalls = () => props.calls.slice(0, CODE_MODE_VISIBLE_CALLS);
+  const hiddenCount = () => Math.max(0, props.calls.length - CODE_MODE_VISIBLE_CALLS);
+  const allCallsJson = () =>
+    JSON.stringify(
+      props.calls.map((call) => ({ tool: call.tool, status: call.status, input: call.input })),
+      null,
+      2
+    );
+
+  return (
+    <div class="structured-tool-row code-mode-tool-calls-row">
+      <span class="structured-tool-label">calls</span>
+      <ol class="code-mode-tool-calls" aria-label="Code Mode tool calls">
+        {/* Calls have no IDs; OpenCode reports them in start order. Keep rows mounted by position. */}
+        <For keyed={false} each={visibleCalls()}>
+          {(call) => {
+            const args = () => formatCodeModeCallArgs(call().input);
+            const argsJson = () => JSON.stringify(call().input, null, 2);
+            return (
+              <li class="code-mode-tool-call" data-status={call().status}>
+                <ToolCallIcon
+                  toolName={call().tool}
+                  statusClass={`tool-status-${call().status}`}
+                  statusLabel={CODE_MODE_CALL_STATUS_LABELS[call().status]}
+                />
+                <span class="code-mode-tool-call-signature" title={`${call().tool}(${args()})`}>
+                  <span
+                    class={`code-mode-tool-call-name${call().status === 'running' ? ' shimmer-progress' : ''}`}
+                  >
+                    {call().tool}
+                  </span>
+                  <span class="code-mode-tool-call-args">({args()})</span>
+                </span>
+                <Show when={args()}>
+                  <OpenTextIconButton
+                    content={argsJson()}
+                    title={`${call().tool} (input)`}
+                    label={`${call().tool} input`}
+                    language="json"
+                  />
+                  <CopyIconButton text={argsJson()} label={`${call().tool} input`} />
+                </Show>
+              </li>
+            );
+          }}
+        </For>
+        <Show when={hiddenCount() > 0}>
+          <li class="code-mode-tool-call code-mode-tool-call-more">
+            <span class="code-mode-tool-call-signature">
+              {`+${hiddenCount()} more ${hiddenCount() === 1 ? 'call' : 'calls'}`}
+            </span>
+            <OpenTextIconButton
+              content={allCallsJson()}
+              title={`${props.toolTitle} (calls)`}
+              label="all calls"
+              language="json"
+            />
+          </li>
+        </Show>
+      </ol>
+    </div>
+  );
+}
+
 function StructuredToolCard(props: {
   actions?: JSX.Element;
+  details?: JSX.Element;
   inputEntries: Array<[string, unknown]>;
+  /** Input keys whose block values are code, mapped to their highlight language. */
+  valueLanguages?: Readonly<Record<string, string>>;
+  /** Shows `valueLanguages` code in full instead of clamped. */
+  unclampCode?: boolean;
   result: StructuredToolResult | null;
   onOpenPath: (path: string) => void;
   /** Prefixes editor-tab titles so an opened value says which tool it came from. */
@@ -2061,11 +2662,22 @@ function StructuredToolCard(props: {
       {props.actions}
       <For each={nonPromptEntries()}>
         {([key, value]) => {
+          // valueLanguages derives from deferred detail state, so read it in JSX.
+          const codeLanguage = () => (isString(value) ? props.valueLanguages?.[key] : undefined);
           const blockValue = shouldShowStructuredToolValueAsBlock(key, value);
           return (
             <div class="structured-tool-row">
               <span class="structured-tool-label">{key}</span>
-              {isPathKey(key) && isString(value) ? (
+              {codeLanguage() ? (
+                <ClampedToolText
+                  content={formatExpandedValue(key, value)}
+                  title={`${props.toolTitle} (${key})`}
+                  language={codeLanguage()}
+                  highlight
+                  unclamped={props.unclampCode}
+                  class="structured-tool-value structured-tool-value-code"
+                />
+              ) : isPathKey(key) && isString(value) ? (
                 <a
                   href="#"
                   class="file-path-link structured-tool-value"
@@ -2089,6 +2701,12 @@ function StructuredToolCard(props: {
                   <pre class="structured-tool-value structured-tool-value-single">
                     {formatExpandedValue(key, value)}
                   </pre>
+                  <OpenTextIconButton
+                    content={formatExpandedValue(key, value)}
+                    title={`${props.toolTitle} (${key})`}
+                    label={key}
+                    language="plaintext"
+                  />
                   <CopyIconButton text={formatExpandedValue(key, value)} label={key} />
                 </div>
               )}
@@ -2109,6 +2727,7 @@ function StructuredToolCard(props: {
           </div>
         )}
       </Show>
+      {props.details}
       <Show when={props.result}>
         {(result) => (
           <div
@@ -2118,7 +2737,8 @@ function StructuredToolCard(props: {
             <ClampedToolText
               content={result().value}
               title={`${props.toolTitle} (${result().label})`}
-              language={result().status ? 'plaintext' : undefined}
+              language={result().status ? 'plaintext' : result().language}
+              highlight={!result().status && !!result().language}
               view={props.previewMarkdown && !result().status ? 'markdown-preview' : undefined}
               class={`structured-tool-value structured-tool-value-result${
                 result().status

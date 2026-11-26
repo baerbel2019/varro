@@ -1,11 +1,11 @@
-import { Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
+import { createEffect, Show, createMemo, createSignal, onSettled } from 'solid-js';
 import type { SelectedModel } from '../../lib/app-state-types';
 import {
   formatProviderLimitTitle,
   formatVariantLabel,
   getProviderLimitCompactBadges,
-  hasProviderLimitWindowWithinThreshold,
 } from '../../lib/format';
+import { createProviderLimitDisplay } from '../../lib/provider-limit-display';
 import { getContextWindow } from '../../lib/message-metrics';
 import { getVariantsForModel } from '../../lib/model-variants';
 import { getProviderIcon } from '../../lib/provider-icons';
@@ -122,7 +122,7 @@ export function ManagedSubagentFooter(props: {
     );
   });
   const sessionCost = createMemo(() => getSessionCost(currentSessionMessages(), activeSession()));
-  const currentProviderLimit = createMemo(() => {
+  const currentProviderLimit = createProviderLimitDisplay(() => {
     const current = currentModel();
     return getProviderLimit(current.providerID, current.modelID);
   });
@@ -134,12 +134,10 @@ export function ManagedSubagentFooter(props: {
       current.modelName
     );
   });
-  const showProviderLimit = createMemo(() =>
-    hasProviderLimitWindowWithinThreshold(compactProviderLimit(), 100)
-  );
   const providerLimitBadges = createMemo(() =>
-    showProviderLimit() ? getProviderLimitCompactBadges(compactProviderLimit()) : []
+    getProviderLimitCompactBadges(compactProviderLimit())
   );
+  const showProviderLimit = createMemo(() => providerLimitBadges().length > 0);
   const providerLimitTitle = createMemo(() =>
     showProviderLimit() ? formatProviderLimitTitle(compactProviderLimit()) : null
   );
@@ -150,16 +148,22 @@ export function ManagedSubagentFooter(props: {
     setShowProviderLimitPopup(false);
   };
 
-  let popupSessionId = state.activeSessionId;
-  createEffect(() => {
-    const sessionId = state.activeSessionId;
-    if (sessionId !== popupSessionId) closePopups();
-    popupSessionId = sessionId;
-    if (!showProviderLimit()) setShowProviderLimitPopup(false);
-    if (!contextUsage()) setShowContextPopup(false);
-  });
+  createEffect(
+    () => ({
+      sessionId: state.activeSessionId,
+      providerLimit: showProviderLimit(),
+      usage: contextUsage(),
+    }),
+    ({ sessionId, providerLimit, usage }, previous) => {
+      if (previous && sessionId !== previous.sessionId) closePopups();
+      if (!providerLimit) setShowProviderLimitPopup(false);
+      if (!usage) setShowContextPopup(false);
+    }
+  );
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     const handlePointerDown = (event: PointerEvent) => {
       if (event.target instanceof Node && footerRef?.contains(event.target)) return;
       closePopups();
@@ -173,10 +177,14 @@ export function ManagedSubagentFooter(props: {
     };
     document.addEventListener('pointerdown', handlePointerDown);
     window.addEventListener('keydown', handleKeyDown);
-    onCleanup(() => {
+    cleanups.push(() => {
       document.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('keydown', handleKeyDown);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   return (
@@ -261,6 +269,7 @@ export function ManagedSubagentFooter(props: {
                     badges={providerLimitBadges()}
                     title={showProviderLimitPopup() ? null : providerLimitTitle()}
                     ariaLabel={providerLimitTitle()}
+                    expanded={showProviderLimitPopup()}
                     onClick={() => {
                       setShowContextPopup(false);
                       setShowProviderLimitPopup((visible) => !visible);

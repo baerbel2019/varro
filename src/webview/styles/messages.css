@@ -371,14 +371,7 @@
   }
 }
 
-.assistant-turn-content.assistant-turn-content-bare {
-  padding: 0;
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-}
-
+.assistant-turn-content.assistant-turn-content-bare,
 .assistant-turn-content.assistant-turn-content-plain {
   padding: 0;
   border: none;
@@ -455,9 +448,19 @@
   display: none;
 }
 
-.assistant-active-activity-items:has(> .assistant-active-activity-item .thinking-chevron.expanded) {
+/* An expanded item is the only one shown (see below), so it gets its natural height rather than
+   scrolling inside the tray's few-row viewport. It must also stop being a scroll container:
+   `overflow-x: hidden` turns `overflow-y: visible` into `auto`, and a non-scrolling scroller
+   under the pointer makes every transcript wheel event wait on a busy main thread. `clip`
+   still trims horizontal overflow without creating a scroller. */
+.assistant-active-activity-items:has(
+  > .assistant-active-activity-item
+    :is(.tool-invocation-chevron.expanded, .thinking-chevron.expanded)
+) {
   max-height: none;
+  overflow-x: clip;
   overflow-y: visible;
+  overscroll-behavior: auto;
 }
 
 .assistant-active-activity-items:has(
@@ -519,42 +522,6 @@
   padding-top: var(--assistant-bordered-block-gap);
 }
 
-.assistant-active-activity-item.is-entering {
-  animation: assistant-active-activity-in var(--assistant-activity-entry-duration, 0.28s)
-    cubic-bezier(0.16, 0.72, 0.24, 1) both;
-}
-
-/* Incremental entry growth changes the native thumb's drag mapping on every frame. */
-.interactive-list[data-pointer-scroll-owned] {
-  --assistant-activity-entry-duration: 0s;
-}
-
-.interactive-item-container.interactive-response:not(.interactive-item-entering):has(
-    .assistant-message-flow
-      > .assistant-active-activity-tray:only-child:not(.has-active-summary)
-      > .assistant-active-activity-items
-      > .assistant-active-activity-item.is-entering:only-child
-  ) {
-  animation: assistant-active-activity-row-in var(--assistant-activity-entry-duration, 0.28s)
-    cubic-bezier(0.16, 0.72, 0.24, 1) both;
-}
-
-.interactive-item-container.interactive-response:not(.interactive-item-entering):has(
-    .assistant-message-flow
-      > .assistant-active-activity-tray:only-child:not(.has-active-summary)
-      > .assistant-active-activity-items
-      > .assistant-active-activity-item.is-entering:only-child
-  )
-  .assistant-turn-content:not(
-    .assistant-turn-content-bare,
-    .assistant-turn-content-plain,
-    .assistant-turn-content-highlighted,
-    .assistant-turn-content-planning
-  ) {
-  animation: assistant-active-activity-shell-in var(--assistant-activity-entry-duration, 0.28s)
-    cubic-bezier(0.16, 0.72, 0.24, 1) both;
-}
-
 .assistant-active-activity-item.is-completed {
   opacity: 0.82;
 }
@@ -570,60 +537,9 @@
   );
 }
 
+/* Active tools appear and leave immediately; they never fold in or out. */
 .assistant-active-activity-item.is-exiting {
-  animation: assistant-active-activity-out 0.42s cubic-bezier(0.3, 0, 0.2, 1) both;
-}
-
-@keyframes assistant-active-activity-in {
-  from {
-    grid-template-rows: 0fr;
-    opacity: 0;
-  }
-
-  to {
-    grid-template-rows: 1fr;
-    opacity: 1;
-  }
-}
-
-@keyframes assistant-active-activity-row-in {
-  from {
-    padding-top: 0;
-    padding-bottom: 0;
-  }
-
-  to {
-    padding-top: 6px;
-    padding-bottom: 6px;
-  }
-}
-
-@keyframes assistant-active-activity-shell-in {
-  from {
-    padding-top: 0;
-    padding-bottom: 0;
-    border-top-width: 0;
-    border-bottom-width: 0;
-  }
-
-  to {
-    padding-top: 12px;
-    padding-bottom: 12px;
-    border-top-width: 1px;
-    border-bottom-width: 1px;
-  }
-}
-
-@keyframes assistant-active-activity-out {
-  from {
-    grid-template-rows: 1fr;
-    opacity: 0.82;
-  }
-
-  to {
-    grid-template-rows: 0fr;
-    opacity: 0;
-  }
+  display: none;
 }
 
 @keyframes assistant-active-activity-summary-gap-out {
@@ -682,13 +598,6 @@
   position: absolute;
   inset: -5px 0;
   content: '';
-}
-
-.assistant-activity-status-failed {
-  margin-left: 0.35em;
-  color: color-mix(in srgb, var(--color-vscode-error) 82%, var(--color-vscode-fg));
-  font-size: 11px;
-  line-height: inherit;
 }
 
 .assistant-activity-summary:focus-visible {
@@ -1422,10 +1331,7 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
 .interactive-item-container.interactive-response.interactive-response-follows-response:not(
     .interactive-item-render-empty,
     :empty
-  ) {
-  padding-top: 6px;
-}
-
+  ),
 .interactive-item-container.interactive-response.interactive-response-follows-response.interactive-response-continues-activity-group:not(
     .interactive-item-render-empty,
     :empty
@@ -1436,10 +1342,7 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
 .interactive-item-container.interactive-item-follows-bordered-block:not(
     .interactive-item-render-empty,
     :empty
-  ) {
-  padding-top: 3px;
-}
-
+  ),
 .interactive-item-container.interactive-response.interactive-response-follows-response.interactive-item-follows-bordered-block:not(
     .interactive-item-render-empty,
     :empty
@@ -1613,12 +1516,7 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
     background-color 120ms ease;
 }
 
-.assistant-dialog-summary.is-hover-intent-active .assistant-dialog-summary-turn-action {
-  opacity: 1;
-  filter: blur(0);
-  pointer-events: auto;
-}
-
+.assistant-dialog-summary.is-hover-intent-active .assistant-dialog-summary-turn-action,
 .assistant-dialog-summary-turn-action:focus-visible {
   opacity: 1;
   filter: blur(0);
@@ -1667,7 +1565,9 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
     repeat-x center / 16px 7px;
 }
 
-.assistant-dialog-summary:hover {
+.assistant-dialog-summary:hover:not(
+    :has(.assistant-dialog-summary-actions:hover, .assistant-dialog-summary-plan-skipped:hover)
+  ) {
   --assistant-summary-line-color: var(--assistant-summary-fork-border);
 }
 
@@ -1682,10 +1582,10 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
   width: 100%;
 }
 
+/* One line at every width: wrapping the hover actions would change the row height. */
 .assistant-dialog-summary-plan-skipped {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
   gap: 6px;
   min-height: 26px;
   margin-top: 8px;
@@ -1699,11 +1599,23 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  min-height: 26px;
+  white-space: nowrap;
+}
+
+.assistant-dialog-summary-plan-skipped-label > .assistant-dialog-summary-plan-skipped-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.assistant-dialog-summary-plan-skipped-label > :not(.assistant-dialog-summary-plan-skipped-text) {
+  flex-shrink: 0;
 }
 
 .assistant-dialog-summary-plan-skipped-actions {
   display: flex;
-  flex-wrap: wrap;
+  flex-shrink: 0;
   justify-content: flex-end;
   gap: 6px;
   margin-left: auto;
@@ -1711,7 +1623,13 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
 }
 
 .assistant-dialog-summary-plan-skipped:hover .assistant-dialog-summary-plan-skipped-actions,
-.assistant-dialog-summary-plan-skipped:focus-within .assistant-dialog-summary-plan-skipped-actions {
+.assistant-dialog-summary-plan-skipped:focus-within .assistant-dialog-summary-plan-skipped-actions,
+/* The options menu renders outside the row, so an open menu or a running summary keeps actions. */
+.assistant-dialog-summary-plan-skipped:has(
+    .assistant-dialog-summary-split[data-menu-open],
+    .assistant-dialog-summary-action[aria-busy='true']
+  )
+  .assistant-dialog-summary-plan-skipped-actions {
   visibility: visible;
 }
 
@@ -1747,6 +1665,29 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
   --plan-action-color: var(--color-vscode-error);
 }
 
+/* Implement and its options menu read as one control with a structural divider. */
+.assistant-dialog-summary-split {
+  display: inline-flex;
+}
+
+.assistant-dialog-summary-split > .question-btn.assistant-dialog-summary-action:not(:last-child) {
+  padding-right: 11px;
+  border-right-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.question-btn.assistant-dialog-summary-action-more {
+  padding: 0 7px;
+  border-left-color: color-mix(
+    in srgb,
+    var(--plan-action-color) 60%,
+    var(--assistant-summary-fork-border)
+  );
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
 .question-btn.assistant-dialog-summary-action:hover:not(:disabled) {
   border-color: color-mix(
     in srgb,
@@ -1759,19 +1700,13 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .assistant-activity-
 .assistant-file-edit-stack {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--assistant-bordered-block-gap, 9px);
 }
 
+/* The stack gap owns spacing; the note's standalone margin would make one gap wider. */
 .assistant-file-edit-stack:not(:has(.file-change-inline-diffs-unwrapped))
-  > :is(.file-change-card, .file-change-truncated-summary)
-  + .file-change-card {
-  margin-top: -0.5px;
-}
-
-.assistant-file-edit-stack:not(:has(.file-change-inline-diffs-unwrapped))
-  > :is(.file-change-card, .file-change-truncated-summary)
-  + .file-change-truncated-summary {
-  margin-top: 2.5px;
+  > .file-change-truncated-summary {
+  margin-top: 0;
 }
 
 .assistant-file-edit-stack:has(.file-change-inline-diffs-unwrapped) {
@@ -2173,14 +2108,14 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   text-wrap: wrap;
 }
 
-.rendered-markdown p:not(.markdown-bold-heading):has(+ p),
+.rendered-markdown p:where(:not(li > p)):not(.markdown-bold-heading):has(+ p),
 .rendered-markdown
   > [data-markdown-segment='stable'][data-markdown-tail-tag='p']
   > p:last-child:not(.markdown-bold-heading) {
   margin-bottom: 12px;
 }
 
-.rendered-markdown p:has(+ :is(ul, ol, .streaming-markdown-pending-list)),
+.rendered-markdown p:where(:not(li > p)):has(+ :is(ul, ol, .streaming-markdown-pending-list)),
 .rendered-markdown
   > [data-markdown-segment='stable']:is(
     [data-markdown-tail-tag='ul'],
@@ -2209,7 +2144,7 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   margin-right: 0.3em;
 }
 
-.rendered-markdown p.markdown-bold-heading {
+.rendered-markdown p.markdown-bold-heading:where(:not(li > p)) {
   margin-top: 14px;
   margin-bottom: 8px;
 }
@@ -2334,6 +2269,8 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   margin: 1px 0;
 }
 .rendered-markdown li > p {
+  /* Tight lists gain paragraph wrappers when later streamed text makes them loose.
+     Prose adjacency and bold-heading spacing must not apply to these wrappers. */
   margin: 0;
 }
 
@@ -2358,6 +2295,12 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
 .link-leading-content {
   display: inline-block;
   white-space: nowrap;
+}
+
+/* Carry the anchor's decoration through code into the atomic icon/letter wrapper. */
+.rendered-markdown a.external-link code,
+.rendered-markdown a.external-link .link-leading-content {
+  text-decoration: inherit;
 }
 
 .rendered-markdown .link-leading-content.file-icon-selected {
@@ -2387,14 +2330,83 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   text-decoration-skip-ink: none;
 }
 
-.external-link-icon {
+.external-link-icon,
+.session-reference-icon {
   display: inline-block;
-  width: 12px;
-  height: 12px;
+  width: 0.875em;
+  height: 0.875em;
   margin-right: 2px;
-  vertical-align: -2px;
-  color: var(--color-vscode-muted);
+  /* An integer offset keeps the image and the text baseline snapping together. */
+  vertical-align: round(nearest, -0.11em, 1px);
   object-fit: contain;
+}
+
+.file-type-icon {
+  /* Normalize visible artwork area, not the padded SVG canvas, without distorting its shape. */
+  width: calc(var(--file-icon-size, 12px) * var(--file-icon-fill, 1) * var(--file-icon-aspect, 1));
+  height: calc(var(--file-icon-size, 12px) * var(--file-icon-fill, 1));
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.file-path-icon {
+  --file-icon-size: 0.875em;
+
+  display: inline-block;
+  vertical-align: baseline;
+  margin-right: 0.125em;
+}
+
+.external-link-icon,
+.session-reference-icon {
+  color: var(--color-vscode-muted);
+}
+
+.rendered-markdown :is(.file-path-icon, .session-reference-icon, .external-link-icon) {
+  /* The icon artwork and the first glyph already leave some space. */
+  margin-right: 0.5px;
+}
+
+/* Link artwork fills its box width, so the margin is the visible gap before the title. */
+.external-link-icon,
+.rendered-markdown .external-link-icon {
+  margin-right: 0.18em;
+}
+
+/* The artwork ends 2/24 short of its box width, so subtract that from the visible gap. */
+.session-reference-icon,
+.rendered-markdown .session-reference-icon {
+  margin-right: calc(0.18em - (2 / 24) * 0.875em);
+}
+
+/* Link artwork leaves empty space below its ink. Seat the ink itself on the text baseline, because
+   a rounded box offset lands on different pixels at each text size. */
+.external-link-icon,
+.session-reference-icon {
+  --link-icon-ink-gap: calc(6 / 32);
+
+  vertical-align: baseline;
+  transform: translateY(calc(var(--link-icon-ink-gap) * 0.875em));
+}
+
+.external-link-icon[data-chip-icon='git'] {
+  --link-icon-ink-gap: calc(1.66 / 32);
+}
+
+.session-reference-icon {
+  --link-icon-ink-gap: calc(3 / 24);
+}
+
+/* A round shape reads high when it only touches the baseline. High-density screens can overshoot
+   by a single device pixel, as round letters do; at 1x the same offset would be a whole pixel. */
+@media (min-resolution: 2dppx) {
+  .session-reference-icon {
+    transform: translateY(calc(var(--link-icon-ink-gap) * 0.875em + 0.5px));
+  }
+}
+
+.rendered-markdown .file-path-icon {
+  margin-right: 0.25em;
 }
 
 .rendered-markdown a.file-path-link,
@@ -2417,6 +2429,36 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   padding: 0;
   background: transparent;
   border: 0;
+}
+
+/* Long paths elide their middle so the file name stays visible. The anchor stays inline,
+   keeping its border at the text baseline. Overflow clip preserves the label baseline. */
+.rendered-markdown .path-middle-truncate {
+  display: inline-flex;
+  max-width: 100%;
+  white-space: nowrap;
+}
+
+.rendered-markdown .path-middle-truncate > .link-leading-content {
+  flex: 0 1000 auto;
+  min-width: 0;
+  overflow: clip;
+  text-overflow: ellipsis;
+}
+
+/* Even fractional shrinking would show an ellipsis, so the file name is clipped only when it
+   cannot fit by itself. */
+.rendered-markdown .path-middle-truncate > .link-trailing-label {
+  flex: none;
+  max-width: 100%;
+  overflow: clip;
+  text-overflow: ellipsis;
+}
+
+/* Flex items copy as blocks; inline layout keeps copied paths on one line. */
+.is-copying-truncated-paths .rendered-markdown .path-middle-truncate,
+.is-copying-truncated-paths .rendered-markdown .path-middle-truncate > * {
+  display: inline;
 }
 
 .rendered-markdown a.file-path-link:hover {
@@ -2442,15 +2484,6 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   outline: none;
 }
 
-.file-path-icon {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  margin-right: 2px;
-  vertical-align: -2px;
-  object-fit: contain;
-}
-
 .rendered-markdown a.session-reference-link {
   display: inline;
   overflow-wrap: normal;
@@ -2462,16 +2495,6 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   font-size: 0.9em;
 }
 
-.session-reference-icon {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  margin-right: 2px;
-  vertical-align: -2px;
-  color: var(--color-vscode-muted);
-  object-fit: contain;
-}
-
 .rendered-markdown img {
   max-width: 100%;
   user-select: none;
@@ -2479,20 +2502,8 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   -webkit-user-drag: none;
 }
 
-.rendered-markdown .markdown-image-frame {
-  display: block;
-  width: min(100%, 480px);
-  max-height: 270px;
-  aspect-ratio: 16 / 9;
-}
-
-.rendered-markdown .markdown-image-frame > img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-
-.rendered-markdown.remote-images-enabled [data-remote-image] {
+.rendered-markdown.remote-images-enabled [data-remote-image],
+.rendered-markdown [data-local-image] {
   display: inline-flex;
   vertical-align: top;
   width: min(100%, 384px);
@@ -2501,6 +2512,20 @@ body:is(.vscode-light, .vscode-high-contrast-light) .chat-empty-logo {
   border-radius: 6px;
   background: var(--color-vscode-bg);
   overflow: hidden;
+}
+
+.local-markdown-image {
+  display: flex;
+  width: 100%;
+  height: 100%;
+}
+
+.local-markdown-image-placeholder {
+  align-self: center;
+  width: 100%;
+  padding: 12px;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
 .remote-markdown-image-placeholder {
@@ -3054,16 +3079,6 @@ body:is(.vscode-high-contrast, .vscode-high-contrast-light) .remote-markdown-ima
   background: var(--color-vscode-result-editor-bg) !important;
 }
 
-.interactive-result-code-block pre.code-block code {
-  background: none;
-  border: none;
-  padding: 0;
-  border-radius: 0;
-  font-size: inherit;
-  color: var(--color-vscode-fg);
-  white-space: pre;
-}
-
 .interactive-result-code-block pre.code-block code .hljs-comment,
 .interactive-result-code-block pre.code-block code .hljs-quote {
   color: var(--color-code-comment);
@@ -3320,10 +3335,7 @@ body.vscode-dark[data-vscode-theme-id='Dark 2026'] .interactive-session .chat-in
   );
 }
 
-.interactive-session .chat-input-container.showing-context-popup {
-  z-index: var(--z-chrome-raised);
-}
-
+.interactive-session .chat-input-container.showing-context-popup,
 .interactive-session .chat-input-container.showing-model-picker {
   z-index: var(--z-chrome-raised);
 }
@@ -3404,33 +3416,6 @@ body.vscode-dark .interactive-session .chat-input-container[data-dictation-reque
 
 .interactive-session .inline-edit-composer-slot .composer-edit-loading {
   inset: 2px 0 0;
-}
-
-.interactive-session .model-selection-row {
-  display: flex;
-  justify-content: flex-start;
-  padding: 0 2px;
-  position: relative;
-  z-index: var(--z-cover);
-}
-
-.interactive-session .model-selection-trigger {
-  max-width: min(100%, 280px);
-  gap: 6px;
-}
-
-.interactive-session .model-selection-trigger .toolbar-picker-label.model-name {
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.interactive-session .model-selection-label {
-  flex-shrink: 0;
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--color-vscode-muted);
 }
 
 .interactive-session .chat-input-toolbars {
@@ -3585,10 +3570,7 @@ body.vscode-light .interactive-session .chat-input-toolbars.toolbar-meta {
 
 .interactive-session
   .chat-input-toolbars.toolbar-meta
-  .permission-mode-settings-button:focus-visible {
-  opacity: 0.9;
-}
-
+  .permission-mode-settings-button:focus-visible,
 .interactive-session .permission-mode-controls:hover .permission-mode-settings-button:hover {
   opacity: 0.9;
 }
@@ -3728,10 +3710,7 @@ body.vscode-light .interactive-session .chat-input-toolbars.toolbar-meta {
 .interactive-session
   .chat-input-toolbars.toolbar-meta
   .toolbar-picker.permission-mode-button
-  .codicon-chevron {
-  opacity: 0.6;
-}
-
+  .codicon-chevron,
 .interactive-session
   .chat-input-toolbars.toolbar-meta
   .toolbar-picker.workspace-picker-button

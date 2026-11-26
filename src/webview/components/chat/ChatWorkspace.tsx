@@ -1,5 +1,5 @@
-import { Show, Suspense, createMemo, createSignal, lazy, onCleanup, onMount } from 'solid-js';
-import { Portal } from 'solid-js/web';
+import { Show, Loading, createMemo, createSignal, lazy, onSettled, untrack } from 'solid-js';
+import { Portal } from '@solidjs/web';
 import { MessageList } from '../MessageList';
 import { ChatInput } from '../ChatInput';
 import { ActiveChatHeader, SessionPickerHeader } from './ChatHeader';
@@ -7,13 +7,14 @@ import { WindowChatThemeToggle } from './WindowChatThemeToggle';
 import { SessionListView } from './SessionListView';
 import type { SessionIndicatorSets, SessionListFilter } from './SessionListView';
 import type { SlowApiRequest } from '../../lib/bridge';
-import { onMessage, postMessage } from '../../lib/bridge';
+import { onMessage } from '../../lib/bridge';
 import { editingMessage, inlineEditMount } from '../../lib/message-edit-state';
 import { ralphStore } from '../../lib/stores/ralph-store';
 import {
   setShowMcpSettings,
   setShowModels,
   setShowPermissionSettings,
+  setShowSkillSettings,
   state,
 } from '../../lib/state';
 import { ManagedSubagentFooter } from './ManagedSubagentFooter';
@@ -29,6 +30,9 @@ const LazyPermissionSettingsPanel = lazy(() =>
   import('../PermissionSettingsPanel').then((module) => ({
     default: module.PermissionSettingsPanel,
   }))
+);
+const LazySkillSettingsPanel = lazy(() =>
+  import('../SkillSettingsPanel').then((module) => ({ default: module.SkillSettingsPanel }))
 );
 const LazyMcpSettingsPanel = lazy(() =>
   import('../McpSettingsPanel').then((module) => ({ default: module.McpSettingsPanel }))
@@ -65,12 +69,7 @@ function ComposerHost() {
       <div class="composer-bottom-slot" ref={setBottomMount} />
       <div hidden ref={setParkingMount} />
       <Show when={!!mountTarget()}>
-        <Portal
-          mount={mountTarget()!}
-          ref={(el) => {
-            el.style.display = 'contents';
-          }}
-        >
+        <Portal mount={mountTarget()!}>
           <ChatInput />
         </Portal>
       </Show>
@@ -87,8 +86,11 @@ export function ChatWorkspace(props: {
   showSessionPicker: boolean;
   showModels: boolean;
   showPermissionSettings: boolean;
+  showSkillSettings: boolean;
   showMcpSettings: boolean;
   showReconnectBanner: boolean;
+  showProviderSetupBanner: boolean;
+  onConnectProvider: () => void;
   slowApiRequests: readonly SlowApiRequest[];
   sessionFilter: SessionListFilter | null;
   subagentParentId: string | null;
@@ -144,7 +146,7 @@ export function ChatWorkspace(props: {
 }) {
   let chatContentRef: HTMLDivElement | undefined;
   const [visiblePrimarySessionsCount, setVisiblePrimarySessionsCount] = createSignal(
-    props.primarySessionsCount
+    untrack(() => props.primarySessionsCount)
   );
   const [markAllRead, setMarkAllRead] = createSignal<(() => void) | null>(null);
   // Create this memo under the component owner, not in a JSX prop getter read by a click handler.
@@ -158,12 +160,18 @@ export function ChatWorkspace(props: {
     void chatContentRef.offsetWidth;
     chatContentRef.classList.add('active-session-reselected');
   };
-  onMount(() => {
-    onCleanup(
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    cleanups.push(
       onMessage((message) => {
         if (message.type === 'command/highlight-session') showActiveSessionCue();
       })
     );
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
   const sidebarSubagentParentId = () =>
     props.showSessionPicker ? props.subagentParentId : props.sidebarSubagentParentId;
@@ -180,6 +188,7 @@ export function ChatWorkspace(props: {
       filterTitle={useSidebarCounts ? sidebarFilterTitle() : props.sessionListFilterTitle}
       primarySessionsCount={visiblePrimarySessionsCount()}
       showBackButton={!!(useSidebarCounts ? sidebarSubagentParentId() : props.subagentParentId)}
+      subagentParentId={useSidebarCounts ? sidebarSubagentParentId() : props.subagentParentId}
       backTitle={useSidebarCounts ? 'Back to sessions' : undefined}
       showFailedBadge={props.shouldShowFailedBadge}
       showAttentionBadge={props.shouldShowAttentionBadge}
@@ -292,38 +301,6 @@ export function ChatWorkspace(props: {
       </Show>
       <div class="chat-main-column-shell">
         <Show
-          when={
-            state.activeSessionId &&
-            (state.transferredSessions[state.activeSessionId] ??
-              (() => {
-                const session = state.sessions.find((entry) => entry.id === state.activeSessionId);
-                return session?.transfer?.available === false ? session.directory : undefined;
-              })())
-          }
-        >
-          {(directory) => (
-            <div class="chat-transport-banner" role="status" aria-live="polite">
-              <div class="chat-transport-copy">
-                <span class="chat-transport-title">Conversation moved</span>
-                <span class="chat-transport-message">
-                  This conversation is now in {directory()}. Its history stays available here. Open
-                  that folder to send messages.
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const sessionId = state.activeSessionId;
-                    if (sessionId)
-                      postMessage({ type: 'session/open-transferred', payload: { sessionId } });
-                  }}
-                >
-                  Open folder
-                </button>
-              </div>
-            </div>
-          )}
-        </Show>
-        <Show
           when={activeRalphSessionId()}
           fallback={
             <>
@@ -338,9 +315,9 @@ export function ChatWorkspace(props: {
           }
         >
           {(sessionId) => (
-            <Suspense>
+            <Loading>
               <LazyRalphDashboard sessionId={sessionId()} />
-            </Suspense>
+            </Loading>
           )}
         </Show>
       </div>
@@ -349,7 +326,7 @@ export function ChatWorkspace(props: {
 
   return (
     <div
-      class={`interactive-session${props.showModels ? ' interactive-session-showing-models' : ''}${props.showMcpSettings ? ' interactive-session-showing-mcp-settings' : ''}`}
+      class={`interactive-session${props.showModels ? ' interactive-session-showing-models' : ''}${props.showMcpSettings || props.showSkillSettings ? ' interactive-session-showing-mcp-settings' : ''}`}
     >
       <WindowChatThemeToggle />
       <Show when={props.showSessionHeader}>
@@ -382,6 +359,28 @@ export function ChatWorkspace(props: {
         </div>
       </Show>
 
+      <Show when={props.showProviderSetupBanner}>
+        <div
+          class={`chat-transport-banner chat-provider-setup-banner ${props.shouldRenderWorkspace ? 'chat-main-column' : ''}`}
+          role="status"
+          aria-live="polite"
+        >
+          <div class="chat-transport-copy">
+            <span class="chat-transport-title">No providers connected</span>
+            <span class="chat-transport-message">
+              Connect a provider to choose a model and chat.
+            </span>
+          </div>
+          <button
+            type="button"
+            class="chat-provider-setup-action"
+            onClick={props.onConnectProvider}
+          >
+            Connect provider
+          </button>
+        </div>
+      </Show>
+
       <Show when={props.slowApiRequests.length > 0}>
         <div
           class={`chat-transport-banner chat-api-warning-banner ${props.shouldRenderWorkspace ? 'chat-main-column' : ''}`}
@@ -409,7 +408,7 @@ export function ChatWorkspace(props: {
           panelClass="models-panel"
           onClose={() => setShowModels(false)}
         >
-          <Suspense
+          <Loading
             fallback={
               <div class="models-panel">
                 <div class="chat-messages-loading" role="status" aria-label="Loading models">
@@ -421,7 +420,7 @@ export function ChatWorkspace(props: {
             }
           >
             <LazyModelsPanel />
-          </Suspense>
+          </Loading>
         </SettingsPanelBoundary>
       </Show>
       <Show when={props.showPermissionSettings}>
@@ -430,9 +429,30 @@ export function ChatWorkspace(props: {
           panelClass="permission-settings-panel"
           onClose={() => setShowPermissionSettings(false)}
         >
-          <Suspense>
+          <Loading>
             <LazyPermissionSettingsPanel />
-          </Suspense>
+          </Loading>
+        </SettingsPanelBoundary>
+      </Show>
+      <Show when={props.showSkillSettings}>
+        <SettingsPanelBoundary
+          name="Skill settings"
+          panelClass="mcp-settings-panel"
+          onClose={() => setShowSkillSettings(false)}
+        >
+          <Loading
+            fallback={
+              <section class="mcp-settings-panel" aria-label="Skill settings">
+                <div class="chat-messages-loading" role="status" aria-label="Loading skills">
+                  <span class="chat-messages-loading-dot" />
+                  <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.3s' }} />
+                  <span class="chat-messages-loading-dot" style={{ 'animation-delay': '0.6s' }} />
+                </div>
+              </section>
+            }
+          >
+            <LazySkillSettingsPanel />
+          </Loading>
         </SettingsPanelBoundary>
       </Show>
       <Show when={props.showMcpSettings}>
@@ -441,7 +461,7 @@ export function ChatWorkspace(props: {
           panelClass="mcp-settings-panel"
           onClose={() => setShowMcpSettings(false)}
         >
-          <Suspense
+          <Loading
             fallback={
               <section class="mcp-settings-panel" aria-label="MCP settings">
                 <div class="chat-messages-loading" role="status" aria-label="Loading MCP settings">
@@ -453,7 +473,7 @@ export function ChatWorkspace(props: {
             }
           >
             <LazyMcpSettingsPanel />
-          </Suspense>
+          </Loading>
         </SettingsPanelBoundary>
       </Show>
 

@@ -1,7 +1,7 @@
 /* oxlint-disable anti-slop/require-safety-comment-for-type-assertion -- SAFETY: These E2E callbacks mutate protocol-shaped messages owned by the controlled harness fixture. */
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
-import { getE2EState } from './helpers';
+import { getE2EState, postWebviewMessage } from './helpers';
 
 async function expectSelectionEdgeContinuity(
   page: Page,
@@ -28,6 +28,104 @@ async function expectSelectionEdgeContinuity(
     for (const color of row) expect(color).toEqual(row[0]);
   }
 }
+
+test('fenced code overrides unlayered host defaults without changing inline code', async ({
+  page,
+}) => {
+  await page.goto('/e2e/harness/index.html?scenario=message-rendering');
+  const markdown = page.locator('[data-msg-id="message-rendering-assistant"] .rendered-markdown');
+  await expect(markdown.locator('pre code')).toBeVisible();
+  await postWebviewMessage(page, {
+    type: 'server/event',
+    payload: {
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'message-rendering-assistant-part-1',
+          sessionID: 'session-message-rendering',
+          messageID: 'message-rendering-assistant',
+          type: 'text',
+          text: [
+            'Inline `sample value`.',
+            '',
+            '```text',
+            'CPS audio testing',
+            '│',
+            '└── Check the environment',
+            '```',
+            '',
+            '```ts',
+            'const blockValue = 1;',
+            '```',
+          ].join('\n'),
+        },
+      },
+    },
+  });
+  const inlineCode = markdown.locator('p > code');
+  await expect(inlineCode).toHaveText('sample value');
+  await expect(markdown.locator('.hljs-keyword')).toHaveText('const');
+  const inlineStyles = () =>
+    inlineCode.evaluate((code) => {
+      const style = getComputedStyle(code);
+      return {
+        background: style.backgroundColor,
+        color: style.color,
+        padding: style.padding,
+        border: style.border,
+        borderRadius: style.borderRadius,
+        fontFamily: style.fontFamily,
+        fontSize: style.fontSize,
+        whiteSpace: style.whiteSpace,
+      };
+    });
+  const before = await inlineStyles();
+  expect(before).toMatchObject({
+    background: 'rgba(255, 255, 255, 0.1)',
+    color: 'rgb(215, 186, 125)',
+    padding: '1px 3px',
+    borderRadius: '4px',
+    whiteSpace: 'pre-wrap',
+  });
+
+  // Older editor hosts inject these defaults without a cascade layer.
+  await page.addStyleTag({
+    content: `
+      :root {
+        --vscode-textPreformat-foreground: #d7ba7d;
+        --vscode-textPreformat-background: #ffffff1a;
+        --monaco-monospace-font: var(--font-mono);
+      }
+      code {
+        font-family: var(--monaco-monospace-font);
+        color: var(--vscode-textPreformat-foreground);
+        background-color: var(--vscode-textPreformat-background);
+        padding: 1px 3px;
+        border-radius: 4px;
+      }
+      pre code { padding: 0; }
+    `,
+  });
+
+  expect(await inlineStyles()).toEqual(before);
+  const blocks = markdown.locator('.interactive-result-code-block pre.code-block > code.hljs');
+  await expect(blocks).toHaveCount(2);
+  await expect(blocks.nth(0)).toHaveText('CPS audio testing\n│\n└── Check the environment');
+  await expect(blocks.nth(1)).toHaveText('const blockValue = 1;');
+  for (const code of await blocks.all()) {
+    await expect(code).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+    await expect(code).toHaveCSS('color', 'rgb(204, 204, 204)');
+    await expect(code).toHaveCSS('padding', '0px');
+    await expect(code).toHaveCSS('border-width', '0px');
+    await expect(code).toHaveCSS('border-radius', '0px');
+    await expect(code).toHaveCSS('white-space', 'pre');
+    const preFontSize = await code.evaluate(
+      (element) => getComputedStyle(element.parentElement!).fontSize
+    );
+    await expect(code).toHaveCSS('font-size', preFontSize);
+  }
+  await expect(markdown.locator('.hljs-keyword')).not.toHaveCSS('color', 'rgb(204, 204, 204)');
+});
 
 test('a pathological code line preserves text and leaves the browser event loop responsive', async ({
   page,
@@ -462,25 +560,20 @@ test('delayed citation validation preserves wrapping and row height', async ({ p
 test('keeps PDF icons visible before and after exact-path validation', async ({ page }) => {
   await page.goto('/e2e/harness/index.html?scenario=message-rendering&citationCheckDelayMs=1500');
   await expect(page.getByRole('link', { name: 'README.md', exact: true })).toBeVisible();
-  await page.evaluate(() => {
-    window.postMessage(
-      {
-        type: 'server/event',
-        payload: {
-          type: 'message.part.updated',
-          properties: {
-            part: {
-              id: 'message-rendering-assistant-part-1',
-              sessionID: 'session-message-rendering',
-              messageID: 'message-rendering-assistant',
-              type: 'text',
-              text: "I'll copy `pdf-source/65129.pdf` to `pdf-source/__65129.pdf`.\n\nCopied to dev `pdf-source/__65129.pdf`.",
-            },
-          },
+  await postWebviewMessage(page, {
+    type: 'server/event',
+    payload: {
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'message-rendering-assistant-part-1',
+          sessionID: 'session-message-rendering',
+          messageID: 'message-rendering-assistant',
+          type: 'text',
+          text: "I'll copy `pdf-source/65129.pdf` to `pdf-source/__65129.pdf`.\n\nCopied to dev `pdf-source/__65129.pdf`.",
         },
       },
-      '*'
-    );
+    },
   });
   const pendingIcons = page.locator('code.citation-path img.file-path-icon');
   await expect(pendingIcons).toHaveCount(3);
@@ -509,26 +602,21 @@ for (const [kind, selector, label] of [
     await page.goto('/e2e/harness/index.html?scenario=message-rendering');
     if (kind === 'PDF') {
       await expect(page.getByRole('link', { name: 'README.md', exact: true })).toBeVisible();
-      await page.evaluate(() =>
-        window.postMessage(
-          {
-            type: 'server/event',
-            payload: {
-              type: 'message.part.updated',
-              properties: {
-                part: {
-                  id: 'message-rendering-assistant-part-1',
-                  sessionID: 'session-message-rendering',
-                  messageID: 'message-rendering-assistant',
-                  type: 'text',
-                  text: 'Copied to dev `pdf-source/__65129.pdf` using the server credentials. Verified its SHA-256 matches the original.\n\nThe scheduled sync may delete it on the next run.',
-                },
-              },
+      await postWebviewMessage(page, {
+        type: 'server/event',
+        payload: {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              id: 'message-rendering-assistant-part-1',
+              sessionID: 'session-message-rendering',
+              messageID: 'message-rendering-assistant',
+              type: 'text',
+              text: 'Copied to dev `pdf-source/__65129.pdf` using the server credentials. Verified its SHA-256 matches the original.\n\nThe scheduled sync may delete it on the next run.',
             },
           },
-          '*'
-        )
-      );
+        },
+      });
     }
     const reference = page.locator(selector).filter({ hasText: label });
     await expect(reference).toBeVisible();
@@ -551,7 +639,8 @@ for (const [kind, selector, label] of [
       );
     });
     const unselected = await icon.screenshot();
-    const selectedText = await reference.evaluate((element, fullParagraph) => {
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+    await reference.evaluate((element, fullParagraph) => {
       const range = document.createRange();
       const target = fullParagraph ? (element.parentElement ?? element) : element;
       range.selectNodeContents(target);
@@ -561,8 +650,11 @@ for (const [kind, selector, label] of [
       const selection = window.getSelection();
       selection?.removeAllRanges();
       selection?.addRange(range);
-      return selection?.toString();
     }, kind === 'PDF');
+    // Truncated paths use flex layout, so check the copied text rather than Selection.toString().
+    await page.keyboard.press('ControlOrMeta+C');
+    const selectedText = await page.evaluate(() => navigator.clipboard.readText());
+    await expect(page.locator('html')).not.toHaveClass(/is-copying-truncated-paths/);
     expect(selectedText).toBe(
       kind === 'PDF'
         ? `dev ${label} using the server credentials. Verified its SHA-256 matches the original.`

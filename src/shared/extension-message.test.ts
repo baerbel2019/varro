@@ -2,6 +2,17 @@ import { describe, expect, it } from 'vitest';
 import { isEditorContext, parseExtensionMessage } from './extension-message';
 
 describe('parseExtensionMessage', () => {
+  it('validates authoritative pinned-session snapshots', () => {
+    for (const sessionIds of [[], ['session-1', 'session-2']]) {
+      const message = { type: 'pinned-sessions/sync', payload: { sessionIds } };
+      expect(parseExtensionMessage(message)).toEqual(message);
+    }
+    for (const sessionIds of [null, 'session-1', [1], [''], ['session-1', null]]) {
+      expect(
+        parseExtensionMessage({ type: 'pinned-sessions/sync', payload: { sessionIds } })
+      ).toBeNull();
+    }
+  });
   it('validates dictation results and provider names', () => {
     const message = {
       type: 'dictation/result',
@@ -305,6 +316,12 @@ describe('parseExtensionMessage', () => {
     expect(parseExtensionMessage({ type: 'command/open-completed-sessions' })).toEqual({
       type: 'command/open-completed-sessions',
     });
+    expect(parseExtensionMessage({ type: 'command/open-skill-settings' })).toEqual({
+      type: 'command/open-skill-settings',
+    });
+    expect(parseExtensionMessage({ type: 'command/open-mcp-settings' })).toEqual({
+      type: 'command/open-mcp-settings',
+    });
     expect(
       parseExtensionMessage({
         type: 'command/switch-session',
@@ -313,6 +330,12 @@ describe('parseExtensionMessage', () => {
     ).toEqual({ type: 'command/switch-session', payload: { direction: 'previous' } });
     expect(
       parseExtensionMessage({ type: 'command/switch-session', payload: { direction: 'sideways' } })
+    ).toBeNull();
+    expect(
+      parseExtensionMessage({ type: 'command/navigate-history', payload: { direction: 'back' } })
+    ).toEqual({ type: 'command/navigate-history', payload: { direction: 'back' } });
+    expect(
+      parseExtensionMessage({ type: 'command/navigate-history', payload: { direction: 'up' } })
     ).toBeNull();
     expect(parseExtensionMessage({ type: 'command/abort' })).toEqual({ type: 'command/abort' });
   });
@@ -727,6 +750,43 @@ describe('parseExtensionMessage', () => {
           runs: { 'manager-1': { ...run, legacyMigrationAcknowledged: 'yes' } },
           activeIds: [],
         },
+      })
+    ).toBeNull();
+  });
+
+  it('parses warming/state and rejects malformed session entries', () => {
+    const payload = {
+      available: true,
+      mode: 'chosen',
+      durationMs: 1_800_000,
+      openCodeWarming: false,
+      sessions: {
+        'session-1': { warmUntil: 2_000, sentAt: 1_000, ttlMs: 300_000, stopped: null },
+        'session-2': { warmUntil: null, sentAt: null, ttlMs: null, stopped: null },
+      },
+      learned: { 'claude-agent/opus': { ms: 3_600_000, bounded: true } },
+    } as const;
+    expect(parseExtensionMessage({ type: 'warming/state', payload })).toEqual({
+      type: 'warming/state',
+      payload,
+    });
+    for (const session of [
+      { warmUntil: 'soon', sentAt: null, ttlMs: null, stopped: null },
+      { warmUntil: null, sentAt: null, ttlMs: -1, stopped: null },
+    ])
+      expect(
+        parseExtensionMessage({
+          type: 'warming/state',
+          payload: { ...payload, sessions: { 'session-1': session } },
+        })
+      ).toBeNull();
+    expect(
+      parseExtensionMessage({ type: 'warming/state', payload: { ...payload, mode: 'sometimes' } })
+    ).toBeNull();
+    expect(
+      parseExtensionMessage({
+        type: 'warming/state',
+        payload: { ...payload, learned: { 'openai/*': { ms: 0, bounded: true } } },
       })
     ).toBeNull();
   });
@@ -1154,6 +1214,29 @@ describe('parseExtensionMessage', () => {
       }
     }
   );
+
+  it.each([
+    [100_000, true],
+    [0, true],
+    [-1, false],
+    [Infinity, false],
+    ['100000', false],
+  ])('accepts only non-negative finite cache warning thresholds: %s', (value, accepted) => {
+    const parsed = parseExtensionMessage({
+      type: 'config/update',
+      payload: {
+        promptCacheWarningTokens: value,
+        desktopSessionPaneSide: 'left',
+        defaultPermissionMode: 'default',
+        chatFontSize: 13,
+        chatEditorFontSize: 12,
+        chatFontFamily: 'default',
+      },
+    });
+    if (parsed?.type !== 'config/update') throw new Error('Expected a config update');
+    if (accepted) expect(parsed.payload.promptCacheWarningTokens).toBe(value);
+    else expect(parsed.payload).not.toHaveProperty('promptCacheWarningTokens');
+  });
 
   it('parses config/update with strict payload', () => {
     expect(

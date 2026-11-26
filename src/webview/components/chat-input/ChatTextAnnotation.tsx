@@ -1,10 +1,11 @@
-import { Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js';
-import { Portal } from 'solid-js/web';
+import { createEffect, Show, createSignal, onCleanup, onSettled } from 'solid-js';
+import { Portal } from '@solidjs/web';
 import { createChatAnnotation } from '../../../shared/chat-annotation';
 import type { DroppedFile } from '../../../shared/protocol';
 import { observePopupViewport } from '../../lib/popup-position';
 import { selectionMarkdown } from '../../lib/selection-markdown';
 import { writeClipboard } from '../../lib/write-clipboard';
+import { selectionText } from '../markdown-path-truncation';
 
 type AnnotationSelection = {
   sessionId: string;
@@ -71,7 +72,7 @@ export function ChatTextAnnotation(props: {
     };
     if (!inMessage(range.startContainer) || !inMessage(range.endContainer)) return;
     if (!range.intersectsNode(event.target)) return;
-    const text = selected.toString().trim();
+    const text = selectionText(selected).trim();
     if (!text) return;
     event.preventDefault();
     event.stopPropagation();
@@ -96,7 +97,9 @@ export function ChatTextAnnotation(props: {
     });
   }
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     let root = props.chatRoot();
     let disposed = false;
     root?.addEventListener('contextmenu', open);
@@ -106,19 +109,28 @@ export function ChatTextAnnotation(props: {
       root = props.chatRoot();
       root?.addEventListener('contextmenu', open);
     });
-    onCleanup(() => {
+    cleanups.push(() => {
       disposed = true;
       root?.removeEventListener('contextmenu', open);
     });
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
-  createEffect(() => {
-    const current = selection();
-    if (current && current.sessionId !== props.sessionId) close();
-  });
+  createEffect(
+    () => {
+      const current = selection();
+      return current && current.sessionId !== props.sessionId;
+    },
+    (switched) => {
+      if (switched) close();
+    }
+  );
 
-  createEffect(() => {
-    if (!selection()) return;
+  createEffect(selection, (current) => {
+    if (!current) return;
     const outside = (event: Event) => {
       if (event.target instanceof Node && popup?.contains(event.target)) return;
       close();
@@ -133,46 +145,47 @@ export function ChatTextAnnotation(props: {
     window.addEventListener('contextmenu', outside, true);
     window.addEventListener('focusin', outside);
     window.addEventListener('keydown', escape, true);
-    onCleanup(() => {
+    return () => {
       window.removeEventListener('pointerdown', outside, true);
       window.removeEventListener('contextmenu', outside, true);
       window.removeEventListener('focusin', outside);
       window.removeEventListener('keydown', escape, true);
-    });
+    };
   });
 
-  createEffect(() => {
-    const current = selection();
-    const isEditing = editing();
-    if (!current) return;
-    let disposed = false;
-    let stopObserving: (() => void) | undefined;
-    queueMicrotask(() => {
-      if (disposed || !popup) return;
-      stopObserving = observePopupViewport(popup, () => {
-        if (!popup) return;
-        const rect = popup.getBoundingClientRect();
-        const bounds = current.bounds;
-        const top =
-          isEditing && bounds
-            ? bounds.bottom + 8 + rect.height <= window.innerHeight - 8
-              ? bounds.bottom + 8
-              : bounds.top - rect.height - 8 >= 8
-                ? bounds.top - rect.height - 8
-                : current.y
-            : current.y;
-        popup.style.left = `${Math.max(8, Math.min(current.x, window.innerWidth - rect.width - 8))}px`;
-        popup.style.top = `${Math.max(8, Math.min(top, window.innerHeight - rect.height - 8))}px`;
+  createEffect(
+    () => [selection(), editing()] as const,
+    ([current, isEditing]) => {
+      if (!current) return;
+      let disposed = false;
+      let stopObserving: (() => void) | undefined;
+      queueMicrotask(() => {
+        if (disposed || !popup) return;
+        stopObserving = observePopupViewport(popup, () => {
+          if (!popup) return;
+          const rect = popup.getBoundingClientRect();
+          const bounds = current.bounds;
+          const top =
+            isEditing && bounds
+              ? bounds.bottom + 8 + rect.height <= window.innerHeight - 8
+                ? bounds.bottom + 8
+                : bounds.top - rect.height - 8 >= 8
+                  ? bounds.top - rect.height - 8
+                  : current.y
+              : current.y;
+          popup.style.left = `${Math.max(8, Math.min(current.x, window.innerWidth - rect.width - 8))}px`;
+          popup.style.top = `${Math.max(8, Math.min(top, window.innerHeight - rect.height - 8))}px`;
+        });
+        popup.querySelector<HTMLElement>(isEditing ? 'textarea' : '[role="menuitem"]')?.focus({
+          preventScroll: true,
+        });
       });
-      popup.querySelector<HTMLElement>(isEditing ? 'textarea' : '[role="menuitem"]')?.focus({
-        preventScroll: true,
-      });
-    });
-    onCleanup(() => {
-      disposed = true;
-      stopObserving?.();
-    });
-  });
+      return () => {
+        disposed = true;
+        stopObserving?.();
+      };
+    }
+  );
 
   function save() {
     const current = selection();

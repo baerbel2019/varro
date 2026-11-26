@@ -1,4 +1,3 @@
-import { batch } from 'solid-js';
 import type { AppStateInstance } from './app-state';
 import { isFunction } from './runtime-values';
 
@@ -76,69 +75,52 @@ export function flushPendingStreamingDeltasFor(appState: AppStateInstance) {
   const deltas = appState.streamingDeltaQueue.takeAll();
   if (deltas.length === 0) return;
   const latest = deltas[deltas.length - 1]!;
-  let appendedPart = false;
-  let committedPreviousStreamingPart = false;
-
-  batch(() => {
-    if (appState.state.streamingPartId && appState.state.streamingPartId !== latest.partId) {
+  // Keep read-after-write indexing inside the store transaction. A staged
+  // setter need not expose an appended part through appState.state yet.
+  appState.setState((draft) => {
+    let appendedPart = false;
+    let committedPreviousStreamingPart = false;
+    if (draft.streamingPartId && draft.streamingPartId !== latest.partId) {
       const previousLocation = appState.messageIndex.findPartLocation(
-        appState.state.messages,
-        appState.state.streamingPartId
+        draft.messages,
+        draft.streamingPartId
       );
-      if (previousLocation) {
-        const previousPart =
-          appState.state.messages[previousLocation.msgIdx]?.parts[previousLocation.partIdx];
-        if (
-          previousPart &&
-          (previousPart.type === 'text' || previousPart.type === 'reasoning') &&
-          previousPart.text !== appState.state.streamingText
-        ) {
-          appState.setState(
-            'messages',
-            previousLocation.msgIdx,
-            'parts',
-            previousLocation.partIdx,
-            (currentPart) => {
-              if (currentPart.type !== 'text' && currentPart.type !== 'reasoning') {
-                return currentPart;
-              }
-              return {
-                ...currentPart,
-                text: appState.state.streamingText,
-              };
-            }
-          );
-          committedPreviousStreamingPart = true;
-        }
+      const previousPart = previousLocation
+        ? draft.messages[previousLocation.msgIdx]?.parts[previousLocation.partIdx]
+        : undefined;
+      if (
+        previousLocation &&
+        previousPart &&
+        (previousPart.type === 'text' || previousPart.type === 'reasoning') &&
+        previousPart.text !== draft.streamingText
+      ) {
+        draft.messages[previousLocation.msgIdx]!.parts[previousLocation.partIdx] = {
+          ...previousPart,
+          text: draft.streamingText,
+        };
+        committedPreviousStreamingPart = true;
       }
     }
-
-    appState.setState('streamingPartId', latest.partId);
-    appState.setState('streamingText', latest.text);
+    draft.streamingPartId = latest.partId;
+    draft.streamingText = latest.text;
 
     for (const item of deltas) {
-      const msgIdx = appState.messageIndex.findMessageIndex(
-        appState.state.messages,
-        item.messageId
-      );
+      const msgIdx = appState.messageIndex.findMessageIndex(draft.messages, item.messageId);
       if (msgIdx === -1) continue;
-      const location = appState.messageIndex.findPartLocation(
-        appState.state.messages,
-        item.partId,
-        msgIdx
-      );
+      const message = draft.messages[msgIdx]!;
+      const location = appState.messageIndex.findPartLocation(draft.messages, item.partId, msgIdx);
       if (location) {
-        const currentPart = appState.state.messages[location.msgIdx]?.parts[location.partIdx];
+        const currentPart = draft.messages[location.msgIdx]?.parts[location.partIdx];
         if (
           item.partId !== latest.partId &&
           (currentPart?.type === 'text' || currentPart?.type === 'reasoning') &&
           currentPart.text !== item.text &&
           shouldUseStreamingText(currentPart.text, item.text)
         ) {
-          appState.setState('messages', location.msgIdx, 'parts', location.partIdx, {
+          draft.messages[location.msgIdx]!.parts[location.partIdx] = {
             ...currentPart,
             text: item.text,
-          });
+          };
           committedPreviousStreamingPart = true;
         }
         continue;
@@ -147,24 +129,22 @@ export function flushPendingStreamingDeltasFor(appState: AppStateInstance) {
       const commonPart = {
         id: item.partId,
         messageID: item.messageId,
-        sessionID: item.sessionId || appState.state.messages[msgIdx]!.info.sessionID,
+        sessionID: item.sessionId || message.info.sessionID,
         text: item.text,
       };
       const part =
         item.partType === 'reasoning'
           ? { ...commonPart, type: 'reasoning' as const, time: { start: item.partStartedAt } }
           : { ...commonPart, type: 'text' as const };
-      appState.setState('messages', msgIdx, 'parts', (parts) => [...parts, part]);
+      const partIdx = message.parts.length;
+      message.parts = [...message.parts, part];
       appendedPart = true;
-      appState.messageIndex.appendPart(appState.state.messages, item.partId, {
-        msgIdx,
-        partIdx: appState.state.messages[msgIdx]!.parts.length - 1,
-      });
+      appState.messageIndex.appendPart(draft.messages, item.partId, { msgIdx, partIdx });
     }
 
     if (!appendedPart && committedPreviousStreamingPart) {
       // Keep the part index fresh after committing the previously active streaming part.
-      appState.messageIndex.ensureIndex(appState.state.messages);
+      appState.messageIndex.ensureIndex(draft.messages);
     }
   });
 }

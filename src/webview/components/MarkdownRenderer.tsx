@@ -1,6 +1,15 @@
-import { Show, createSignal, createEffect, createMemo, onMount, onCleanup } from 'solid-js';
-import type { JSX } from 'solid-js';
-import { Portal, render } from 'solid-js/web';
+import {
+  createEffect,
+  For,
+  Show,
+  createSignal,
+  createMemo,
+  onSettled,
+  onCleanup,
+  untrack,
+} from 'solid-js';
+import { type JSX, Portal } from '@solidjs/web';
+
 import DOMPurify from 'dompurify';
 import { renderToString as renderKatex } from 'katex';
 import { marked, Tokenizer } from 'marked';
@@ -22,12 +31,18 @@ import { state, theme } from '../lib/state';
 import { getLeafPathName, normalizePath } from '../lib/path-display';
 import { formatCommandDisplay } from '../lib/command-display';
 import { getSessionReferenceContextKey, splitSessionReferenceText } from '../lib/session-reference';
+import {
+  getSessionReferenceLookupScope,
+  lookupSessionReferences,
+} from '../lib/session-reference-lookups';
+import { client } from '../lib/client';
 import { rememberDirectSessionReturn } from '../lib/session-navigation';
 import { selectSession } from '../hooks/useOpenCode';
-import { trapModalFocus } from '../lib/modal-focus';
+import { modalFocus } from '../lib/modal-focus';
 import { mixRgb, parseThemeColor } from '../lib/theme';
 import { getExternalLinkContext, isSafeExternalHref } from '../lib/external-link';
 import { parseRemoteImageUrl } from '../../shared/remote-images';
+import { parseLocalImagePath } from '../../shared/local-images';
 import { getLinkContext } from '../lib/link-context';
 import { asRecord, getString } from '../lib/runtime-values';
 import { parseCitationSymbol } from '../../shared/citation-symbol';
@@ -38,8 +53,10 @@ import { createMaterialChipIconElement } from './MaterialChipIcon';
 import { createUiIconElement, UiIcon } from './UiIcon';
 import { Tooltip } from './Tooltip';
 import { RemoteMarkdownImage } from './RemoteMarkdownImage';
+import { LocalMarkdownImage } from './LocalMarkdownImage';
 import { MarkdownCitationLinks } from './markdown-citation-links';
 import { markdownCitationSelection } from './markdown-citation-selection';
+import { middleTruncatePathLabel } from './markdown-path-truncation';
 import { showSessionActionFeedback } from './chat/SessionActionFeedback';
 
 interface MarkdownProps {
@@ -109,6 +126,7 @@ type MarkdownHydrationFlags = {
   copyButtons: boolean;
   mermaid: boolean;
   remoteImages: boolean;
+  localImages: boolean;
 };
 
 type RenderMarkdownContext = {
@@ -189,6 +207,7 @@ const ALLOWED_HTML_ATTRIBUTES = [
   'data-highlight-lang',
   'data-mermaid-source',
   'data-remote-image',
+  'data-local-image',
   'data-varro-generated',
   'd',
   'fill',
@@ -300,6 +319,7 @@ const MERMAID_SVG_CACHE_LIMIT = 20;
 const TRUSTED_RENDERER_ATTRIBUTE = 'data-varro-generated';
 const PRIVATE_RENDERER_ATTRIBUTES = [
   'data-remote-image',
+  'data-local-image',
   'data-copy',
   'data-copy-text',
   'data-external',
@@ -692,6 +712,8 @@ renderer.link = function ({ href, text: rawText, title, tokens }) {
 };
 
 renderer.image = function ({ href, text }: { href: string; text: string; title?: string | null }) {
+  if (parseLocalImagePath(href))
+    return `<span ${TRUSTED_RENDERER_ATTRIBUTE} data-local-image="${escapeHtml(encodeURIComponent(href))}" alt="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
   const url = parseRemoteImageUrl(href);
   if (!url) return escapeHtml(text);
   return `<span ${TRUSTED_RENDERER_ATTRIBUTE} data-remote-image="${escapeHtml(encodeURIComponent(url.href))}" alt="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
@@ -907,6 +929,7 @@ function sanitizeAnchorHref(anchor: HTMLAnchorElement) {
     anchor.removeAttribute('data-external');
     if (anchor.classList.contains('file-path-link')) {
       prependLinkIcon(anchor, createFileTypeIconElement(reference.path), true);
+      middleTruncatePathLabel(anchor);
     }
     return;
   }
@@ -985,8 +1008,11 @@ function linkifySessionReferences(fragment: DocumentFragment) {
       anchor.href = segment.reference.href;
       anchor.dataset.sessionId = segment.reference.id;
       anchor.dataset.sessionDirectory = segment.reference.directory;
+      if (segment.reference.external) anchor.dataset.sessionExternal = 'true';
       anchor.dataset.copyMarker = segment.reference.marker;
-      anchor.title = `Open session ${segment.reference.id}`;
+      anchor.title = segment.reference.external
+        ? `Open project folder ${segment.reference.directory}`
+        : `Open session ${segment.reference.id}`;
       const icon = createMaterialChipIconElement('session', 'session-reference-icon');
       const label = document.createElement('span');
       label.textContent = segment.reference.title;
@@ -1539,6 +1565,26 @@ function renderIncompleteStreamingMarkdown(
       trailingBulletMarker.index! + trailingBulletMarker[0].length - trailingBulletMarker[1]!.length
     );
   }
+  // Nested and quoted markers are equally empty until content arrives. Painted, `Item\n    -`
+  // becomes a setext heading, `> -` an empty item, and `>` an empty quotation. A rule is only
+  // `---`: `--` after a blank line would paint as a paragraph first. Fenced code stays literal.
+  const trailingContainerMarker =
+    openFence || openMath
+      ? null
+      : blockSafeContent.match(/(?:^|\r?\n)([ \t]*(?:(?:>[ \t]*)+(?:[-+*][ \t]*)?|[-+*][ \t]*))$/);
+  const trailingPartialRule =
+    openFence || openMath
+      ? null
+      : blockSafeContent.match(/(?:^|\r?\n[ \t]*\r?\n)([ \t]{0,3}--[ \t]*)$/);
+  for (const trailingMarker of [trailingContainerMarker, trailingPartialRule]) {
+    if (!trailingMarker) continue;
+    pendingStart = Math.min(
+      pendingStart,
+      trailingMarker.index! + trailingMarker[0].length - trailingMarker[1]!.length
+    );
+  }
+  const pendingBullet =
+    !!trailingBulletMarker || /[-+*][ \t]*$/.test(trailingContainerMarker?.[1] ?? '');
   const trailingPath = blockSafeContent.match(TRAILING_BARE_PATH_CANDIDATE_RE);
   if (trailingPath) {
     const candidateStart = trailingPath.index! + trailingPath[0].length - trailingPath[1]!.length;
@@ -1591,7 +1637,7 @@ function renderIncompleteStreamingMarkdown(
     marker,
     pendingText: content.slice(pendingStart),
     hidePendingText: pendingStart !== visiblePendingStart,
-    pendingBullet: !!trailingBulletMarker,
+    pendingBullet,
     showIndicator:
       mathStart !== null ||
       inlineStart !== null ||
@@ -2028,6 +2074,7 @@ function getMarkdownHydrationFlags(html: string): MarkdownHydrationFlags {
     copyButtons: html.includes('data-copy'),
     mermaid: html.includes('data-mermaid-source'),
     remoteImages: html.includes('data-remote-image'),
+    localImages: html.includes('data-local-image'),
   };
 }
 
@@ -2370,51 +2417,79 @@ export function MarkdownRenderer(props: MarkdownProps) {
 
   const lw = () => props.lightweight ?? false;
   const [mermaidPreview, setMermaidPreview] = createSignal<{ svg: string } | null>(null);
-  let appliedMermaidTheme = theme();
 
   function closeMermaidPreview() {
-    if (!mermaidPreview()) return;
+    if (!untrack(mermaidPreview)) return;
     setMermaidPreview(null);
     postMessage({ type: 'vscode/mermaid-preview', payload: { open: false } });
   }
+
+  createEffect(
+    () => ({ content: props.content || '', scope: getSessionReferenceLookupScope() }),
+    ({ content, scope }) => lookupSessionReferences(content, scope)
+  );
 
   let pendingContent: string | null = null;
   let rafId: number | null = null;
   const stableHighlights = new CodeHighlightBinding();
   const tailHighlights = new CodeHighlightBinding();
-  const initialCacheByContent = !!props.cacheByContent && !props.forceStreaming;
-  const initialSegments = getMarkdownRenderSegments(props.content || '', initialCacheByContent);
+  // The first render is synchronous so a mounted row paints its content immediately. These are
+  // baselines, not live values: the update effect below tracks every input read here and
+  // re-renders against them.
+  const initial = untrack(() => {
+    const cacheByContent = !!props.cacheByContent && !props.forceStreaming;
+    const content = props.content || '';
+    const segments = getMarkdownRenderSegments(content, cacheByContent);
+    const lightweight = lw();
+    const disablePathLinkify = !!props.disablePathLinkify;
+    const shouldEscapeHtml = !!props.escapeHtml;
+    const directory = sessionDirectory();
+    const stableHtml = segments.stableContent
+      ? parseMarkdown(segments.stableContent, {
+          cacheByContent: false,
+          directory,
+          disablePathLinkify,
+          disableCodeHighlighting: lightweight,
+          allowMermaidHydration: lightweight,
+          escapeHtml: shouldEscapeHtml,
+        })
+      : '';
+    const tailParseOptions = {
+      cacheByContent: segments.stableContent.length === 0 && cacheByContent,
+      directory,
+      disablePathLinkify,
+      disableCodeHighlighting: segments.hasUnclosedFence || lightweight,
+      allowMermaidHydration: lightweight && !segments.hasUnclosedFence,
+      escapeHtml: shouldEscapeHtml,
+    };
+    return {
+      cacheByContent,
+      segments,
+      lightweight,
+      disablePathLinkify,
+      escapeHtml: shouldEscapeHtml,
+      workspacePath: state.editorContext.workspacePath || '',
+      directory,
+      sessionContextKey: getSessionReferenceContextKey(content),
+      stableHtml,
+      tailHtml: cacheByContent
+        ? parseMarkdown(segments.tailContent, tailParseOptions)
+        : parseIncompleteStreamingMarkdown(segments.tailContent, tailParseOptions),
+    };
+  });
+  const initialSegments = initial.segments;
   let lastAppliedScanState = initialSegments.scanState;
-  let lastAppliedCacheByContent = initialCacheByContent;
-  let lastAppliedLightweight = lw();
-  let lastAppliedDisablePathLinkify = !!props.disablePathLinkify;
-  let lastAppliedEscapeHtml = !!props.escapeHtml;
-  let lastAppliedWorkspacePath = state.editorContext.workspacePath || '';
-  let lastAppliedDirectory = sessionDirectory();
-  let lastAppliedSessionContextKey = getSessionReferenceContextKey(props.content || '');
+  let lastAppliedCacheByContent = initial.cacheByContent;
+  let lastAppliedLightweight = initial.lightweight;
+  let lastAppliedDisablePathLinkify = initial.disablePathLinkify;
+  let lastAppliedEscapeHtml = initial.escapeHtml;
+  let lastAppliedWorkspacePath = initial.workspacePath;
+  let lastAppliedDirectory = initial.directory;
+  let lastAppliedSessionContextKey = initial.sessionContextKey;
   let lastAppliedStableContent = initialSegments.stableContent;
   let lastAppliedTailContent = initialSegments.tailContent;
-  let lastAppliedStableHtml = initialSegments.stableContent
-    ? parseMarkdown(initialSegments.stableContent, {
-        cacheByContent: false,
-        directory: lastAppliedDirectory,
-        disablePathLinkify: !!props.disablePathLinkify,
-        disableCodeHighlighting: lw(),
-        allowMermaidHydration: lw(),
-        escapeHtml: !!props.escapeHtml,
-      })
-    : '';
-  const initialTailParseOptions = {
-    cacheByContent: initialSegments.stableContent.length === 0 && initialCacheByContent,
-    directory: lastAppliedDirectory,
-    disablePathLinkify: !!props.disablePathLinkify,
-    disableCodeHighlighting: initialSegments.hasUnclosedFence || lw(),
-    allowMermaidHydration: lw() && !initialSegments.hasUnclosedFence,
-    escapeHtml: !!props.escapeHtml,
-  };
-  let lastAppliedTailHtml = initialCacheByContent
-    ? parseMarkdown(initialSegments.tailContent, initialTailParseOptions)
-    : parseIncompleteStreamingMarkdown(initialSegments.tailContent, initialTailParseOptions);
+  let lastAppliedStableHtml = initial.stableHtml;
+  let lastAppliedTailHtml = initial.tailHtml;
   let lastAppliedStableHydrationFlags = getMarkdownHydrationFlags(lastAppliedStableHtml);
   let lastAppliedTailHydrationFlags = getMarkdownHydrationFlags(lastAppliedTailHtml);
   let lastAppliedStableContentWasAppendOnlySafe = isAppendOnlySafeMarkdown(
@@ -2424,16 +2499,26 @@ export function MarkdownRenderer(props: MarkdownProps) {
   const remoteImageDisposers = new Map<HTMLElement, () => void>();
   const linkTooltips = new Map<
     HTMLAnchorElement,
-    { dispose: () => void; setContent: (content: string) => void }
+    { content: () => string; setContent: (content: string) => void }
   >();
+  const [linkTooltipAnchors, setLinkTooltipAnchors] = createSignal<HTMLAnchorElement[]>([]);
+  const [markdownIslands, setMarkdownIslands] = createSignal<
+    { host: HTMLElement; render: () => JSX.Element }[]
+  >([]);
   let disposed = false;
 
+  function mountMarkdownIsland(content: () => JSX.Element, host: HTMLElement) {
+    const island = { host, render: content };
+    setMarkdownIslands((islands) => [...islands, island]);
+    return () => setMarkdownIslands((islands) => islands.filter((item) => item !== island));
+  }
+
   function disposeLinkTooltips(root?: HTMLElement) {
-    for (const [anchor, tooltip] of linkTooltips) {
+    for (const anchor of linkTooltips.keys()) {
       if (root && !root.contains(anchor)) continue;
-      tooltip.dispose();
       linkTooltips.delete(anchor);
     }
+    setLinkTooltipAnchors((anchors) => anchors.filter((anchor) => linkTooltips.has(anchor)));
   }
 
   function hydrateLinkTooltip(anchor: HTMLAnchorElement) {
@@ -2446,14 +2531,8 @@ export function MarkdownRenderer(props: MarkdownProps) {
     if (!content) return;
     anchor.removeAttribute('title');
     const [tooltipContent, setContent] = createSignal(content);
-    const host = document.createElement('div');
-    linkTooltips.set(anchor, {
-      dispose: render(
-        () => <Tooltip target={anchor} content={tooltipContent()} delay={400} />,
-        host
-      ),
-      setContent,
-    });
+    linkTooltips.set(anchor, { content: tooltipContent, setContent });
+    setLinkTooltipAnchors((anchors) => [...anchors, anchor]);
   }
 
   function hydrateLinkTooltips(root: HTMLDivElement | undefined) {
@@ -2495,8 +2574,33 @@ export function MarkdownRenderer(props: MarkdownProps) {
       element.replaceChildren();
       remoteImageDisposers.set(
         element,
-        render(
+        mountMarkdownIsland(
           () => <RemoteMarkdownImage source={source} alt={alt} onLoadAll={loadAllRemoteImages} />,
+          element
+        )
+      );
+    }
+  }
+
+  function hydrateLocalImages(root?: HTMLElement) {
+    if (!root || disposed) return;
+    for (const element of root.querySelectorAll<HTMLElement>('[data-local-image]')) {
+      if (remoteImageDisposers.has(element)) continue;
+      const source = decodeCopyPayload(element.dataset.localImage ?? '');
+      if (!parseLocalImagePath(source)) continue;
+      const alt = element.getAttribute('alt') ?? '';
+      element.replaceChildren();
+      remoteImageDisposers.set(
+        element,
+        mountMarkdownIsland(
+          () => (
+            <LocalMarkdownImage
+              source={source}
+              alt={alt}
+              directory={sessionDirectory() || state.editorContext.workspacePath || undefined}
+              sessionID={(props.sessionID ?? state.activeSessionId) || undefined}
+            />
+          ),
           element
         )
       );
@@ -2566,7 +2670,7 @@ export function MarkdownRenderer(props: MarkdownProps) {
         host.dataset.markdownInlineSlot = nextMarker;
         fragment.append(host);
         const slot = slotByMarker.get(nextMarker)!;
-        inlineSlotDisposers.set(host, render(slot.render, host));
+        inlineSlotDisposers.set(host, mountMarkdownIsland(slot.render, host));
         offset = nextIndex + nextMarker.length;
       }
       textNode.replaceWith(fragment);
@@ -2577,6 +2681,7 @@ export function MarkdownRenderer(props: MarkdownProps) {
     if (disposed) return;
     hydrateRenderedMarkdown(root, flags);
     if (flags.remoteImages) hydrateRemoteImages(root);
+    if (flags.localImages) hydrateLocalImages(root);
     citationLinks.hydrate(
       root,
       {
@@ -2594,8 +2699,7 @@ export function MarkdownRenderer(props: MarkdownProps) {
 
   // Keep cross-segment spacing local. Looking through the tail with :has() makes
   // older Chromium invalidate unrelated transcript content on each append.
-  createEffect(() => {
-    tailHtml();
+  createEffect(tailHtml, () => {
     const firstTailBlock = tailRef?.firstElementChild;
     const tag = firstTailBlock?.classList.contains('streaming-markdown-pending-block')
       ? ''
@@ -2782,45 +2886,41 @@ export function MarkdownRenderer(props: MarkdownProps) {
     }
   }
 
-  createEffect(() => {
-    const content = props.content || '';
-    const cacheByContent = !!props.cacheByContent;
-    const forceStreaming = !!props.forceStreaming;
-    const isLightweight = lw();
-    const disablePathLinkify = !!props.disablePathLinkify;
-    const escapeRawHtml = !!props.escapeHtml;
-    const workspacePath = state.editorContext.workspacePath;
-    const directory = sessionDirectory();
-    const sessionContextKey = getSessionReferenceContextKey(content);
-    if (rafId !== null) {
+  createEffect(
+    () => ({
+      content: props.content || '',
+      cacheByContent: !!props.cacheByContent,
+      forceStreaming: !!props.forceStreaming,
+      lightweight: lw(),
+      disablePathLinkify: !!props.disablePathLinkify,
+      escapeRawHtml: !!props.escapeHtml,
+      workspacePath: state.editorContext.workspacePath,
+      directory: sessionDirectory(),
+      sessionContextKey: getSessionReferenceContextKey(props.content || ''),
+    }),
+    ({ content }) => {
+      if (rafId !== null) {
+        pendingContent = content;
+        return;
+      }
       pendingContent = content;
-      return;
+      rafId = requestAnimationFrame(flushPending);
     }
-    pendingContent = content;
-    rafId = requestAnimationFrame(flushPending);
-    void workspacePath;
-    void directory;
-    void sessionContextKey;
-    void cacheByContent;
-    void forceStreaming;
-    void isLightweight;
-    void disablePathLinkify;
-    void escapeRawHtml;
-  });
+  );
 
-  createEffect(() => {
-    const slots = props.inlineSlots;
-    slots?.forEach((slot) => slot.marker);
-    queueMicrotask(() => {
-      hydrateInlineSlots(stableRef);
-      hydrateInlineSlots(tailRef);
-    });
-  });
+  createEffect(
+    () => props.inlineSlots?.map((slot) => slot.marker),
+    () => {
+      queueMicrotask(() => {
+        hydrateInlineSlots(stableRef);
+        hydrateInlineSlots(tailRef);
+      });
+    }
+  );
 
-  createEffect(() => {
-    const nextTheme = theme();
-    if (nextTheme === appliedMermaidTheme) return;
-    appliedMermaidTheme = nextTheme;
+  createEffect(theme, (nextTheme, previousTheme) => {
+    // The first run is the theme the diagrams were rendered with.
+    if (previousTheme === undefined || nextTheme === previousTheme) return;
     closeMermaidPreview();
     resetMermaidDiagramsForThemeForTests(stableRef);
     resetMermaidDiagramsForThemeForTests(tailRef);
@@ -2943,6 +3043,13 @@ export function MarkdownRenderer(props: MarkdownProps) {
     );
     if (sessionLink?.dataset.sessionId) {
       e.preventDefault();
+      e.stopPropagation();
+      if (sessionLink.dataset.sessionExternal === 'true') {
+        void client.varro.session
+          .openReference(sessionLink.dataset.sessionId)
+          .catch(() => showSessionActionFeedback('Could not open the project window', 'warning'));
+        return;
+      }
       if (state.activeSessionId) {
         rememberDirectSessionReturn(sessionLink.dataset.sessionId, state.activeSessionId);
       }
@@ -3014,15 +3121,31 @@ export function MarkdownRenderer(props: MarkdownProps) {
     transfer.setData('ResourceURLs', JSON.stringify([uri]));
   }
 
-  onMount(() => {
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
     ref?.addEventListener('click', handleClick);
     ref?.addEventListener('dragstart', handleDragStart);
-    if (ref) onCleanup(markdownCitationSelection.bind(ref));
-    hydrateMarkdownRoot(stableRef, lastAppliedStableHydrationFlags);
-    hydrateMarkdownRoot(tailRef, lastAppliedTailHydrationFlags);
-    stableHighlights.reconcile([stableRef], initialCacheByContent ? 0 : 1);
-    tailHighlights.reconcile([tailRef], initialCacheByContent ? 0 : 1);
+    if (ref) cleanups.push(markdownCitationSelection.bind(ref));
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
+  // Hydration registers declarative tooltip and portal children. Do not call render()
+  // here: its implicit flush would run inside this effect's apply phase.
+  createEffect(
+    () => null,
+    () => {
+      // One-time mount hydration with the current link context. Later input changes
+      // re-render through the update effect, which hydrates again.
+      untrack(() => {
+        hydrateMarkdownRoot(stableRef, lastAppliedStableHydrationFlags);
+        hydrateMarkdownRoot(tailRef, lastAppliedTailHydrationFlags);
+        stableHighlights.reconcile([stableRef], initial.cacheByContent ? 0 : 1);
+        tailHighlights.reconcile([tailRef], initial.cacheByContent ? 0 : 1);
+      });
+    }
+  );
   onCleanup(() => {
     ref?.removeEventListener('click', handleClick);
     ref?.removeEventListener('dragstart', handleDragStart);
@@ -3049,58 +3172,85 @@ export function MarkdownRenderer(props: MarkdownProps) {
           innerHTML={tailHtml()}
         />
       </div>
+      <For each={linkTooltipAnchors()}>
+        {(anchor) => {
+          const tooltip = linkTooltips.get(anchor)!;
+          return <Tooltip target={anchor} content={tooltip.content()} delay={400} />;
+        }}
+      </For>
+      <For each={markdownIslands()}>
+        {(island) => <Portal mount={island.host}>{island.render()}</Portal>}
+      </For>
       <MermaidPreviewOverlay preview={mermaidPreview()} onClose={closeMermaidPreview} />
     </>
   );
 }
 
 function MermaidPreviewOverlay(props: { preview: { svg: string } | null; onClose: () => void }) {
-  createEffect(() => {
-    if (!props.preview) return;
-    const handleKeydown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      props.onClose();
-    };
-    window.addEventListener('keydown', handleKeydown);
-    onCleanup(() => window.removeEventListener('keydown', handleKeydown));
-  });
+  createEffect(
+    () => props.preview,
+    (preview) => {
+      const cleanups: Array<() => void> = [];
+
+      if (!preview)
+        return () => {
+          for (const cleanup of cleanups.toReversed()) cleanup();
+        };
+      const handleKeydown = (event: KeyboardEvent) => {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        props.onClose();
+      };
+      window.addEventListener('keydown', handleKeydown);
+      cleanups.push(() => window.removeEventListener('keydown', handleKeydown));
+
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
+    }
+  );
 
   return (
     <Show when={props.preview}>
-      {(preview) => (
-        <Portal>
-          <div
-            ref={(element) => onCleanup(trapModalFocus(element))}
-            class="mermaid-preview-overlay"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Mermaid diagram preview"
-            onClick={props.onClose}
-          >
-            <div class="mermaid-preview-toolbar">
-              <button
-                type="button"
-                aria-label="Close diagram preview"
-                title="Close diagram preview"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  props.onClose();
-                }}
-              >
-                <UiIcon source={xmarkIcon} width={14} height={14} />
-              </button>
-            </div>
+      {(preview) => {
+        const focus = modalFocus();
+        return (
+          <Portal>
             <div
-              ref={(element) =>
-                element.replaceChildren(createSanitizedMermaidFragment(preview().svg))
-              }
-              class="mermaid-preview-canvas"
-              onClick={(event) => event.stopPropagation()}
-            />
-          </div>
-        </Portal>
-      )}
+              ref={focus}
+              class="mermaid-preview-overlay"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Mermaid diagram preview"
+              onClick={props.onClose}
+            >
+              <div class="mermaid-preview-toolbar">
+                <button
+                  type="button"
+                  aria-label="Close diagram preview"
+                  title="Close diagram preview"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    props.onClose();
+                  }}
+                >
+                  <UiIcon source={xmarkIcon} width={14} height={14} />
+                </button>
+              </div>
+              <div
+                // The overlay is modal, so its diagram cannot change while it is open.
+                ref={(element) =>
+                  element.replaceChildren(
+                    createSanitizedMermaidFragment(untrack(() => preview().svg))
+                  )
+                }
+                class="mermaid-preview-canvas"
+                onClick={(event) => event.stopPropagation()}
+              />
+            </div>
+          </Portal>
+        );
+      }}
     </Show>
   );
 }

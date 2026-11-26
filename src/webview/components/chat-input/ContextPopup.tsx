@@ -1,4 +1,5 @@
-import { For, createSignal, onCleanup, onMount, Show } from 'solid-js';
+import { ariaBoolean } from '../../lib/aria';
+import { For, createSignal, onSettled, Show } from 'solid-js';
 import {
   checkSquareIcon,
   databaseBackupIcon,
@@ -6,8 +7,9 @@ import {
   infoCircleIcon,
   navArrowRightIcon,
   squareIcon,
+  reportsIcon,
 } from '../../lib/ui-icons';
-import { formatCost, formatNumber } from '../../lib/message-metrics';
+import { formatCost, formatNumber, formatTokenCount } from '../../lib/message-metrics';
 import {
   alignPopupToBoundary,
   clampPopupToViewport,
@@ -21,12 +23,18 @@ import type {
 import { Tooltip } from '../Tooltip';
 import { UiIcon } from '../UiIcon';
 import { isFunction } from '../../lib/runtime-values';
+import { useSecondClock } from '../../lib/clock';
+import { formatDuration } from '../../lib/time-format';
+import type { PromptCacheWarmingSession } from '../../../shared/protocol';
+import { promptCacheKeepAliveIntervalMs } from '../../../shared/prompt-cache-lifetime';
 
 const CONTEXT_USAGE_WARNING_PERCENT = 70;
 const CONTEXT_USAGE_ERROR_PERCENT = 90;
 const CONTEXT_COMPACT_ACTION_PERCENT = 30;
 const CACHE_READ_TOOLTIP =
   "Tokens reused from the provider's prompt cache. They count toward the context window but are excluded from session totals.";
+const PROMPT_CACHE_TOOLTIP_SUFFIX =
+  'Estimated from the last request that read or wrote it. Sending while it is warm is usually cheaper and faster.';
 const CACHE_WRITE_TOOLTIP =
   "Tokens stored in the provider's prompt cache for reuse by later requests. They count toward session input and totals.";
 
@@ -49,6 +57,35 @@ type ContextTokens = {
   cacheRead: number;
   cacheWrite: number;
 };
+
+export type ContextPopupModel = { providerName: string; modelName: string };
+
+/** When the session's latest completed response last used the prompt cache, and for how long it lives. */
+export type PromptCacheActivity = {
+  /** When the request that last read or wrote the cache was sent. */
+  lastUsedAt: number;
+  inUse: boolean;
+  /** How long the model's cache is sure to live, from `resolvePromptCacheLifetime`. */
+  ttlMs: number;
+  /** How long it usually lives; at least `ttlMs`. Past this it is likely expired. */
+  likelyMs: number;
+  description: string;
+};
+
+/** Keep-alive state for the composer's root session; absent when warming is off or unavailable. */
+export type PromptCacheWarmingView =
+  | { kind: 'opencode' }
+  | {
+      kind: 'chosen';
+      enabled: boolean;
+      session: PromptCacheWarmingSession | null;
+      /** The cache lifetime the keep-alive schedule follows. */
+      ttlMs: number;
+      durationMs: number;
+    };
+
+const PROMPT_CACHE_WARMING_TOOLTIP =
+  "Sends a short keep-alive with the whole session context just before the provider's cache would expire, for a while after each reply. Each keep-alive re-reads the context from the cache, which costs money or subscription quota. With typical pricing, about twelve keep-alives cost as much as re-sending the context once uncached, so long windows only pay off if you come back soon.";
 
 type ContextTokenRow = {
   key: 'input' | 'output' | 'reasoning' | 'cacheRead' | 'cacheWrite';
@@ -85,6 +122,150 @@ function getTokenRows(tokens: ContextTokens): ContextTokenRow[] {
   return items;
 }
 
+function formatCountdown(ms: number) {
+  const seconds = Math.ceil(ms / 1000);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours > 0
+    ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}`
+    : `${minutes}:${pad(seconds % 60)}`;
+}
+
+function PromptCacheRow(props: { activity: PromptCacheActivity }) {
+  const now = useSecondClock(() => !props.activity.inUse);
+  const status = () => {
+    const activity = props.activity;
+    if (activity.inUse) return { tone: 'warm', text: 'In use', countdown: '' };
+    const idle = now() - activity.lastUsedAt;
+    if (idle < activity.ttlMs)
+      return { tone: 'warm', text: 'Warm', countdown: formatCountdown(activity.ttlMs - idle) };
+    // Past the provider's minimum, some caches usually still last a while.
+    if (idle < activity.likelyMs) return { tone: 'warm', text: 'May be warm', countdown: '' };
+    return { tone: 'cold', text: 'Likely expired', countdown: '' };
+  };
+
+  return (
+    <div class="context-popup-row context-popup-prompt-cache" data-tone={status().tone}>
+      <span class="context-popup-row-label">
+        Prompt cache
+        <Tooltip content={`${props.activity.description} ${PROMPT_CACHE_TOOLTIP_SUFFIX}`}>
+          <span class="context-popup-cost-info" tabindex="0" aria-label="Prompt cache estimate">
+            <UiIcon source={infoCircleIcon} width="11" height="11" />
+          </span>
+        </Tooltip>
+      </span>
+      <span class="context-popup-row-value">
+        {status().text}
+        <Show when={status().countdown}>
+          {(countdown) => <span class="context-popup-prompt-cache-countdown">{countdown()}</span>}
+        </Show>
+      </span>
+    </div>
+  );
+}
+
+type WarmingDescription = { status: string; detail: string | null };
+
+function describeWarming(
+  view: Extract<PromptCacheWarmingView, { kind: 'chosen' }>,
+  contextTokens: number,
+  now: number
+): WarmingDescription {
+  const session = view.session;
+  if (!view.enabled || !session) {
+    if (view.ttlMs >= view.durationMs) {
+      return {
+        status: 'Off',
+        detail: `Not needed: the cache lasts ${formatDuration(view.ttlMs)} after each request`,
+      };
+    }
+    const tokens = contextTokens > 0 ? `~${formatTokenCount(contextTokens)}` : 'the';
+    const interval = formatDuration(promptCacheKeepAliveIntervalMs(view.ttlMs));
+    return { status: 'Off', detail: `Re-reads ${tokens} cached tokens every ${interval} while on` };
+  }
+  if (session.stopped === 'cache-miss') {
+    return { status: 'Stopped', detail: 'The cache had already expired' };
+  }
+  if (session.stopped === 'failed') return { status: 'Stopped', detail: 'A keep-alive failed' };
+  if (session.warmUntil === null) return { status: 'After reply', detail: null };
+  if (session.stopped === 'expired' || session.warmUntil <= now) {
+    return { status: 'Ended', detail: 'Restarts after the next reply' };
+  }
+  const left = `${formatDuration(Math.ceil((session.warmUntil - now) / 60_000) * 60_000)} left`;
+  // A cache that outlives the window stays warm without keep-alives.
+  if (
+    session.sentAt !== null &&
+    session.ttlMs !== null &&
+    session.sentAt + session.ttlMs >= session.warmUntil
+  )
+    return { status: left, detail: 'No keep-alive needed' };
+  return { status: left, detail: null };
+}
+
+function PromptCacheWarmingRow(props: {
+  view: PromptCacheWarmingView;
+  contextTokens: number;
+  onToggle?: (enabled: boolean) => void;
+}) {
+  const chosen = () => (props.view.kind === 'chosen' ? props.view : null);
+  const now = useSecondClock(() => !!chosen()?.session?.warmUntil);
+  return (
+    <div class="context-popup-row context-popup-prompt-cache-warming">
+      <span class="context-popup-row-label">
+        <Show when={chosen()} fallback={<span>Kept warm by OpenCode</span>}>
+          {(view) => (
+            <label class="context-breakdown-nested context-popup-warming-toggle">
+              <input
+                type="checkbox"
+                checked={view().enabled}
+                onChange={(event) => props.onToggle?.(event.currentTarget.checked)}
+              />
+              <UiIcon
+                source={view().enabled ? checkSquareIcon : squareIcon}
+                class="context-breakdown-checkbox"
+                width="16"
+                height="16"
+              />
+              <span>Keep warm</span>
+            </label>
+          )}
+        </Show>
+        <Tooltip
+          content={
+            chosen()
+              ? PROMPT_CACHE_WARMING_TOOLTIP
+              : "OpenCode's warming setting keeps every session's cache alive after each reply."
+          }
+        >
+          <span class="context-popup-cost-info" tabindex="0" aria-label="Keep warm details">
+            <UiIcon source={infoCircleIcon} width="11" height="11" />
+          </span>
+        </Tooltip>
+      </span>
+      <Show when={chosen()}>
+        {(view) => {
+          const description = () => describeWarming(view(), props.contextTokens, now());
+          return (
+            <>
+              <span class="context-popup-row-value context-popup-warming-status">
+                {description().status}
+              </span>
+              <Show when={description().detail}>
+                {(detail) => <span class="context-popup-warming-detail">{detail()}</span>}
+              </Show>
+            </>
+          );
+        }}
+      </Show>
+    </div>
+  );
+}
+
+function formatModelName(model: ContextPopupModel) {
+  return `${model.providerName} / ${model.modelName}`;
+}
+
 function CacheReadInfo() {
   return (
     <Tooltip content={CACHE_READ_TOOLTIP}>
@@ -117,10 +298,16 @@ export function ContextPopup(props: {
   subagentTokens: ContextTokens;
   subagentCount: number;
   model: { providerName: string; modelName: string };
+  /** Models with recorded usage across the session tree; more than one marks mixed usage. */
+  models?: ContextPopupModel[];
+  promptCache?: PromptCacheActivity | null;
+  warming?: PromptCacheWarmingView | null;
+  onToggleWarming?: (enabled: boolean) => void;
   compactDisabled: boolean;
   showCompactAction?: boolean;
   onClose: () => void;
   onCompact: () => void;
+  onOpenUsageReport?: () => void;
 }) {
   const [subagentsExpanded, setSubagentsExpanded] = createSignal(false);
   const [nestedBreakdown, setNestedBreakdown] = createSignal(true);
@@ -131,6 +318,11 @@ export function ContextPopup(props: {
   const subagentTotal = () => getSessionTotalTokens(props.subagentTokens);
   const sessionTokensAvailable = () => sessionTotal() > 0;
   const overallTotal = () => sessionTotal() + subagentTotal();
+  const showUsageReport = () => !!props.onOpenUsageReport && overallTotal() > 0;
+  const mixedModels = () => {
+    const models = props.models ?? [];
+    return models.length > 1 ? models : undefined;
+  };
   let popupEl: HTMLDivElement | undefined;
 
   const setRef = (el: HTMLDivElement) => {
@@ -139,8 +331,13 @@ export function ContextPopup(props: {
     if (isFunction(forwarded)) forwarded(el);
   };
 
-  onMount(() => {
-    if (!popupEl || !props.boundaryRef) return;
+  onSettled(() => {
+    const cleanups: Array<() => void> = [];
+
+    if (!popupEl || !props.boundaryRef)
+      return () => {
+        for (const cleanup of cleanups.toReversed()) cleanup();
+      };
 
     const reposition = () => {
       if (!popupEl || !props.boundaryRef) return;
@@ -149,7 +346,11 @@ export function ContextPopup(props: {
       clampPopupToViewport(popupEl);
     };
 
-    onCleanup(observePopupViewport(popupEl, reposition));
+    cleanups.push(observePopupViewport(popupEl, reposition));
+
+    return () => {
+      for (const cleanup of cleanups.toReversed()) cleanup();
+    };
   });
 
   return (
@@ -182,11 +383,13 @@ export function ContextPopup(props: {
         <For each={getTokenRows(props.tokens)}>
           {(row) => (
             <div
-              class="context-popup-row"
-              classList={{
-                'context-popup-row-cache-read': row.key === 'cacheRead',
-                'context-popup-row-cache-write': row.key === 'cacheWrite',
-              }}
+              class={[
+                'context-popup-row',
+                {
+                  'context-popup-row-cache-read': row.key === 'cacheRead',
+                  'context-popup-row-cache-write': row.key === 'cacheWrite',
+                },
+              ]}
             >
               <span class="context-popup-row-label">{row.label}</span>
               <span
@@ -232,6 +435,18 @@ export function ContextPopup(props: {
               </span>
               <span class="context-popup-row-value">{cost()}</span>
             </div>
+          )}
+        </Show>
+        <Show when={props.promptCache}>
+          {(activity) => <PromptCacheRow activity={activity()} />}
+        </Show>
+        <Show when={props.promptCache && props.warming}>
+          {(view) => (
+            <PromptCacheWarmingRow
+              view={view()}
+              contextTokens={props.usage.used}
+              onToggle={props.onToggleWarming}
+            />
           )}
         </Show>
       </div>
@@ -283,7 +498,7 @@ export function ContextPopup(props: {
         <button
           type="button"
           class="context-popup-section context-popup-section-toggle"
-          aria-expanded={subagentsExpanded()}
+          aria-expanded={ariaBoolean(subagentsExpanded())}
           onClick={() => setSubagentsExpanded((expanded) => !expanded)}
         >
           <span>Agents{props.subagentCount > 0 ? ` (${props.subagentCount})` : ''}</span>
@@ -302,11 +517,13 @@ export function ContextPopup(props: {
             <For each={getTokenRows(props.subagentTokens)}>
               {(row) => (
                 <div
-                  class="context-popup-row"
-                  classList={{
-                    'context-popup-row-cache-read': row.key === 'cacheRead',
-                    'context-popup-row-cache-write': row.key === 'cacheWrite',
-                  }}
+                  class={[
+                    'context-popup-row',
+                    {
+                      'context-popup-row-cache-read': row.key === 'cacheRead',
+                      'context-popup-row-cache-write': row.key === 'cacheWrite',
+                    },
+                  ]}
                 >
                   <span class="context-popup-row-label">{row.label}</span>
                   <span class="context-popup-row-value">
@@ -355,9 +572,53 @@ export function ContextPopup(props: {
         </div>
       </Show>
 
-      <Show when={props.model.modelName}>
-        <div class="context-popup-model">
-          {props.model.providerName} / {props.model.modelName}
+      <Show when={props.model.modelName || mixedModels() || showUsageReport()}>
+        <div class="context-popup-footer">
+          <Show
+            when={mixedModels()}
+            fallback={
+              <Show when={props.model.modelName}>
+                <div class="context-popup-model">{formatModelName(props.model)}</div>
+              </Show>
+            }
+          >
+            {(models) => (
+              <Tooltip
+                content={
+                  <div class="context-popup-models-tooltip">
+                    <div>Models used in this session:</div>
+                    <For each={models()}>{(model) => <div>{formatModelName(model)}</div>}</For>
+                  </div>
+                }
+              >
+                <div
+                  class="context-popup-model context-popup-models-mixed"
+                  tabindex="0"
+                  aria-label={`Models used in this session: ${models()
+                    .map((model) => formatModelName(model))
+                    .join(', ')}`}
+                >
+                  Mixed models ({models().length})
+                </div>
+              </Tooltip>
+            )}
+          </Show>
+          <Show when={showUsageReport()}>
+            <Tooltip content="Usage by model and session, including nested sessions">
+              <button
+                type="button"
+                class="context-popup-report-button"
+                aria-label="Open session usage report"
+                onClick={() => {
+                  props.onClose();
+                  props.onOpenUsageReport?.();
+                }}
+              >
+                <UiIcon source={reportsIcon} width="11" height="11" />
+                <span>Report</span>
+              </button>
+            </Tooltip>
+          </Show>
         </div>
       </Show>
     </div>
@@ -397,7 +658,7 @@ export function ContextUsageButton(props: {
   );
 }
 
-export function getContextUsageTone(percent: number) {
+function getContextUsageTone(percent: number) {
   if (percent >= CONTEXT_USAGE_ERROR_PERCENT) return 'error';
   if (percent >= CONTEXT_USAGE_WARNING_PERCENT) return 'warning';
   return '';

@@ -1,4 +1,6 @@
 import { apiCall, onMessage, postMessage } from './bridge';
+import { parseSessionGoal } from '../../shared/session-goal';
+import type { SessionGoal } from '../../shared/session-goal';
 import type { FollowupAction, FollowupSuggestionSet, FollowupSource } from '../../shared/followups';
 import { FOLLOWUP_REQUEST_TIMEOUT_MS } from '../../shared/followups';
 import type {
@@ -25,7 +27,9 @@ import type {
   ServerEvent,
   ServerEventName,
   SessionDiffSummary,
+  SessionFollowupUsage,
   SessionLocation,
+  SessionLookup,
   SessionHistoryScope,
   SessionTitleFallbackResponse,
   WorkspaceStatusEventSummary,
@@ -89,6 +93,22 @@ export type SessionListPage = {
   unavailableDirectories?: string[];
 };
 export type McpAuthStart = { authorizationUrl: string; oauthState: string; paste?: true };
+export type SessionPromptBody = {
+  messageID?: string;
+  parts: Array<{
+    type: string;
+    text?: string;
+    mime?: string;
+    filename?: string;
+    url?: string;
+  }>;
+  model?: { providerID: string; modelID: string };
+  agent?: string;
+  noReply?: boolean;
+  delivery?: 'steer' | 'queue';
+  variant?: string;
+  queuedMessageDispatch?: { itemId: string; lease: number };
+};
 
 export const client = {
   async health(): Promise<HealthResponse> {
@@ -98,6 +118,17 @@ export const client = {
   },
 
   session: {
+    async goal(
+      id: string,
+      options?: { directory?: string; signal?: AbortSignal }
+    ): Promise<SessionGoal | null> {
+      const path = withDirectory(`/session/${encodeURIComponent(id)}/goal`, options?.directory);
+      const response = await apiCall('GET', path, undefined, { signal: options?.signal });
+      if (response === null) return null;
+      const goal = parseSessionGoal(response);
+      if (!goal) throw malformedResponse(path, 'a session goal');
+      return goal;
+    },
     async childTaskControls(
       id: string,
       directory?: string,
@@ -416,22 +447,7 @@ export const client = {
     },
     async sendAsync(
       id: string,
-      body: {
-        messageID?: string;
-        parts: Array<{
-          type: string;
-          text?: string;
-          mime?: string;
-          filename?: string;
-          url?: string;
-        }>;
-        model?: { providerID: string; modelID: string };
-        agent?: string;
-        noReply?: boolean;
-        delivery?: 'steer' | 'queue';
-        variant?: string;
-        queuedMessageDispatch?: { itemId: string; lease: number };
-      },
+      body: SessionPromptBody,
       options?: { directory?: string; interruptedRecovery?: true }
     ): Promise<void> {
       // `delivery` is a client-side timing concern, not a server one. "Steer" means
@@ -459,10 +475,11 @@ export const client = {
       sessionId: string,
       permissionId: string,
       response: 'once' | 'always' | 'reject',
-      options?: { permissionAutomationLease?: number }
+      options?: { permissionAutomationLease?: number; message?: string }
     ): Promise<boolean> {
       const path = `/permission/${encodeURIComponent(permissionId)}/reply`;
-      const body = { reply: response };
+      const message = response === 'reject' ? options?.message?.trim() : undefined;
+      const body = message ? { reply: response, message } : { reply: response };
       return options?.permissionAutomationLease === undefined
         ? apiCall('POST', path, body)
         : apiCall('POST', path, body, {
@@ -554,6 +571,13 @@ export const client = {
         withDirectory(`/session/${encodeURIComponent(id)}/unrevert`, options?.directory)
       );
     },
+    /** V2 only: permanently removes the messages hidden by a staged rewind. */
+    async commitRevert(id: string, options?: { directory?: string }): Promise<Session> {
+      return apiCall(
+        'POST',
+        withDirectory(`/session/${encodeURIComponent(id)}/revert-commit`, options?.directory)
+      );
+    },
     async compact(
       id: string,
       model: { providerID: string; modelID: string },
@@ -630,7 +654,7 @@ export const client = {
       ]);
       const response = requireRecord(providerResponse, path);
       return {
-        providers: requireArray<Provider>(response.providers, path),
+        providers: requireArray<Provider>(response.providers, path).map(withProviderDisplayName),
         // SAFETY: The surrounding shape or discriminator check establishes the Record<string, string> contract used below.
         default: requireRecord(response.default, path) as Record<string, string>,
         defaultModel,
@@ -654,7 +678,7 @@ export const client = {
       const path = '/provider';
       const response = requireRecord(await apiCall('GET', path), path);
       return {
-        all: requireArray<Provider>(response.all, path),
+        all: requireArray<Provider>(response.all, path).map(withProviderDisplayName),
         // SAFETY: The surrounding shape or discriminator check establishes the Record<string, string> contract used below.
         default: requireRecord(response.default, path) as Record<string, string>,
         connected: requireArray<string>(response.connected, path),
@@ -760,6 +784,27 @@ export const client = {
       },
     },
     session: {
+      async reference(sessionID: string): Promise<SessionLookup> {
+        const path = buildVarroSessionEndpoint(sessionID, 'reference');
+        const value = asRecord(await apiCall('GET', path));
+        if (
+          value?.id !== sessionID ||
+          !isString(value.title) ||
+          !isString(value.directory) ||
+          !isBoolean(value.external)
+        ) {
+          throw new Error(`Malformed response from ${path}`);
+        }
+        return {
+          id: sessionID,
+          title: value.title,
+          directory: value.directory,
+          external: value.external,
+        };
+      },
+      async openReference(sessionID: string): Promise<void> {
+        await apiCall('POST', buildVarroSessionEndpoint(sessionID, 'reference'));
+      },
       async location(
         sessionID: string,
         options?: { directory?: string }
@@ -809,6 +854,17 @@ export const client = {
         const revisionPath = revision === undefined ? path : `${path}?revision=${revision}`;
         return apiCall('GET', withDirectory(revisionPath, options?.directory));
       },
+      async followupUsage(
+        sessionID: string,
+        options?: { directory?: string; signal?: AbortSignal }
+      ): Promise<SessionFollowupUsage> {
+        return apiCall(
+          'GET',
+          withDirectory(buildVarroSessionEndpoint(sessionID, 'followup-usage'), options?.directory),
+          undefined,
+          { signal: options?.signal }
+        );
+      },
       async setPinned(
         sessionID: string,
         pinned: boolean,
@@ -818,6 +874,17 @@ export const client = {
           'POST',
           withDirectory(buildVarroSessionEndpoint(sessionID, 'pin'), options?.directory),
           { pinned }
+        );
+      },
+      async setTodo(
+        sessionID: string,
+        todo: boolean,
+        options?: { directory?: string }
+      ): Promise<string[]> {
+        return apiCall(
+          'POST',
+          withDirectory(buildVarroSessionEndpoint(sessionID, 'todo'), options?.directory),
+          { todo }
         );
       },
       async reorderPinned(
@@ -1055,6 +1122,7 @@ export const client = {
         | 'small_model'
         | 'agent'
         | 'commit_message'
+        | 'review'
         | 'auto_approve'
         | 'prompt_completion'
         | 'followups';
@@ -1165,8 +1233,13 @@ export const client = {
       };
       return response.paste === true ? { ...authorization, paste: true } : authorization;
     },
-    async completeAuth(name: string, code: string): Promise<McpStatus> {
-      return apiCall('POST', `/mcp/${encodeURIComponent(name)}/auth/callback`, { code });
+    async completeAuth(name: string, code: string, attemptID?: string): Promise<McpStatus> {
+      // Several views may hold OAuth attempts for one server; the attempt ID selects this one.
+      return apiCall(
+        'POST',
+        `/mcp/${encodeURIComponent(name)}/auth/callback`,
+        attemptID ? { code, attemptID } : { code }
+      );
     },
     async removeAuth(name: string): Promise<{ success: true }> {
       return apiCall('DELETE', `/mcp/${encodeURIComponent(name)}/auth`);
@@ -1194,6 +1267,14 @@ export const client = {
   command: {
     async list(): Promise<Command[]> {
       return requireArray<Command>(await apiCall('GET', '/command'), '/command');
+    },
+  },
+
+  skill: {
+    async list(): Promise<SkillSummary[]> {
+      return requireArray<unknown>(await apiCall('GET', '/skill'), '/skill').flatMap(
+        parseSkillSummary
+      );
     },
   },
 
@@ -1233,11 +1314,45 @@ function withDirectory(path: string, directory: string | undefined): string {
   return `${url.pathname}${url.search}`;
 }
 
+/** OpenCode's built-in Claude subscription provider reads better as plain "Claude". */
+function withProviderDisplayName(provider: Provider): Provider {
+  return provider.id === 'claude-agent' && provider.name === 'Claude Agent'
+    ? { ...provider, name: 'Claude' }
+    : provider;
+}
+
 function requireArray<T, V = unknown>(value: V, path: string): T[] {
   if (!Array.isArray(value)) throw malformedResponse(path, 'an array');
   // SAFETY: The surrounding shape or discriminator check establishes the T contract used below.
   return value as T[];
 }
+
+export type SkillSummary = {
+  id: string;
+  name: string;
+  description: string;
+  /** SKILL.md location; absent for skills served on demand, such as MCP skills. */
+  path?: string;
+};
+
+/* oxlint-disable anti-slop/no-unknown-parameters -- Validate untrusted skill entries at the client boundary. */
+function parseSkillSummary(value: unknown): SkillSummary[] {
+  const record = asRecord(value);
+  if (!record) return [];
+  // V2 skills have an invocable ID; V1 skills are invoked by name.
+  const id = isString(record.id) && record.id ? record.id : record.name;
+  if (!isString(id) || !id) return [];
+  const location = isString(record.path) ? record.path : record.location;
+  const skill: SkillSummary = {
+    id,
+    name: isString(record.name) && record.name ? record.name : id,
+    description: isString(record.description) ? record.description : '',
+  };
+  // Built-in skills report virtual locations: V2 uses skill:// URIs and V1 uses "<built-in>".
+  if (isString(location) && /^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(location)) skill.path = location;
+  return [skill];
+}
+/* oxlint-enable anti-slop/no-unknown-parameters */
 
 /* oxlint-disable anti-slop/no-unknown-parameters -- Validate the untrusted MCP defaults REST response at the client boundary. */
 function parseMcpDefaults(value: unknown): McpDefaults {

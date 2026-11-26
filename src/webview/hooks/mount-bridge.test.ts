@@ -1,15 +1,14 @@
+import { flush as flushSolid } from 'solid-js';
 import { describe, expect, it, vi } from 'vitest';
 import type {
   ExtensionMessage,
   WebviewMessage,
   WorkspaceStatusEventSummary,
 } from '../../shared/protocol';
-import type { MockedObject } from 'vitest';
-import type * as StateModule from '../lib/state';
+import { setState, state } from '../lib/state';
 import { sessionStore } from '../lib/stores/session-store';
 
 const {
-  setState,
   setError,
   setTheme,
   addContextFiles,
@@ -35,7 +34,6 @@ const {
   applySessionPlanStateUpdate,
   setProviderLimit,
 } = vi.hoisted(() => ({
-  setState: vi.fn(),
   setError: vi.fn(),
   setTheme: vi.fn(),
   addContextFiles: vi.fn(),
@@ -63,16 +61,10 @@ const {
 }));
 
 /* oxlint-disable anti-slop/no-module-mocking -- These tests exercise mount-bridge integration with state and client modules. */
-vi.mock('../lib/state', async () => {
-  // SAFETY: The test installs the typed mock implementation before this statement.
-  const actual = (await vi.importActual('../lib/state')) as MockedObject<typeof StateModule>;
+vi.mock(import('../lib/state'), async (importOriginal) => {
+  const actual = await importOriginal();
   return {
     ...actual,
-    state: {
-      ...actual.state,
-      editorContext: { ...actual.state.editorContext, activeFile: null },
-    },
-    setState,
     setProviderLimit,
     setError,
     setTheme,
@@ -292,37 +284,11 @@ describe('mount bridge helpers', () => {
     const ensureConnectionInitialized = vi.fn();
 
     handleExtensionMessageWithDependencies(
-      {
+      createMessageDependencies({
         setServerStatus,
         clearError,
         ensureConnectionInitialized,
-        getServerState: () => 'stopped',
-        invalidateConnection: vi.fn(),
-        clearProvidersState: vi.fn(),
-        setTheme: vi.fn(),
-        setConfig: vi.fn(),
-        getPreviousActiveFilePath: () => null,
-        getCurrentWorkspacePath: () => null,
-        setCurrentWorkspacePath: vi.fn(),
-        setEditorContext: vi.fn(),
-        rememberCurrentDocumentNavigation: vi.fn(),
-        syncWorkspaceState: vi.fn(),
-        resetWorkspaceForChange: vi.fn(),
-        reloadWorkspaceAfterChange: vi.fn(),
-        isInitialized: () => false,
-        setTerminalSelection: vi.fn(),
-        addContextFiles: vi.fn(),
-        removeContextFile: vi.fn(),
-        createSession: vi.fn(),
-        requestComposerFocus: vi.fn(),
-        requestOpenAttentionSessions: vi.fn(),
-        requestOpenCompletedSessions: vi.fn(),
-        abortSession: vi.fn(),
-        refreshMcps: vi.fn(),
-        refreshProviders: vi.fn(),
-        setWorkspaceStatusSummary: vi.fn(),
-        setWorkspaceStatuses: vi.fn(),
-      },
+      }),
       {
         type: 'server/status',
         payload: { state: 'running', url: 'http://127.0.0.1:4096' },
@@ -349,37 +315,14 @@ describe('mount bridge helpers', () => {
         serverState = payload.state;
       }
     );
-    const deps = {
+    const deps = createMessageDependencies({
       setServerStatus,
       clearError,
       ensureConnectionInitialized,
       getServerState: () => serverState,
       invalidateConnection,
       clearProvidersState,
-      setTheme: vi.fn(),
-      setConfig: vi.fn(),
-      getPreviousActiveFilePath: () => null,
-      getCurrentWorkspacePath: () => null,
-      setCurrentWorkspacePath: vi.fn(),
-      setEditorContext: vi.fn(),
-      rememberCurrentDocumentNavigation: vi.fn(),
-      syncWorkspaceState: vi.fn(),
-      resetWorkspaceForChange: vi.fn(),
-      reloadWorkspaceAfterChange: vi.fn(),
-      isInitialized: () => false,
-      setTerminalSelection: vi.fn(),
-      addContextFiles: vi.fn(),
-      removeContextFile: vi.fn(),
-      createSession: vi.fn(),
-      requestComposerFocus: vi.fn(),
-      requestOpenAttentionSessions: vi.fn(),
-      requestOpenCompletedSessions: vi.fn(),
-      abortSession: vi.fn(),
-      refreshMcps: vi.fn(),
-      refreshProviders: vi.fn(),
-      setWorkspaceStatusSummary: vi.fn(),
-      setWorkspaceStatuses: vi.fn(),
-    };
+    });
 
     handleExtensionMessageWithDependencies(deps, {
       type: 'server/status',
@@ -402,42 +345,15 @@ describe('mount bridge helpers', () => {
     const setServerReconnecting = vi.fn();
     let serverState: Extract<ExtensionMessage, { type: 'server/status' }>['payload']['state'] =
       'running';
-    const deps = {
+    const deps = createMessageDependencies({
       setServerStatus: (
         payload: Extract<ExtensionMessage, { type: 'server/status' }>['payload']
       ) => {
         serverState = payload.state;
       },
       setServerReconnecting,
-      clearError: vi.fn(),
-      ensureConnectionInitialized: vi.fn(),
       getServerState: () => serverState,
-      invalidateConnection: vi.fn(),
-      clearProvidersState: vi.fn(),
-      setTheme: vi.fn(),
-      setConfig: vi.fn(),
-      getPreviousActiveFilePath: () => null,
-      getCurrentWorkspacePath: () => null,
-      setCurrentWorkspacePath: vi.fn(),
-      setEditorContext: vi.fn(),
-      rememberCurrentDocumentNavigation: vi.fn(),
-      syncWorkspaceState: vi.fn(),
-      resetWorkspaceForChange: vi.fn(),
-      reloadWorkspaceAfterChange: vi.fn(),
-      isInitialized: () => false,
-      setTerminalSelection: vi.fn(),
-      addContextFiles: vi.fn(),
-      removeContextFile: vi.fn(),
-      createSession: vi.fn(),
-      requestComposerFocus: vi.fn(),
-      requestOpenAttentionSessions: vi.fn(),
-      requestOpenCompletedSessions: vi.fn(),
-      abortSession: vi.fn(),
-      refreshMcps: vi.fn(),
-      refreshProviders: vi.fn(),
-      setWorkspaceStatusSummary: vi.fn(),
-      setWorkspaceStatuses: vi.fn(),
-    };
+    });
 
     handleExtensionMessageWithDependencies(deps, {
       type: 'server/status',
@@ -498,15 +414,8 @@ describe('mount bridge helpers', () => {
     };
 
     handleExtensionMessageWithDependencies(
-      {
-        setServerStatus: vi.fn(),
-        clearError: vi.fn(),
-        ensureConnectionInitialized: vi.fn(),
+      createMessageDependencies({
         getServerState: () => 'running',
-        invalidateConnection: vi.fn(),
-        clearProvidersState: vi.fn(),
-        setTheme: vi.fn(),
-        setConfig: vi.fn(),
         getPreviousActiveFilePath: () => '/repo/src/old.ts',
         getCurrentWorkspacePath: () => '/repo',
         setCurrentWorkspacePath,
@@ -516,19 +425,7 @@ describe('mount bridge helpers', () => {
         resetWorkspaceForChange,
         reloadWorkspaceAfterChange,
         isInitialized: () => true,
-        setTerminalSelection: vi.fn(),
-        addContextFiles: vi.fn(),
-        removeContextFile: vi.fn(),
-        createSession: vi.fn(),
-        requestComposerFocus: vi.fn(),
-        requestOpenAttentionSessions: vi.fn(),
-        requestOpenCompletedSessions: vi.fn(),
-        abortSession: vi.fn(),
-        refreshMcps: vi.fn(),
-        refreshProviders: vi.fn(),
-        setWorkspaceStatusSummary: vi.fn(),
-        setWorkspaceStatuses: vi.fn(),
-      },
+      }),
       {
         type: 'context/update',
         payload,
@@ -559,37 +456,15 @@ describe('mount bridge helpers', () => {
     const reloadWorkspaceAfterChange = vi.fn();
 
     handleExtensionMessageWithDependencies(
-      {
-        setServerStatus: vi.fn(),
-        clearError: vi.fn(),
-        ensureConnectionInitialized: vi.fn(),
+      createMessageDependencies({
         getServerState: () => 'running',
-        invalidateConnection: vi.fn(),
-        clearProvidersState: vi.fn(),
-        setTheme: vi.fn(),
-        setConfig: vi.fn(),
-        getPreviousActiveFilePath: () => null,
         getCurrentWorkspacePath: () => 'C:\\Users\\Andrew\\Repo',
         setCurrentWorkspacePath,
-        setEditorContext: vi.fn(),
-        rememberCurrentDocumentNavigation: vi.fn(),
         syncWorkspaceState,
         resetWorkspaceForChange,
         reloadWorkspaceAfterChange,
         isInitialized: () => true,
-        setTerminalSelection: vi.fn(),
-        addContextFiles: vi.fn(),
-        removeContextFile: vi.fn(),
-        createSession: vi.fn(),
-        requestComposerFocus: vi.fn(),
-        requestOpenAttentionSessions: vi.fn(),
-        requestOpenCompletedSessions: vi.fn(),
-        abortSession: vi.fn(),
-        refreshMcps: vi.fn(),
-        refreshProviders: vi.fn(),
-        setWorkspaceStatusSummary: vi.fn(),
-        setWorkspaceStatuses: vi.fn(),
-      },
+      }),
       {
         type: 'context/update',
         payload: {
@@ -614,37 +489,13 @@ describe('mount bridge helpers', () => {
     const reloadWorkspaceAfterChange = vi.fn();
 
     handleExtensionMessageWithDependencies(
-      {
-        setServerStatus: vi.fn(),
-        clearError: vi.fn(),
-        ensureConnectionInitialized: vi.fn(),
+      createMessageDependencies({
         getServerState: () => 'running',
-        invalidateConnection: vi.fn(),
-        clearProvidersState: vi.fn(),
-        setTheme: vi.fn(),
-        setConfig: vi.fn(),
-        getPreviousActiveFilePath: () => null,
         getCurrentWorkspacePath: () => undefined,
-        setCurrentWorkspacePath: vi.fn(),
-        setEditorContext: vi.fn(),
-        rememberCurrentDocumentNavigation: vi.fn(),
         syncWorkspaceState,
         resetWorkspaceForChange,
         reloadWorkspaceAfterChange,
-        isInitialized: () => false,
-        setTerminalSelection: vi.fn(),
-        addContextFiles: vi.fn(),
-        removeContextFile: vi.fn(),
-        createSession: vi.fn(),
-        requestComposerFocus: vi.fn(),
-        requestOpenAttentionSessions: vi.fn(),
-        requestOpenCompletedSessions: vi.fn(),
-        abortSession: vi.fn(),
-        refreshMcps: vi.fn(),
-        refreshProviders: vi.fn(),
-        setWorkspaceStatusSummary: vi.fn(),
-        setWorkspaceStatuses: vi.fn(),
-      },
+      }),
       {
         type: 'context/update',
         payload: {
@@ -666,37 +517,12 @@ describe('mount bridge helpers', () => {
     const reloadWorkspaceAfterChange = vi.fn();
 
     handleExtensionMessageWithDependencies(
-      {
-        setServerStatus: vi.fn(),
-        clearError: vi.fn(),
-        ensureConnectionInitialized: vi.fn(),
+      createMessageDependencies({
         getServerState: () => 'running',
-        invalidateConnection: vi.fn(),
-        clearProvidersState: vi.fn(),
-        setTheme: vi.fn(),
-        setConfig: vi.fn(),
-        getPreviousActiveFilePath: () => null,
         getCurrentWorkspacePath: () => '/repo-old',
-        setCurrentWorkspacePath: vi.fn(),
-        setEditorContext: vi.fn(),
-        rememberCurrentDocumentNavigation: vi.fn(),
-        syncWorkspaceState: vi.fn(),
         resetWorkspaceForChange,
         reloadWorkspaceAfterChange,
-        isInitialized: () => false,
-        setTerminalSelection: vi.fn(),
-        addContextFiles: vi.fn(),
-        removeContextFile: vi.fn(),
-        createSession: vi.fn(),
-        requestComposerFocus: vi.fn(),
-        requestOpenAttentionSessions: vi.fn(),
-        requestOpenCompletedSessions: vi.fn(),
-        abortSession: vi.fn(),
-        refreshMcps: vi.fn(),
-        refreshProviders: vi.fn(),
-        setWorkspaceStatusSummary: vi.fn(),
-        setWorkspaceStatuses: vi.fn(),
-      },
+      }),
       {
         type: 'context/update',
         payload: {
@@ -728,25 +554,8 @@ describe('mount bridge helpers', () => {
     const openExternal = vi.fn();
     const addDroppedContextFiles = vi.fn();
     const removeDroppedContextFile = vi.fn();
-    const deps = {
-      setServerStatus: vi.fn(),
-      clearError: vi.fn(),
-      ensureConnectionInitialized: vi.fn(),
+    const deps = createMessageDependencies({
       getServerState: () => 'running' as const,
-      invalidateConnection: vi.fn(),
-      clearProvidersState: vi.fn(),
-      setTheme: vi.fn(),
-      setConfig: vi.fn(),
-      getPreviousActiveFilePath: () => null,
-      getCurrentWorkspacePath: () => null,
-      setCurrentWorkspacePath: vi.fn(),
-      setEditorContext: vi.fn(),
-      rememberCurrentDocumentNavigation: vi.fn(),
-      syncWorkspaceState: vi.fn(),
-      resetWorkspaceForChange: vi.fn(),
-      reloadWorkspaceAfterChange: vi.fn(),
-      isInitialized: () => false,
-      setTerminalSelection: vi.fn(),
       addContextFiles: addDroppedContextFiles,
       removeContextFile: removeDroppedContextFile,
       createSession,
@@ -762,9 +571,7 @@ describe('mount bridge helpers', () => {
       setProviderRefreshPending,
       revalidateProviderAuth,
       openExternal,
-      setWorkspaceStatusSummary: vi.fn(),
-      setWorkspaceStatuses: vi.fn(),
-    };
+    });
 
     const quotaUpdate: ExtensionMessage = {
       type: 'provider-limit/updated',
@@ -875,7 +682,47 @@ describe('mount bridge helpers', () => {
     expect(openExternal).toHaveBeenCalledWith('https://mcp.example.com/authorize');
   });
 
+  it('applies committed pins independently of an expired API response', () => {
+    const deps = createMessageDependencies();
+    handleExtensionMessageWithDependencies(deps, {
+      type: 'pinned-sessions/sync',
+      payload: { sessionIds: ['session-2', 'session-1'] },
+    });
+    flushSolid();
+    expect([...state.pinnedSessionIds]).toEqual(['session-2', 'session-1']);
+
+    handleExtensionMessageWithDependencies(deps, {
+      type: 'pinned-sessions/sync',
+      payload: { sessionIds: [] },
+    });
+    flushSolid();
+    expect([...state.pinnedSessionIds]).toEqual([]);
+    expect(deps.ensureConnectionInitialized).not.toHaveBeenCalled();
+    expect(deps.clearError).not.toHaveBeenCalled();
+  });
+
+  it('applies host todo marks, including marks cleared by a new prompt', () => {
+    const deps = createMessageDependencies();
+    handleExtensionMessageWithDependencies(deps, {
+      type: 'todo-sessions/sync',
+      payload: { sessionIds: ['session-1'] },
+    });
+    flushSolid();
+    expect([...state.todoSessionIds]).toEqual(['session-1']);
+
+    handleExtensionMessageWithDependencies(deps, {
+      type: 'todo-sessions/sync',
+      payload: { sessionIds: [] },
+    });
+    flushSolid();
+    expect([...state.todoSessionIds]).toEqual([]);
+  });
+
   it('binds extension message handling to shared webview state', () => {
+    setState((draft) => {
+      draft.remoteImages = 'off';
+    });
+    flushSolid();
     const ensureConnectionInitialized = vi.fn();
     const applyTheme = vi.fn();
     const operations = createMountBridgeOperations({
@@ -923,25 +770,26 @@ describe('mount bridge helpers', () => {
       },
     });
 
+    flushSolid();
     expect(setTheme).toHaveBeenCalledWith('light');
     expect(applyTheme).toHaveBeenCalledWith('light');
-    expect(setState).toHaveBeenCalledWith('serverStatus', {
+    expect(state.serverStatus).toEqual({
       state: 'running',
       url: 'http://127.0.0.1:4096',
     });
     expect(setError).not.toHaveBeenCalled();
     expect(ensureConnectionInitialized).toHaveBeenCalledTimes(1);
     expect(setDefaultPermissionModePreference).toHaveBeenCalledWith('full');
-    expect(setState).toHaveBeenCalledWith('remoteImages', 'ask');
+    expect(state.remoteImages).toBe('ask');
     expect(setShowFileDiffs).toHaveBeenCalledWith(true);
     expect(setExpandThinking).toHaveBeenCalledWith(true);
     expect(setShowChangedFiles).toHaveBeenCalledWith(true);
     expect(setShowTurnTimer).toHaveBeenCalledWith(true);
     expect(setShowEmptyStateHistogram).toHaveBeenCalledWith(true);
-    expect(setState).toHaveBeenCalledWith('followupsEnabled', false);
-    expect(setState).toHaveBeenCalledWith('debugShowQuotaWarning', true);
-    expect(setState).toHaveBeenCalledWith('autoAttachProblems', false);
-    expect(setState).toHaveBeenCalledWith('autoAttachActiveFile', false);
+    expect(state.followupsEnabled).toBe(false);
+    expect(state.debugShowQuotaWarning).toBe(true);
+    expect(state.autoAttachProblems).toBe(false);
+    expect(state.autoAttachActiveFile).toBe(false);
     expect(document.documentElement.style.getPropertyValue('--varro-chat-font-size')).toBe('16px');
     expect(document.documentElement.style.getPropertyValue('--varro-chat-editor-font-size')).toBe(
       '15px'
@@ -975,9 +823,12 @@ describe('mount bridge helpers', () => {
       },
     });
     expect(setShowEmptyStateHistogram).toHaveBeenLastCalledWith(false);
-    expect(setState).toHaveBeenCalledWith('followupsEnabled', true);
+    flushSolid();
+    expect(state.followupsEnabled).toBe(true);
     document.documentElement.style.removeProperty('--varro-chat-font-size');
+    flushSolid();
     document.documentElement.style.removeProperty('--varro-chat-editor-font-size');
+    flushSolid();
   });
 
   it('marks visible editor session trees seen as visibility changes', () => {
@@ -1034,37 +885,11 @@ describe('mount bridge helpers', () => {
       latest: undefined,
     });
 
-    const deps = {
-      setServerStatus: vi.fn(),
-      clearError: vi.fn(),
-      ensureConnectionInitialized: vi.fn(),
+    const deps = createMessageDependencies({
       getServerState: () => 'running' as const,
-      invalidateConnection: vi.fn(),
-      clearProvidersState: vi.fn(),
-      setTheme: vi.fn(),
-      setConfig: vi.fn(),
-      getPreviousActiveFilePath: () => null,
-      getCurrentWorkspacePath: () => null,
-      setCurrentWorkspacePath: vi.fn(),
-      setEditorContext: vi.fn(),
-      rememberCurrentDocumentNavigation: vi.fn(),
-      syncWorkspaceState: vi.fn(),
-      resetWorkspaceForChange: vi.fn(),
-      reloadWorkspaceAfterChange: vi.fn(),
-      isInitialized: () => false,
-      setTerminalSelection: vi.fn(),
-      addContextFiles: vi.fn(),
-      removeContextFile: vi.fn(),
-      createSession: vi.fn(),
-      requestComposerFocus: vi.fn(),
-      requestOpenAttentionSessions: vi.fn(),
-      requestOpenCompletedSessions: vi.fn(),
-      abortSession: vi.fn(),
-      refreshMcps: vi.fn(),
-      refreshProviders: vi.fn(),
       setWorkspaceStatusSummary,
       setWorkspaceStatuses,
-    };
+    });
 
     handleExtensionMessageWithDependencies(deps, {
       type: 'server/event',
@@ -1123,8 +948,11 @@ describe('mount bridge helpers', () => {
         value: 'visible',
       });
       document.dispatchEvent(new Event('visibilitychange'));
+      flushSolid();
       window.dispatchEvent(new Event('focus'));
+      flushSolid();
       window.dispatchEvent(new Event('blur'));
+      flushSolid();
 
       expect(setDocumentVisible).toHaveBeenCalledWith(true);
       expect(postFocusState).toHaveBeenCalledTimes(3);
@@ -1133,6 +961,7 @@ describe('mount bridge helpers', () => {
       expect(refreshProviders).toHaveBeenCalledTimes(2);
     } finally {
       dispose();
+      flushSolid();
       Object.defineProperty(document, 'visibilityState', {
         configurable: true,
         value: originalVisibility,
@@ -1163,10 +992,12 @@ describe('mount bridge helpers', () => {
         value: 'visible',
       });
       document.dispatchEvent(new Event('visibilitychange'));
+      flushSolid();
 
       expect(syncSessionMessages).toHaveBeenCalledWith('session-1');
     } finally {
       dispose();
+      flushSolid();
       Object.defineProperty(document, 'visibilityState', {
         configurable: true,
         value: originalVisibility,

@@ -134,6 +134,31 @@ webview per workspace may run automatic permission work. The extension host elec
 and publishes owner flags with a shared generation lease. A ready sidebar is preferred in its
 workspace; otherwise, the current ready owner or the next ready editor owns automation there.
 
+A session belongs to the workspace whose directory matches it exactly, or else to the open root
+whose session catalog authorizes it: nested folders under `descendants`, project worktrees under
+`project`, and conversations moved out of an open folder. Owner lookup, lease validation, pending
+snapshots, and host attention (notifications, badge, status bar) must all use that same catalog
+root. A path-containment check alone is not enough, because it misses worktrees outside the folder
+and ignores the configured history scope. An exact open root wins over a catalog root that also
+contains the session, as with nested roots. Moving one conversation must not revoke another moved
+conversation's verified transfer. A transfer is verified through the open folder it moved out of,
+never another open root; concurrent verifications share one canonical lookup, and a confirmed
+mismatch is not retried for a minute. After a full catalog invalidation or reload, an attention
+event for a visible retained link re-verifies it before routing, and the pending snapshot
+re-verifies every unverified visible link for its folder so a request asked before the reload is
+not stranded. Automatic re-verification goes only through a folder whose link is still visible.
+A verification that fails for an uncertain reason, including malformed data or a missing origin
+location, rejects the snapshot rather than letting the omission read as resolution; only a missing
+canonical session or a well-formed project or directory mismatch is a confirmed mismatch. A
+conversation linked from several open roots is verified through the first one still showing the
+link, so exactly one root owns it. A session whose directory is itself an open root belongs to that
+root even when a parent root's catalog also contains it. A catalog load or
+snapshot whose catalog generation changed while loading publishes no authorization. Overlapping
+catalogs resolve a session to the earlier open root, and live attention for a non-exact session
+goes only to views of its catalog root. An attention ask whose routing waited on verification is
+dropped if the host has already seen its reply. Changing the selected folder keeps host state for
+sessions whose catalog root is still open.
+
 - Only the elected owner for a workspace may run the model judge, answer full-mode requests, or
   automatically process that workspace's pending-permission snapshot. This also applies to direct
   `todowrite` and `question` replies in every mode.
@@ -147,6 +172,11 @@ workspace; otherwise, the current ready owner or the next ready editor owns auto
   actionable and notifies the current owner so it can reconcile the pending snapshot.
 - Losing ownership must not remove the visible fallback. A late automatic decision still needs a
   current lease before its reply can reach OpenCode.
+- An owner whose lease rotates without losing ownership reconciles its pending snapshot again, so
+  replies rejected under the old lease are retried with the new one.
+- A full-access reply that fails while the session stays in full access follows the bounded retry
+  described under full mode below. An automatic reply that fails after its hidden judge attempt
+  was superseded triggers a fresh snapshot instead of being dropped.
 - Interrupted-session recovery is claimed by one elected endpoint, not by every webview that loads.
 
 The lease check belongs in the extension host, not only in webview state. Multiple runtimes can be
@@ -225,10 +255,12 @@ An actionable survey replaces its question tool card. Linked requests render onl
 standalone requests also suppress pending or running question cards in their owning session, without
 duplicating the form inline. Completed question summaries and tools from other sessions stay visible.
 
-Full mode intentionally does not restore a prompt while the mode remains `full`. A failed full-mode
-reply currently surfaces an error and remains pending for a later permission sync to retry. Do not
-copy that exception into default or auto mode; changes to full mode should prefer adding bounded
-automatic retry rather than exposing a manual approval that contradicts full access.
+Full mode keeps a failed reply hidden while the mode remains `full`: it surfaces an error and
+retries through fresh pending snapshots after 1, 4, and 15 seconds; a failed snapshot read counts
+as an attempt. Only after the last retry fails does the request become a visible prompt, so a
+persistent failure never leaves a tool call waiting with nothing to act on. That fallback stays
+visible on later snapshots until a reply or an authoritative omission resolves it. Do not copy the
+hidden retry phase into default or auto mode.
 
 ## Manual Approval
 
@@ -305,6 +337,12 @@ ID and owning session against the server before changing rules.
 - In auto mode, a successful `Always` response rechecks other visible requests in the same
   conversation tree so requests that were already judged can use the new preference.
 - `Reject` denies the request.
+- `Reject with instructions` sends `reject` with trimmed, nonempty feedback in `message` for every
+  represented group member. The form replaces the action row like the standing-approval review;
+  Cancel sends no reply. V1 wraps the feedback in its own rejection error. V2 passes `message` to the
+  model verbatim, so the adapter prefixes V1's `The user rejected permission to use this specific
+  tool call with the following feedback:` wording to keep the tool classified as rejected after
+  reload. Automatic replies never carry feedback.
 
 The Permissions screen must preserve these scopes as independent layers. Project edits write only to
 the workspace config. Session edits patch only `Session.permission` and serialize with permission-mode
@@ -358,7 +396,22 @@ session ID, title, and metadata, so requests from different sessions are not gro
 
 ## Automatic Judging
 
-Auto mode applies local rules first, then opted-in decision providers, then the chat-model judge.
+Auto mode applies configured V2 shell rules first, then local rules, opted-in decision providers,
+and the chat-model judge.
+
+On V2, configured native shell rules are checked before local rules. Every concrete resource in
+the request must resolve to an explicit configured `allow` to bypass the judge; the request's save
+suggestions and command display metadata cannot supply that evidence. Last-match ordering preserves
+later `ask` exceptions to configured allowances and configured `deny` rules, which return manual review
+or rejection respectively. An unconfigured resource or an ordinary ask-by-default policy continues
+through normal Auto review. Configuration reads use the permission-owning workspace,
+have a bounded timeout, and are not verdict-cached. Failed reads reveal the request.
+JSONC comments are preserved as documentation, not interpreted as permission instructions.
+
+Native project and global standing approvals skip exact or provably narrower patterns already allowed
+in the target file, including covered parts of compound requests. A later potentially overlapping ask
+or deny prevents deduplication. Existing entries, ordering, and comments remain intact; a fully redundant
+save does not rewrite the file. Uncertain wildcard containment is kept rather than silently skipped.
 
 ### Local Rules
 
@@ -546,7 +599,16 @@ mutation guards. Preserve these rules:
 
 The extension filters pending snapshots to the current workspace and removes hidden or recycled
 sessions before reconciling host attention. It must first collect each snapshot from every OpenCode
-directory instance that can own a visible session. If any required directory or session catalog fails,
+directory instance that can own a visible session, including verified transfer destinations, and
+keep requests from every catalog-authorized session. The webview treats an omission as
+resolution, so a snapshot that drops a session whose live events are routed makes its prompt
+flash and disappear while the tool call hangs. Host reconciliation removes an omitted request for
+a catalog session only when that snapshot queried the session's current directory.
+
+Initial webview state and boot replay use the same catalog-aware visibility. Boot replay may
+synthesize a reply only for requests that this view's HTML actually embedded; a pending request
+that was filtered out of the HTML is not resolved, and a synthetic `question.replied` would
+tombstone it. If any required directory or session catalog fails,
 reject the snapshot rather than using partial omissions as proof that a request resolved. Keep
 permission and question reconciliation independent.
 

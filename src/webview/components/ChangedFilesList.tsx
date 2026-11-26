@@ -1,5 +1,7 @@
+import { ariaBoolean } from '../lib/aria';
 import { For, Show, createMemo, createSignal } from 'solid-js';
 import { isActiveSessionWorking, showChangedFiles, state } from '../lib/state';
+import { createRecordSnapshots } from '../lib/record-snapshots';
 import { postMessage } from '../lib/bridge';
 import {
   getDiffFileChanges,
@@ -34,9 +36,12 @@ export function ChangedFilesList() {
   let cachedSessionId: string | null = null;
   let cachedChanges: FileChange[] = [];
   let cachedSummaryStats: ReturnType<typeof getDiffSummaryStats> = null;
+  const messageSnapshots = createRecordSnapshots(() => state.messages);
   const activeMessages = createMemo(() => {
     const sessionId = state.activeSessionId;
-    return sessionId ? state.messages.filter((entry) => entry.info.sessionID === sessionId) : [];
+    return sessionId
+      ? messageSnapshots().filter((entry) => entry.info.sessionID === sessionId)
+      : [];
   });
 
   const resetCacheForSession = (sessionId: string | null) => {
@@ -184,7 +189,7 @@ export function ChangedFilesList() {
           type="button"
           class="todo-block-header"
           onClick={() => setCollapsed(!collapsed())}
-          aria-expanded={!collapsed()}
+          aria-expanded={ariaBoolean(!collapsed())}
         >
           <UiIcon
             source={navArrowDownIcon}

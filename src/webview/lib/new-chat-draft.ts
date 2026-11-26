@@ -1,15 +1,17 @@
-import { batch, createSignal } from 'solid-js';
+import { storePath } from '@solidjs/signals';
+import { createSignal } from 'solid-js';
 import { getDefaultPrimaryAgentName } from '../hooks/routing-state';
 import {
   clearMessages,
+  currentDraftKey,
+  finishNewChatDraft,
   getPersistedSelectedAgent,
-  inputText,
+  readLatestDraftText,
   isSessionAwaitingInput,
   persistActiveSessionId,
   requestComposerFocus,
   restoreSelectedModelForComposer,
   setError,
-  setInputText,
   setPersistentShowSessionPicker,
   setSelectedAgent,
   setShowModelPicker,
@@ -46,10 +48,8 @@ export function detachDiscardableActiveBlankSession(): string | false {
   if (!sessionId) return false;
 
   newChatDraftGeneration += 1;
-  batch(() => {
-    setState('activeSessionId', null);
-    persistActiveSessionId(null);
-  });
+  setState(storePath('activeSessionId', null));
+  persistActiveSessionId(null);
   return sessionId;
 }
 
@@ -63,34 +63,34 @@ export function startNewChatDraft() {
   const draftGeneration = newChatDraftGeneration;
   const blankSessionId = getDiscardableActiveBlankSessionId();
   const deferTranscriptClear = !blankSessionId && state.messages.length > 0;
-  const craftedText = inputText();
-  batch(() => {
-    setNewChatDraftKey(draftGeneration);
-    resetMessageEditState();
-    setInputText(craftedText);
-    resetToolCallExpansionState();
-    // Detach first so a live virtualized transcript can unmount before its
-    // backing entries disappear. Clearing both in one reactive flush can leave
-    // rows and streaming effects reading entries that were just removed.
-    if (!deferTranscriptClear) clearMessages();
-    setState('messagesLoading', false);
-    setState('pendingSessionSelectionId', null);
-    if (!blankSessionId) {
-      setState('activeSessionId', null);
-      persistActiveSessionId(null);
-    }
-    setError(null);
-    setShowModels(false);
-    setShowModelPicker(false);
-    stopLoading();
-    setPersistentShowSessionPicker(false);
-    restoreSelectedModelForComposer(null);
-    setSelectedAgent(getDefaultPrimaryAgentName(state.agents, getPersistedSelectedAgent()), {
-      sessionId: blankSessionId || null,
-      persistGlobal: false,
-    });
-    requestComposerFocus();
+  const craftedText = readLatestDraftText();
+  const sourceKey = currentDraftKey();
+  setNewChatDraftKey(draftGeneration);
+  resetMessageEditState();
+  resetToolCallExpansionState();
+  // Detach first so a live virtualized transcript can unmount before its
+  // backing entries disappear. Clearing both in one reactive flush can leave
+  // rows and streaming effects reading entries that were just removed.
+  if (!deferTranscriptClear) clearMessages();
+  setState(storePath('messagesLoading', false));
+  setState(storePath('pendingSessionSelectionId', null));
+  if (!blankSessionId) {
+    setState(storePath('activeSessionId', null));
+    persistActiveSessionId(null);
+  }
+  setError(null);
+  setShowModels(false);
+  setShowModelPicker(false);
+  stopLoading();
+  setPersistentShowSessionPicker(false);
+  finishNewChatDraft(sourceKey, craftedText);
+  setSelectedAgent(getDefaultPrimaryAgentName(state.agents, getPersistedSelectedAgent()), {
+    sessionId: blankSessionId || null,
+    persistGlobal: false,
   });
+  // The new chat model follows the default agent, as in OpenCode.
+  restoreSelectedModelForComposer(null);
+  requestComposerFocus();
 
   if (deferTranscriptClear) {
     requestAnimationFrame(() => {

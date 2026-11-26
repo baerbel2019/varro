@@ -48,7 +48,7 @@ const mocks = vi.hoisted(() => ({
         dispose: vi.fn(),
       })),
       createWebviewPanel: vi.fn(),
-      onDidChangeWindowState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeWindowState: vi.fn((_listener: () => void) => ({ dispose: vi.fn() })),
       onDidChangeActiveColorTheme: vi.fn(() => ({ dispose: vi.fn() })),
       activeColorTheme: { kind: 2 },
       showOpenDialog: vi.fn(() => Promise.resolve(undefined)),
@@ -198,6 +198,19 @@ export function createWorkspaceState() {
   };
 }
 
+export function createStoredWorkspaceState(storage: Map<string, unknown>) {
+  return {
+    get: vi.fn((key: string, fallback?: unknown) =>
+      storage.has(key) ? storage.get(key) : fallback
+    ),
+    update: vi.fn((key: string, value: unknown) => {
+      if (value === undefined) storage.delete(key);
+      else storage.set(key, value);
+      return Promise.resolve();
+    }),
+  };
+}
+
 export function createContextProvider() {
   const context: EditorContext = {
     workspacePath: '/repo',
@@ -289,6 +302,7 @@ export async function createSidebarProviderInstance(
     extensionUri?: { fsPath: string };
     workspaceState?: ReturnType<typeof createWorkspaceState>;
     globalState?: ReturnType<typeof createWorkspaceState>;
+    globalStorageUri?: { fsPath: string; scheme: string; authority: string };
     contextProvider?: ReturnType<typeof createContextProvider>;
     providerSignatureFileSystem?: typeof mocks.providerSignatureFileSystem;
     server?: ReturnType<typeof createServer>;
@@ -307,7 +321,9 @@ export async function createSidebarProviderInstance(
     server as never,
     'koltyakov.varro',
     false,
-    options.providerSignatureFileSystem ?? mocks.providerSignatureFileSystem
+    options.providerSignatureFileSystem ?? mocks.providerSignatureFileSystem,
+    undefined,
+    options.globalStorageUri as never
   );
 
   return { SidebarProvider, provider, workspaceState, globalState, contextProvider, server };

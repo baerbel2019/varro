@@ -1,5 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
-import { render } from 'solid-js/web';
+import { flush as flushSolid, OBSERVE, untrack } from 'solid-js';
+import { storePath } from '@solidjs/signals';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
+import { render } from '@solidjs/web';
 import {
   replaceMessages,
   removeMessage,
@@ -46,6 +48,13 @@ import {
   textPart,
   toolPart,
   userMessage,
+  flushFrame,
+  installTrackedResizeObservers,
+  mockElementRects,
+  assistantRows,
+  conversationTurns,
+  defineLayoutMetrics,
+  backScrollTop,
 } from './MessageList.test-utils';
 import { fixture } from '../test-fixtures';
 import { buildStopProcessPrompt } from '../lib/background-process-action';
@@ -63,6 +72,14 @@ installMessageListTestEnvironment({
     cleanup = nextCleanup;
   },
 });
+
+/** Mounts MessageList into the test container and returns its scroll container. */
+function mountList(): HTMLDivElement {
+  cleanup = render(() => MessageList(), container!);
+  flushSolid();
+  // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
+  return container?.querySelector('.interactive-list') as HTMLDivElement;
+}
 
 describe('inline preview virtualization signatures', () => {
   const compactFileEdit: Part = {
@@ -635,23 +652,31 @@ describe('removed virtual rows', () => {
   it('retains a mounted streaming entry until Solid disposes its removed row', async () => {
     const messageId = 'assistant-streaming';
     const part = { ...textPart('text-streaming', 'Initial response'), messageID: messageId };
-    setState('activeSessionId', 'session-1');
-    setState('sessionStatus', { 'session-1': { type: 'busy' } });
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
+    setState(storePath('sessionStatus', { 'session-1': { type: 'busy' } }));
+    flushSolid();
     replaceMessages([
       {
         info: assistantMessage(messageId, { time: { created: 1 } }),
         parts: [part],
       },
     ]);
-    setState('streamingPartId', part.id);
-    setState('streamingText', 'Streaming response');
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    setState(storePath('streamingPartId', part.id));
+    flushSolid();
+    setState(storePath('streamingText', 'Streaming response'));
+    flushSolid();
+    mountList();
     await Promise.resolve();
+    flushSolid();
 
     expect(container?.querySelector(`[data-msg-id="${messageId}"]`)).not.toBeNull();
 
     removeMessage('session-1', messageId);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     expect(state.streamingPartId).toBeNull();
     expect(container?.querySelector(`[data-msg-id="${messageId}"]`)).toBeNull();
@@ -660,29 +685,33 @@ describe('removed virtual rows', () => {
 
 describe('virtualized editing', () => {
   it('pins a distant edited row with full content in a bounded range', async () => {
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 400);
-      if (this.dataset.msgId) return new DOMRect(0, 0, 500, 100);
+    mockElementRects((element) => {
+      if (element.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 400);
+      if (element.dataset.msgId) return new DOMRect(0, 0, 500, 100);
       return new DOMRect(0, 0, 500, 0);
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages(
       Array.from({ length: 60 }, (_, index) => ({
         info: userMessage(`user-${index}`),
         parts: [textPart(`text-${index}`, `Prompt ${index}`)],
       }))
     );
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
     expect(container?.querySelector('[data-msg-id="user-0"]')).toBeNull();
 
     startEditingMessage('user-0', 'session-1', 'Prompt 0');
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     const editedRow = container?.querySelector<HTMLElement>('[data-msg-id="user-0"]');
     expect(editedRow).not.toBeNull();
@@ -696,6 +725,7 @@ describe('virtualized editing', () => {
     'releases a forced zero-height diff row when its %s request settles',
     async (outcome) => {
       const animationFrames = installQueuedAnimationFrameMocks();
+      flushSolid();
       let resolveDiff!: (value: Awaited<ReturnType<typeof client.session.diff>>) => void;
       let rejectDiff!: (reason: Error) => void;
       const pendingDiff = new Promise<Awaited<ReturnType<typeof client.session.diff>>>(
@@ -705,30 +735,35 @@ describe('virtualized editing', () => {
         }
       );
       vi.spyOn(client.session, 'diff').mockReturnValue(pendingDiff);
-      vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-        this: HTMLElement
-      ) {
-        if (this.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 400);
-        if (this.classList.contains('interactive-list-track')) {
-          const targetHasContent = state.messages
-            .find((message) => message.info.id === 'message-30')
-            ?.parts.some((part) => part.type === 'text' && part.text.trim());
+      mockElementRects((element) => {
+        if (element.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 400);
+        if (element.classList.contains('interactive-list-track')) {
+          // Fake geometry reads the store like a measurement: untracked.
+          const targetHasContent = untrack(() =>
+            state.messages
+              .find((message) => message.info.id === 'message-30')
+              ?.parts.some((part) => part.type === 'text' && part.text.trim())
+          );
           return new DOMRect(0, 0, 500, targetHasContent ? 6000 : 5900);
         }
-        if (this.dataset.msgId) {
-          const targetHasContent = state.messages
-            .find((message) => message.info.id === 'message-30')
-            ?.parts.some((part) => part.type === 'text' && part.text.trim());
+        if (element.dataset.msgId) {
+          // Fake geometry reads the store like a measurement: untracked.
+          const targetHasContent = untrack(() =>
+            state.messages
+              .find((message) => message.info.id === 'message-30')
+              ?.parts.some((part) => part.type === 'text' && part.text.trim())
+          );
           return new DOMRect(
             0,
             0,
             500,
-            this.dataset.msgId === 'message-30' && !targetHasContent ? 0 : 100
+            element.dataset.msgId === 'message-30' && !targetHasContent ? 0 : 100
           );
         }
         return new DOMRect(0, 0, 500, 0);
       });
-      setState('activeSessionId', 'session-1');
+      setState(storePath('activeSessionId', 'session-1'));
+      flushSolid();
       replaceMessages(
         Array.from({ length: 60 }, (_, index) => {
           const messageId = `message-${index}`;
@@ -747,32 +782,39 @@ describe('virtualized editing', () => {
           };
         })
       );
-      cleanup = render(() => MessageList(), container!);
+      flushSolid();
+      mountList();
       const list = container!.querySelector<HTMLElement>('.interactive-list')!;
-      Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
-      Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 5900 });
+      defineLayoutMetrics(list, { clientHeight: 400, scrollHeight: 5900 });
       await measureTranscriptRows(list, animationFrames);
+      flushSolid();
       // Keep the viewport at the head so editing the tail creates the pinned placeholder gap.
       list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
+      flushSolid();
       list.scrollTop = 0;
       list.dispatchEvent(new Event('scroll'));
+      flushSolid();
       for (let frame = 0; frame < 4; frame += 1) {
         await Promise.resolve();
-        animationFrames.flush();
+        flushFrame(animationFrames);
       }
 
       // Measurement returns to the tail. Detach at the head so editing the last row
       // creates an inert pinned gap containing the zero-height assistant under test.
       list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -5900 }));
+      flushSolid();
       list.scrollTop = 0;
       list.dispatchEvent(new Event('scroll'));
+      flushSolid();
       await Promise.resolve();
-      animationFrames.flush();
+      flushFrame(animationFrames);
       expect(container?.querySelector('[data-msg-id="message-0"]')).not.toBeNull();
       expect(container?.querySelector('[data-msg-id="message-59"]')).toBeNull();
       expect(container?.querySelector('[data-msg-id="message-30"]')).toBeNull();
       startEditingMessage('message-59', 'session-1', 'Prompt 59');
+      flushSolid();
       await Promise.resolve();
+      flushSolid();
       expect(container?.querySelector('[data-msg-id="message-59"]')).not.toBeNull();
       expect(container?.querySelector('.virtual-pinned-gap')).not.toBeNull();
       expect(container?.querySelector('[data-msg-id="message-30"]')).toBeNull();
@@ -790,8 +832,11 @@ describe('virtualized editing', () => {
             : message
         )
       );
+      flushSolid();
       await Promise.resolve();
+      flushSolid();
       await Promise.resolve();
+      flushSolid();
 
       expect(client.session.diff).toHaveBeenCalledWith('session-1', 'message-30', {
         directory: undefined,
@@ -801,9 +846,10 @@ describe('virtualized editing', () => {
 
       if (outcome === 'empty') resolveDiff([]);
       else rejectDiff(new Error('Diff unavailable'));
+      flushSolid();
       for (let frame = 0; frame < 4; frame += 1) {
         await Promise.resolve();
-        animationFrames.flush();
+        flushFrame(animationFrames);
       }
 
       expect(container?.querySelector('[data-msg-id="message-30"]')).toBeNull();
@@ -826,13 +872,15 @@ describe('virtualized editing', () => {
         }
       });
       mutationObserver.observe(track, { childList: true, subtree: true });
+      flushSolid();
       upsertPart({
         ...textPart('text-30', 'Content appeared after the diff request settled'),
         messageID: 'message-30',
       });
+      flushSolid();
       for (let frame = 0; frame < 4; frame += 1) {
         await Promise.resolve();
-        animationFrames.flush();
+        flushFrame(animationFrames);
       }
 
       expect(container?.querySelector('[data-msg-id="message-59"]')).not.toBeNull();
@@ -840,26 +888,27 @@ describe('virtualized editing', () => {
       expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
       mutationObserver.disconnect();
       animationFrames.restore();
+      flushSolid();
     }
   );
 
   it('keeps an older zero-height assistant unmounted when a newer assistant owns diff eligibility', async () => {
     const animationFrames = installQueuedAnimationFrameMocks();
+    flushSolid();
     const pendingDiff = new Promise<Awaited<ReturnType<typeof client.session.diff>>>(() => {});
     const diffSpy = vi.spyOn(client.session, 'diff').mockReturnValue(pendingDiff);
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 400);
-      if (this.classList.contains('interactive-list-track')) {
+    mockElementRects((element) => {
+      if (element.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 400);
+      if (element.classList.contains('interactive-list-track')) {
         return new DOMRect(0, 0, 500, 5900);
       }
-      if (this.dataset.msgId) {
-        return new DOMRect(0, 0, 500, this.dataset.msgId === 'message-30' ? 0 : 100);
+      if (element.dataset.msgId) {
+        return new DOMRect(0, 0, 500, element.dataset.msgId === 'message-30' ? 0 : 100);
       }
       return new DOMRect(0, 0, 500, 0);
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages(
       Array.from({ length: 60 }, (_, index) => {
         const messageId = `message-${index}`;
@@ -884,17 +933,20 @@ describe('virtualized editing', () => {
         };
       })
     );
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     for (let frame = 0; frame < 4; frame += 1) {
       await Promise.resolve();
-      animationFrames.flush();
+      flushFrame(animationFrames);
     }
 
     expect(diffSpy).toHaveBeenCalledTimes(1);
     expect(diffSpy).toHaveBeenCalledWith('session-1', 'message-58', { directory: undefined });
     expect(container?.querySelector('[data-msg-id="message-30"]')).toBeNull();
     startEditingMessage('message-59', 'session-1', 'Prompt 59');
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(container?.querySelector('[data-msg-id="message-59"]')).not.toBeNull();
 
     let olderAssistantMounted = false;
@@ -915,15 +967,17 @@ describe('virtualized editing', () => {
       childList: true,
       subtree: true,
     });
+    flushSolid();
     upsertMessageInfo(
       assistantMessage('message-30', {
         mode: 'subagent',
         time: { created: 1, completed: 2 },
       })
     );
+    flushSolid();
     for (let frame = 0; frame < 4; frame += 1) {
       await Promise.resolve();
-      animationFrames.flush();
+      flushFrame(animationFrames);
     }
 
     expect(diffSpy).toHaveBeenCalledTimes(1);
@@ -932,16 +986,16 @@ describe('virtualized editing', () => {
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
     mutationObserver.disconnect();
     animationFrames.restore();
+    flushSolid();
   });
 });
 
 describe('retained row estimates', () => {
   it('keeps cold, reopened, appended, and explicitly reset windows bounded', async () => {
     const frames = installQueuedAnimationFrameMocks();
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      return new DOMRect(0, 0, 500, this.hasAttribute('data-msg-id') ? 100 : 400);
+    flushSolid();
+    mockElementRects((element) => {
+      return new DOMRect(0, 0, 500, element.hasAttribute('data-msg-id') ? 100 : 400);
     });
     const messages = Array.from({ length: 60 }, (_, index) => {
       const id = `retained-${index}`;
@@ -950,27 +1004,33 @@ describe('retained row estimates', () => {
         parts: [{ ...textPart(`text-${index}`, `Response ${index}`), messageID: id }],
       };
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages(messages);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     for (let frame = 0; frame < 4; frame += 1) {
       await Promise.resolve();
-      frames.flush();
+      flushFrame(frames);
     }
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
-    cleanup();
-    cleanup = render(() => MessageList(), container!);
+    cleanup!();
+    flushSolid();
+    mountList();
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
     replaceMessages([
       ...messages,
       { info: assistantMessage('appended'), parts: [textPart('appended-text', 'New response')] },
     ]);
+    flushSolid();
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
-    cleanup();
+    cleanup!();
+    flushSolid();
     resetSessionMessageWindowForRefetch('session-1');
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(30);
     // Reset discards retained measurements, so the unseen prefix uses cold 160px estimates.
@@ -980,12 +1040,31 @@ describe('retained row estimates', () => {
       `${firstIndex * 160}px`
     );
     await Promise.resolve();
-    frames.flush();
+    flushFrame(frames);
     frames.restore();
+    flushSolid();
   });
 });
 
 describe('MessageList history pagination', () => {
+  /** Mounts `current-user` after a failed history load from `cursor`, then clicks Retry. */
+  function retryFailedHistoryLoad(cursor: string): void {
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
+    setSessionHistoryCursor('session-1', cursor);
+    flushSolid();
+    markSessionHistoryLoadFailed('session-1', true);
+    flushSolid();
+    replaceMessages([
+      { info: userMessage('current-user'), parts: [textPart('current-text', 'Current prompt')] },
+    ]);
+    flushSolid();
+
+    mountList();
+    container?.querySelector<HTMLButtonElement>('.message-history-banner-retry')?.click();
+    flushSolid();
+  }
+
   async function mountDeferredHistory(
     initialMessages: MessageEntry[] = [
       {
@@ -1013,51 +1092,47 @@ describe('MessageList history pagination', () => {
     });
     const messagesSpy = vi.spyOn(client.session, 'messages').mockReturnValue(pendingPage);
     let list: HTMLDivElement | null = null;
-    let scrollTopValue = 0;
+    const scrollTop = { value: 0 };
 
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this === list || this.classList.contains('interactive-list')) {
+    mockElementRects((element) => {
+      if (element === list || element.classList.contains('interactive-list')) {
         return new DOMRect(0, 0, 500, 400);
       }
-      if (this.classList.contains('interactive-list-track')) {
-        return new DOMRect(0, 0, 500, state.messages.length * 100);
+      if (element.classList.contains('interactive-list-track')) {
+        return new DOMRect(0, 0, 500, untrack(() => state.messages.length) * 100);
       }
-      if (this.dataset.assistantRenderKey) {
-        const messageId = this.closest<HTMLElement>('[data-msg-id]')?.dataset.msgId;
+      if (element.dataset.assistantRenderKey) {
+        const messageId = element.closest<HTMLElement>('[data-msg-id]')?.dataset.msgId;
         const index = state.messages.findIndex((message) => message.info.id === messageId);
         const documentTop = index * 100 + getMessageLayoutOffset(messageId || '');
-        return new DOMRect(0, documentTop + 6 - scrollTopValue, 500, 40);
+        return new DOMRect(0, documentTop + 6 - scrollTop.value, 500, 40);
       }
-      if (this.dataset.msgId) {
-        const index = state.messages.findIndex((message) => message.info.id === this.dataset.msgId);
-        const documentTop = index * 100 + getMessageLayoutOffset(this.dataset.msgId);
-        return new DOMRect(0, documentTop - scrollTopValue, 500, 100);
+      if (element.dataset.msgId) {
+        const index = state.messages.findIndex(
+          (message) => message.info.id === element.dataset.msgId
+        );
+        const documentTop = index * 100 + getMessageLayoutOffset(element.dataset.msgId);
+        return new DOMRect(0, documentTop - scrollTop.value, 500, 100);
       }
       return new DOMRect(0, 0, 500, 40);
     });
 
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
     setSessionHistoryCursor('session-1', 'cursor-1');
     replaceMessages(initialMessages);
+    flushSolid();
     cleanup = render(() => MessageList(), container!);
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
-    Object.defineProperty(list, 'clientWidth', { configurable: true, value: 500 });
-    Object.defineProperty(list, 'offsetWidth', { configurable: true, value: 500 });
-    Object.defineProperty(list, 'scrollHeight', {
-      configurable: true,
-      get: () => 1200 + Math.max(0, state.messages.length - initialMessages.length) * 100,
-    });
-    Object.defineProperty(list, 'scrollTop', {
-      configurable: true,
-      get: () => scrollTopValue,
-      set: (value: number) => {
-        scrollTopValue = value;
-      },
-    });
+    defineLayoutMetrics(
+      list,
+      { clientHeight: 400, clientWidth: 500, offsetWidth: 500 },
+      {
+        scrollHeight: () =>
+          1200 + Math.max(0, state.messages.length - initialMessages.length) * 100,
+      }
+    );
+    backScrollTop(list, scrollTop);
 
     await Promise.resolve();
     await Promise.resolve();
@@ -1067,14 +1142,15 @@ describe('MessageList history pagination', () => {
     return {
       animationFrames,
       list,
-      getScrollTop: () => scrollTopValue,
+      getScrollTop: () => scrollTop.value,
       setScrollTop: (value: number) => {
-        scrollTopValue = value;
+        scrollTop.value = value;
       },
       async startLoad(top: number) {
         list!.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
-        scrollTopValue = top;
+        scrollTop.value = top;
         list!.dispatchEvent(new Event('scroll'));
+        flushSolid();
         await vi.waitFor(() => {
           expect(messagesSpy).toHaveBeenCalledWith('session-1', {
             limit: 200,
@@ -1105,16 +1181,25 @@ describe('MessageList history pagination', () => {
 
   it('keeps a pending history anchor after an upward wheel cannot move past the top boundary', async () => {
     const harness = await mountDeferredHistory();
+    flushSolid();
     await harness.startLoad(0);
+    flushSolid();
 
     harness.list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -120 }));
+    flushSolid();
     await harness.resolveLoad();
+    flushSolid();
 
     expect(harness.getScrollTop()).toBe(200);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('bounds measurement work when history arrives after input becomes idle', async () => {
+    const diagnostics = OBSERVE!.diagnostics.capture();
+    onTestFinished(() => {
+      diagnostics.stop();
+    });
     const buildMessages = (prefix: string, messageCount: number) =>
       Array.from({ length: messageCount }, (_, index) => {
         const messageId = `${prefix}-${index}`;
@@ -1128,83 +1213,197 @@ describe('MessageList history pagination', () => {
       ReturnType<typeof client.session.messages>
     >;
     const harness = await mountDeferredHistory(buildMessages('current', 200), undefined, olderPage);
+    flushSolid();
     await harness.startLoad(0);
+    flushSolid();
     // Slow page responses must still have one history owner, not a generic anchor per mounted row.
     await vi.advanceTimersByTimeAsync(1000);
+    flushSolid();
     const rectSpy = vi.mocked(HTMLElement.prototype.getBoundingClientRect);
     rectSpy.mockClear();
     await harness.resolveLoad();
+    flushSolid();
 
     expect(rectSpy.mock.calls.length).toBeLessThan(500);
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(80);
+    expect(diagnostics.events.filter((event) => event.code === 'HUGE_FAN_IN')).toEqual([]);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
-  it('bounds geometry reads during a native scroll remount before saving its destination', async () => {
-    const messages = Array.from({ length: 200 }, (_, index) => {
-      const messageId = `current-${index}`;
-      return {
-        info: index % 2 === 0 ? userMessage(messageId) : assistantMessage(messageId),
-        parts: [{ ...textPart(`${messageId}-text`, 'History row'), messageID: messageId }],
-      };
-    });
-    let growth = 0;
-    const harness = await mountDeferredHistory(messages, (messageId) => {
-      const index = Number(messageId.slice('current-'.length));
-      return Math.max(0, Math.min(10, index - 90)) * growth;
-    });
-    Object.defineProperty(harness.list, 'scrollHeight', { configurable: true, value: 20_000 });
-    await measureTranscriptRows(harness.list, harness.animationFrames);
-    for (let frame = 0; frame < 4; frame += 1) {
-      await Promise.resolve();
-      harness.animationFrames.flush();
-    }
-    expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
-    expect(container?.querySelector('[data-msg-id="current-100"]')).toBeNull();
-    harness.list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -10_000 }));
-    harness.setScrollTop(10_000);
-    const rectSpy = vi.mocked(HTMLElement.prototype.getBoundingClientRect);
-    const originalRect = rectSpy.getMockImplementation()!;
-    const mutations = new MutationObserver(() => {});
-    mutations.observe(harness.list, { childList: true, subtree: true, attributes: true });
-    const measuredRows = new Set<string>();
-    let interleavedWrites = 0;
-    rectSpy.mockImplementation(function (this: HTMLElement) {
-      if (this.dataset.msgId && !measuredRows.has(this.dataset.msgId)) {
-        const writes = mutations.takeRecords();
-        if (measuredRows.size && writes.length) interleavedWrites += 1;
-        measuredRows.add(this.dataset.msgId);
+  it.each([false, true])(
+    'batches a held-scrollbar cold prepend without moving its viewport, with immediate release %s',
+    async (releaseDuringMeasurement) => {
+      const buildMessages = (prefix: string, count: number) =>
+        Array.from({ length: count }, (_, index) => {
+          const messageId = `${prefix}-${index}`;
+          return {
+            info: index % 2 === 0 ? userMessage(messageId) : assistantMessage(messageId),
+            parts: [{ ...textPart(`${messageId}-text`, 'History row'), messageID: messageId }],
+          };
+        });
+      // SAFETY: Pagination consumes the same complete SDK records as this controlled fixture.
+      const olderPage = buildMessages('older', 29) as Awaited<
+        ReturnType<typeof client.session.messages>
+      >;
+      const harness = await mountDeferredHistory(
+        buildMessages('current', 202),
+        undefined,
+        olderPage
+      );
+      flushSolid();
+      await harness.startLoad(0);
+      harness.list.dispatchEvent(
+        new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 495 })
+      );
+      flushSolid();
+      const writes: number[] = [];
+      Object.defineProperty(harness.list, 'scrollTop', {
+        configurable: true,
+        get: harness.getScrollTop,
+        set(value: number) {
+          writes.push(value);
+          harness.setScrollTop(value);
+        },
+      });
+      const rects = vi.mocked(HTMLElement.prototype.getBoundingClientRect);
+      const originalRect = rects.getMockImplementation()!;
+      let released = false;
+      rects.mockImplementation(function (this: HTMLElement) {
+        if (releaseDuringMeasurement && !released && this.dataset.msgId?.startsWith('older-')) {
+          released = true;
+          document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+        }
+        return originalRect.call(this);
+      });
+      rects.mockClear();
+      try {
+        await harness.resolveLoad();
+        flushSolid();
+        // A fixed-input work budget, not a host-dependent elapsed-time assertion.
+        // Singleton mount measurements used 139 reads for this bounded 29-row prepend.
+        if (!releaseDuringMeasurement) expect(rects.mock.calls.length).toBeLessThan(135);
+        else expect(released).toBe(true);
+        expect(harness.getScrollTop()).toBe(0);
+        expect(writes).toEqual([]);
+        expect(harness.list.querySelectorAll('[data-msg-id]').length).toBeLessThan(40);
+        expect(harness.list.querySelector('[data-msg-id="older-0"]')).not.toBeNull();
+        document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+        for (let frame = 0; frame < 6; frame += 1) {
+          await Promise.resolve();
+          harness.animationFrames.flush();
+          flushSolid();
+        }
+        expect(harness.getScrollTop()).toBe(0);
+        expect(writes).toEqual([]);
+      } finally {
+        document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+        harness.animationFrames.restore();
+        flushSolid();
       }
-      const rect = originalRect.call(this);
-      const index = Number(this.dataset.msgId?.slice('current-'.length));
-      return index >= 90 && index < 100
-        ? new DOMRect(rect.x, rect.y, rect.width, rect.height + growth)
-        : rect;
-    });
-    growth = 30;
-    rectSpy.mockClear();
-    harness.list.dispatchEvent(new Event('scroll'));
-
-    expect(container?.querySelector('[data-msg-id="current-100"]')).not.toBeNull();
-    expect(rectSpy.mock.calls.length).toBeLessThan(150);
-    mutations.disconnect();
-    // Allow anchor capture and a correction-driven range update, not a write/read per row.
-    expect(interleavedWrites).toBeLessThanOrEqual(4);
-    const destination = harness.getScrollTop();
-    expect(destination).toBeGreaterThan(10_000);
-    const marker = container!.querySelector('[data-msg-id="current-100"]')!;
-    const markerTop = marker.getBoundingClientRect().top;
-    for (let frame = 0; frame < 4; frame += 1) {
-      await Promise.resolve();
-      harness.animationFrames.flush();
     }
-    expect(harness.getScrollTop()).toBe(destination);
-    expect(marker.isConnected).toBe(true);
-    expect(marker.getBoundingClientRect().top).toBe(markerTop);
-    expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(40);
-    harness.animationFrames.restore();
-  });
+  );
+
+  it.each(['wheel', 'touch', 'scrollbar'] as const)(
+    'bounds native scroll remount geometry with %s ownership',
+    async (owner) => {
+      const messages = Array.from({ length: 200 }, (_, index) => {
+        const messageId = `current-${index}`;
+        return {
+          info: index % 2 === 0 ? userMessage(messageId) : assistantMessage(messageId),
+          parts: [{ ...textPart(`${messageId}-text`, 'History row'), messageID: messageId }],
+        };
+      });
+      let growth = 0;
+      const harness = await mountDeferredHistory(messages, (messageId) => {
+        const index = Number(messageId.slice('current-'.length));
+        return Math.max(0, Math.min(10, index - 90)) * growth;
+      });
+      flushSolid();
+      Object.defineProperty(harness.list, 'scrollHeight', { configurable: true, value: 20_000 });
+      await measureTranscriptRows(harness.list, harness.animationFrames);
+      flushSolid();
+      for (let frame = 0; frame < 4; frame += 1) {
+        await Promise.resolve();
+        flushSolid();
+        harness.animationFrames.flush();
+        flushSolid();
+      }
+      expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
+      expect(container?.querySelector('[data-msg-id="current-100"]')).toBeNull();
+      if (owner !== 'wheel') {
+        const pointer = new MouseEvent('pointerdown', {
+          bubbles: true,
+          button: 0,
+          clientX: 499,
+        });
+        Object.defineProperty(pointer, 'pointerType', {
+          value: owner === 'touch' ? 'touch' : 'mouse',
+        });
+        harness.list.dispatchEvent(pointer);
+        flushSolid();
+      }
+      flushSolid();
+      harness.list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -10_000 }));
+      flushSolid();
+      harness.setScrollTop(10_000);
+      flushSolid();
+      const rectSpy = vi.mocked(HTMLElement.prototype.getBoundingClientRect);
+      const originalRect = rectSpy.getMockImplementation()!;
+      const mutations = new MutationObserver(() => {});
+      mutations.observe(harness.list, { childList: true, subtree: true, attributes: true });
+      flushSolid();
+      const measuredRows = new Set<string>();
+      let interleavedWrites = 0;
+      rectSpy.mockImplementation(function (this: HTMLElement) {
+        if (this.dataset.msgId && !measuredRows.has(this.dataset.msgId)) {
+          const writes = mutations.takeRecords();
+          if (measuredRows.size && writes.length) interleavedWrites += 1;
+          measuredRows.add(this.dataset.msgId);
+        }
+        const rect = originalRect.call(this);
+        const index = Number(this.dataset.msgId?.slice('current-'.length));
+        return index >= 90 && index < 100
+          ? new DOMRect(rect.x, rect.y, rect.width, rect.height + growth)
+          : rect;
+      });
+      growth = 30;
+      rectSpy.mockClear();
+      harness.list.dispatchEvent(new Event('scroll'));
+      flushSolid();
+
+      expect(container?.querySelector('[data-msg-id="current-100"]')).not.toBeNull();
+      expect(rectSpy.mock.calls.length).toBeLessThan(150);
+      mutations.disconnect();
+      // Allow anchor capture and a correction-driven range update, not a write/read per row.
+      expect(interleavedWrites).toBeLessThanOrEqual(4);
+      const destination = harness.getScrollTop();
+      if (owner === 'scrollbar') {
+        // Chromium retains the native thumb's destination. A JS prefix correction competes
+        // with that destination and is reversed by the next native scrollbar reconciliation.
+        expect(destination).toBe(10_000);
+      } else {
+        expect(destination).toBeGreaterThan(10_000);
+      }
+      const marker = container!.querySelector('[data-msg-id="current-100"]')!;
+      const markerTop = marker.getBoundingClientRect().top;
+      for (let frame = 0; frame < 4; frame += 1) {
+        await Promise.resolve();
+        flushSolid();
+        harness.animationFrames.flush();
+        flushSolid();
+      }
+      expect(harness.getScrollTop()).toBe(destination);
+      expect(marker.isConnected).toBe(true);
+      expect(marker.getBoundingClientRect().top).toBe(markerTop);
+      expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(40);
+      if (owner !== 'wheel') document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+      flushSolid();
+      harness.animationFrames.restore();
+      flushSolid();
+    }
+  );
 
   it('does not publish a cached history prepend inside the native scroll event', async () => {
     // SAFETY: The fixture provides the complete domain shape read by this statement.
@@ -1216,19 +1415,29 @@ describe('MessageList history pagination', () => {
       },
     ] as Awaited<ReturnType<typeof client.session.messages>>;
     const harness = await mountDeferredHistory(undefined, undefined, olderPage);
+    flushSolid();
     cacheSessionHistoryPage('session-1', 'cursor-1', olderPage);
     harness.setScrollTop(100);
+    flushSolid();
     harness.list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
+    flushSolid();
     harness.setScrollTop(0);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
 
     expect(state.messages[0]?.info.id).toBe('current-user');
     await Promise.resolve();
+    flushSolid();
     expect(state.messages[0]?.info.id).toBe('current-user');
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
     await vi.waitFor(() => expect(state.messages[0]?.info.id).toBe('older-user'));
+    flushSolid();
     await harness.resolveLoad();
+    flushSolid();
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('keeps the visible message fixed when a prepended activity group moves to an older owner', async () => {
@@ -1276,6 +1485,7 @@ describe('MessageList history pagination', () => {
       undefined,
       olderPage
     );
+    flushSolid();
     const currentRow = container?.querySelector<HTMLElement>('[data-msg-id="current-assistant"]');
     expect(
       container
@@ -1283,13 +1493,17 @@ describe('MessageList history pagination', () => {
         ?.closest('[data-msg-id]')
         ?.getAttribute('data-msg-id')
     ).toBe('current-assistant');
+    flushSolid();
 
     await harness.startLoad(0);
+    flushSolid();
     const topBefore = currentRow!.getBoundingClientRect().top;
     harness.releaseLoad();
     await harness.waitForPrepend();
+    flushSolid();
     expect(currentRow!.getBoundingClientRect().top).toBe(topBefore);
     await harness.resolveLoad();
+    flushSolid();
 
     expect(
       container
@@ -1297,12 +1511,15 @@ describe('MessageList history pagination', () => {
         ?.closest('[data-msg-id]')
         ?.getAttribute('data-msg-id')
     ).toBe('older-assistant');
+    flushSolid();
     expect(currentRow!.getBoundingClientRect().top).toBe(topBefore);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('keeps prepended rows lightweight while pinning a distant history anchor', async () => {
     const animationFrames = installQueuedAnimationFrameMocks();
+    flushSolid();
     const buildMessages = (prefix: string) =>
       Array.from({ length: 50 }, (_, index) => {
         const messageId = `${prefix}-${index}`;
@@ -1364,17 +1581,18 @@ describe('MessageList history pagination', () => {
       return new DOMRect(0, 0, 500, 40);
     });
 
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-1');
+    flushSolid();
     replaceMessages(currentMessages);
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
-    Object.defineProperty(list, 'scrollHeight', {
-      configurable: true,
-      get: () => state.messages.length * 100,
-    });
+    flushSolid();
+    list = mountList();
+    defineLayoutMetrics(
+      list,
+      { clientHeight: 400 },
+      { scrollHeight: () => state.messages.length * 100 }
+    );
     Object.defineProperty(list, 'scrollTop', {
       configurable: true,
       get: () => scrollTopValue,
@@ -1386,7 +1604,7 @@ describe('MessageList history pagination', () => {
 
     for (let frame = 0; frame < 4; frame += 1) {
       await Promise.resolve();
-      animationFrames.flush();
+      flushFrame(animationFrames);
     }
     expect(container?.querySelector('.interactive-list-track.virtualized')).not.toBeNull();
     const normalOverscanRow = container?.querySelector<HTMLElement>('.interactive-item-off-core');
@@ -1398,8 +1616,11 @@ describe('MessageList history pagination', () => {
     scrollTopWrites = 0;
     rowRectReads = 0;
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
+    flushSolid();
     list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await vi.waitFor(() => expect(client.session.messages).toHaveBeenCalled());
+    flushSolid();
     expect(rowRectReads).toBeLessThan(80);
     const anchor = container?.querySelector<HTMLElement>('[data-msg-id="current-0"]');
     const anchorTopBefore = anchor?.getBoundingClientRect().top;
@@ -1429,9 +1650,11 @@ describe('MessageList history pagination', () => {
       }
     });
     mountObserver.observe(list, { childList: true, subtree: true });
+    flushSolid();
     misreportVirtualPlaceholderHeight = true;
     releasePage?.(olderPage);
     await vi.waitFor(() => expect(state.messages).toHaveLength(100));
+    flushSolid();
     mountObserver.disconnect();
     expect(scrollTopWrites).toBeLessThan(30);
     expect(anchor?.isConnected).toBe(true);
@@ -1452,8 +1675,11 @@ describe('MessageList history pagination', () => {
       ...reasoningPart('older-30-reasoning', 'New reasoning'),
       messageID: 'older-30',
     });
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     const forcedGapRow = container?.querySelector<HTMLElement>('[data-msg-id="older-30"]');
     expect(forcedGapRow).toBeInstanceOf(HTMLDivElement);
     expect(forcedGapRow?.classList).not.toContain('interactive-item-virtual-placeholder');
@@ -1463,22 +1689,31 @@ describe('MessageList history pagination', () => {
     Object.defineProperty(touchStart, 'pointerType', { value: 'touch' });
     Object.defineProperty(touchStart, 'isPrimary', { value: true });
     list.dispatchEvent(touchStart);
+    flushSolid();
     scrollTopValue += 20;
     list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     for (let frame = 0; frame < 3; frame += 1) {
       await Promise.resolve();
-      animationFrames.flush();
+      flushFrame(animationFrames);
     }
     await vi.advanceTimersByTimeAsync(600);
+    flushSolid();
     animationFrames.flush(performance.now());
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(50);
 
     scrollTopValue = 7_800;
     list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     animationFrames.flush(performance.now());
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     const retainedRow = container?.querySelector<HTMLElement>('[data-msg-id="older-49"]');
     expect(retainedRow).toBeInstanceOf(HTMLDivElement);
     expect(retainedRow?.classList).toContain('interactive-item-virtual-placeholder');
@@ -1486,61 +1721,88 @@ describe('MessageList history pagination', () => {
     expect(retainedRow?.childElementCount).toBe(0);
 
     document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+    flushSolid();
     await vi.advanceTimersByTimeAsync(100);
+    flushSolid();
     hydratedRowRectReads = 0;
     animationFrames.flush(performance.now());
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     // Hydration registers a mount measurement, then the list batches it before the next paint.
     await Promise.resolve();
+    flushSolid();
     const hydratedRow = container?.querySelector<HTMLElement>('[data-msg-id="older-49"]');
     expect(hydratedRow).toBeInstanceOf(HTMLDivElement);
     expect(hydratedRow?.classList).not.toContain('interactive-item-virtual-placeholder');
     expect(hydratedRow?.childElementCount).toBeGreaterThan(0);
     expect(hydratedRowRectReads).toBeGreaterThan(0);
     animationFrames.restore();
+    flushSolid();
   });
 
   it('updates pending history ownership for inertial movement after touch release', async () => {
     const harness = await mountDeferredHistory();
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
 
     const touchStart = new MouseEvent('pointerdown', { bubbles: true, button: 0 });
     Object.defineProperty(touchStart, 'pointerType', { value: 'touch' });
     Object.defineProperty(touchStart, 'isPrimary', { value: true });
     harness.list.dispatchEvent(touchStart);
+    flushSolid();
     harness.setScrollTop(120);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+    flushSolid();
 
     harness.setScrollTop(160);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await harness.resolveLoad();
+    flushSolid();
 
     expect(harness.getScrollTop()).toBe(360);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('yields history settling to continued user movement after the prepend', async () => {
     const harness = await mountDeferredHistory();
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
 
     harness.list.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'PageDown' }));
+    flushSolid();
     harness.setScrollTop(120);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     harness.releaseLoad();
     await harness.waitForPrepend();
+    flushSolid();
     expect(harness.getScrollTop()).toBe(320);
 
     // Native key scrolling and trackpad momentum can continue without another input event.
     harness.setScrollTop(240);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     for (let frame = 0; frame < 3; frame += 1) {
       await Promise.resolve();
+      flushSolid();
       harness.animationFrames.flush();
+      flushSolid();
     }
 
     expect(harness.getScrollTop()).toBe(240);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it.each([
@@ -1554,8 +1816,11 @@ describe('MessageList history pagination', () => {
     { name: 'Space', key: ' ', shiftKey: false, nextTop: 420 },
   ])('transfers pending history ownership after $name movement', async (input) => {
     const harness = await mountDeferredHistory();
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
     vi.advanceTimersByTime(600);
+    flushSolid();
 
     harness.list.dispatchEvent(
       new KeyboardEvent('keydown', {
@@ -1564,78 +1829,157 @@ describe('MessageList history pagination', () => {
         shiftKey: input.shiftKey,
       })
     );
+    flushSolid();
     harness.setScrollTop(input.nextTop);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await harness.resolveLoad();
+    flushSolid();
 
     expect(harness.getScrollTop()).toBe(input.nextTop + 200);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('transfers pending history ownership for an actual scroll after input is idle', async () => {
     const harness = await mountDeferredHistory();
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
     vi.advanceTimersByTime(600);
+    flushSolid();
 
     harness.setScrollTop(140);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await harness.resolveLoad();
+    flushSolid();
 
     expect(harness.getScrollTop()).toBe(340);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('transfers pending history ownership during a scrollbar pointer movement', async () => {
     const harness = await mountDeferredHistory();
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
     vi.advanceTimersByTime(600);
+    flushSolid();
 
+    harness.list.dispatchEvent(
+      new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 495 })
+    );
+    flushSolid();
+    harness.setScrollTop(140);
+    flushSolid();
+    harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
+    document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+    flushSolid();
+    await harness.resolveLoad();
+    flushSolid();
+
+    expect(harness.getScrollTop()).toBe(340);
+    harness.animationFrames.restore();
+    flushSolid();
+  });
+
+  it.each([false, true])(
+    'keeps a cold prepend out of the held thumb destination, including immediate release %s',
+    async (releaseAtPrepend) => {
+      const harness = await mountDeferredHistory();
+      flushSolid();
+      await harness.startLoad(20);
+      harness.list.dispatchEvent(
+        new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 495 })
+      );
+      harness.setScrollTop(140);
+      harness.list.dispatchEvent(new Event('scroll'));
+      flushSolid();
+      await vi.advanceTimersByTimeAsync(1_100);
+      flushSolid();
+      const writes: number[] = [];
+      Object.defineProperty(harness.list, 'scrollTop', {
+        configurable: true,
+        get: harness.getScrollTop,
+        set(value: number) {
+          writes.push(value);
+          harness.setScrollTop(value);
+        },
+      });
+      const release = () => document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+      const observer = new MutationObserver(() => {
+        if (!releaseAtPrepend || !harness.list.querySelector('[data-msg-id="older-user"]')) return;
+        observer.disconnect();
+        release();
+        flushSolid();
+      });
+      observer.observe(harness.list, { childList: true, subtree: true });
+      try {
+        await harness.resolveLoad();
+        flushSolid();
+        expect(harness.getScrollTop()).toBe(140);
+        expect(writes).toEqual([]);
+        release();
+        for (let frame = 0; frame < 6; frame += 1) {
+          await Promise.resolve();
+          harness.animationFrames.flush();
+          flushSolid();
+        }
+        flushSolid();
+        expect(harness.getScrollTop()).toBe(140);
+        expect(writes).toEqual([]);
+      } finally {
+        observer.disconnect();
+        release();
+        harness.animationFrames.restore();
+      }
+    }
+  );
+
+  it('keeps late-page anchoring after a streamed append while held and release before delivery', async () => {
+    const harness = await mountDeferredHistory();
+    flushSolid();
+    await harness.startLoad(20);
     harness.list.dispatchEvent(
       new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 495 })
     );
     harness.setScrollTop(140);
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
+    setMessagesIncremental([
+      ...state.messages,
+      {
+        info: assistantMessage('new-tail'),
+        parts: [textPart('new-tail-text', 'Streaming tail')],
+      },
+    ]);
+    flushSolid();
+    expect(harness.getScrollTop()).toBe(140);
     document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+    flushSolid();
     await harness.resolveLoad();
-
+    flushSolid();
+    // Appending does not change the captured prefix. Release before the actual page arrives
+    // must still retain ordinary history anchoring instead of retiring that owner early.
     expect(harness.getScrollTop()).toBe(340);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('transfers pending history ownership after an expansion correction', async () => {
-    const observers: Array<{
-      callback: ResizeObserverCallback;
-      targets: Set<Element>;
-    }> = [];
-    class TestResizeObserver {
-      readonly targets = new Set<Element>();
-
-      constructor(readonly callback: ResizeObserverCallback) {
-        observers.push(this);
-      }
-      observe(target: Element) {
-        this.targets.add(target);
-      }
-      unobserve(target: Element) {
-        this.targets.delete(target);
-      }
-      disconnect() {
-        this.targets.clear();
-      }
-    }
-    // SAFETY: The fixture provides the unknown fields read by this statement.
-    globalThis.ResizeObserver = TestResizeObserver as typeof ResizeObserver;
+    const observers = installTrackedResizeObservers();
     let expansionOffset = 0;
-    const harness = await mountDeferredHistory(
-      [
-        { info: userMessage('user-1'), parts: [textPart('text-1', 'Prompt 1')] },
-        { info: assistantMessage('assistant-1'), parts: [textPart('text-2', 'Response 1')] },
-        { info: userMessage('user-2'), parts: [textPart('text-3', 'Prompt 2')] },
-        { info: assistantMessage('assistant-2'), parts: [textPart('text-4', 'Response 2')] },
-      ],
-      (messageId) => (messageId === 'user-2' || messageId === 'assistant-2' ? expansionOffset : 0)
+    const harness = await mountDeferredHistory(conversationTurns(2), (messageId) =>
+      messageId === 'user-2' || messageId === 'assistant-2' ? expansionOffset : 0
     );
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     const track = container?.querySelector('.interactive-list-track') as HTMLDivElement;
     const layoutObserver = observers.find(
@@ -1645,10 +1989,12 @@ describe('MessageList history pagination', () => {
     const expandedRow = container?.querySelector('[data-msg-id="user-2"]') as HTMLDivElement;
     const expansionControl = document.createElement('button');
     expansionControl.setAttribute('aria-expanded', 'false');
+    flushSolid();
     expansionControl.getBoundingClientRect = () =>
       new DOMRect(0, 200 + expansionOffset - harness.getScrollTop(), 500, 20);
     expandedRow.append(expansionControl);
     expansionControl.click();
+    flushSolid();
 
     expansionOffset = 100;
     // SAFETY: The fixture provides the unknown fields read by this statement.
@@ -1657,7 +2003,9 @@ describe('MessageList history pagination', () => {
       fixture<ResizeObserver>(layoutObserver)
     );
     harness.animationFrames.flush();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(harness.getScrollTop()).toBe(120);
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     const visibleRow = container?.querySelector('[data-msg-id="assistant-1"]') as HTMLDivElement;
@@ -1665,48 +2013,25 @@ describe('MessageList history pagination', () => {
       visibleRow.getBoundingClientRect().top - harness.list.getBoundingClientRect().top;
 
     await harness.resolveLoad();
+    flushSolid();
 
     const visibleTopAfter =
       visibleRow.getBoundingClientRect().top - harness.list.getBoundingClientRect().top;
     expect(visibleTopAfter).toBe(visibleTopBefore);
     expect(harness.getScrollTop()).toBe(320);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('yields expansion anchoring to direct outer wheel movement', async () => {
-    const observers: Array<{
-      callback: ResizeObserverCallback;
-      targets: Set<Element>;
-    }> = [];
-    class TestResizeObserver {
-      readonly targets = new Set<Element>();
-
-      constructor(readonly callback: ResizeObserverCallback) {
-        observers.push(this);
-      }
-      observe(target: Element) {
-        this.targets.add(target);
-      }
-      unobserve(target: Element) {
-        this.targets.delete(target);
-      }
-      disconnect() {
-        this.targets.clear();
-      }
-    }
-    // SAFETY: The fixture provides the unknown fields read by this statement.
-    globalThis.ResizeObserver = TestResizeObserver as typeof ResizeObserver;
+    const observers = installTrackedResizeObservers();
     let expansionOffset = 0;
-    const harness = await mountDeferredHistory(
-      [
-        { info: userMessage('user-1'), parts: [textPart('text-1', 'Prompt 1')] },
-        { info: assistantMessage('assistant-1'), parts: [textPart('text-2', 'Response 1')] },
-        { info: userMessage('user-2'), parts: [textPart('text-3', 'Prompt 2')] },
-        { info: assistantMessage('assistant-2'), parts: [textPart('text-4', 'Response 2')] },
-      ],
-      (messageId) => (messageId === 'user-2' || messageId === 'assistant-2' ? expansionOffset : 0)
+    const harness = await mountDeferredHistory(conversationTurns(2), (messageId) =>
+      messageId === 'user-2' || messageId === 'assistant-2' ? expansionOffset : 0
     );
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     const track = container?.querySelector('.interactive-list-track') as HTMLDivElement;
     const layoutObserver = observers.find(
@@ -1716,10 +2041,12 @@ describe('MessageList history pagination', () => {
     const expandedRow = container?.querySelector('[data-msg-id="user-2"]') as HTMLDivElement;
     const expansionControl = document.createElement('button');
     expansionControl.setAttribute('aria-expanded', 'false');
+    flushSolid();
     expansionControl.getBoundingClientRect = () =>
       new DOMRect(0, 200 + expansionOffset - harness.getScrollTop(), 500, 20);
     expandedRow.append(expansionControl);
     expansionControl.click();
+    flushSolid();
     expansionOffset = 100;
     // SAFETY: The fixture provides the unknown fields read by this statement.
     layoutObserver!.callback(
@@ -1727,13 +2054,19 @@ describe('MessageList history pagination', () => {
       fixture<ResizeObserver>(layoutObserver)
     );
     harness.animationFrames.flush();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(harness.getScrollTop()).toBe(120);
 
     expansionControl.click();
+    flushSolid();
     harness.list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 200 }));
+    flushSolid();
     harness.setScrollTop(160);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     expansionOffset = 200;
     // SAFETY: The fixture provides the unknown fields read by this statement.
     layoutObserver!.callback(
@@ -1741,59 +2074,77 @@ describe('MessageList history pagination', () => {
       fixture<ResizeObserver>(layoutObserver)
     );
     harness.animationFrames.flush();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     expect(harness.getScrollTop()).toBe(160);
     await harness.resolveLoad();
+    flushSolid();
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('transfers pending history anchoring to the edited row through a prepend', async () => {
-    const harness = await mountDeferredHistory([
-      { info: userMessage('user-1'), parts: [textPart('text-1', 'Prompt 1')] },
-      { info: assistantMessage('assistant-1'), parts: [textPart('text-2', 'Response 1')] },
-      { info: userMessage('user-2'), parts: [textPart('text-3', 'Prompt 2')] },
-      { info: assistantMessage('assistant-2'), parts: [textPart('text-4', 'Response 2')] },
-    ]);
+    const harness = await mountDeferredHistory(conversationTurns(2));
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
 
     harness.setScrollTop(120);
+    flushSolid();
     harness.list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     startEditingMessage('user-2', 'session-1', 'Prompt 2');
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
     const editedRow = container?.querySelector('[data-msg-id="user-2"]') as HTMLDivElement;
     const editedTopBefore =
       editedRow.getBoundingClientRect().top - harness.list.getBoundingClientRect().top;
     await harness.resolveLoad();
+    flushSolid();
 
     const editedTopAfter =
       editedRow.getBoundingClientRect().top - harness.list.getBoundingClientRect().top;
     expect(editedTopAfter).toBe(editedTopBefore);
     expect(harness.getScrollTop()).toBe(320);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('permanently yields pending history restoration to an explicit bottom-follow request', async () => {
     const harness = await mountDeferredHistory();
+    flushSolid();
     // Finish initial positioning so the explicit return exercises detached navigation.
     settleBottomFollow(harness.animationFrames, harness.list);
+    flushSolid();
     harness.animationFrames.flush();
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
 
     requestMessageListScrollToBottom();
     await Promise.resolve();
+    flushSolid();
     expect(harness.getScrollTop()).toBe(800);
     harness.animationFrames.flush();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     settleBottomFollow(harness.animationFrames, harness.list);
+    flushSolid();
     expect(harness.getScrollTop()).toBe(800);
 
     await harness.resolveLoad();
+    flushSolid();
 
     settleBottomFollow(harness.animationFrames, harness.list);
+    flushSolid();
     expect(harness.getScrollTop()).toBe(1000);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('does not reuse a pending history load or anchor after switching A to B and back to A', async () => {
@@ -1808,36 +2159,52 @@ describe('MessageList history pagination', () => {
       },
     ];
     const harness = await mountDeferredHistory(sessionOneMessages);
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
 
-    setState('activeSessionId', 'session-2');
+    setState(storePath('activeSessionId', 'session-2'));
+    flushSolid();
     replaceMessages([
       {
         info: { ...userMessage('session-2-user'), sessionID: 'session-2' },
         parts: [{ ...textPart('session-2-text', 'Session 2'), sessionID: 'session-2' }],
       },
     ]);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     harness.animationFrames.flush();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     replaceMessages(sessionOneMessages);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     harness.animationFrames.flush();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     const staleLoadShown = container
       ?.querySelector('.message-history-banner')
       ?.classList.contains('is-loading');
 
     expect(harness.getScrollTop()).toBe(800);
     await harness.resolveLoad();
+    flushSolid();
 
     expect(staleLoadShown).toBe(false);
     settleBottomFollow(harness.animationFrames, harness.list);
+    flushSolid();
     expect(harness.getScrollTop()).toBe(1000);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('invalidates pending history state before a late response resolves after cleanup', async () => {
@@ -1852,22 +2219,29 @@ describe('MessageList history pagination', () => {
       return observer;
     });
     const harness = await mountDeferredHistory();
+    flushSolid();
     await harness.startLoad(20);
+    flushSolid();
     const historyObserver = observers.at(-1);
 
     cleanup?.();
+    flushSolid();
     cleanup = undefined;
     await Promise.resolve();
+    flushSolid();
 
     expect(historyObserver?.disconnect).toHaveBeenCalledOnce();
     await harness.resolveLoad();
+    flushSolid();
 
     expect(harness.getScrollTop()).toBe(20);
     harness.animationFrames.restore();
+    flushSolid();
   });
 
   it('preserves a DOM anchor when a history prepend crosses from 49 to 50 rows', async () => {
     const animationFrames = installQueuedAnimationFrameMocks();
+    flushSolid();
     // SAFETY: The fixture provides the complete domain shape read by this statement.
     const olderPage = [
       {
@@ -1881,31 +2255,31 @@ describe('MessageList history pagination', () => {
     });
     vi.spyOn(client.session, 'messages').mockReturnValue(pendingPage);
     let list: HTMLDivElement | null = null;
-    let scrollTopValue = 0;
+    const scrollTop = { value: 0 };
     const olderBoundaryId = olderPage[0]!.info.id;
     const olderLoaded = () => state.messages[0]?.info.id === olderBoundaryId;
 
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this === list || this.classList.contains('interactive-list')) {
+    mockElementRects((element) => {
+      if (element === list || element.classList.contains('interactive-list')) {
         return new DOMRect(0, 0, 500, 400);
       }
-      if (this.classList.contains('interactive-list-track')) {
+      if (element.classList.contains('interactive-list-track')) {
         return new DOMRect(0, 0, 500, olderLoaded() ? 5200 : 4900);
       }
-      if (this.dataset.msgId === 'older-boundary') {
-        return new DOMRect(0, -scrollTopValue, 500, 300);
+      if (element.dataset.msgId === 'older-boundary') {
+        return new DOMRect(0, -scrollTop.value, 500, 300);
       }
-      if (this.dataset.msgId?.startsWith('current-')) {
-        const index = Number(this.dataset.msgId.replace('current-', ''));
+      if (element.dataset.msgId?.startsWith('current-')) {
+        const index = Number(element.dataset.msgId.replace('current-', ''));
         const documentTop = index * 100 + (olderLoaded() ? 300 : 0);
-        return new DOMRect(0, documentTop - scrollTopValue, 500, 100);
+        return new DOMRect(0, documentTop - scrollTop.value, 500, 100);
       }
       return new DOMRect(0, 0, 500, 40);
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-49');
+    flushSolid();
     replaceMessages(
       Array.from({ length: 49 }, (_, index) => {
         const messageId = `current-${index}`;
@@ -1915,53 +2289,54 @@ describe('MessageList history pagination', () => {
         };
       })
     );
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
-    Object.defineProperty(list, 'scrollHeight', {
-      configurable: true,
-      get: () => (olderLoaded() ? 5400 : 4900),
-    });
-    Object.defineProperty(list, 'scrollTop', {
-      configurable: true,
-      get: () => scrollTopValue,
-      set: (value: number) => {
-        scrollTopValue = value;
-      },
-    });
+    flushSolid();
+    list = mountList();
+    defineLayoutMetrics(
+      list,
+      { clientHeight: 400 },
+      { scrollHeight: () => (olderLoaded() ? 5400 : 4900) }
+    );
+    backScrollTop(list, scrollTop);
 
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
-    animationFrames.flush();
+    flushFrame(animationFrames);
     await Promise.resolve();
+    flushSolid();
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
-    scrollTopValue = 20;
+    flushSolid();
+    scrollTop.value = 20;
     list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await vi.waitFor(() => {
       expect(client.session.messages).toHaveBeenCalledWith('session-1', {
         limit: 200,
         before: 'cursor-49',
       });
     });
+    flushSolid();
     const anchorBefore = container
       ?.querySelector<HTMLElement>('[data-msg-id="current-0"]')
       ?.getBoundingClientRect().top;
 
     releasePage?.(olderPage);
     await vi.waitFor(() => expect(olderLoaded()).toBe(true));
+    flushSolid();
     for (let frame = 0; frame < 3; frame += 1) {
       await Promise.resolve();
-      animationFrames.flush();
+      flushFrame(animationFrames);
     }
     await Promise.resolve();
+    flushSolid();
 
     const anchorAfter = container
       ?.querySelector<HTMLElement>('[data-msg-id="current-0"]')
       ?.getBoundingClientRect().top;
     expect(anchorAfter).toBe(anchorBefore);
-    expect(scrollTopValue).toBe(320);
+    expect(scrollTop.value).toBe(320);
     animationFrames.restore();
+    flushSolid();
   });
 
   it('preserves image carousel selection through a history prepend', async () => {
@@ -1973,17 +2348,22 @@ describe('MessageList history pagination', () => {
         { ...filePart('image-2', 'Image 2'), messageID: currentMessageId },
       ],
     };
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setMessagesIncremental([current]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     await Promise.resolve();
+    flushSolid();
 
     const currentRow = () =>
       container?.querySelector<HTMLElement>(`[data-msg-id="${currentMessageId}"]`);
     const originalRow = currentRow();
     expect(currentRow()?.textContent).toContain('1 / 2');
     currentRow()?.querySelector<HTMLButtonElement>('[aria-label="Next image"]')?.click();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
     expect(currentRow()?.textContent).toContain('2 / 2');
 
     setMessagesIncremental([
@@ -1999,7 +2379,9 @@ describe('MessageList history pagination', () => {
         ],
       },
     ]);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     expect(currentRow()).toBe(originalRow);
     expect(currentRow()?.textContent).toContain('2 / 3');
@@ -2014,6 +2396,7 @@ describe('MessageList history pagination', () => {
     },
   ])('anchors a history prepend $interaction', async ({ userScrollTop, expectedScrollTop }) => {
     const animationFrames = installQueuedAnimationFrameMocks();
+    flushSolid();
     // SAFETY: The fixture provides the complete domain shape read by this statement.
     const olderPage = [
       { info: userMessage('older-user'), parts: [textPart('older-user-text', 'Older prompt')] },
@@ -2029,25 +2412,27 @@ describe('MessageList history pagination', () => {
     vi.spyOn(client.session, 'messages').mockReturnValue(pendingPage);
 
     let list: HTMLDivElement | null = null;
-    let scrollTopValue = 0;
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this === list || this.classList.contains('interactive-list')) {
+    const scrollTop = { value: 0 };
+    mockElementRects((element) => {
+      if (element === list || element.classList.contains('interactive-list')) {
         return new DOMRect(0, 0, 500, 400);
       }
-      if (this.classList.contains('interactive-list-track')) {
-        return new DOMRect(0, 0, 500, state.messages.length * 100);
+      if (element.classList.contains('interactive-list-track')) {
+        return new DOMRect(0, 0, 500, untrack(() => state.messages.length) * 100);
       }
-      if (this.dataset.msgId) {
-        const index = state.messages.findIndex((message) => message.info.id === this.dataset.msgId);
-        return new DOMRect(0, index * 100 - scrollTopValue, 500, 100);
+      if (element.dataset.msgId) {
+        const index = state.messages.findIndex(
+          (message) => message.info.id === element.dataset.msgId
+        );
+        return new DOMRect(0, index * 100 - scrollTop.value, 500, 100);
       }
       return new DOMRect(0, 0, 500, 40);
     });
 
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-1');
+    flushSolid();
     replaceMessages([
       {
         info: userMessage('current-user'),
@@ -2058,54 +2443,58 @@ describe('MessageList history pagination', () => {
         parts: [textPart('current-assistant-text', 'Current response')],
       },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
-    Object.defineProperty(list, 'scrollHeight', {
-      configurable: true,
-      get: () => 1200 + Math.max(0, state.messages.length - 2) * 100,
-    });
-    Object.defineProperty(list, 'scrollTop', {
-      configurable: true,
-      get: () => scrollTopValue,
-      set: (value: number) => {
-        scrollTopValue = value;
-      },
-    });
+    list = mountList();
+    defineLayoutMetrics(
+      list,
+      { clientHeight: 400 },
+      { scrollHeight: () => 1200 + Math.max(0, state.messages.length - 2) * 100 }
+    );
+    backScrollTop(list, scrollTop);
 
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
-    animationFrames.flush();
+    flushFrame(animationFrames);
     await Promise.resolve();
+    flushSolid();
 
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
-    scrollTopValue = 20;
+    flushSolid();
+    scrollTop.value = 20;
     list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await vi.waitFor(() => {
       expect(client.session.messages).toHaveBeenCalledWith('session-1', {
         limit: 200,
         before: 'cursor-1',
       });
     });
+    flushSolid();
 
     if (userScrollTop !== null) {
       list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 100 }));
-      scrollTopValue = userScrollTop;
+      flushSolid();
+      scrollTop.value = userScrollTop;
       list.dispatchEvent(new Event('scroll'));
+      flushSolid();
     }
+    flushSolid();
 
     releasePage?.(olderPage);
     await vi.waitFor(() => {
       expect(state.messages[0]?.info.id).toBe('older-user');
     });
-    animationFrames.flush();
+    flushFrame(animationFrames);
     await Promise.resolve();
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
-    expect(scrollTopValue).toBe(expectedScrollTop);
+    expect(scrollTop.value).toBe(expectedScrollTop);
     animationFrames.restore();
+    flushSolid();
   });
 
   it('does not let one session pagination request lock another session', async () => {
@@ -2126,45 +2515,60 @@ describe('MessageList history pagination', () => {
       return Promise.resolve(pageFor('session-2', 'session-2-older'));
     });
 
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-1');
+    flushSolid();
     markSessionHistoryLoadFailed('session-1', true);
+    flushSolid();
     replaceMessages([
       { info: userMessage('session-1-current'), parts: [textPart('session-1-text', 'Current')] },
     ]);
-    cleanup = render(() => MessageList(), container!);
+    flushSolid();
+    mountList();
     await Promise.resolve();
+    flushSolid();
 
     container?.querySelector<HTMLButtonElement>('.message-history-banner-retry')?.click();
+    flushSolid();
     await vi.waitFor(() => {
       expect(messagesSpy).toHaveBeenCalledWith('session-1', { limit: 200, before: 'cursor-1' });
     });
+    flushSolid();
 
     setSessionHistoryCursor('session-2', 'cursor-2');
+    flushSolid();
     markSessionHistoryLoadFailed('session-2', true);
-    setState('activeSessionId', 'session-2');
+    flushSolid();
+    setState(storePath('activeSessionId', 'session-2'));
+    flushSolid();
     replaceMessages([
       {
         info: { ...userMessage('session-2-current'), sessionID: 'session-2' },
         parts: [{ ...textPart('session-2-text', 'Current'), sessionID: 'session-2' }],
       },
     ]);
+    flushSolid();
     await Promise.resolve();
+    flushSolid();
 
     const secondRetry = container?.querySelector<HTMLButtonElement>(
       '.message-history-banner-retry'
     );
     const secondRetryEnabled = secondRetry?.disabled === false;
     secondRetry?.click();
+    flushSolid();
     await vi.waitFor(() => {
       expect(messagesSpy.mock.calls.some(([sessionId]) => sessionId === 'session-2')).toBe(true);
     });
+    flushSolid();
     const secondSessionRequested = messagesSpy.mock.calls.some(
       ([sessionId]) => sessionId === 'session-2'
     );
 
     releaseFirstPage?.(pageFor('session-1', 'session-1-older'));
     await Promise.resolve();
+    flushSolid();
 
     expect(secondRetryEnabled).toBe(true);
     expect(secondSessionRequested).toBe(true);
@@ -2176,21 +2580,23 @@ describe('MessageList history pagination', () => {
       { info: userMessage('older-user'), parts: [textPart('older-text', 'Older prompt')] },
     ] as Awaited<ReturnType<typeof client.session.messages>>;
     const messagesSpy = vi.spyOn(client.session, 'messages').mockResolvedValue(olderPage);
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-older');
+    flushSolid();
     replaceMessages([
       { info: userMessage('current-user'), parts: [textPart('current-text', 'Current prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    const list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 500 });
-    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 180 });
+    const list = mountList();
+    defineLayoutMetrics(list, { clientHeight: 500, scrollHeight: 180 });
     Object.defineProperty(list, 'scrollTop', { configurable: true, writable: true, value: 0 });
     await Promise.resolve();
+    flushSolid();
 
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -120 }));
+    flushSolid();
 
     await vi.waitFor(() => {
       expect(messagesSpy).toHaveBeenCalledWith('session-1', {
@@ -2198,6 +2604,7 @@ describe('MessageList history pagination', () => {
         before: 'cursor-older',
       });
     });
+    flushSolid();
     expect(state.messages.map((message) => message.info.id)).toEqual([
       'older-user',
       'current-user',
@@ -2218,23 +2625,25 @@ describe('MessageList history pagination', () => {
       .spyOn(client.session, 'messages')
       .mockResolvedValueOnce(firstPage)
       .mockResolvedValueOnce(secondPage);
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-older');
+    flushSolid();
     replaceMessages([
       { info: userMessage('current-user'), parts: [textPart('current-text', 'Current prompt')] },
     ]);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    const list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 500 });
-    Object.defineProperty(list, 'scrollHeight', {
-      configurable: true,
-      get: () => (state.messages.length < 3 ? 500 : 700),
-    });
+    const list = mountList();
+    defineLayoutMetrics(
+      list,
+      { clientHeight: 500 },
+      { scrollHeight: () => (state.messages.length < 3 ? 500 : 700) }
+    );
     Object.defineProperty(list, 'scrollTop', { configurable: true, writable: true, value: 0 });
 
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(2));
+    flushSolid();
 
     expect(messagesSpy).toHaveBeenNthCalledWith(1, 'session-1', {
       limit: 200,
@@ -2245,10 +2654,12 @@ describe('MessageList history pagination', () => {
       before: 'cursor-oldest',
     });
     await vi.waitFor(() => expect(list.scrollTop).toBe(200));
+    flushSolid();
   });
 
   it('does not treat provisional virtual overflow as a filled initial viewport', async () => {
     const animationFrames = installQueuedAnimationFrameMocks();
+    flushSolid();
     const currentMessages = Array.from({ length: 60 }, (_, index) => ({
       info: userMessage(`current-user-${index}`),
       parts: [textPart(`current-text-${index}`, `Current prompt ${index}`)],
@@ -2267,20 +2678,19 @@ describe('MessageList history pagination', () => {
       .spyOn(client.session, 'messages')
       .mockResolvedValueOnce(firstPage)
       .mockResolvedValueOnce(secondPage);
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this.dataset.msgId) return new DOMRect(0, 0, 500, 1);
-      if (this.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 500);
+    mockElementRects((element) => {
+      if (element.dataset.msgId) return new DOMRect(0, 0, 500, 1);
+      if (element.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 500);
       return new DOMRect(0, 0, 500, 60);
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-older');
+    flushSolid();
     replaceMessages(currentMessages);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    const list = container?.querySelector('.interactive-list') as HTMLDivElement;
+    const list = mountList();
     Object.defineProperty(list, 'clientHeight', { configurable: true, value: 500 });
     Object.defineProperty(list, 'scrollHeight', {
       configurable: true,
@@ -2291,7 +2701,9 @@ describe('MessageList history pagination', () => {
 
     for (let frame = 0; frame < 120; frame += 1) {
       await vi.advanceTimersByTimeAsync(16);
+      flushSolid();
       animationFrames.flush(performance.now());
+      flushSolid();
       if (
         messagesSpy.mock.calls.length === 2 &&
         container!.querySelectorAll('[data-msg-id]').length < 50
@@ -2306,6 +2718,7 @@ describe('MessageList history pagination', () => {
     });
     expect(container?.querySelectorAll('[data-msg-id]').length).toBeLessThan(50);
     animationFrames.restore();
+    flushSolid();
   });
 
   it('stops initial fill when one hydrated page exactly fills the viewport', async () => {
@@ -2321,40 +2734,41 @@ describe('MessageList history pagination', () => {
     })) as Awaited<ReturnType<typeof client.session.messages>>;
     fillingPage.nextCursor = 'cursor-must-not-load';
     const messagesSpy = vi.spyOn(client.session, 'messages').mockResolvedValueOnce(fillingPage);
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this.dataset.msgId) {
-        const height = this.dataset.msgId.startsWith('filling-user-12')
+    mockElementRects((element) => {
+      if (element.dataset.msgId) {
+        const height = element.dataset.msgId.startsWith('filling-user-12')
           ? 20
-          : this.dataset.msgId.startsWith('filling-user-')
+          : element.dataset.msgId.startsWith('filling-user-')
             ? 40
             : 1;
         return new DOMRect(0, 0, 500, height);
       }
-      if (this.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 500);
+      if (element.classList.contains('interactive-list')) return new DOMRect(0, 0, 500, 500);
       return new DOMRect(0, 0, 500, 60);
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-filling');
+    flushSolid();
     replaceMessages(currentMessages);
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    const list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 500 });
-    Object.defineProperty(list, 'scrollHeight', {
-      configurable: true,
-      get: () => (state.messages.length === currentMessages.length ? 60 : 11_360),
-    });
+    const list = mountList();
+    defineLayoutMetrics(
+      list,
+      { clientHeight: 500 },
+      { scrollHeight: () => (state.messages.length === currentMessages.length ? 60 : 11_360) }
+    );
     Object.defineProperty(list, 'scrollTop', { configurable: true, writable: true, value: 0 });
 
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalled());
+    flushSolid();
     await vi.waitFor(() =>
       expect(
         container?.querySelector('.message-history-banner')?.classList.contains('is-loading')
       ).toBe(false)
     );
+    flushSolid();
 
     expect(messagesSpy).toHaveBeenCalledOnce();
     expect(messagesSpy).not.toHaveBeenCalledWith('session-1', {
@@ -2376,15 +2790,7 @@ describe('MessageList history pagination', () => {
       .spyOn(client.session, 'messages')
       .mockResolvedValueOnce(emptyPage)
       .mockResolvedValueOnce(olderPage);
-    setState('activeSessionId', 'session-1');
-    setSessionHistoryCursor('session-1', 'cursor-empty');
-    markSessionHistoryLoadFailed('session-1', true);
-    replaceMessages([
-      { info: userMessage('current-user'), parts: [textPart('current-text', 'Current prompt')] },
-    ]);
-
-    cleanup = render(() => MessageList(), container!);
-    container?.querySelector<HTMLButtonElement>('.message-history-banner-retry')?.click();
+    retryFailedHistoryLoad('cursor-empty');
 
     await vi.waitFor(() => {
       expect(messagesSpy).toHaveBeenCalledWith('session-1', {
@@ -2392,6 +2798,7 @@ describe('MessageList history pagination', () => {
         before: 'cursor-next',
       });
     });
+    flushSolid();
     expect(state.messages.map((message) => message.info.id)).toEqual([
       'older-user',
       'current-user',
@@ -2414,20 +2821,14 @@ describe('MessageList history pagination', () => {
       .spyOn(client.session, 'messages')
       .mockReturnValueOnce(pendingStalePage)
       .mockResolvedValueOnce(freshPage);
-    setState('activeSessionId', 'session-1');
-    setSessionHistoryCursor('session-1', 'cursor-stale');
-    markSessionHistoryLoadFailed('session-1', true);
-    replaceMessages([
-      { info: userMessage('current-user'), parts: [textPart('current-text', 'Current prompt')] },
-    ]);
-
-    cleanup = render(() => MessageList(), container!);
-    container?.querySelector<HTMLButtonElement>('.message-history-banner-retry')?.click();
+    retryFailedHistoryLoad('cursor-stale');
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(1));
+    flushSolid();
     invalidateSessionMessageWindowRequests('session-1');
     releaseStalePage?.(stalePage);
 
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(2));
+    flushSolid();
     expect(state.messages.map((message) => message.info.id)).toEqual([
       'older-user',
       'current-user',
@@ -2445,21 +2846,16 @@ describe('MessageList history pagination', () => {
       .spyOn(client.session, 'messages')
       .mockReturnValueOnce(pendingStalePage)
       .mockResolvedValueOnce([]);
-    setState('activeSessionId', 'session-1');
-    setSessionHistoryCursor('session-1', 'cursor-stale');
-    markSessionHistoryLoadFailed('session-1', true);
-    replaceMessages([
-      { info: userMessage('current-user'), parts: [textPart('current-text', 'Current prompt')] },
-    ]);
-
-    cleanup = render(() => MessageList(), container!);
-    container?.querySelector<HTMLButtonElement>('.message-history-banner-retry')?.click();
+    retryFailedHistoryLoad('cursor-stale');
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(1));
+    flushSolid();
 
     invalidateSessionMessageWindowRequests('session-1');
     setSessionHistoryCursor('session-1', 'cursor-current');
+    flushSolid();
     releaseStalePage?.(stalePage);
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
 
     expect(messagesSpy).toHaveBeenCalledTimes(1);
     expect(messagesSpy).not.toHaveBeenCalledWith('session-1', {
@@ -2479,21 +2875,17 @@ describe('MessageList history pagination', () => {
       .spyOn(client.session, 'messages')
       .mockReturnValueOnce(pendingStalePage)
       .mockResolvedValueOnce([]);
-    setState('activeSessionId', 'session-1');
-    setSessionHistoryCursor('session-1', 'cursor-stale');
-    markSessionHistoryLoadFailed('session-1', true);
-    replaceMessages([
-      { info: userMessage('current-user'), parts: [textPart('current-text', 'Current prompt')] },
-    ]);
-
-    cleanup = render(() => MessageList(), container!);
-    container?.querySelector<HTMLButtonElement>('.message-history-banner-retry')?.click();
+    retryFailedHistoryLoad('cursor-stale');
     await vi.waitFor(() => expect(messagesSpy).toHaveBeenCalledTimes(1));
+    flushSolid();
 
     resetSessionMessageWindowForRefetch('session-1');
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-current');
+    flushSolid();
     releaseStalePage?.(stalePage);
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
 
     expect(messagesSpy).toHaveBeenCalledTimes(1);
     expect(messagesSpy).not.toHaveBeenCalledWith('session-1', {
@@ -2504,6 +2896,7 @@ describe('MessageList history pagination', () => {
 
   it('does not pin a stale history anchor after the same-session window resets', async () => {
     const animationFrames = installQueuedAnimationFrameMocks();
+    flushSolid();
     // SAFETY: The fixture provides the complete domain shape read by this statement.
     const stalePage = [] as Awaited<ReturnType<typeof client.session.messages>>;
     let releaseStalePage: ((page: typeof stalePage) => void) | undefined;
@@ -2512,74 +2905,67 @@ describe('MessageList history pagination', () => {
     });
     const messagesSpy = vi.spyOn(client.session, 'messages').mockReturnValue(pendingStalePage);
     let list: HTMLDivElement | null = null;
-    let scrollTopValue = 0;
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
-      this: HTMLElement
-    ) {
-      if (this === list || this.classList.contains('interactive-list')) {
+    const scrollTop = { value: 0 };
+    mockElementRects((element) => {
+      if (element === list || element.classList.contains('interactive-list')) {
         return new DOMRect(0, 0, 500, 400);
       }
-      if (this.classList.contains('interactive-list-track')) {
+      if (element.classList.contains('interactive-list-track')) {
         return new DOMRect(0, 0, 500, 6000);
       }
-      if (this.dataset.msgId?.startsWith('assistant-')) {
-        const index = Number(this.dataset.msgId.replace('assistant-', ''));
-        return new DOMRect(0, index * 100 - scrollTopValue, 500, 100);
+      if (element.dataset.msgId?.startsWith('assistant-')) {
+        const index = Number(element.dataset.msgId.replace('assistant-', ''));
+        return new DOMRect(0, index * 100 - scrollTop.value, 500, 100);
       }
       return new DOMRect(0, 0, 500, 40);
     });
-    setState('activeSessionId', 'session-1');
+    setState(storePath('activeSessionId', 'session-1'));
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-stale');
-    replaceMessages(
-      Array.from({ length: 60 }, (_, index) => {
-        const messageId = `assistant-${index}`;
-        return {
-          info: assistantMessage(messageId),
-          parts: [{ ...textPart(`text-${index}`, `Response ${index}`), messageID: messageId }],
-        };
-      })
-    );
+    flushSolid();
+    replaceMessages(assistantRows(60));
+    flushSolid();
 
-    cleanup = render(() => MessageList(), container!);
-    // SAFETY: The rendered DOM fixture provides the browser shape used by this statement.
-    list = container?.querySelector('.interactive-list') as HTMLDivElement;
-    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 400 });
-    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 6000 });
-    Object.defineProperty(list, 'scrollTop', {
-      configurable: true,
-      get: () => scrollTopValue,
-      set: (value: number) => {
-        scrollTopValue = value;
-      },
-    });
+    list = mountList();
+    defineLayoutMetrics(list, { clientHeight: 400, scrollHeight: 6000 });
+    backScrollTop(list, scrollTop);
     for (let frame = 0; frame < 4; frame += 1) {
       await Promise.resolve();
-      animationFrames.flush();
+      flushFrame(animationFrames);
     }
 
     list.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -200 }));
-    scrollTopValue = 20;
+    flushSolid();
+    scrollTop.value = 20;
     list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await vi.waitFor(() => {
       expect(messagesSpy).toHaveBeenCalledWith('session-1', {
         limit: 200,
         before: 'cursor-stale',
       });
     });
+    flushSolid();
 
     resetSessionMessageWindowForRefetch('session-1');
+    flushSolid();
     setSessionHistoryCursor('session-1', 'cursor-current');
-    scrollTopValue = 5000;
+    flushSolid();
+    scrollTop.value = 5000;
     list.dispatchEvent(new Event('scroll'));
+    flushSolid();
     await Promise.resolve();
-    animationFrames.flush();
+    flushFrame(animationFrames);
     await Promise.resolve();
+    flushSolid();
 
     const renderedRows = [...container!.querySelectorAll<HTMLElement>('[data-msg-id]')];
     releaseStalePage?.(stalePage);
     await vi.advanceTimersByTimeAsync(0);
+    flushSolid();
     expect(renderedRows.length).toBeLessThan(40);
     expect(renderedRows[0]?.dataset.msgId).not.toBe('assistant-0');
     animationFrames.restore();
+    flushSolid();
   });
 });

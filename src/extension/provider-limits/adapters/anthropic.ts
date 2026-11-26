@@ -28,6 +28,7 @@ import {
   unsupportedProviderStatus,
   providerErrorStatus,
   VARRO_USER_AGENT,
+  clampFraction,
 } from '../adapter-utils';
 import { delay } from '../../server-utils';
 
@@ -52,6 +53,9 @@ const ANTHROPIC_QUOTA_DEFS = [
   { id: 'monthly_limit', label: 'Monthly Limit' },
   { id: 'extra_usage', label: 'Extra Usage' },
 ] as const;
+const ANTHROPIC_FABLE_WINDOW = { id: 'seven_day_fable', label: 'Weekly Fable' } as const;
+// Claude Code reports Fable's included weekly usage under this legacy key.
+const ANTHROPIC_FABLE_LEGACY_KEY = 'seven_day_overage_included';
 
 const MERIDIAN_WINDOW_LABELS: Record<string, string> = {
   five_hour: '5-Hour Limit',
@@ -68,7 +72,16 @@ type AnthropicCredentials = {
   refreshToken: string | null;
   credentialsFilePath: string | null;
   origin: 'opencode-auth' | 'claude-credentials' | 'claude-keychain' | 'claude-env';
+  planName?: string;
 };
+
+const ANTHROPIC_PLAN_NAMES = new Map([
+  ['free', 'Free'],
+  ['pro', 'Pro'],
+  ['max', 'Max'],
+  ['team', 'Team'],
+  ['enterprise', 'Enterprise'],
+]);
 
 export function createAnthropicAdapter(): ProviderLimitAdapter {
   return {
@@ -229,14 +242,22 @@ export function createAnthropicAdapter(): ProviderLimitAdapter {
       const accessToken = credentials.accessToken;
       try {
         const apiStatus = coordinate
-          ? await coordinate([ANTHROPIC_USAGE_ENDPOINT, accessToken], poll, {
-              enabled: !combinedStatus && !localProxyBaseUrl,
-              isIdentityCurrent: async (currentAuth) =>
-                (await resolveAnthropicCredentials(currentAuth, provider.id))?.accessToken ===
-                accessToken,
-            })
+          ? await coordinate(
+              // Older hosts drop the weekly Fable window when publishing shared snapshots.
+              ['anthropic-usage-v2', ANTHROPIC_USAGE_ENDPOINT, accessToken],
+              poll,
+              {
+                enabled: !combinedStatus && !localProxyBaseUrl,
+                isIdentityCurrent: async (currentAuth) =>
+                  (await resolveAnthropicCredentials(currentAuth, provider.id))?.accessToken ===
+                  accessToken,
+              }
+            )
           : await poll();
-        return mergeAnthropicStatuses(combinedStatus, apiStatus) ?? apiStatus;
+        const status = mergeAnthropicStatuses(combinedStatus, apiStatus) ?? apiStatus;
+        // The plan comes from the local login, so cached quota snapshots never need to carry it.
+        const planName = credentials?.planName;
+        return status.status === 'available' && planName ? { ...status, planName } : status;
       } catch (error) {
         if (!(error instanceof ProviderQuotaIdentityChanged)) throw error;
         return (
@@ -363,7 +384,50 @@ function extractAnthropicWindows(payload: unknown, checkedAt: number): ProviderL
     if (window) windows.push(window);
   }
 
+  const fable =
+    buildAnthropicFableLimitWindow(record.limits, checkedAt) ??
+    buildAnthropicWindow(
+      ANTHROPIC_FABLE_WINDOW.id,
+      ANTHROPIC_FABLE_WINDOW.label,
+      asRecord(record[ANTHROPIC_FABLE_LEGACY_KEY]),
+      checkedAt
+    );
+  if (fable) {
+    // Keep weekly windows together, ahead of monthly and extra-usage spend.
+    const spendIndex = windows.findIndex(
+      (window) => window.id === 'monthly_limit' || window.id === 'extra_usage'
+    );
+    windows.splice(spendIndex < 0 ? windows.length : spendIndex, 0, fable);
+  }
+
   return windows;
+}
+
+/** Reads Fable's weekly row from the usage endpoint's server-defined limits[] list. */
+function buildAnthropicFableLimitWindow(
+  limits: unknown,
+  checkedAt: number
+): ProviderLimitWindow | null {
+  if (!Array.isArray(limits)) return null;
+  for (const item of limits) {
+    const row = asRecord(item);
+    if (!row || row.kind !== 'weekly_scoped') continue;
+    const displayName = getString(asRecord(asRecord(row.scope)?.model)?.display_name);
+    if (!/^fable\b/i.test(displayName)) continue;
+
+    const percent = clampPercent(parseFiniteNumber(row.percent));
+    if (percent == null) return null;
+    return {
+      id: ANTHROPIC_FABLE_WINDOW.id,
+      label: ANTHROPIC_FABLE_WINDOW.label,
+      unit: 'unknown',
+      remaining: Math.max(100 - percent, 0),
+      limit: 100,
+      resetAt: parseRateLimitResetAt(row.resets_at ?? row.resetsAt, checkedAt),
+      percent,
+    } satisfies ProviderLimitWindow;
+  }
+  return null;
 }
 
 function extractMeridianWindows(payload: unknown, checkedAt: number): ProviderLimitWindow[] {
@@ -646,15 +710,26 @@ function parseAnthropicCredentials(
     const refreshToken = getString(oauth.refreshToken) || null;
     if (!accessToken && !refreshToken) return null;
 
-    return {
+    const credentials: AnthropicCredentials = {
       accessToken,
       refreshToken,
       credentialsFilePath,
       origin: 'claude-credentials',
     };
+    const planName = getAnthropicPlanName(oauth.subscriptionType, oauth.rateLimitTier);
+    if (planName) credentials.planName = planName;
+    return credentials;
   } catch {
     return null;
   }
+}
+
+/** Maps Claude Code's subscription and rate-limit tier to a known plan label. */
+function getAnthropicPlanName(subscriptionType: unknown, rateLimitTier: unknown) {
+  const plan = ANTHROPIC_PLAN_NAMES.get(getString(subscriptionType).toLowerCase());
+  if (plan !== 'Max') return plan;
+  const multiplier = /max_(5|20)x\b/i.exec(getString(rateLimitTier))?.[1];
+  return multiplier ? `Max ${multiplier}x` : plan;
 }
 
 async function fetchAnthropicUsage(token: string) {
@@ -844,11 +919,6 @@ function parsePositiveInteger(value: unknown) {
   const parsed = parseFiniteNumber(value);
   if (parsed == null || parsed <= 0) return null;
   return Math.round(parsed);
-}
-
-function clampFraction(value: number | null) {
-  if (value == null || !Number.isFinite(value)) return null;
-  return Math.max(0, Math.min(1, value));
 }
 
 function parseJsonRecord(raw: string) {

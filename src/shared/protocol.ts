@@ -3,6 +3,7 @@ import type { DroppedContentDirectory } from './dropped-content-policy';
 import type { ExtensionContext } from './extension-context';
 import type { ContextBreakdownSegment } from './context-breakdown';
 import type { NativePdfAttachment } from './native-pdf';
+import type { LearnedPromptCacheLifetimes } from './prompt-cache-lifetime';
 import type { ServerEventPropertiesByName, WorkspaceStatusEntry } from './opencode-types';
 import type { ExtensionConfigSnapshot, WebviewConfigUpdatePayload } from './provider-limit-config';
 import type { RemoteImageMode } from './remote-images';
@@ -22,11 +23,6 @@ export interface WorkspaceFolderContext {
   name: string;
   path: string;
 }
-
-export type SessionLocator = {
-  id: string;
-  directory: string;
-};
 
 export interface EditorTextContext {
   kind: 'selection' | 'dirty-buffer';
@@ -294,10 +290,22 @@ export type SessionTokenBreakdown = {
   subagentCount: number;
 };
 
+export type SessionModelRoute = {
+  providerID: string;
+  modelID: string;
+};
+
 export type SessionLocation = {
   directory: string;
   isGitWorktree: boolean;
   projectDirectory?: string;
+};
+
+export type SessionLookup = {
+  id: string;
+  title: string;
+  directory: string;
+  external: boolean;
 };
 
 export type SessionDiffSummary = {
@@ -308,10 +316,51 @@ export type SessionDiffSummary = {
   deletions: number;
   tokens: number;
   model?: { providerID: string; modelID: string; variant?: string };
+  /** Distinct models with recorded usage in the session and its nested sessions. */
+  models?: SessionModelRoute[];
   tokenBreakdown?: SessionTokenBreakdown;
   nestedContextBreakdown?: ContextBreakdownSegment[];
   durationMs: number;
   activeStartedAt: number | null;
+};
+
+/** Recorded usage of native assistant steps, not a provider bill. */
+export type SessionUsageTotals = {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  /** Records whose usage was counted. */
+  steps: number;
+  /** Settled records without recorded usage. Their usage is unknown, not zero. */
+  missing: number;
+  /** Records that have not settled yet. */
+  active: number;
+};
+
+/**
+ * Child usage from one group of delivered user prompts until the next delivered group.
+ * Prompts delivered before the same model step share the whole interval.
+ */
+export type SessionFollowupUsageInterval = {
+  promptIDs: string[];
+  usage: SessionUsageTotals;
+  /** A later delivered prompt closed this interval, so later work cannot change it. */
+  final: boolean;
+  /** Earlier prompts outside the bounded history read may share this interval's first step. */
+  boundaryUnknown?: boolean;
+};
+
+export type SessionFollowupUsage = {
+  /** False when the server cannot report native child prompt usage. */
+  supported: boolean;
+  /** True when the history read reached the start of the session. */
+  complete: boolean;
+  intervals: SessionFollowupUsageInterval[];
+  /** Admitted prompts that have not been delivered to the child yet. */
+  pendingPromptIDs: string[];
 };
 
 export type ProviderLimitUnit = 'requests' | 'tokens' | 'messages' | 'credits' | 'usd' | 'unknown';
@@ -334,6 +383,9 @@ export type ProviderLimitResetCredit = {
 export type ProviderLimitResetCredits = {
   availableCount: number;
   credits: ProviderLimitResetCredit[] | null;
+  /** Time of the last successful reset-credit request, not the latest quota refresh. */
+  checkedAt?: number;
+  stale?: boolean;
 };
 
 export type ProviderLimitStatus =
@@ -343,11 +395,17 @@ export type ProviderLimitStatus =
       status: 'available';
       source: 'opencode' | 'provider';
       checkedAt: number;
+      /** Earliest next provider poll; UI polling may run later. */
+      retryAt?: number;
+      /** Retained quota data, bounded from the original checkedAt timestamp. */
+      stale?: boolean;
       windows: ProviderLimitWindow[];
       planName?: string;
       creditBalance?: number;
       note?: string;
       usageLimitResets?: ProviderLimitResetCredits;
+      /** A failed reset-credit request must not be mistaken for confirmed zero credits. */
+      usageLimitResetsUnavailable?: boolean;
     }
   | {
       providerID: string;
@@ -355,6 +413,8 @@ export type ProviderLimitStatus =
       status: 'unsupported' | 'error';
       source: 'opencode' | 'provider';
       checkedAt: number;
+      retryAt?: number;
+      failureKind?: 'authentication';
       note: string;
       codexLoginRequired?: { connectionID: string };
     };
@@ -470,6 +530,7 @@ export type WorkspaceStatusEventSummary = {
 export const VARRO_API_NAMESPACE = '/varro' as const;
 
 export const VARRO_API_ENDPOINTS = {
+  localImage: `${VARRO_API_NAMESPACE}/local-image`,
   remoteImage: `${VARRO_API_NAMESPACE}/remote-image`,
   promptCompletion: `${VARRO_API_NAMESPACE}/prompt-completion`,
   promptCompletionModels: `${VARRO_API_NAMESPACE}/prompt-completion/models`,
@@ -524,12 +585,15 @@ export interface ModelPricing {
 
 export type VarroSessionEndpointAction =
   | 'location'
+  | 'reference'
   | 'activate'
   | 'delete'
   | 'diff-summary'
+  | 'followup-usage'
   | 'permission-mode'
   | 'pin'
   | 'reorder-pin'
+  | 'todo'
   | 'rename-if-untitled';
 
 export function buildVarroSessionEndpoint(
@@ -572,6 +636,7 @@ export const SERVER_EVENT_NAMES = [
   'session.unarchived',
   'session.deleted',
   'session.status',
+  'session.goal.updated',
   'session.error',
   'session.idle',
   'session.compacted',
@@ -721,9 +786,27 @@ function parseServerEventRecord(record: UnknownRecord | null): ServerEvent | nul
     : getSyncServerEventName(record.type, record.name);
   if (!eventType) return null;
 
-  const properties = asRecord(
-    isServerEventName(record.type) ? (record.properties ?? record.data) : record.data
+  return buildServerEvent(
+    record,
+    eventType,
+    asRecord(isServerEventName(record.type) ? (record.properties ?? record.data) : record.data)
   );
+}
+
+function parseSyncEventRecord(record: UnknownRecord | null): ServerEvent | null {
+  if (!record) return null;
+
+  const eventType = getVersionedServerEventName(record.type);
+  if (!eventType) return null;
+
+  return buildServerEvent(record, eventType, asRecord(record.data));
+}
+
+function buildServerEvent(
+  record: UnknownRecord,
+  eventType: ServerEventName,
+  properties: UnknownRecord | null
+): ServerEvent {
   const id = getServerEventId(record);
   const sequenceOnly = record.sequenceOnly === true;
   const sequenceStart =
@@ -735,34 +818,6 @@ function parseServerEventRecord(record: UnknownRecord | null): ServerEvent | nul
     : undefined;
   // Current `/api/event` payloads put the durable cursor under `durable.seq`;
   // transitional/legacy sync wrappers may still expose it at the top level.
-  const seq = getServerEventSeq(record);
-  const event: ParsedServerEvent = { type: eventType };
-  if (id !== undefined) event.id = id;
-  if (sequenceOnly) event.sequenceOnly = true;
-  if (sequenceStart !== undefined) event.sequenceStart = sequenceStart;
-  if (workspaceDirectory) event.workspaceDirectory = workspaceDirectory;
-  if (seq !== undefined) event.seq = seq;
-  if (properties) event.properties = properties;
-  // SAFETY: eventType was normalized against SERVER_EVENT_NAMES; property payloads remain intentionally shallow-validated.
-  return event as ServerEvent;
-}
-
-function parseSyncEventRecord(record: UnknownRecord | null): ServerEvent | null {
-  if (!record) return null;
-
-  const eventType = getVersionedServerEventName(record.type);
-  if (!eventType) return null;
-
-  const properties = asRecord(record.data);
-  const id = getServerEventId(record);
-  const sequenceOnly = record.sequenceOnly === true;
-  const sequenceStart =
-    isNumber(record.sequenceStart) && Number.isFinite(record.sequenceStart)
-      ? record.sequenceStart
-      : undefined;
-  const workspaceDirectory = isString(record.workspaceDirectory)
-    ? record.workspaceDirectory
-    : undefined;
   const seq = getServerEventSeq(record);
   const event: ParsedServerEvent = { type: eventType };
   if (id !== undefined) event.id = id;
@@ -926,6 +981,7 @@ export type InitialWebviewState = {
   followupModel?: string;
   debugShowQuotaWarning?: boolean;
   debugResetWarningDays?: number;
+  promptCacheWarningTokens?: number;
   autoAttachProblems?: boolean;
   autoAttachActiveFile?: boolean;
   desktopSessionPaneSide?: DesktopSessionPaneSide;
@@ -953,6 +1009,8 @@ export type InitialWebviewState = {
   pendingQuestions?: UnknownRecord[];
   recycleBinEntries?: RecycleBinEntry[];
   pinnedSessionIds?: string[];
+  /** Sessions the user marked to come back to. */
+  todoSessionIds?: string[];
   queuedMessages?: QueuedMessageSnapshot[];
 };
 
@@ -1067,6 +1125,8 @@ export type ExtensionMessage =
         deniedReason?: 'missing';
       };
     }
+  | { type: 'pinned-sessions/sync'; payload: { sessionIds: string[] } }
+  | { type: 'todo-sessions/sync'; payload: { sessionIds: string[] } }
   | {
       type: 'permission-modes/sync';
       payload: { modes: Record<string, PermissionMode>; recoveringSessionIds?: string[] };
@@ -1115,9 +1175,49 @@ export type ExtensionMessage =
   | { type: 'command/search-sessions' }
   | { type: 'command/open-attention-sessions' }
   | { type: 'command/open-completed-sessions' }
+  | { type: 'command/open-skill-settings' }
+  | { type: 'command/open-mcp-settings' }
   | { type: 'command/switch-session'; payload: { direction: 'previous' | 'next' } }
+  | { type: 'command/navigate-history'; payload: { direction: 'back' | 'forward' } }
   | { type: 'command/abort' }
-  | { type: 'ralph/state'; payload: RalphStatePayload };
+  | { type: 'ralph/state'; payload: RalphStatePayload }
+  | { type: 'warming/state'; payload: PromptCacheWarmingState };
+
+/** `varro.chat.promptCacheWarming`: chosen sessions are warmed by Varro, all by OpenCode's config. */
+export type PromptCacheWarmingMode = 'off' | 'chosen' | 'all';
+
+export type PromptCacheWarmingSession = {
+  /** End of the current warming window, or `null` until the next reply finishes. */
+  warmUntil: number | null;
+  /** When the latest request or keep-alive sent the context; the cache lifetime counts from here. */
+  sentAt: number | null;
+  /** The model's expected cache lifetime, or `null` until it is resolved. */
+  ttlMs: number | null;
+  /** Why warming stopped before the next reply: the window ended, the cache was gone, or a ping failed. */
+  stopped: 'expired' | 'cache-miss' | 'failed' | null;
+};
+
+export type PromptCacheWarmingState = {
+  /** OpenCode v2 with a running server; v1 has no transient generate route. */
+  available: boolean;
+  mode: PromptCacheWarmingMode;
+  durationMs: number;
+  /** OpenCode's own `warming` config is on, so it warms every session itself. */
+  openCodeWarming: boolean;
+  /** Chosen sessions, keyed by session ID. */
+  sessions: Record<string, PromptCacheWarmingSession>;
+  /** How long caches have actually lasted for this user, per model and per provider. */
+  learned: LearnedPromptCacheLifetimes;
+};
+
+/** A request after an idle gap in a loaded session's history, sent at `at`. */
+export type PromptCacheHistorySample = {
+  providerID: string;
+  modelID: string;
+  at: number;
+  gapMs: number;
+  hit: boolean;
+};
 
 export type WebviewMessage =
   | {
@@ -1131,6 +1231,8 @@ export type WebviewMessage =
       payload: {
         canAbort: boolean;
         canSwitchSessions: boolean;
+        canNavigateBack?: boolean;
+        canNavigateForward?: boolean;
         model: ChatModelSelection | null;
         modelVisible?: boolean;
         sessionId?: string | null;
@@ -1198,6 +1300,7 @@ export type WebviewMessage =
   | { type: 'model-preferences/migrate'; payload: ModelPreferences }
   | { type: 'session/export'; payload: { sessionId: string; directory?: string } }
   | { type: 'usage/report'; payload: { includeAllTime: boolean } }
+  | { type: 'usage/session-report'; payload: { sessionId: string; directory?: string } }
   | { type: 'webview/reload' }
   | { type: 'vscode/open-folder'; payload?: { sessionId: string; directory: string } }
   | { type: 'vscode/open-settings'; payload: { query?: string } }
@@ -1325,6 +1428,12 @@ export type WebviewMessage =
        */
       type: 'ralph/sync';
       payload: { legacyRuns?: Record<string, RalphRun> };
+    }
+  | { type: 'warming/sync' }
+  | { type: 'warming/set'; payload: { sessionId: string; enabled: boolean } }
+  | {
+      type: 'warming/samples';
+      payload: { sessionId: string; samples: PromptCacheHistorySample[] };
     }
   | {
       type: 'log';

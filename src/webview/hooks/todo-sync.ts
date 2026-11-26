@@ -1,4 +1,5 @@
-import { batch } from 'solid-js';
+import { storePath } from '@solidjs/signals';
+
 import { appStore } from '../lib/stores/app-store';
 import { isTodoToolName } from '../lib/tool-normalization';
 import type { AssistantMessage, MessageEntry, NormalizedTodo, Part } from '../types';
@@ -6,29 +7,78 @@ import { isNumber, isString, type UnknownRecord, isObject } from '../lib/runtime
 import { STARTUP_TODO_TIMEOUT_MS, withStartupDeadline } from '../../shared/startup';
 
 type TodoSyncDependencies = {
-  loadSessionTodos?(sessionId: string, signal: AbortSignal): Promise<void | boolean | object>;
+  loadSessionTodos?(
+    sessionId: string,
+    signal: AbortSignal,
+    directory?: string
+  ): Promise<void | boolean | object>;
+  resolveSessionDirectory?(sessionId: string): string | undefined;
 };
 
 export function resetTodoSync() {
-  appStore.setState('todos', []);
+  appStore.setState(storePath('todos', []));
 }
 
 function setStateTodos(todos: NormalizedTodo[], options?: { preserveAdvancedStatuses?: boolean }) {
-  const nextTodos = options?.preserveAdvancedStatuses
-    ? preserveAdvancedTodoStatuses(todos, appStore.state.todos)
-    : todos;
-  if (areTodosEqual(appStore.state.todos, nextTodos)) return;
-  appStore.setState('todos', nextTodos);
+  appStore.setState((draft) => {
+    const nextTodos = options?.preserveAdvancedStatuses
+      ? preserveAdvancedTodoStatuses(todos, draft.todos)
+      : todos;
+    if (areTodosEqual(draft.todos, nextTodos)) return;
+    draft.todos = nextTodos;
+  });
 }
+
+type TodoPrefetch = {
+  sessionId: string;
+  directory: string | undefined;
+  generation: number;
+  controller: AbortController;
+  snapshot: Promise<void | boolean | object>;
+};
 
 export function createTodoSyncOperations(deps: TodoSyncDependencies = {}) {
   let nativeTodosEnabled = false;
   let todoLoadGeneration = 0;
+  let prefetch: TodoPrefetch | null = null;
+
+  const discardPrefetch = () => {
+    prefetch?.controller.abort();
+    prefetch = null;
+  };
 
   const reset = () => {
+    discardPrefetch();
     todoLoadGeneration += 1;
     nativeTodosEnabled = false;
     resetTodoSync();
+  };
+
+  // Selection starts the native read alongside the transcript load so its latency
+  // overlaps instead of stacking after messages, before the panel is revealed.
+  const prefetchTodosForSession = (
+    sessionId: string,
+    directory = deps.resolveSessionDirectory?.(sessionId)
+  ) => {
+    const load = deps.loadSessionTodos;
+    discardPrefetch();
+    if (!load) return;
+    const controller = new AbortController();
+    const snapshot = new Promise<void | boolean | object>((resolve) => {
+      resolve(load(sessionId, controller.signal, directory));
+    });
+    // The consuming sync owns error handling; an abandoned prefetch is best-effort.
+    snapshot.catch(() => {});
+    prefetch = { sessionId, directory, generation: todoLoadGeneration, controller, snapshot };
+  };
+
+  // A prefetch is reusable only when nothing invalidated todo state since it started.
+  const takePrefetch = (sessionId: string, generation: number) => {
+    const current = prefetch;
+    prefetch = null;
+    if (current?.sessionId === sessionId && current.generation === generation) return current;
+    current?.controller.abort();
+    return null;
   };
 
   const applyNativeTodos = <T>(raw: T, options?: { preserveAdvancedStatuses?: boolean }) => {
@@ -39,10 +89,18 @@ export function createTodoSyncOperations(deps: TodoSyncDependencies = {}) {
     return true;
   };
 
-  const syncTodosFromMessagesWithState = <T>(
-    messages: MessageEntry[] = appStore.state.messages,
-    latestEventPayload?: T
-  ) => {
+  const syncTodosFromMessagesWithState = <T>(messages?: MessageEntry[], latestEventPayload?: T) => {
+    // Callers usually sync right after writing a part, which the committed transcript does not
+    // show until the store flushes. That flush is already queued, so read the transcript after it.
+    // An event payload is authoritative on its own and applies at once.
+    if (!messages && latestEventPayload === undefined) {
+      queueMicrotask(() => syncTodosNow(appStore.state.messages));
+      return;
+    }
+    syncTodosNow(messages ?? appStore.state.messages, latestEventPayload);
+  };
+
+  const syncTodosNow = <T>(messages: MessageEntry[], latestEventPayload?: T) => {
     if (
       nativeTodosEnabled &&
       applyNativeTodos(latestEventPayload, { preserveAdvancedStatuses: true })
@@ -62,6 +120,7 @@ export function createTodoSyncOperations(deps: TodoSyncDependencies = {}) {
     messages: MessageEntry[] = appStore.state.messages
   ) => {
     const load = deps.loadSessionTodos;
+    const prefetched = takePrefetch(sessionId, todoLoadGeneration);
     const generation = ++todoLoadGeneration;
     const isCurrent = () =>
       generation === todoLoadGeneration && appStore.state.activeSessionId === sessionId;
@@ -76,7 +135,19 @@ export function createTodoSyncOperations(deps: TodoSyncDependencies = {}) {
 
     try {
       const snapshot = await withStartupDeadline(
-        (signal) => load(sessionId, signal),
+        (signal) => {
+          // This runs after a microtask, so a session upserted with the loaded transcript
+          // is visible here. A read from a different directory is not reusable.
+          if (!prefetched) return load(sessionId, signal);
+          if (prefetched.directory !== deps.resolveSessionDirectory?.(sessionId)) {
+            prefetched.controller.abort();
+            return load(sessionId, signal);
+          }
+          signal.addEventListener('abort', () => prefetched.controller.abort(signal.reason), {
+            once: true,
+          });
+          return prefetched.snapshot;
+        },
         STARTUP_TODO_TIMEOUT_MS,
         'Session todo lookup'
       );
@@ -90,10 +161,8 @@ export function createTodoSyncOperations(deps: TodoSyncDependencies = {}) {
         }
         // Resolve the native snapshot and message fallback as one visible update.
         // An empty intermediate list would unmount the panel and replay its entrance animation.
-        batch(() => {
-          setStateTodos(todos, { preserveAdvancedStatuses: true });
-          advanceTodosFromMessages(messages);
-        });
+        setStateTodos(todos, { preserveAdvancedStatuses: true });
+        advanceTodosFromMessages(messages);
       }
     } catch {
       if (!isCurrent()) return;
@@ -117,6 +186,7 @@ export function createTodoSyncOperations(deps: TodoSyncDependencies = {}) {
 
   return {
     resetTodoSync: reset,
+    prefetchTodosForSession,
     syncTodosFromMessages: syncTodosFromMessagesWithState,
     syncTodosForSession: syncTodosForSessionWithState,
     handoffTodosToMessages: handoffTodosToMessagesWithState,
@@ -127,16 +197,21 @@ function advanceTodosFromMessages(messages: MessageEntry[]) {
   const messageTodos = deriveTodosFromMessages(messages);
   if (messageTodos.length === 0) return false;
 
-  const currentTodos = appStore.state.todos;
-  if (currentTodos.length === 0) {
-    setStateTodos(messageTodos);
-    return true;
-  }
+  let advanced = false;
+  appStore.setState((draft) => {
+    const currentTodos = draft.todos;
+    if (currentTodos.length === 0) {
+      setStateTodos(messageTodos);
+      advanced = true;
+      return;
+    }
 
-  if (currentTodos.length !== messageTodos.length) return false;
-  const nextTodos = mergeTodoEventAdvance(currentTodos, messageTodos);
-  setStateTodos(nextTodos);
-  return true;
+    if (currentTodos.length !== messageTodos.length) return;
+    const nextTodos = mergeTodoEventAdvance(currentTodos, messageTodos);
+    setStateTodos(nextTodos);
+    advanced = true;
+  });
+  return advanced;
 }
 
 function isStaleSettledNativeTodoSnapshot(todos: NormalizedTodo[], messages: MessageEntry[]) {
@@ -164,15 +239,9 @@ export function extractTodos<T>(raw: T): NormalizedTodo[] | null {
   return null;
 }
 
-export function deriveTodosFromMessages(messages: MessageEntry[]): NormalizedTodo[] {
-  let lastUserMessageIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]!.info.role === 'user') {
-      lastUserMessageIndex = index;
-      break;
-    }
-  }
-
+// Scans the current turn, after the last user message, from the newest assistant part backward.
+function findLatestTurnTodos(messages: MessageEntry[]) {
+  const lastUserMessageIndex = messages.findLastIndex((entry) => entry.info.role === 'user');
   for (
     let messageIndex = messages.length - 1;
     messageIndex > lastUserMessageIndex;
@@ -183,11 +252,15 @@ export function deriveTodosFromMessages(messages: MessageEntry[]): NormalizedTod
 
     for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex -= 1) {
       const todos = extractTodosFromPart(message.parts[partIndex]!);
-      if (todos) return todos;
+      if (todos) return { messageId: message.info.id, todos };
     }
   }
 
-  return [];
+  return null;
+}
+
+export function deriveTodosFromMessages(messages: MessageEntry[]): NormalizedTodo[] {
+  return findLatestTurnTodos(messages)?.todos ?? [];
 }
 
 export function syncTodosFromMessages<T>(
@@ -389,14 +462,7 @@ function areTodosEqual(left: NormalizedTodo[], right: NormalizedTodo[]) {
 function getLatestAssistantMessageInTurn(
   messages: MessageEntry[]
 ): MessageEntry<AssistantMessage> | undefined {
-  let lastUserMessageIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]!.info.role === 'user') {
-      lastUserMessageIndex = index;
-      break;
-    }
-  }
-
+  const lastUserMessageIndex = messages.findLastIndex((entry) => entry.info.role === 'user');
   return messages
     .slice(lastUserMessageIndex + 1)
     .findLast(
@@ -405,27 +471,5 @@ function getLatestAssistantMessageInTurn(
 }
 
 function getLatestTodoMessageId(messages: MessageEntry[]) {
-  let lastUserMessageIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]!.info.role === 'user') {
-      lastUserMessageIndex = index;
-      break;
-    }
-  }
-
-  for (
-    let messageIndex = messages.length - 1;
-    messageIndex > lastUserMessageIndex;
-    messageIndex -= 1
-  ) {
-    const message = messages[messageIndex]!;
-    if (message.info.role !== 'assistant') continue;
-
-    for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex -= 1) {
-      const todos = extractTodosFromPart(message.parts[partIndex]!);
-      if (todos) return message.info.id;
-    }
-  }
-
-  return null;
+  return findLatestTurnTodos(messages)?.messageId ?? null;
 }

@@ -13,6 +13,7 @@ import { formatSkillReference } from '../../lib/skill-reference';
 import { getWorkspaceRelativePath } from '../../lib/path-display';
 import { problemIdentity, uniqueProblems } from '../../lib/editor-problems';
 import { isVarroVisionAgent } from '../../../shared/vision-agent';
+import { SESSION_ID_RE } from '../../lib/session-reference';
 
 export const SKILLS_COMMAND_NAME = 'skills';
 export const PROBLEMS_COMMAND_NAME = 'problems';
@@ -245,7 +246,9 @@ export function normalizeSessionLookupQuery(query: string) {
 }
 
 export function getSessionReferenceIds(text: string) {
-  return Array.from(text.matchAll(/(?:^|\s)session:([a-z0-9_-]+)/gi), (match) => match[1]!);
+  return Array.from(
+    new Set(Array.from(text.matchAll(SESSION_ID_RE), (match) => match[1] || match[2]!))
+  );
 }
 
 export function getLeadingSlashCommand(text: string) {
@@ -315,8 +318,10 @@ export function getCompletionSelection(
 }
 
 export function getAgentBadgeLine(agent: Agent) {
-  const badges: string[] = [];
-  badges.push(agent.mode === 'subagent' ? 'Subagent' : 'Primary');
+  const role = agent.mode === 'subagent' ? 'Subagent' : 'Primary';
+  if (agent.permission == null) return role;
+
+  const badges: string[] = [role];
   const editMode = getAgentPermissionMode(agent, 'edit', 'deny');
   if (editMode === 'allow') badges.push('Can edit');
   else if (editMode === 'ask') badges.push('Edits ask');

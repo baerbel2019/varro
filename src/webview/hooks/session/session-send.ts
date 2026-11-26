@@ -1,4 +1,6 @@
-import { batch } from 'solid-js';
+import { storePath } from '@solidjs/signals';
+import { applyQueuedModelCapabilities } from '../../lib/queued-model-capabilities';
+
 import { captureExtensionContexts } from '../../host/extensions';
 import { cloneExtensionContexts, formatExtensionContext } from '../../../shared/extension-context';
 import type { ExtensionContext } from '../../../shared/extension-context';
@@ -21,6 +23,7 @@ import {
   hasInlineProblemsForFile,
 } from '../../lib/editor-problems';
 import type { IssueAttachment } from '../../lib/editor-problems';
+import type { SessionPromptBody } from '../../lib/client';
 import type {
   DroppedFile,
   EditorContext,
@@ -109,23 +112,7 @@ type ComposerState = {
   visionDelegationAvailable?: boolean;
 };
 
-export type SessionSendBody = {
-  followupTitle?: string;
-  messageID?: string;
-  parts: Array<{
-    type: string;
-    text?: string;
-    mime?: string;
-    filename?: string;
-    url?: string;
-  }>;
-  model?: { providerID: string; modelID: string };
-  agent?: string;
-  noReply?: boolean;
-  delivery?: 'steer' | 'queue';
-  variant?: string;
-  queuedMessageDispatch?: { itemId: string; lease: number };
-};
+export type SessionSendBody = SessionPromptBody & { followupTitle?: string };
 
 type SendFlowOptions = {
   noReply?: boolean;
@@ -809,8 +796,10 @@ function clearCapturedComposerAttachments(
     }
   }
   if (removedProblemIds.size > 0)
-    appStore.setState('inlineProblems', (references) =>
-      references.filter((reference) => !removedProblemIds.has(reference.id))
+    appStore.setState(
+      storePath('inlineProblems', (references) =>
+        references.filter((reference) => !removedProblemIds.has(reference.id))
+      )
     );
 
   const currentTerminalSelection = appStore.state.terminalSelection;
@@ -862,10 +851,12 @@ function restoreClearedComposerAttachments(cleared: ClearedComposerAttachments) 
     (reference) => !appStore.state.inlineProblems.some((current) => current.id === reference.id)
   );
   if (restored.length > 0)
-    appStore.setState('inlineProblems', [
-      ...appStore.state.inlineProblems,
-      ...cloneInlineProblems(restored),
-    ]);
+    appStore.setState(
+      storePath('inlineProblems', [
+        ...appStore.state.inlineProblems,
+        ...cloneInlineProblems(restored),
+      ])
+    );
   for (const file of cleared.droppedFiles) {
     if (!appStore.state.droppedFiles.some((current) => current.path === file.path)) {
       composerStore.addContextFile({
@@ -888,11 +879,15 @@ function restoreClearedComposerAttachments(cleared: ClearedComposerAttachments) 
     composerStore.setTerminalSelection({ ...cleared.terminalSelection });
   }
   if (cleared.attachedDiagnostics && !appStore.state.attachedDiagnostics) {
-    appStore.setState('attachedDiagnostics', {
-      diagnostics: cleared.attachedDiagnostics.diagnostics.map((diagnostic) => ({ ...diagnostic })),
-      total: cleared.attachedDiagnostics.total,
-      inline: cleared.attachedDiagnostics.inline,
-    });
+    appStore.setState(
+      storePath('attachedDiagnostics', {
+        diagnostics: cleared.attachedDiagnostics.diagnostics.map((diagnostic) => ({
+          ...diagnostic,
+        })),
+        total: cleared.attachedDiagnostics.total,
+        inline: cleared.attachedDiagnostics.inline,
+      })
+    );
   }
 }
 
@@ -1043,14 +1038,18 @@ export class SessionSendOperations {
     // Capture the displayed reasoning choice before session creation can turn
     // an absent variant into an explicit session default.
     // Preparation must fail before an edit deletes the original history.
+    const queuedContext = options?.queuedContext;
+    const queuedModel = queuedContext?.editorContext.queuedModel;
+    const providers = queuedModel
+      ? applyQueuedModelCapabilities([...appStore.state.providers], queuedModel)
+      : [...appStore.state.providers];
     const capturedSelectedModel = resolveComposerSendModel({
       selectedModel,
-      providers: appStore.state.providers,
+      providers,
       providerDefaults: appStore.state.providerDefaults,
       modelVariantSelections,
     });
     const capturedAttachments = captureComposerAttachments(options?.queuedAttachments);
-    const queuedContext = options?.queuedContext;
     if (!appStore.state.autoAttachActiveFile && queuedContext?.currentDocumentEnabled) {
       const activePath = queuedContext.editorContext.activeFile?.path;
       const autoAttachedPath = queuedContext.autoAttachedFilePath;
@@ -1068,7 +1067,7 @@ export class SessionSendOperations {
     const capturedComposerState: ComposerState = {
       selectedAgent,
       selectedModel: capturedSelectedModel ? { ...capturedSelectedModel } : null,
-      providers: [...appStore.state.providers],
+      providers,
       providerDefaults: { ...appStore.state.providerDefaults },
       modelVariantSelections,
       editorContext: {
@@ -1391,36 +1390,34 @@ export async function sendMessageWithDependencies(
     options?.optimisticModel,
     optimisticImages
   );
-  batch(() => {
-    if (optimisticMessage) deps.beforeOptimisticPublish?.();
-    if (expectsAssistantReply) {
-      deps.setSessionFailed(sessionId, false);
-      deps.setSessionStatusEntry?.(sessionId, { type: 'busy' });
-    }
-    if (expectsAssistantReply && deps.getActiveSessionId() === sessionId) {
-      deps.startLoading();
-    }
-    if (deps.getActiveSessionId() === sessionId) deps.setError(null);
-    if (effectiveModel && deps.getActiveSessionId() === sessionId) {
-      deps.applyEffectiveModel(effectiveModel, sessionId);
-    }
+  if (optimisticMessage) deps.beforeOptimisticPublish?.();
+  if (expectsAssistantReply) {
+    deps.setSessionFailed(sessionId, false);
+    deps.setSessionStatusEntry?.(sessionId, { type: 'busy' });
+  }
+  if (expectsAssistantReply && deps.getActiveSessionId() === sessionId) {
+    deps.startLoading();
+  }
+  if (deps.getActiveSessionId() === sessionId) deps.setError(null);
+  if (effectiveModel && deps.getActiveSessionId() === sessionId) {
+    deps.applyEffectiveModel(effectiveModel, sessionId);
+  }
 
-    deps.clearSessionUsageLimit(sessionId);
-    // Steering continues the current turn and must not reattach a detached reader,
-    // including when admission arrives after they scroll away from the pending steer.
-    if (
-      !isSteerDelivery &&
-      deps.getActiveSessionId() === sessionId &&
-      !options?.preserveScrollPosition
-    ) {
-      deps.requestMessageListScrollToBottom(
-        expectsAssistantReply && optimisticMessage ? messageId : undefined
-      );
-    }
-    if (optimisticMessage) {
-      deps.appendOptimisticMessage?.(optimisticMessage);
-    }
-  });
+  deps.clearSessionUsageLimit(sessionId);
+  // Steering continues the current turn and must not reattach a detached reader,
+  // including when admission arrives after they scroll away from the pending steer.
+  if (
+    !isSteerDelivery &&
+    deps.getActiveSessionId() === sessionId &&
+    !options?.preserveScrollPosition
+  ) {
+    deps.requestMessageListScrollToBottom(
+      expectsAssistantReply && optimisticMessage ? messageId : undefined
+    );
+  }
+  if (optimisticMessage) {
+    deps.appendOptimisticMessage?.(optimisticMessage);
+  }
 
   const shouldClearComposer = deps.shouldClearComposerAfterSend();
   const canClearComposerBeforeSend =
@@ -1508,7 +1505,7 @@ function clearSessionUsageLimitForSessionTree(sessionId: string) {
 function appendOptimisticMessageToActiveSession(entry: OptimisticMessageEntry) {
   if (appStore.state.activeSessionId !== entry.info.sessionID) return;
   trackPendingOptimisticUserMessage(entry.info.sessionID, entry.info.id);
-  appStore.setState('messages', (messages) => [...messages, entry]);
+  appStore.setState(storePath('messages', (messages) => [...messages, entry]));
   appStore.defaultAppState.messageIndex.invalidate();
 }
 
@@ -1519,7 +1516,7 @@ function removeOptimisticMessageFromActiveSession(messageId: string) {
   }
   const nextMessages = appStore.state.messages.filter((entry) => entry.info.id !== messageId);
   if (nextMessages.length === appStore.state.messages.length) return;
-  appStore.setState('messages', nextMessages);
+  appStore.setState(storePath('messages', nextMessages));
   appStore.defaultAppState.messageIndex.invalidate();
 }
 

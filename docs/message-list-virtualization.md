@@ -56,8 +56,9 @@ the shared invariants below remain true.
   its painted destination. Reduced-motion following must not oscillate
   between virtual ranges while those writes settle. Cancel pending correction writes on disposal.
   Streamed entrance height updates also defer observer-triggered writes.
-  Consuming a trailing reserve also resizes the observed track, so observer-triggered reserve
-  reconciliation runs in the next animation frame. The latest painted follow destination is a
+   Consuming a trailing reserve also resizes the observed track, so observer-triggered reserve
+  reconciliation runs in the next animation frame. Immediate bottom-follow from that observer must
+  skip its usual synchronous reserve reconciliation too. The latest painted follow destination is a
   lower bound while the reserve is consumed. Measured entrances retain a fractional natural height
   rather than rounding it up, so animation cleanup does not shrink the range by a painted pixel.
   `scroll-resize-observer.spec.ts` and `scroll-streaming.spec.ts` check
@@ -77,6 +78,13 @@ the shared invariants below remain true.
 - A distant history anchor may extend the mounted range beyond ordinary overscan. Only the viewport,
   forced rows, and pinned anchor require full content; the intervening gap may use prefix-sized inert
   placeholders.
+- A native held thumb also outranks pending history restoration. When a prepend changes the captured
+  prefix, invalidate its history owner before range selection so the list does not mount an obsolete
+  content destination and then return to the native numeric destination. Do not revive that owner on
+  release. A gesture released before delivery still uses normal history anchoring. Continue measuring
+  the actual numeric viewport; neither guessed prefix correction nor skipped visible rows is valid.
+  `scroll-cold-prepend.spec.ts` checks viewport reconstruction, competing history writes, continued
+  native movement, a hold beyond the input timeout, and release.
 - Activity map membership alone must not hydrate that gap. Only groups connected to the real
   viewport/overscan or pinned row require their cross-message content; unrelated completed groups stay
   inert. Otherwise a prepend can temporarily mount thousands of historical tools while still reporting
@@ -105,9 +113,14 @@ the shared invariants below remain true.
   observer setup also measures its connected snapshot as a batch. While history owns an exact anchor,
   measurement publication must not queue a competing generic anchor after direct input becomes idle.
    Gesture-driven range updates collect mounted rows during the scroll handler's reactive batch, then
-   measure them together before saving the destination anchor. Coalesce mounted sticky-preview checks
-   at the same boundary. Other gesture-driven mounts still measure synchronously. Never defer height
-   compensation above the viewport until after the handler has remembered an already-shifted destination.
+    measure them together before saving the destination anchor. Coalesce mounted sticky-preview checks
+     at the same boundary. Other gesture-driven mounts still measure synchronously. Never defer height
+     compensation above the viewport until after the handler has remembered an already-shifted destination.
+    The actual prepend that retires a held native thumb's history anchor also uses that pre-paint
+    microtask and one sticky check per connected batch. Its marker belongs to the current history
+    transaction and session/window generation, not every invalidated anchor. Keep the retired anchor
+    invalid after release, measure the real numeric viewport, and leave wheel/touch compensation and
+    unrelated streaming mounts on their existing paths.
 
 ### Height Accounting
 
@@ -141,6 +154,10 @@ the shared invariants below remain true.
   Native subagent result notifications render as ordinary automatic-action tools inside Explored,
   not as a second standalone subagent task card. Preserve their result text, status, and native IDs;
   the original task card remains the subagent navigation entry.
+- Native goal kickoffs are an exception to synthetic-action rendering. Show the `/goal` objective as
+  the user's prompt under the native message and part IDs, including while it waits in the inbox.
+  It owns subsequent assistant replies. Hide internal goal continuations and resume instructions;
+  the backend-driven goal row above the composer shows their current state and controls.
 - `virtualMetrics.prefix.at(index)` must describe the same ordered ID list used by the renderer.
 - Published prefixes are immutable snapshots. Large prefixes share complete 256-entry chunks;
   a dirty suffix copies its partial boundary chunk before writing. Earlier snapshots must remain
@@ -149,6 +166,11 @@ the shared invariants below remain true.
   remain valid.
 - A row measurement correction above the visible anchor must preserve that anchor's viewport
   position.
+- A held native scrollbar owns its numeric destination. Do not apply inferred prefix-height scroll
+  corrections or generic measurement-anchor restoration against that destination, including after the
+  input-intent timeout. Chromium reconciles the thumb on its next move and reverses competing writes.
+  Continue measuring and publishing the bounded mounted range. Wheel and touch retain above-viewport
+  compensation. `scroll-scrollbar-activity.spec.ts` covers cold remounts, a long hold, and release.
 - Content below the anchor may change `scrollHeight`, but it must not move the anchor.
 - Completing a short new turn must retain any bottom reserve needed by the current viewport.
   Clearing the new-turn reserve outright can shrink the scroll range and clamp already-painted
@@ -167,6 +189,11 @@ the shared invariants below remain true.
   preserving detached anchoring. `remote-images.spec.ts` checks consent, frame geometry, preview opening,
   virtual remounts, and setting changes above a detached viewport. Raw HTML images remain blocked
   and the webview CSP does not admit remote sources.
+- Local Markdown image paths load automatically near the viewport, independently of the remote-image
+  setting. Relative paths resolve against the message's session directory; absolute paths and `file://`
+  URLs use the same canonical, open-workspace checks as file reads. Reserve the same 384 px-wide,
+  16:9 frame before loading, keep its geometry on failures and thumbnail arrival, and request original
+  raster bytes only while opening the image preview. Raw HTML image elements remain blocked.
 - History file parts carry scoped content references. Request bounded image thumbnails only near the
   viewport, and request the original only for an open preview or an edit draft. Single thumbnails reserve
   a 384 px frame, capped by the available width, with the existing 16:9 aspect ratio. Their intrinsic
@@ -204,10 +231,35 @@ the shared invariants below remain true.
   invalidated prefix. Keep intervening rows as bounded placeholders and suppress competing generic
   measurement anchors until settling ends. Release the pin on direct input, owner replacement, or
   session change; an already-unmounted anchor cannot provide exact DOM restoration.
-- Capture a diff-toggle anchor before DOM replacement can clamp the scroll range. Detached readers
-  may need a temporary bottom deficit reserve; its target must follow the retained marker when the
+- Capture a diff-toggle anchor before DOM replacement can clamp the scroll range. Capture through the
+  app instance's before-change subscription in `setShowFileDiffs`, not a reactive effect whose
+  scheduling could run after removal. Remove the subscription when the message list is disposed.
+  Detached readers may need a temporary bottom deficit reserve; its target must follow the retained
+  marker when the
   trailing summary slot changes, even if the reserve's size is already sufficient. Native scroll
   detachment must cancel stale go-to-latest requests so they cannot block this anchor owner.
+  Prefer a fully painted prose block over the first row's virtual top. If that row exposes only the
+  tail of a diff, preserving its offscreen top while hiding the diff can scroll the next visible
+  paragraph out of view. Fall back to the row coordinate when no stable painted block exists.
+  `scroll-diff-preview.spec.ts` covers consecutive tool-step rows and samples the paragraph every frame.
+  Keep that detached anchor while deferred preview requests remain pending. Pause bounded settling
+  when waiting and wake it from detail completion before paint; do not expire it after twelve idle
+  frames or poll indefinitely. New direct input cancels the retained owner and pin.
+  For wheel or keyboard movement, transfer its saved paragraph identity and translate the saved
+  destination by the actual movement from the last observed scroll coordinate. Reconcile partial
+  hydration against that destination before recapturing genuinely exposed earlier prose. A passive
+  wheel callback may already see native movement and unpresented growth; neither its live rectangle
+  nor an additional predicted wheel delta describes the presented destination.
+  Exact painted-anchor selection for diff-preview owners must exclude the sticky prompt's opaque
+  card and solid gap. Width reflow and thinking anchors share the selector but keep the topmost
+  block: excluding the overlay there moves the reader's text after PageDown and a resize, which the
+  `performance.spec.ts` width-reflow cases cover.
+  A paragraph behind that overlay can enter the scrollport after a wheel tick without
+  becoming visible. Preserving it during hydration moves the genuinely visible prose
+  below its growing diff. Once earlier prose is actually exposed, it may own the new
+  destination. The deferred diff-tail regression covers both cases with native input.
+  Do not include the translucent fade or additional sticky collision safety margin in
+  this paint cutoff. Prose below the solid gap remains exposed through the fade.
 - Publish changed heights and the anchor's new virtual scroll coordinate in one batch. Range
   selection must not mount the old numeric destination against the new prefix and then discard it
   during anchor restoration. Read the mounted batch's rectangles before writing row corrections.
@@ -230,6 +282,16 @@ the shared invariants below remain true.
   a boundary row, replacing its cached diff height with its shorter summary on each pass.
   Coalesce completion/unmount wakeups with an executing settle pass or its scheduled animation frame.
   Replacing that frame with another microtask can starve paint indefinitely during range churn.
+- Before releasing a deferred diff row's temporary `min-height`, reserve the actual scroll-range
+  shortfall against its natural in-flow child geometry. A successful streamed patch can remove its
+  status card while the hold still supplies that height; consuming its first removal reserve before
+  the hold ends otherwise clamps the viewport backward when details arrive. Publish the replacement
+  reserve before removing the hold, without acquiring a collapse owner. Explicit diff-view bottom
+  replacement keeps its own physical-bottom policy; a held scrollbar keeps its range owner.
+- While diff-view bottom-follow owns replacement, departing summaries must not acquire an activity
+  collapse target or append reserve. Those owners block immediate physical-bottom correction until a
+  later frame. The individually delayed sibling-preview case in `scroll-diff-preview.spec.ts` releases
+  details separately after 400 ms and checks every frame for a bottom gap of at most 1 px and no reserve.
 - Width reflow owns a stable visible message captured before the first changed-height batch is
   applied. Deferring prefix publication must not make later resize batches classify rows against an
   already-adjusted `scrollTop` and stale prefixes.
@@ -363,6 +425,8 @@ the shared invariants below remain true.
   the browser moves the transcript. Later history, expansion, or resize compensation may account for
   content inserted above that destination but must not undo the native movement. Scrolling keys inside
   editable controls do not own the transcript.
+  Native movement may precede its scroll notification. Defer the old destination's restoration,
+  and translate it before measurement compensation advances the observed scroll coordinate.
 - A downward user movement during an append transition is a new lower bound. A later animation frame
   must never interpolate to a smaller `scrollTop` and visibly reverse the gesture.
 - Width-resize anchoring is established before applying the first resize measurement. Wheel,
@@ -389,6 +453,16 @@ the shared invariants below remain true.
   Appended assistant steps must not start a measured append transition while this owner or its
   retained summary anchor is active. A group-collapse settle restores that summary instead of
   briefly jumping to a different bottom target and letting the summary undo it next frame.
+  When continuation text releases that owner, transfer the hidden Thinking row's measured height
+  into the consumable append reserve and collapse its placeholder. Keeping both the blank Thinking
+  slot and entering text makes a short replacement scroll the preceding summary after the exit
+  reserve is exhausted. Restore the row's normal height when Thinking is visible again, and clear
+  the transfer on row removal or session replacement. Check every continuation frame, not only the
+  exit frames or a single text-visible sample; combined reserved space must not grow during transfer.
+  A summary below a separate active tray cannot own that tray's geometry, including when the tray
+  belongs to an earlier assistant step. Release an already-retained summary owner before restoring
+  it against that preview's growth, and do not recapture it on collapse. Preserve the painted scroll
+  target and consume existing reserve instead.
 - Reaching the physical bottom during an exit that began while detached reserves the remaining
   animated tray height. Otherwise the shrinking scroll range reverses the just-completed gesture.
 - Transcript-scrolling keys release the old activity-exit target and summary anchor while handing its
@@ -403,17 +477,23 @@ the shared invariants below remain true.
   Disable native CSS scroll anchoring during this hold too: a detached non-virtualized list can
   otherwise let browser anchor adjustments fight its thumb position during activity growth.
   Restore the stylesheet's anchoring policy on release without writing a scroll position.
-  Track the held scroll range even while detached, reserving lost range when a tray shrinks;
-  the pinned exit-reserve path alone does not cover detached tool churn. Reserve detached activity
-  collapses before removal: resize delivery is too late to prevent native thumb mapping from seeing
-  the shorter range. Keep offscreen reserve through the hold, consume it against the held range,
-  and exclude reserve from new range growth so repeated replacements cannot accumulate blank space.
-  On pointer release or cancellation, discard reserve wholly below the viewport even if no further
-  scroll or resize event arrives. Otherwise a later drag can inherit that obsolete range and land
-  below every message. Preserve reserve intersecting the viewport and do not write a scroll position.
-  If a measurement correction leaves the entire held viewport inside trailing reserve, retire that
-  obsolete range and let the browser clamp to real content. There is no painted anchor to preserve
-  there; range protection must not maintain a wholly blank viewport during or after the gesture.
+  Hold the track at its grabbed height for the whole gesture, with equal `min-height` and
+  `max-height` and vertical `overflow: clip`. Chromium maps the held thumb's pixel position through
+  the scroll range, so any range change remaps it, sometimes backward for a frame. That includes
+  genuine growth and a reserve that reaches the page a frame after a replacement row. The fixed
+  height absorbs detached tool churn in the same layout, and growth below it stays clipped until
+  release. Fold any existing reserve into the held height, and do not publish held-range reserve
+  while it is in place. Measure content from in-flow children only: out-of-flow and sticky children
+  paint where they are positioned, not where the content ends.
+  On pointer release or cancellation, hand the held height's blank part to the bottom reserve before
+  removing it, then discard reserve wholly below the viewport even if no further scroll or resize
+  event arrives. Otherwise a later drag can inherit that obsolete range and land below every
+  message. Preserve reserve intersecting the viewport and do not write a scroll position.
+  If a measurement correction leaves the entire held viewport below every message, shrink the held
+  height to the content and let the browser clamp. There is no painted anchor to preserve there;
+  range protection must not maintain a wholly blank viewport during or after the gesture.
+  When a bottom-pinned gesture releases ownership, refresh the follow target from its actual
+  destination. A pre-drag target can describe a longer cold range and must not become append reserve.
   Finish activity-entry height animations immediately while the pointer owns scrolling. Their
   incremental growth otherwise changes native thumb mapping even when no JavaScript scroll write
   occurs. Preserve animation-end cleanup and restore normal entry timing on release.
@@ -492,6 +572,20 @@ Direct input acquires ownership only when it can affect the transcript:
   final answer's visible bounds, not only bottom distance. `scroll-hidden-completion.spec.ts` completes
   a turn with suspended frames and checks short and virtualized histories, with and without visibility
   events, while retaining detached reading positions.
+- While that resumed follower is pending, a short-lived track mutation observer reconciles trailing
+  DOM growth that lands after resize delivery and before the next follow tick. Disconnect it on
+  settlement, cancellation, session/input ownership changes, or unmount. At-bottom mutations must not
+  reset settlement. The hidden-activity regression includes late 24 px chrome growth and a native
+  wheel handoff before that growth; the latter must preserve the reader's new position.
+- Activity-summary settling and bottom-follow share the pending-frame clock. Cancelling or replacing
+  the follower must not reset a rendering gap while its summary owner still has a pending frame.
+  Both owners detect resumed rendering and release obsolete reserves before restoring an old target.
+  Reset the clock when settling becomes idle, on direct scroll cancellation, and on session replacement;
+  ordinary idle time is not evidence of suspended rendering. Repeated tray collapses reserve only the
+  actual target shortfall after accounting for replacement growth, even before frames resume.
+  Do not restore a summary against a zero-height scrollport. `scroll-hidden-activity.spec.ts` checks
+  busy activity, completion just before reveal, and detached reading at narrow and desktop widths
+  without a visibility event or inflated tool heights.
 - Keep the transcript hidden behind its loading indicator through initial positioning and any initial
   viewport-filling history fetch. Reaching the end of the first page is not a ready-to-paint state when
   compact tool rows leave that page shorter than the viewport. Reveal only after the final bottom
@@ -531,6 +625,10 @@ Direct input acquires ownership only when it can affect the transcript:
 - Send-time composer collapse eases its held minimum height over 220 ms. Before each shrinking frame,
   reserve only the scroll-range shortfall at the current painted scroll position. Reserving the whole
   height delta makes bottom-follow chase temporary space and leaves an unnecessary trailing reserve.
+  Predict the integer `clientHeight` from the borderless scrollport's fractional height plus the
+  disappearing slice. Rounding each slice up can create a persistent 1 px reserve even when the
+  scrollport's integer height does not change. Keep genuine rounded shortfalls until content consumes
+  them; do not clear other owners' reserves when the composer finishes.
   Keep the toolbar against the bottom border throughout the hold and collapse. Measure natural height
   by subtracting the divider's auto-margin space without releasing the hold. Reduced motion releases
   immediately; session replacement and disposal cancel the frame loop.
@@ -547,6 +645,8 @@ Direct input acquires ownership only when it can affect the transcript:
   tray slot can otherwise consume the last reserved pixel before a deferred correction removes it,
   clamping the viewport backward. A deferred rounding write must recreate the required reserve even
   when replacement growth has already consumed the spacer completely.
+  Do not seed a rounding reserve at scroll position zero. Track minimum height can hide unused room,
+  so repeated fractional tool corrections otherwise accumulate a pixel per collapse despite that room.
   `scroll-auto-scroll.spec.ts` checks the same anchor every frame
   through this replacement and the subsequent full collapse.
 - A fixed collapse target does not consume reserve, but it still reserves pending row-rounding
@@ -556,14 +656,26 @@ Direct input acquires ownership only when it can affect the transcript:
   Animated reasoning exits also reserve the source row's already-applied rounding correction before
   publishing exit membership. An explicit measurement can remove that correction before it becomes
   a pending observer reduction, including below the virtualization threshold.
+  When the last non-exiting item leaves a tray, reserve the tray wrapper's own block padding once.
+  Padding inside the measured item is already included; wrapper padding is not. Fractional wrapper
+  padding must not leave the scroll range a pixel short when the wrapper is finally removed.
   `scroll-reasoning-exit.spec.ts` checks the pre-exit budget and a painted marker through the handoff.
+- Commit a newly recreated reserve spacer before applying a reducing row-rounding correction.
+  Solid's deferred signal publication can otherwise leave no spacer in the DOM during the style
+  write, even though the next rendered frame reports a sufficient reserve. That ordering produced
+  a one-pixel browser clamp during ordinary streamed text after tools.
+  `scroll-streaming-patch-failure.spec.ts` checks both this correction and delayed diff-height release
+  with previews enabled and disabled.
 - Automatic todo completion and removal announce their disappearing block, margins, and parent gap
   before changing the layout. A later ResizeObserver correction is insufficient: the September 11
   editor replay briefly clamped the transcript backward by 139 px when its todo panel disappeared.
   `scroll-auto-scroll.spec.ts` checks automatic completion and clearing at removal and frame boundaries.
 - The trailing Thinking, loading, empty-reserve, and Worked states share one post-message slot. The
-  slot stays invisibly reserved while active tool previews or inline edits replace its label. Do not
-  show a tool-specific Waiting indicator. The normal Thinking verb cycle resumes when eligible.
+  slot stays invisibly reserved while inline edits replace its label, and takes no height while an
+  active tool is visible so no space opens below the tool. Active tools appear and leave immediately,
+  without a fold animation. Content never scrolls backward at these swaps, and Thinking keeps its
+  normal distance from the content above it. Do not show a tool-specific Waiting indicator. The
+  normal Thinking verb cycle resumes when eligible.
   Its elapsed time counts from the latest completed
   text, reasoning, tool, or assistant event in the current turn, falling back to the turn's loading start.
   Ordinary streaming activity does not reset it. Verb rotation and the initial 1-second elapsed-label
@@ -627,12 +739,13 @@ Direct input acquires ownership only when it can affect the transcript:
   even if it has completed partial text and `finish: error`. Keep the loading slot through retry and
   the next empty attempt; do not briefly insert Worked. `automatic-retry.spec.ts` checks that handoff
   and the gap from the retry notice to Thinking every frame.
-- The trailing final-answer marker requires settled execution and presentation, even when a terminal
-  step's Worked summary is already visible or retained. A message completion timestamp or `finish: stop`
-  alone does not prove the session is finished. Remove that marker when work resumes, keep it absent
-  through background notices and continuation loading, and mark only the settled continuation.
-  Earlier completed turns keep their markers while a new turn runs. `MessageList.rendering.test.ts`
-  covers busy, retry, local loading, child execution, streaming, and background handoffs.
+- The trailing Worked summary and final-answer marker require settled execution and presentation.
+  A message completion timestamp or `finish: stop` alone does not prove the session is finished.
+  Revoke both when work resumes, including a retained summary, and keep them absent through
+  background notices and continuation loading. Show them only for the settled continuation.
+  Earlier completed turns keep their summaries and markers while a new turn runs.
+  `MessageList.rendering.test.ts` covers busy, retry, local loading, child execution, streaming,
+  and background handoffs.
 - Follow-ups use that same settled final-response identity. New inference requires an observed
   unfinished assistant or new live prompt, or an unread opening captured before acknowledging it.
   Unread eligibility compares answer completion with the previous seen timestamp. A busy snapshot
@@ -693,6 +806,10 @@ Direct input acquires ownership only when it can affect the transcript:
 - While inline editing is active, the edited row top may not move above the sticky message-jump inset.
   Clamp native and wheel movement at that boundary and settle for bounded frames. Editing never
   re-enables bottom follow.
+- Submitting an inline edit suppresses the abandoned turn's Worked summary before replacement
+  publication. Announce that disappearing block before removing it and reserve only the scroll-range
+  shortfall, without changing the edit scroll owner. Restoring the summary or publishing replacement
+  content consumes the reserve. `scroll-auto-scroll.spec.ts` checks every delayed-deletion frame.
 - The inline composer replaces a real prompt card and remains a sticky collision boundary. The
   preceding sticky prompt must yield to it so the edit banner and Cancel control stay actionable.
 - Focused diff content owns local interaction geometry and pauses bottom follow. Resume only if follow
@@ -876,6 +993,11 @@ Direct input acquires ownership only when it can affect the transcript:
   painting it gives the preceding paragraph list spacing that a following hidden token removes again.
   `markdown-streaming-append.spec.ts` checks the entering row every frame for whole and split
   deliveries and requires no painted orphan bullet.
+- Deeply nested and quoted marker-only suffixes follow the same pending-block rule. An unfinished
+  nested `-` must not temporarily turn the preceding item into a setext heading, and a quote-only
+  suffix must not paint an empty bordered block. Preserve literal code and completed Markdown syntax.
+  A boundary replay of the reported `ses_dfde9136fffeaRG6Zgn3qN4oED` response reproduced backward
+  movements of up to 20 px when these temporary blocks disappeared.
 - Incomplete HTML tag suffixes must not paint as temporary prose. Opening and closing tags such as
   `<details` and `</summary` otherwise lose a line when `>` arrives. Omit these suffixes before parsing;
   a hidden marker at the root of a raw HTML segment can itself change trailing-block spacing.
@@ -914,10 +1036,12 @@ Direct input acquires ownership only when it can affect the transcript:
   preceding content upward. Initial positioning, browser clamp corrections, and reduced motion remain
   immediate. The final easing step reaches the destination before the one-pixel settle threshold.
   The viewport follower uses critically damped motion with a 220 ms smoothing time and a
-  1,100 px/s speed limit. While paced text is releasing, newly revealed lines may trail the viewport by
-  at most 64 px: beyond that the follower catches up continuously at up to 2,200 px/s, never by a jump,
-  so a large first chunk does not sit below the composer for a third of a second. A tick that lands
-  mid catch-up may exceed the bound for one frame. Preserve velocity across incoming blocks, retain fractional progress between
+  1,100 px/s speed limit. While paced text is releasing, the follower targets at most 64 px of lag,
+  catching up continuously at up to 2,200 px/s. Upward frame-speed changes are limited to
+  6,000 px/s² across ordinary follow and catch-up, including repeated threshold crossings.
+  A large burst may temporarily exceed the preferred lag while velocity builds; never enforce that
+  lag by snapping or bypassing acceleration. The final <=2 px settlement remains immediate.
+  Preserve velocity across incoming blocks, retain fractional progress between
   painted frames, and reset momentum after interruption. Use animation-frame timestamps so rendering
   work does not turn a late callback into a sudden speed change. Do not replay an ease-out curve at
   full initial speed for each arrival.

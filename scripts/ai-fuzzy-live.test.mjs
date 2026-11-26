@@ -53,6 +53,80 @@ const ready = {
   nestedActivityScroller: { hasRange: true },
 };
 
+test('frame and event evidence stay in the installed document when action worlds change', async () => {
+  const controller = Object.assign(Object.create(CdpController.prototype), {
+    targetId: 'iframe',
+    frameId: 'content',
+    targetContext: { viewId: 'sidebar' },
+    contextId: 1,
+    mainContextUniqueId: 'document-A',
+  });
+  const world = vm.createContext({ window: new EventTarget(), performance, structuredClone });
+  controller.call = async (method, params) => {
+    assert.equal(method, 'Runtime.evaluate');
+    assert.equal(params.uniqueContextId, 'document-A');
+    assert.equal(params.contextId, undefined);
+    try {
+      return { result: { value: vm.runInContext(params.expression, world) } };
+    } catch (error) {
+      return { exceptionDetails: { text: String(error) } };
+    }
+  };
+  const owner = controller.observationOwner();
+  await controller.startSessionEventCapture(owner);
+  await controller.evaluateObservation(
+    owner,
+    'Install test frame observer',
+    'globalThis.observer = { stop: () => 42 }; true'
+  );
+  world.window.dispatchEvent(
+    new MessageEvent('message', {
+      data: { type: 'server/event', payload: { type: 'session.idle' } },
+    })
+  );
+  controller.contextId = 2;
+  assert.equal(await controller.evaluateObservation(owner, 'Stop', 'observer.stop()'), 42);
+  assert.equal((await controller.finishSessionEventCapture(owner))[0].event.type, 'session.idle');
+  await assert.rejects(
+    controller.finishSessionEventCapture(owner),
+    /Installed session-event capture is missing/
+  );
+  controller.mainContextUniqueId = 'document-B';
+  await assert.rejects(
+    controller.evaluateObservation(owner, 'Stop', 'observer.stop()'),
+    /Stop.*document-A.*owner changed.*document-B/
+  );
+});
+
+test('AI-08 retains completed action evidence and identifies the interrupted step', async () => {
+  const results = [];
+  const started = [];
+  let top = 0;
+  const cdp = {
+    captureActionState: async () => ({
+      transcript: { scrollTop: top, firstVisibleMessageId: 'one', firstVisibleTop: -top },
+    }),
+    wheel: async () => {
+      if (top) throw new Error('action target lost');
+      top = 100;
+      return true;
+    },
+  };
+  const plan = [1, 2].map((step) => ({ step, action: 'wheel transcript', delta: 100 }));
+  await assert.rejects(
+    executeActionPlan(cdp, plan, '', 0, {
+      results,
+      onActionStart: ({ step }) => started.push(step),
+    }),
+    /action target lost/
+  );
+  assert.deepEqual(started, [1, 2]);
+  assert.deepEqual(
+    results.map(({ step, executed }) => ({ step, executed })),
+    [{ step: 1, executed: true }]
+  );
+});
+
 test('AI-18 defaults to the current pinned fixture layout', async () => {
   const { DEFAULT_AI18_FIXTURE_EDIT_PATH } = await import('./ai-fuzzy-live.mjs');
   assert.equal(DEFAULT_AI18_FIXTURE_EDIT_PATH, 'packages/util/src/bom.ts');
@@ -112,6 +186,33 @@ test('composer replacement never submits a contaminated or restored draft', asyn
   );
 });
 
+for (const [key, virtualKeyCode] of [
+  ['Backspace', 8],
+  ['Escape', 27],
+  ['ArrowLeft', 37],
+  ['ArrowRight', 39],
+  ['Delete', 46],
+]) {
+  test(`native ${key} includes Chromium's Windows key codes`, async () => {
+    const controller = Object.create(CdpController.prototype);
+    const calls = [];
+    controller.call = async (method, params) => {
+      calls.push({ method, params });
+    };
+    assert.equal(await controller.key('', key), true);
+    assert.deepEqual(
+      calls.map((call) => call.params.type),
+      ['keyDown', 'keyUp']
+    );
+    for (const call of calls) {
+      assert.equal(call.method, 'Input.dispatchKeyEvent');
+      assert.equal(call.params.key, key);
+      assert.equal(call.params.windowsVirtualKeyCode, virtualKeyCode);
+      assert.equal(call.params.nativeVirtualKeyCode, virtualKeyCode);
+    }
+  });
+}
+
 test('awaits asynchronous frame observations before returning their values', async () => {
   const controller = Object.create(CdpController.prototype);
   controller.contextId = 7;
@@ -120,6 +221,82 @@ test('awaits asynchronous frame observations before returning their values', asy
     return { result: { value: params.awaitPromise ? await value : undefined } };
   };
   assert.deepEqual(await controller.evaluate('Promise.resolve(42)'), 42);
+});
+
+test('queue handoff readiness requires an enabled, exposed native steer control', async () => {
+  const dom = new JSDOM(
+    '<div data-queued-message-id="queue" data-queued-message-owner="sidebar"><button aria-label="Play queued message"></button><button aria-label="Send as Steer" hidden></button></div>'
+  );
+  try {
+    const controller = Object.create(CdpController.prototype);
+    controller.evaluate = async (expression) =>
+      vm.runInNewContext(expression, { document: dom.window.document });
+    const button = dom.window.document.querySelector('[aria-label="Send as Steer"]');
+    button.getBoundingClientRect = () => ({ width: 22 });
+    assert.equal((await controller.readQueueRow('queue')).steerAvailable, false);
+    button.hidden = false;
+    button.disabled = true;
+    assert.equal((await controller.readQueueRow('queue')).steerAvailable, false);
+    button.disabled = false;
+    const queueRow = await controller.readQueueRow('queue');
+    assert.equal(queueRow.steerAvailable, true);
+    assert.equal(queueRow.ownerViewId, 'sidebar');
+    assert.equal(queueRow.paused, true);
+    button.getBoundingClientRect = () => ({ width: 0 });
+    assert.equal((await controller.readQueueRow('queue')).steerAvailable, false);
+    assert.equal(await controller.readQueueRow('other'), null);
+  } finally {
+    dom.window.close();
+  }
+});
+
+test('reveals an unmounted current-turn disclosure without substituting another turn', async () => {
+  const { revealRetainedActivity } = await import('./ai-fuzzy-live.mjs');
+  const scope = { messageIds: ['tool-message'] },
+    inputs = [];
+  let step = 0;
+  const cdp = {
+    snapshot: async () => ({ routeSessionId: 'session' }),
+    captureActionState: async (requested) => {
+      assert.equal(requested, scope);
+      return {
+        transcript: { scrollTop: 1000 - step * 420 },
+        disclosures: step === 2 ? [{ visible: true }] : [{ visible: false }],
+      };
+    },
+    wheel: async (selector, delta, edge) => {
+      inputs.push({ selector, delta, edge });
+      step++;
+      return true;
+    },
+  };
+  const result = await revealRetainedActivity(cdp, 'session', scope, { wait: async () => {} });
+  assert.equal(result.found, true);
+  assert.equal(inputs.length, 2);
+  assert.ok(inputs.every((input) => input.delta === -420 && input.edge === 'right'));
+});
+
+test('retained activity navigation stops on missing scope, another route, and its native-input bound', async () => {
+  const { revealRetainedActivity } = await import('./ai-fuzzy-live.mjs');
+  const cdp = {
+    snapshot: async () => ({ routeSessionId: 'other' }),
+    captureActionState: async () => ({ transcript: { scrollTop: 5000 }, disclosures: [] }),
+    wheel: async () => true,
+  };
+  assert.equal((await revealRetainedActivity(cdp, 'session', null)).actions.length, 0);
+  assert.equal(
+    (await revealRetainedActivity(cdp, 'session', { messageIds: ['tool'] })).actions.length,
+    0
+  );
+  cdp.snapshot = async () => ({ routeSessionId: 'session' });
+  const result = await revealRetainedActivity(
+    cdp,
+    'session',
+    { messageIds: ['tool'] },
+    { maxSteps: 2, wait: async () => {} }
+  );
+  assert.equal(result.found, false);
+  assert.equal(result.actions.length, 2);
 });
 
 test('live snapshots use the folder-scoped sidebar route in a fresh profile', async () => {
@@ -241,6 +418,123 @@ test('native thumb targeting re-grabs once only after observed range growth with
   assert.equal(result.attempts.length, 2);
   assert.equal(result.attempts[1].reached, true);
   assert.equal(releases, 2);
+});
+
+test('native fractional grabs use distinct thumb endpoints and verify fractional arrival', async () => {
+  const endpoints = [];
+  for (const fraction of [0.25, 0.75, 0.5]) {
+    const controller = Object.create(CdpController.prototype);
+    const list = {
+      scrollHeight: 2000,
+      clientHeight: 400,
+      scrollTop: 0,
+      offsetWidth: 500,
+      clientWidth: 490,
+      getBoundingClientRect: () => ({ top: 100, bottom: 900, right: 500, height: 800 }),
+      hasAttribute: () => true,
+      querySelectorAll: () => [list],
+    };
+    controller.evaluate = async (expression) =>
+      vm.runInNewContext(expression, {
+        document: { querySelector: () => list },
+        innerHeight: 1100,
+      });
+    controller.call = async (_method, params) => {
+      if (params.type === 'mouseReleased') endpoints.push(params.y);
+    };
+    controller.captureActionState = async () => ({
+      transcript: {
+        scrollTop: fraction * 1600,
+        scrollHeight: 2000,
+        clientHeight: 400,
+        visibleRows: [{ messageId: 'visible', top: 0 }],
+      },
+    });
+    const result = await controller.dragTranscriptScrollbar(fraction);
+    assert.equal(result.dispatched, true);
+    assert.equal(result.held, true);
+    assert.equal(result.attempts.length, 1);
+    assert.equal(result.attempts[0].reached, true);
+  }
+  assert.deepEqual(endpoints, [340, 660, 500]);
+});
+
+test('invalid scrollbar fractions never dispatch native input', async () => {
+  const controller = Object.create(CdpController.prototype);
+  controller.evaluate = async () => {
+    throw new Error('Unexpected evaluation');
+  };
+  for (const fraction of [-1, 2, NaN, Infinity, undefined])
+    await assert.rejects(controller.dragTranscriptScrollbar(fraction), /fraction/);
+});
+
+test('fractional arrival allows only native pointer quantization, not a wrong destination', async () => {
+  for (const [offset, expected] of [
+    [12, true],
+    [60, false],
+  ]) {
+    const controller = Object.create(CdpController.prototype);
+    controller.evaluate = async (expression) =>
+      expression.includes('hasAttribute')
+        ? { held: true, visible: true, top: 7500 + offset, range: 30000 }
+        : { x: 490, start: 700, end: 200, range: 30000, travel: 600 };
+    controller.call = async () => {};
+    controller.captureActionState = async () => ({
+      transcript: {
+        scrollTop: 7500 + offset,
+        scrollHeight: 30600,
+        clientHeight: 600,
+        visibleRows: [{ messageId: 'visible', top: 0 }],
+      },
+    });
+    const result = await controller.dragTranscriptScrollbar(0.25);
+    assert.equal(result.attempts[0].targetTolerance, 51.5);
+    assert.equal(result.attempts[0].reached, expected);
+    assert.equal(result.attempts.length, 1);
+  }
+});
+
+test('fractional native targeting calibrates the held drag and preserves failed observations', async () => {
+  for (const failure of [null, 'blank', 'ownership']) {
+    const controller = Object.create(CdpController.prototype);
+    const range = 29824;
+    const start = 657.90625;
+    const travel = 610.90625;
+    const end = start - 0.75 * travel;
+    const events = [];
+    let top = range;
+    controller.call = async (_method, event) => {
+      events.push(event);
+      if (event.type === 'mouseMoved') {
+        // Different native travel from the controller's estimate; integer pointer coordinates.
+        top = Math.round(range + ((Math.round(event.y) - Math.round(start)) * range) / 614);
+      }
+    };
+    controller.evaluate = async (expression) =>
+      expression.includes('hasAttribute')
+        ? { held: failure !== 'ownership', visible: failure !== 'blank', top, range }
+        : { x: 481, start, end, range, travel };
+    controller.captureActionState = async () => ({
+      transcript: {
+        scrollTop: top,
+        scrollHeight: range + 631,
+        clientHeight: 631,
+        visibleRows: [{}],
+      },
+    });
+    const result = await controller.dragTranscriptScrollbar(0.25);
+    const [attempt] = result.attempts;
+    assert.equal(result.attempts.length, 1);
+    assert.equal(attempt.held, failure !== 'ownership');
+    assert.equal(attempt.reached, !failure);
+    assert.equal(events.at(-1).type, 'mouseReleased');
+    assert.equal(events.at(-1).y, events.at(-2).y);
+    assert.equal(attempt.samples.length, failure ? 1 : 3);
+    if (!failure) {
+      assert.ok(Math.abs(attempt.samples[1].top - range / 4) > attempt.targetTolerance);
+      assert.ok(Math.abs(top - range / 4) <= attempt.targetTolerance);
+    }
+  }
 });
 
 test('retries an exhausted live tool window without retrying a scrolling failure', () => {
@@ -626,28 +920,33 @@ test('stops the AI-08 action plan when the model stream settles', async () => {
   ]);
 });
 
-test('exposes the jump control when AI-08 starts bottom-pinned', async () => {
+test('verifies a bottom-pinned jump against its detached starting point', async () => {
   const calls = [];
+  let top = 1000;
   const cdp = {
     click: async (selector) => {
       calls.push(['click', selector]);
-      return calls.length === 4;
+      if (calls.length !== 4) return false;
+      top = 1000;
+      return true;
     },
     wheel: async (selector, delta, side) => {
       calls.push(['wheel', selector, delta, side]);
+      top = 580;
       return true;
     },
-    captureActionState: async () => {
-      const moved = calls.some(([type]) => type === 'wheel');
-      return {
-        focusOwner: 'transcript',
-        transcript: {
-          scrollTop: moved ? 100 : 0,
-          firstVisibleMessageId: moved ? 'message-2' : 'message-1',
-          firstVisibleTop: 0,
-        },
-      };
-    },
+    captureActionState: async () => ({
+      focusOwner: 'transcript',
+      transcript: {
+        sessionId: 'session',
+        scrollTop: top,
+        scrollHeight: 1600,
+        clientHeight: 600,
+        firstVisibleMessageId: top === 1000 ? 'latest' : 'older',
+        firstVisibleTop: 0,
+        visibleRows: [{ messageId: top === 1000 ? 'latest' : 'older', top: 0 }],
+      },
+    }),
   };
 
   const results = await executeActionPlan(
@@ -664,6 +963,93 @@ test('exposes the jump control when AI-08 starts bottom-pinned', async () => {
     ['click', '[aria-label="Scroll to latest message"]'],
   ]);
   assert.equal(results[0].executed, true);
+  assert.equal(results[0].navigationStart.transcript.scrollTop, 580);
+  assert.equal(results[0].before.transcript.scrollTop, 1000);
+  assert.equal(results[0].after.transcript.scrollTop, 1000);
+});
+
+test('does not pass an unverified jump just because it started at bottom', () => {
+  const action = { action: 'click sticky or jump to latest' };
+  const pinned = {
+    transcript: {
+      sessionId: 'session',
+      scrollTop: 1000,
+      scrollHeight: 1600,
+      clientHeight: 600,
+      firstVisibleMessageId: 'latest',
+      firstVisibleTop: 0,
+      visibleRows: [{ messageId: 'latest', top: 0 }],
+    },
+  };
+  const detached = {
+    transcript: { ...pinned.transcript, scrollTop: 580, firstVisibleMessageId: 'older' },
+  };
+  assert.equal(verifyActionEffect(action, pinned, pinned, { dispatched: true }).verified, false);
+  assert.equal(
+    verifyActionEffect(action, pinned, pinned, {
+      dispatched: true,
+      navigationStart: pinned,
+    }).verified,
+    false
+  );
+  assert.equal(
+    verifyActionEffect(action, pinned, detached, {
+      dispatched: true,
+      navigationStart: detached,
+    }).verified,
+    false
+  );
+  assert.equal(
+    verifyActionEffect(
+      action,
+      pinned,
+      { transcript: { ...pinned.transcript, sessionId: 'other' } },
+      {
+        dispatched: true,
+        navigationStart: detached,
+      }
+    ).verified,
+    false
+  );
+});
+
+test('allows bounded follow lag only for a verified active-stream jump', () => {
+  const action = { action: 'click sticky or jump to latest' };
+  const before = {
+    transcript: {
+      sessionId: 'session',
+      scrollTop: 1000,
+      scrollHeight: 1600,
+      clientHeight: 600,
+      firstVisibleMessageId: 'latest',
+      firstVisibleTop: 0,
+      visibleRows: [{ messageId: 'latest', top: 0 }],
+    },
+  };
+  const start = {
+    transcript: {
+      ...before.transcript,
+      scrollTop: 580,
+      firstVisibleMessageId: 'older',
+      visibleRows: [{ messageId: 'older', top: 0 }],
+    },
+  };
+  const after = { transcript: { ...before.transcript, scrollTop: 960 } };
+  assert.equal(
+    verifyActionEffect(action, before, after, {
+      dispatched: true,
+      navigationStart: start,
+    }).verified,
+    false
+  );
+  assert.equal(
+    verifyActionEffect(action, before, after, {
+      dispatched: true,
+      navigationStart: start,
+      streaming: true,
+    }).verified,
+    true
+  );
 });
 
 test('waits for the expanded diff to mount before closing it', async () => {
@@ -940,6 +1326,57 @@ test('summarizes the canonical assistant response for the marked user prompt', (
   assert.equal(summary.tokensInOrder, true);
   assert.deepEqual(canonicalDeliveryFailures(summary), []);
 });
+
+for (const [name, textParts, tokenCounts, tokensInOrder] of [
+  ['ignores tokens echoed in reasoning', ['VFZ-DUP-01', 'VFZ-DUP-END'], [1, 1], true],
+  ['still rejects duplicate text output', ['VFZ-DUP-01\nVFZ-DUP-01\nVFZ-DUP-END'], [2, 1], true],
+  ['does not accept reasoning as missing output', [], [0, 0], false],
+]) {
+  test(`canonical duplicate delivery ${name}`, () => {
+    const summary = summarizeCanonicalDelivery(
+      [
+        {
+          info: { id: 'user', role: 'user' },
+          parts: [{ type: 'text', text: '[VFZ:reasoning:DUP]' }],
+        },
+        {
+          info: {
+            id: 'assistant',
+            role: 'assistant',
+            parentID: 'user',
+            finish: 'stop',
+            time: { completed: 1 },
+          },
+          parts: [
+            {
+              type: 'reasoning',
+              text: 'End with VFZ-DUP-END after VFZ-DUP-01, each exactly once.',
+            },
+            ...textParts.map((text) => ({ type: 'text', text })),
+          ],
+        },
+      ],
+      '[VFZ:reasoning:DUP]',
+      ['VFZ-DUP-01', 'VFZ-DUP-END']
+    );
+
+    assert.equal(summary.assistants[0]?.text, textParts.join('\n'));
+    assert.deepEqual(summary.tokenCounts, tokenCounts);
+    assert.equal(summary.tokensInOrder, tokensInOrder);
+    const failures = canonicalDeliveryFailures(summary);
+    if (tokenCounts.every((count) => count === 1)) {
+      assert.deepEqual(failures, []);
+    } else {
+      assert.ok(
+        failures.includes('canonical response did not contain every required token exactly once')
+      );
+      assert.equal(
+        failures.includes('canonical response tokens were not in the required order'),
+        !tokensInOrder
+      );
+    }
+  });
+}
 
 test('rejects duplicate canonical users, linked assistants, bad finishes, errors, and token order', () => {
   const summary = summarizeCanonicalDelivery(
@@ -1778,6 +2215,16 @@ test('requires clean linked assistants and exact response markers for queued del
   assert.deepEqual(delivery.assistantCounts, [1, 1]);
   assert.deepEqual(delivery.assistantValid, [true, true]);
   assert.equal(delivery.ordered, true);
+  messages[1].parts.unshift({ type: 'reasoning', text: 'Reply with Q1-END' });
+  const reasoningEcho = summarizeQueuedDelivery(messages, turns);
+  assert.deepEqual(reasoningEcho.assistantValid, [true, true]);
+  assert.equal(reasoningEcho.assistantOutcomes[0][0].textMarkerCount, 1);
+  assert.equal(reasoningEcho.assistantOutcomes[0][0].reasoningMarkerCount, 1);
+  messages[1].parts[1].text = '';
+  assert.deepEqual(summarizeQueuedDelivery(messages, turns).assistantValid, [false, true]);
+  messages[1].parts[1].text = 'Q1-END Q1-END';
+  assert.deepEqual(summarizeQueuedDelivery(messages, turns).assistantValid, [false, true]);
+  messages[1].parts[1].text = 'Q1-END';
   messages[3].parts[0].text = 'wrong response';
   assert.deepEqual(summarizeQueuedDelivery(messages, turns).assistantValid, [true, false]);
 });
@@ -1817,6 +2264,40 @@ test('judges the AI-19 permission, queue handoff, steer, and draft lifecycle', (
       editor: { ...passing.editor, orphanedDraftCleared: false },
     })[0],
     /ordinary draft/
+  );
+
+  const turn = { promptMarker: '[LATE-STEER]', responseMarker: 'LATE-STEER-END' };
+  const messages = [
+    {
+      info: { id: 'late-user', role: 'user' },
+      parts: [{ type: 'text', text: turn.promptMarker }],
+    },
+  ];
+  const expiredDelivery = summarizeQueuedDelivery(messages, [turn]);
+  assert.deepEqual(expiredDelivery.assistantCounts, [0]);
+  assert.match(
+    lifecycleScenarioFailures({ ...passing, delivery: expiredDelivery })[0],
+    /canonical user\/assistant delivery/
+  );
+  messages.push({
+    info: {
+      id: 'late-assistant',
+      role: 'assistant',
+      parentID: 'late-user',
+      finish: 'stop',
+      time: { completed: 1 },
+    },
+    parts: [{ type: 'text', text: turn.responseMarker }],
+  });
+  // Waiting for idle does not update the earlier summary object. Recompute from
+  // the final canonical snapshot before judging the lifecycle.
+  assert.deepEqual(expiredDelivery.assistantCounts, [0]);
+  assert.deepEqual(
+    lifecycleScenarioFailures({
+      ...passing,
+      delivery: summarizeQueuedDelivery(messages, [turn]),
+    }),
+    []
   );
 });
 

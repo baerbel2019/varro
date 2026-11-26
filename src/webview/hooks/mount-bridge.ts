@@ -1,5 +1,6 @@
-import { batch } from 'solid-js';
-import { reconcile } from 'solid-js/store';
+import { storePath } from '@solidjs/signals';
+
+import { flush } from 'solid-js';
 import { clearRemoteImagePreviews } from '../lib/remote-image-previews';
 import { syncWindowChatTheme } from '../lib/window-chat-theme';
 import type {
@@ -34,6 +35,7 @@ import {
   applyQueuedMessagesSnapshot,
 } from '../lib/state-queued-messages';
 import { normalizeProjectPath } from './session/session-lifecycle';
+import { reconcileStoreField } from '../lib/store-reconcile';
 
 export function createMountBridgeOperations(deps: {
   ensureConnectionInitialized(): void;
@@ -66,65 +68,41 @@ export function createMountBridgeOperations(deps: {
   const handleExtensionMessage = (msg: ExtensionMessage) => {
     handleExtensionMessageWithDependencies(
       {
-        setServerStatus: (payload) => appStore.setState('serverStatus', payload),
+        ...deps,
+        setServerStatus: (payload) => appStore.setState(storePath('serverStatus', payload)),
         setServerReconnecting: (reconnecting) =>
-          appStore.setState('serverReconnecting', reconnecting),
+          appStore.setState(storePath('serverReconnecting', reconnecting)),
         setRestartBlocked: (payload) => {
           if (payload?.checkId !== undefined && appStore.state.restartBlocked === null) return;
-          appStore.setState('restartBlocked', payload);
+          appStore.setState(storePath('restartBlocked', payload));
         },
         clearError: () => uiStore.setError(null),
-        ensureConnectionInitialized: deps.ensureConnectionInitialized,
-        reloadSessionCatalog: deps.reloadSessionCatalog,
         sessionTransferred: ({ sessionId, directory, available }) => {
-          const session = appStore.state.sessions.find((entry) => entry.id === sessionId);
-          const directoryChanged = session && !isSameWorkspacePath(session.directory, directory);
-          batch(() => {
-            if (session)
-              appStore.setState('sessions', (entry) => entry.id === sessionId, 'transfer', {
+          appStore.setState((draft) => {
+            const session = draft.sessions.find((entry) => entry.id === sessionId);
+            if (session) {
+              const directoryChanged = !isSameWorkspacePath(session.directory, directory);
+              session.transfer = {
                 originDirectory: session.transfer?.originDirectory ?? session.directory,
                 available,
-              });
-            if (directoryChanged) {
-              appStore.setState(
-                'sessions',
-                (entry) => entry.id === sessionId,
-                'isGitWorktree',
-                undefined
-              );
+              };
+              if (directoryChanged) delete session.isGitWorktree;
+              session.directory = directory;
             }
-            appStore.setState(
-              'sessions',
-              (entry) => entry.id === sessionId,
-              'directory',
-              directory
-            );
-            appStore.setState(
-              'transferredSessions',
-              reconcile(
-                available
-                  ? Object.fromEntries(
-                      Object.entries(appStore.state.transferredSessions).filter(
-                        ([id]) => id !== sessionId
-                      )
-                    )
-                  : { ...appStore.state.transferredSessions, [sessionId]: directory }
-              )
-            );
+            if (available) delete draft.transferredSessions[sessionId];
+            else draft.transferredSessions[sessionId] = directory;
           });
-          if (appStore.state.activeSessionId !== sessionId) {
-            void deps.reloadSessionCatalog?.();
-            return;
-          }
-          // Refresh in place. The host admits history reads, not execution in a closed folder.
+          // Commit the move before reopening: selection reads the session's folder and availability.
+          flush();
+          void deps.reloadSessionCatalog?.();
+          if (appStore.state.activeSessionId !== sessionId) return;
+          // Refresh in place without clearing the transcript or draft.
           uiStore.setError(null);
           deps.openSession?.(sessionId, directory, true);
         },
-        getServerState: deps.getServerState,
-        invalidateConnection: deps.invalidateConnection,
         clearProvidersState: () => {
-          appStore.setState('providersLoaded', false);
-          appStore.setState('providerLimits', reconcile({}));
+          appStore.setState(storePath('providersLoaded', false));
+          appStore.setState((draft) => reconcileStoreField(draft, 'providerLimits', {}));
         },
         setTheme: (payload) => {
           const theme = syncWindowChatTheme(payload);
@@ -134,10 +112,10 @@ export function createMountBridgeOperations(deps: {
         setConfig: (payload) => {
           applyChatFontConfig(payload);
           if (payload.autoAttachProblems !== undefined) {
-            appStore.setState('autoAttachProblems', payload.autoAttachProblems);
+            appStore.setState(storePath('autoAttachProblems', payload.autoAttachProblems));
           }
           if (payload.autoAttachActiveFile !== undefined) {
-            appStore.setState('autoAttachActiveFile', payload.autoAttachActiveFile);
+            appStore.setState(storePath('autoAttachActiveFile', payload.autoAttachActiveFile));
           }
           if (payload.showFileDiffs !== undefined) {
             uiStore.setShowFileDiffs(payload.showFileDiffs);
@@ -156,37 +134,40 @@ export function createMountBridgeOperations(deps: {
           }
           if (payload.remoteImages !== undefined) {
             if (payload.remoteImages === 'off') clearRemoteImagePreviews();
-            appStore.setState('remoteImages', payload.remoteImages);
+            appStore.setState(storePath('remoteImages', payload.remoteImages));
           }
           if (payload.promptCompletionModel !== undefined) {
-            appStore.setState('promptCompletionModel', payload.promptCompletionModel);
+            appStore.setState(storePath('promptCompletionModel', payload.promptCompletionModel));
           }
           if (payload.followupsEnabled !== undefined) {
-            appStore.setState('followupsEnabled', payload.followupsEnabled);
+            appStore.setState(storePath('followupsEnabled', payload.followupsEnabled));
           }
           if (payload.followupModel !== undefined) {
-            appStore.setState('followupModel', payload.followupModel);
+            appStore.setState(storePath('followupModel', payload.followupModel));
           }
           if (payload.debugShowQuotaWarning !== undefined) {
-            appStore.setState('debugShowQuotaWarning', payload.debugShowQuotaWarning);
+            appStore.setState(storePath('debugShowQuotaWarning', payload.debugShowQuotaWarning));
           }
           if (payload.debugResetWarningDays !== undefined) {
-            appStore.setState('debugResetWarningDays', payload.debugResetWarningDays);
+            appStore.setState(storePath('debugResetWarningDays', payload.debugResetWarningDays));
+          }
+          if (payload.promptCacheWarningTokens !== undefined) {
+            appStore.setState(
+              storePath('promptCacheWarningTokens', payload.promptCacheWarningTokens)
+            );
           }
           uiStore.setDesktopSessionPaneSide(payload.desktopSessionPaneSide);
           permissionsStore.setDefaultPermissionModePreference(payload.defaultPermissionMode);
         },
         getPreviousActiveFilePath: () => appStore.state.editorContext.activeFile?.path ?? null,
-        getCurrentWorkspacePath: deps.getCurrentWorkspacePath,
         getCurrentWorkspaceFolders: () => appStore.state.editorContext.workspaceFolders ?? [],
-        setCurrentWorkspacePath: deps.setCurrentWorkspacePath,
         persistWorkspacePath: (path) => writeStored(STORAGE_KEYS.workspacePath, path),
         setEditorContext: composerStore.setEditorContext,
         workspaceSelectionFailed: handleWorkspaceSelectionFailure,
         acknowledgeWorkspaceSelection: (path) => {
           if (isSameWorkspacePath(path, appStore.state.pendingWorkspaceSelectionPath)) {
             // Keep the request ID: persisting the host selection can fail after the endpoint switches.
-            appStore.setState('pendingWorkspaceSelectionPath', null);
+            appStore.setState(storePath('pendingWorkspaceSelectionPath', null));
           }
         },
         rememberCurrentDocumentNavigation: composerStore.rememberCurrentDocumentNavigation,
@@ -198,30 +179,21 @@ export function createMountBridgeOperations(deps: {
             (appStore.state.editorContext.workspaceFolders ?? []).map((folder) => folder.path)
           );
         },
-        resetWorkspaceForChange: deps.resetWorkspaceForChange,
-        reloadWorkspaceAfterChange: deps.reloadWorkspaceAfterChange,
-        isInitialized: deps.isInitialized,
         setTerminalSelection: composerStore.setTerminalSelection,
         syncClipboardImages: composerStore.syncClipboardImages,
         addContextFiles: composerStore.addContextFiles,
         removeContextFile: composerStore.removeContextFile,
-        createSession: deps.createSession,
-        openSession: deps.openSession,
         requestComposerFocus: uiStore.requestComposerFocus,
         requestOpenAttentionSessions: uiStore.requestOpenAttentionSessions,
         requestOpenCompletedSessions: uiStore.requestOpenCompletedSessions,
         requestSessionSearchFocus: uiStore.requestSessionSearchFocus,
-        abortSession: deps.abortSession,
-        refreshMcps: deps.refreshMcps,
-        refreshLsps: deps.refreshLsps,
-        refreshProviders: deps.refreshProviders,
         setProviderRefreshPending: (pending) =>
-          appStore.setState('providerRefreshPending', pending),
-        revalidateProviderAuth: deps.revalidateProviderAuth,
+          appStore.setState(storePath('providerRefreshPending', pending)),
         openExternal: (url) => postMessage({ type: 'vscode/open-external', payload: { url } }),
         setWorkspaceStatusSummary: (summary) =>
-          appStore.setState('workspaceStatusSummary', summary),
-        setWorkspaceStatuses: (entries) => appStore.setState('workspaceStatuses', entries),
+          appStore.setState(storePath('workspaceStatusSummary', summary)),
+        setWorkspaceStatuses: (entries) =>
+          appStore.setState(storePath('workspaceStatuses', entries)),
         setEditorTabsState: (open, sessionIds, openSessionIds) => {
           const seenSessionIds = new Set([...visibleEditorSessionIds, ...sessionIds]);
           for (const rootSessionId of seenSessionIds) {
@@ -230,15 +202,12 @@ export function createMountBridgeOperations(deps: {
             }
           }
           visibleEditorSessionIds = sessionIds;
-          appStore.setState('editorTabsOpen', open);
-          appStore.setState('editorSessionIds', sessionIds);
-          appStore.setState('openEditorSessionIds', openSessionIds);
+          appStore.setState(storePath('editorTabsOpen', open));
+          appStore.setState(storePath('editorSessionIds', sessionIds));
+          appStore.setState(storePath('openEditorSessionIds', openSessionIds));
         },
-        setSiblingWorkspaceAlerts: (alerts) => appStore.setState('siblingWorkspaceAlerts', alerts),
-        setPermissionAutomation: deps.setPermissionAutomation,
-        permissionModesSynced: deps.permissionModesSynced,
-        revealPermission: deps.revealPermission,
-        queueInterruptedSessionRecovery: deps.queueInterruptedSessionRecovery,
+        setSiblingWorkspaceAlerts: (alerts) =>
+          appStore.setState(storePath('siblingWorkspaceAlerts', alerts)),
       },
       msg
     );
@@ -339,6 +308,8 @@ export function handleExtensionMessageWithDependencies(
       }
       if (msg.payload.state === 'running') {
         deps.ensureConnectionInitialized();
+        // Warming needs a running v2 server, so its availability follows the server state.
+        if (previousServerState !== 'running') postMessage({ type: 'warming/sync' });
       } else {
         if (previousServerState === 'running') deps.invalidateConnection();
         deps.clearProvidersState();
@@ -488,6 +459,12 @@ export function handleExtensionMessageWithDependencies(
     case 'providers/status':
       deps.setProviderRefreshPending?.(msg.payload.pending);
       break;
+    case 'pinned-sessions/sync':
+      appStore.applyPinnedSessionsSync(msg.payload.sessionIds);
+      break;
+    case 'todo-sessions/sync':
+      appStore.setState(storePath('todoSessionIds', [...msg.payload.sessionIds]));
+      break;
     case 'queued-messages/sync':
       applyQueuedMessagesSnapshot(msg.payload.messages, msg.payload.mutationId);
       break;
@@ -548,6 +525,9 @@ export function handleExtensionMessageWithDependencies(
       break;
     case 'ralph/state':
       ralphStore.applyHostState(msg.payload.runs, msg.payload.activeIds);
+      break;
+    case 'warming/state':
+      appStore.setState(storePath('promptCacheWarming', msg.payload));
       break;
   }
 }
